@@ -1,6 +1,6 @@
 # T003 — Bias calibration job (the edge)
 
-**Priority:** P0 · **Status:** todo
+**Priority:** P0 · **Status:** built-local
 
 ## Goal
 Compute real per-city forecast bias (mean forecast − actual over a trailing
