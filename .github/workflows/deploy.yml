@@ -1,28 +1,15 @@
-# CI + deploy Nestor to the VPS on every push to main.
-# FILL IN once the VPS exists: add repo secrets VPS_HOST, VPS_USER, VPS_SSH_KEY.
-# The daily run itself is scheduled by cron/systemd ON the VPS (not here) —
-# this workflow builds, checks, and ships the binary to the box.
+# Deploy Nestor to the VPS. DISABLED from auto-running until the VPS exists (T008):
+# it needs repo secrets VPS_HOST / VPS_USER / VPS_SSH_KEY, which aren't set yet —
+# auto-running on push would fail every time (that was the source of the failed-build
+# emails). Manual-trigger only for now; T008 will flip it back to `on: push` once the
+# secrets are configured. CI/build health is covered by ci.yml on every push.
 name: deploy
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch: {}
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo build --release
-      - run: cargo test
-
   deploy:
-    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,5 +33,4 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            systemctl --user restart nestor-weather.timer || true
+          script: systemctl --user restart nestor-weather.timer || true

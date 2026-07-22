@@ -1,11 +1,10 @@
-# CI gate — runs on every PR and on branch pushes. This is the objective merge
-# bar (Ryan can't verify Rust by eye): red CI = not mergeable.
+# CI gate — runs on every push (incl. master) and every PR. This is the objective
+# merge/health bar (Ryan can't verify Rust by eye): red CI = broken.
 name: ci
 
 on:
-  pull_request:
   push:
-    branches-ignore: [main]
+  pull_request:
 
 jobs:
   check:
