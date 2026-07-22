@@ -12,7 +12,7 @@ use chrono_tz::America::New_York;
 use engine::config::City;
 use engine::kalshi::Market;
 use engine::strategy::ExecOutcome;
-use engine::{logging, Engine, Side, Signal, SizingHint, Strategy};
+use engine::{alert, logging, Engine, Side, Signal, SizingHint, Strategy};
 use serde_json::json;
 
 pub mod probe;
@@ -84,6 +84,16 @@ impl Strategy for Weather {
             "weather start — mode={:?} date={date_str} ({dcode}) bankroll=${:.2} halted={}",
             eng.mode, st.bankroll, st.halted
         ));
+        if st.halted {
+            alert::notify(
+                &eng.http,
+                &format!(
+                    "weather HALTED — placing no trades (bankroll ${:.2})",
+                    st.bankroll
+                ),
+            )
+            .await;
+        }
 
         let cities: Vec<City> = eng.cities.iter().filter(|c| c.tradeable).cloned().collect();
         for c in &cities {
@@ -163,6 +173,14 @@ impl Weather {
                     "{}: BOUGHT {}x {} @ {ask}c",
                     c.code, order.count, mkt.ticker
                 ));
+                alert::notify(
+                    &eng.http,
+                    &format!(
+                        "{}: BOUGHT {}x {} @ {ask}c",
+                        c.code, order.count, mkt.ticker
+                    ),
+                )
+                .await;
             }
             ExecOutcome::Rejected(r) => {
                 rec["result"] = json!({"rejected": format!("{r:?}")});
@@ -171,6 +189,11 @@ impl Weather {
             ExecOutcome::OrderError(e) => {
                 rec["result"] = json!({"error": e});
                 logging::info(format!("{}: ORDER FAILED ({e})", c.code));
+                alert::notify(
+                    &eng.http,
+                    &format!("{}: ORDER FAILED {} ({e})", c.code, mkt.ticker),
+                )
+                .await;
             }
         }
         logging::record(LOG, rec);

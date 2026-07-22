@@ -15,12 +15,18 @@ pub fn record(file: &str, mut event: serde_json::Value) {
             serde_json::json!(chrono::Utc::now().to_rfc3339()),
         );
     }
-    let _ = std::fs::create_dir_all("logs");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Err(e) = write_line(file, &event) {
+        // A dropped trade record is dangerous (a real order with no local trace),
+        // so scream to stderr with the full event rather than swallowing it.
+        eprintln!("[log] FAILED writing to logs/{file}: {e} — dropped event: {event}");
+    }
+}
+
+fn write_line(file: &str, event: &serde_json::Value) -> std::io::Result<()> {
+    std::fs::create_dir_all("logs")?;
+    let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(format!("logs/{file}"))
-    {
-        let _ = writeln!(f, "{event}");
-    }
+        .open(format!("logs/{file}"))?;
+    writeln!(f, "{event}")
 }

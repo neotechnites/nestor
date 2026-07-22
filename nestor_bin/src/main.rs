@@ -20,12 +20,17 @@ async fn main() -> Result<()> {
     // Overlay calibrated per-city biases (from `calibrate`) over the config
     // placeholders, so the bot bets on the bias-corrected forecast. No-op if the
     // biases file is absent. Does not change which cities are tradeable.
-    let applied = engine::config::apply_biases(
-        &mut settings.cities,
-        &env_str("NESTOR_BIASES_PATH", "data/biases.json"),
-    );
+    let biases_path = env_str("NESTOR_BIASES_PATH", "data/biases.json");
+    let applied = engine::config::apply_biases(&mut settings.cities, &biases_path);
     if applied > 0 {
         eprintln!("nestor: applied {applied} calibrated city biases");
+        if let Some(days) = biases_age_days(&biases_path) {
+            if days > 14 {
+                eprintln!(
+                    "nestor: WARNING calibrated biases are {days} days old — run `nestor calibrate`"
+                );
+            }
+        }
     }
 
     let which = std::env::args().nth(1).unwrap_or_else(|| "weather".into());
@@ -76,7 +81,20 @@ async fn main() -> Result<()> {
         "NESTOR_STATE_PATH",
         "data/state.json",
     )));
-    let risk = RiskManager::load_or_init(settings.risk, store, bankroll)?;
+    let mut risk = RiskManager::load_or_init(settings.risk, store, bankroll)?;
+
+    // `resume` clears a persisted kill-switch halt (operator action after review).
+    if which == "resume" {
+        risk.resume();
+        let st = risk.status();
+        println!(
+            "halt cleared — bankroll ${:.2} drawdown {:.1}% halted={}",
+            st.bankroll,
+            st.drawdown * 100.0,
+            st.halted
+        );
+        return Ok(());
+    }
 
     let kalshi = if mode == Mode::Live {
         let key_id =
@@ -119,4 +137,10 @@ fn env_f64(key: &str, default: f64) -> f64 {
 
 fn env_str(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.into())
+}
+
+/// Age of the biases file in whole days, or None if it doesn't exist / unreadable.
+fn biases_age_days(path: &str) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(modified.elapsed().ok()?.as_secs() / 86_400)
 }
