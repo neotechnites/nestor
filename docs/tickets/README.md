@@ -13,7 +13,7 @@ See [../WORKFLOW.md](../WORKFLOW.md). Priority: P0 (now) → P2 (later/gated).
 | [T006](T006-ci-on-prs.md) | CI on PRs + test scaffolding | P0 | todo | — |
 | [T007](T007-live-order-path-test.md) | Live $1 order-path test | P1 | built (awaits keys) | account |
 | [T008](T008-vps-provisioning.md) | VPS provisioning + systemd timer + deploy secrets | P1 | VPS pick | — |
-| [T009](T009-lock-sleeve.md) | Lock sleeve (always-on BTC favorite fade) | P2 | epic | T001,T004 |
+| [T009](T009-lock-sleeve.md) | Lock sleeve (always-on BTC favorite fade) | P2 | in-progress (signal+backtest done) | T001,T004,T011 |
 | [T010](T010-consume-biases.md) | Weather sleeve consumes calibrated biases + season-aware city filter | P0 | done | T003 |
 | [T011](T011-fill-verification.md) | Verify actual fills before recording positions | P0 (pre-unattended) | todo | T007 |
 

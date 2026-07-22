@@ -28,7 +28,7 @@
 ## The edges (forward-tested 2026-07-15, vault note 13 — real OOS, ~20 days)
 | Edge | Verdict | Status |
 |---|---|---|
-| **Lock / deep-longshot fade** (BTC, off-50) | ✅ HELD 99.3% win, +3.25%/trade | **NOT built — the real money, next big build (T009)** |
+| **Lock / deep-longshot fade** (BTC, off-50) | ✅ HELD 99.3% win, +3.25%/trade | **Signal + backtest BUILT in Rust (T009, `nestor backtest-lock` reproduces 138 trades / 99.28% / +3.26%); live always-on sleeve remains (needs keys/VPS/T011)** |
 | **Weather forecast-buy** | ✅ HELD, ~+3.5–5¢/city durable | **BUILT, code-complete** |
 | Gold × BTC-drop | ⚠️ DECAYED (still +, at-50, noisy) | NOT building |
 | Streak/breadth reversal | ✅ direction only, Kalshi break-even after fees | NOT building (Poly-only) |

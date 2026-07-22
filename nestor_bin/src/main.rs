@@ -35,6 +35,12 @@ async fn main() -> Result<()> {
 
     let which = std::env::args().nth(1).unwrap_or_else(|| "weather".into());
 
+    // `backtest-lock` re-confirms the lock edge in-code against cached data.
+    // Read-only, no keys, no engine.
+    if which == "backtest-lock" {
+        return lock::backtest::run();
+    }
+
     // `calibrate` is a maintenance job (not a strategy): it needs neither the
     // Kalshi client nor the risk layer, so handle it before building the Engine.
     if which == "calibrate" {
