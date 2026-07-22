@@ -151,10 +151,13 @@ pub async fn actual_maxes(
         .await
         .context("parse IEM daily response")?;
 
+    // IEM daily.json ignores sdate/edate and returns the station's full history
+    // ascending; fields are `date` (YYYY-MM-DD) and `max_tmpf`. We build the full
+    // date->max map and let join_pairs filter to the forecast window.
     let mut out = BTreeMap::new();
     for row in &resp.data {
-        let day = row.get("day").and_then(|v| v.as_str());
-        let max = row.get("max_temp_f").and_then(|v| v.as_f64());
+        let day = row.get("date").and_then(|v| v.as_str());
+        let max = row.get("max_tmpf").and_then(|v| v.as_f64());
         if let (Some(day), Some(max)) = (day, max) {
             out.insert(day.to_string(), max);
         }

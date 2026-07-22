@@ -92,22 +92,14 @@ pub fn default_cities() -> Vec<City> {
         }
     }
     vec![
-        c("MIA", "KXHIGHMIA", 25.79, -80.29, "KMIA", "FL_ASOS", true),
-        c("ATL", "KXHIGHTATL", 33.63, -84.44, "KATL", "GA_ASOS", true),
-        c("NY", "KXHIGHNY", 40.78, -73.97, "KNYC", "NY_ASOS", true),
-        c("BOS", "KXHIGHTBOS", 42.36, -71.01, "KBOS", "MA_ASOS", true),
-        c("PHX", "KXHIGHTPHX", 33.43, -112.00, "KPHX", "AZ_ASOS", true),
-        c("CHI", "KXHIGHCHI", 41.79, -87.75, "KMDW", "IL_ASOS", true),
-        c("DEN", "KXHIGHDEN", 39.85, -104.66, "KDEN", "CO_ASOS", false),
-        c(
-            "SEA",
-            "KXHIGHTSEA",
-            47.44,
-            -122.31,
-            "KSEA",
-            "WA_ASOS",
-            false,
-        ),
+        c("MIA", "KXHIGHMIA", 25.79, -80.29, "MIA", "FL_ASOS", true),
+        c("ATL", "KXHIGHTATL", 33.63, -84.44, "ATL", "GA_ASOS", true),
+        c("NY", "KXHIGHNY", 40.78, -73.97, "NYC", "NY_ASOS", true),
+        c("BOS", "KXHIGHTBOS", 42.36, -71.01, "BOS", "MA_ASOS", true),
+        c("PHX", "KXHIGHTPHX", 33.43, -112.00, "PHX", "AZ_ASOS", true),
+        c("CHI", "KXHIGHCHI", 41.79, -87.75, "MDW", "IL_ASOS", true),
+        c("DEN", "KXHIGHDEN", 39.85, -104.66, "DEN", "CO_ASOS", false),
+        c("SEA", "KXHIGHTSEA", 47.44, -122.31, "SEA", "WA_ASOS", false),
     ]
 }
 
@@ -138,7 +130,7 @@ mod tests {
             series = "KXHIGHMIA"
             lat = 25.79
             lon = -80.29
-            station = "KMIA"
+            station = "MIA"
             network = "FL_ASOS"
             bias = 0.9
             tradeable = true

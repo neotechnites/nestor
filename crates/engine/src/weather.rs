@@ -76,9 +76,13 @@ pub async fn actual_high(
         .error_for_status()?
         .json()
         .await?;
+    // IEM ignores sdate/edate and returns the full history ascending, with
+    // fields `date` (YYYY-MM-DD) and `max_tmpf`. Select the row for the exact
+    // requested date rather than data.first() (which is the oldest row on record).
     Ok(resp
         .data
-        .first()
-        .and_then(|r| r.get("max_temp_f"))
+        .iter()
+        .find(|r| r.get("date").and_then(|v| v.as_str()) == Some(date))
+        .and_then(|r| r.get("max_tmpf"))
         .and_then(|v| v.as_f64()))
 }
