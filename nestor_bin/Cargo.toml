@@ -17,3 +17,5 @@ dotenvy.workspace = true
 reqwest.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+futures.workspace = true
+fs2.workspace = true

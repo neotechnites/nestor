@@ -48,18 +48,34 @@ pub struct Engine {
     pub mode: Mode,
     pub risk: Mutex<RiskManager>,
     pub cities: Vec<crate::config::City>,
+    /// Serializes the whole evaluate→place→on_fill sequence across concurrent
+    /// strategy tasks. Without it, two tasks could both clear a cap in `evaluate`
+    /// before either records its fill (the risk lock is dropped across the network
+    /// await). An async mutex is held across that await; the std risk lock is not.
+    pub exec_lock: tokio::sync::Mutex<()>,
 }
 
 impl Engine {
     /// Roll the risk layer's daily counters for `day` (ET, YYYY-MM-DD).
     pub fn begin_day(&self, day: &str) {
-        self.risk.lock().unwrap().begin_day(day);
+        self.risk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin_day(day);
     }
 
     /// Route a signal through the Risk layer, then execute (live) or simulate
     /// (paper). Never holds the risk lock across the network await.
     pub async fn execute(&self, signal: Signal) -> ExecOutcome {
-        let order = match self.risk.lock().unwrap().evaluate(&signal) {
+        // Serialize the evaluate→place→on_fill sequence across concurrent tasks so
+        // two strategies can't both pass a cap before either records its fill.
+        let _exec = self.exec_lock.lock().await;
+        let order = match self
+            .risk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .evaluate(&signal)
+        {
             Ok(o) => o,
             Err(r) => return ExecOutcome::Rejected(r),
         };
@@ -83,13 +99,19 @@ impl Engine {
                 .await
             {
                 Ok(response) => {
-                    self.risk.lock().unwrap().on_fill(&order);
+                    self.risk
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .on_fill(&order);
                     ExecOutcome::Filled { order, response }
                 }
                 Err(e) => ExecOutcome::OrderError(e.to_string()),
             }
         } else {
-            self.risk.lock().unwrap().on_fill(&order);
+            self.risk
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .on_fill(&order);
             ExecOutcome::Paper(order)
         }
     }

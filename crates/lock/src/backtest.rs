@@ -81,7 +81,7 @@ fn median_1min(btc: &[(i64, f64)], t: i64) -> Option<f64> {
     let mut diffs: Vec<f64> = (i - 15..i)
         .map(|j| (btc[j].1 - btc[j - 1].1).abs())
         .collect();
-    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    diffs.sort_by(|a, b| a.total_cmp(b));
     Some(diffs[diffs.len() / 2])
 }
 

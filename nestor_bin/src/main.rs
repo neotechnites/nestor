@@ -83,10 +83,13 @@ async fn main() -> Result<()> {
     let mode = Mode::from_env(&std::env::var("NESTOR_ENV").unwrap_or(settings.trading.env.clone()));
     let bankroll = env_f64("NESTOR_BANKROLL", settings.trading.bankroll);
 
-    let store = Box::new(JsonStore::new(env_str(
-        "NESTOR_STATE_PATH",
-        "data/state.json",
-    )));
+    // Single-writer lock: only one process may hold the state file. Refuses to
+    // start if another nestor (e.g. a stray `lock` or `weather`) is already writing
+    // it — that would clobber state and bypass the kill-switch. Held for the whole
+    // process via `_state_lock`.
+    let state_path = env_str("NESTOR_STATE_PATH", "data/state.json");
+    let _state_lock = acquire_state_lock(&state_path)?;
+    let store = Box::new(JsonStore::new(state_path));
     let mut risk = RiskManager::load_or_init(settings.risk, store, bankroll)?;
 
     // `resume` clears a persisted kill-switch halt (operator action after review).
@@ -118,6 +121,7 @@ async fn main() -> Result<()> {
         mode,
         risk: Mutex::new(risk),
         cities: settings.cities,
+        exec_lock: tokio::sync::Mutex::new(()),
     };
 
     // `reconcile` is not a strategy: it closes open positions against Kalshi's
@@ -176,6 +180,9 @@ fn env_str(key: &str, default: &str) -> String {
 /// strategy as a tokio task. No cross-process state race; kill-switch honored by all.
 async fn run_all(eng: Engine) -> Result<()> {
     use engine::Strategy;
+    use futures::FutureExt;
+    use std::time::Duration;
+
     let eng = std::sync::Arc::new(eng);
     engine::logging::info(
         "nestor run — lock (15s) + weather (9am ET) + settlement (60s), one process",
@@ -183,15 +190,17 @@ async fn run_all(eng: Engine) -> Result<()> {
 
     // Settlement: sweep every 60s so lock's 15-min markets settle intraday (same
     // trading day -> their losses feed the daily-loss kill-switch) and weather
-    // settles the morning after.
+    // settles the morning after. Each iteration is panic-caught so one bad cycle
+    // can't silently kill the loop (which would disable the kill-switch).
     {
         let e = eng.clone();
         tokio::spawn(async move {
             loop {
-                if let Err(err) = engine::reconcile::run(&e).await {
-                    eprintln!("settlement task: {err}");
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let r = std::panic::AssertUnwindSafe(engine::reconcile::run(&e))
+                    .catch_unwind()
+                    .await;
+                report("settlement", r);
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
     }
@@ -202,11 +211,12 @@ async fn run_all(eng: Engine) -> Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(until_next_9am_et()).await;
-                if let Err(err) = weather::Weather.run(&e).await {
-                    eprintln!("weather task: {err}");
-                }
+                let r = std::panic::AssertUnwindSafe(weather::Weather.run(&e))
+                    .catch_unwind()
+                    .await;
+                report("weather", r);
                 // avoid re-firing within the same minute the timer landed on
-                tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+                tokio::time::sleep(Duration::from_secs(90)).await;
             }
         });
     }
@@ -214,25 +224,61 @@ async fn run_all(eng: Engine) -> Result<()> {
     // Lock: continuous scanner in the foreground (keeps the process alive).
     let lock = lock::strategy::Lock;
     loop {
-        if let Err(err) = lock.run(&eng).await {
-            eprintln!("lock task: {err}");
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        let r = std::panic::AssertUnwindSafe(lock.run(&eng))
+            .catch_unwind()
+            .await;
+        report("lock", r);
+        tokio::time::sleep(Duration::from_secs(15)).await;
     }
 }
 
-/// Duration until the next 09:00 America/New_York (handles DST via the tz).
+/// Log a supervised task iteration; a caught panic lets the loop survive.
+fn report(task: &str, r: std::thread::Result<Result<()>>) {
+    match r {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => eprintln!("{task} task error: {err}"),
+        Err(_) => eprintln!("{task} task PANICKED — continuing"),
+    }
+}
+
+/// Exclusive single-writer lock on the state file's `.lock` sibling. Refuses to
+/// start if another nestor already holds it. The returned File must be kept alive
+/// for the whole process (dropping it releases the lock).
+fn acquire_state_lock(state_path: &str) -> Result<std::fs::File> {
+    use fs2::FileExt;
+    let lock_path = format!("{state_path}.lock");
+    if let Some(dir) = std::path::Path::new(&lock_path).parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening state lock {lock_path}"))?;
+    f.try_lock_exclusive().map_err(|_| {
+        anyhow::anyhow!(
+            "another nestor process holds the state lock ({lock_path}) — only one writer allowed"
+        )
+    })?;
+    Ok(f)
+}
+
+/// Duration until the next 09:00 America/New_York (DST-correct: 09:00 wall-clock
+/// on the target date, not now+24h which drifts across a DST transition).
 fn until_next_9am_et() -> std::time::Duration {
     use chrono::{Datelike, TimeZone};
     use chrono_tz::America::New_York;
     let now = chrono::Utc::now().with_timezone(&New_York);
-    let today_9 = New_York
-        .with_ymd_and_hms(now.year(), now.month(), now.day(), 9, 0, 0)
-        .single();
-    let target = match today_9 {
+    let at_9 = |d: chrono::NaiveDate| {
+        New_York
+            .with_ymd_and_hms(d.year(), d.month(), d.day(), 9, 0, 0)
+            .single()
+    };
+    let target = match at_9(now.date_naive()) {
         Some(t) if now < t => t,
-        Some(t) => t + chrono::Duration::days(1),
-        None => now + chrono::Duration::days(1), // DST edge; 9am isn't affected in practice
+        _ => at_9(now.date_naive() + chrono::Duration::days(1))
+            .unwrap_or(now + chrono::Duration::days(1)),
     };
     let secs = (target - now).num_seconds().max(0) as u64;
     std::time::Duration::from_secs(secs)

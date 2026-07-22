@@ -45,7 +45,7 @@ pub async fn run(eng: &Engine) -> Result<()> {
     // Snapshot open tickers+sides so we never hold the risk lock across the
     // network fetch (mirrors Engine::execute's discipline).
     let open: Vec<(String, Side)> = {
-        let r = eng.risk.lock().unwrap();
+        let r = eng.risk.lock().unwrap_or_else(|e| e.into_inner());
         r.open_positions()
             .iter()
             .map(|p| (p.ticker.clone(), p.side))
@@ -78,7 +78,11 @@ pub async fn run(eng: &Engine) -> Result<()> {
         };
 
         // Realize P&L (money math + kill-switch live in the risk layer).
-        let outcome = eng.risk.lock().unwrap().settle(&ticker, won);
+        let outcome = eng
+            .risk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .settle(&ticker, won);
         match outcome {
             Some(o) => {
                 settled += 1;
@@ -105,7 +109,7 @@ pub async fn run(eng: &Engine) -> Result<()> {
         }
     }
 
-    let st = eng.risk.lock().unwrap().status();
+    let st = eng.risk.lock().unwrap_or_else(|e| e.into_inner()).status();
     logging::info(format!(
         "reconcile done — settled={settled} pending={pending} bankroll=${:.2} drawdown={:.1}% halted={}",
         st.bankroll,

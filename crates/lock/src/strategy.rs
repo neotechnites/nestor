@@ -41,7 +41,7 @@ impl Strategy for Lock {
 
         // Don't re-enter a market we already hold.
         let held: HashSet<String> = {
-            let r = eng.risk.lock().unwrap();
+            let r = eng.risk.lock().unwrap_or_else(|e| e.into_inner());
             r.open_positions()
                 .iter()
                 .map(|p| p.ticker.clone())

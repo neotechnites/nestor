@@ -79,7 +79,7 @@ impl Strategy for Weather {
         let dcode = Self::date_code(td);
         let date_str = td.format("%Y-%m-%d").to_string();
         eng.begin_day(&date_str);
-        let st = eng.risk.lock().unwrap().status();
+        let st = eng.risk.lock().unwrap_or_else(|e| e.into_inner()).status();
         logging::info(format!(
             "weather start — mode={:?} date={date_str} ({dcode}) bankroll=${:.2} halted={}",
             eng.mode, st.bankroll, st.halted
@@ -101,7 +101,7 @@ impl Strategy for Weather {
                 logging::info(format!("{}: error ({e}) — skip", c.code));
             }
         }
-        let st = eng.risk.lock().unwrap().status();
+        let st = eng.risk.lock().unwrap_or_else(|e| e.into_inner()).status();
         logging::info(format!(
             "weather done — bankroll=${:.2} drawdown={:.1}%",
             st.bankroll,
