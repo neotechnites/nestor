@@ -17,6 +17,15 @@ async fn main() -> Result<()> {
 
     let settings = Settings::load(&env_str("NESTOR_CONFIG", "nestor.toml"))?;
 
+    let which = std::env::args().nth(1).unwrap_or_else(|| "weather".into());
+
+    // `calibrate` is a maintenance job (not a strategy): it needs neither the
+    // Kalshi client nor the risk layer, so handle it before building the Engine.
+    if which == "calibrate" {
+        let out = env_str("NESTOR_BIASES_PATH", "data/biases.json");
+        return engine::calibrate::run(&settings, 60, &out).await;
+    }
+
     // Secrets + mode come from env (env wins over the file's default).
     let mode = Mode::from_env(&std::env::var("NESTOR_ENV").unwrap_or(settings.trading.env.clone()));
     let bankroll = env_f64("NESTOR_BANKROLL", settings.trading.bankroll);
@@ -45,7 +54,6 @@ async fn main() -> Result<()> {
         cities: settings.cities,
     };
 
-    let which = std::env::args().nth(1).unwrap_or_else(|| "weather".into());
     let strat: Box<dyn Strategy> = match which.as_str() {
         "weather" => Box::new(weather::Weather),
         other => anyhow::bail!("unknown strategy: {other}"),
