@@ -1,6 +1,6 @@
 # T010 — Weather sleeve consumes calibrated biases + season-aware city filter
 
-**Priority:** P0 · **Status:** todo · **Gated on:** T003
+**Priority:** P0 · **Status:** done · **Gated on:** T003
 
 ## Why
 T003's `calibrate` produces real per-city bias + MAE in `data/biases.json`, but

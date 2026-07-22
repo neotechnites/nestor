@@ -2,6 +2,8 @@
 //! absent). Secrets stay in env/.env — never here. Calibrated per-city biases
 //! (T003) are written back into the `[[cities]]` table.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::risk::RiskConfig;
@@ -103,9 +105,66 @@ pub fn default_cities() -> Vec<City> {
     ]
 }
 
+#[derive(Deserialize)]
+struct BiasEntry {
+    bias: f64,
+}
+
+/// Overlay calibrated biases (from `data/biases.json`, produced by `calibrate`)
+/// onto the city table, overriding each matched city's `bias`. Returns the count
+/// applied. Does NOT touch `tradeable`: the tradeable allowlist is a config /
+/// season-policy decision, not something a short calibration window should flip
+/// (a rosy 60-day MAE must not promote DEN/SEA — see T010). Missing/invalid file
+/// is a no-op.
+pub fn apply_biases(cities: &mut [City], path: &str) -> usize {
+    match std::fs::read_to_string(path) {
+        Ok(text) => apply_biases_str(cities, &text),
+        Err(_) => 0,
+    }
+}
+
+/// Pure core of [`apply_biases`] (testable without a file).
+pub fn apply_biases_str(cities: &mut [City], json: &str) -> usize {
+    let map: HashMap<String, BiasEntry> = match serde_json::from_str(json) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    let mut n = 0;
+    for c in cities.iter_mut() {
+        if let Some(e) = map.get(&c.code) {
+            c.bias = e.bias;
+            n += 1;
+        }
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_biases_overrides_bias_not_tradeable() {
+        let mut cities = default_cities();
+        // DEN is tradeable=false in defaults and has a rosy calibrated bias here.
+        let json = r#"{"MIA":{"bias":-1.18,"mae":0.9,"tradeable":true},
+                       "DEN":{"bias":-1.24,"mae":0.8,"tradeable":true}}"#;
+        let n = apply_biases_str(&mut cities, json);
+        assert_eq!(n, 2);
+        let mia = cities.iter().find(|c| c.code == "MIA").unwrap();
+        let den = cities.iter().find(|c| c.code == "DEN").unwrap();
+        assert!((mia.bias - -1.18).abs() < 1e-9); // bias overridden
+        assert!(!den.tradeable); // tradeable NOT flipped by calibration window
+        assert!((den.bias - -1.24).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_biases_missing_or_bad_is_noop() {
+        let mut cities = default_cities();
+        assert_eq!(apply_biases(&mut cities, "/nonexistent/biases.json"), 0);
+        assert_eq!(apply_biases_str(&mut cities, "not json"), 0);
+        assert!((cities[0].bias - 1.5).abs() < 1e-9); // untouched placeholder
+    }
 
     #[test]
     fn missing_file_uses_defaults() {

@@ -15,7 +15,18 @@ use engine::{Engine, Mode, RiskManager, Strategy};
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
-    let settings = Settings::load(&env_str("NESTOR_CONFIG", "nestor.toml"))?;
+    let mut settings = Settings::load(&env_str("NESTOR_CONFIG", "nestor.toml"))?;
+
+    // Overlay calibrated per-city biases (from `calibrate`) over the config
+    // placeholders, so the bot bets on the bias-corrected forecast. No-op if the
+    // biases file is absent. Does not change which cities are tradeable.
+    let applied = engine::config::apply_biases(
+        &mut settings.cities,
+        &env_str("NESTOR_BIASES_PATH", "data/biases.json"),
+    );
+    if applied > 0 {
+        eprintln!("nestor: applied {applied} calibrated city biases");
+    }
 
     let which = std::env::args().nth(1).unwrap_or_else(|| "weather".into());
 

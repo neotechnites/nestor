@@ -14,7 +14,7 @@ See [../WORKFLOW.md](../WORKFLOW.md). Priority: P0 (now) → P2 (later/gated).
 | [T007](T007-live-order-path-test.md) | Live $1 order-path test | P1 | Kalshi keys | account |
 | [T008](T008-vps-provisioning.md) | VPS provisioning + systemd timer + deploy secrets | P1 | VPS pick | — |
 | [T009](T009-lock-sleeve.md) | Lock sleeve (always-on BTC favorite fade) | P2 | epic | T001,T004 |
-| [T010](T010-consume-biases.md) | Weather sleeve consumes calibrated biases + season-aware city filter | P0 | todo | T003 |
+| [T010](T010-consume-biases.md) | Weather sleeve consumes calibrated biases + season-aware city filter | P0 | done | T003 |
 
 **Repo state:** on personal GitHub (`neotechnites/nestor`), bound via a dedicated
 SSH key. T001–T005 merged to `master` (foundational batch — pushed without PR review
