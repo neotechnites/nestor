@@ -1,0 +1,39 @@
+# Deploy Nestor to the VPS on every push to main.
+# FILL IN once the VPS exists: add repo secrets VPS_HOST, VPS_USER, VPS_SSH_KEY.
+# The daily run itself is scheduled by cron/systemd ON the VPS (not here) —
+# this workflow only ships new code to the box.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy code to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "."
+          target: "~/nestor"
+          rm: false
+
+      - name: Install deps + restart timer
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd ~/nestor
+            python3 -m venv .venv || true
+            ./.venv/bin/pip install -q -r requirements.txt
+            # weather runs via the systemd timer set up during provisioning
+            systemctl --user restart nestor-weather.timer || true

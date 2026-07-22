@@ -1,0 +1,20 @@
+# Secrets — NEVER commit these
+.env
+secrets/
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime output
+logs/*.log
+logs/*.jsonl
+data/*.db
+data/*.json
+
+# OS
+.DS_Store
