@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+engine = { path = "../engine" }
 anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

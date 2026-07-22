@@ -642,6 +642,10 @@ name = "lock"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "chrono",
+ "engine",
+ "reqwest",
  "serde",
  "serde_json",
 ]

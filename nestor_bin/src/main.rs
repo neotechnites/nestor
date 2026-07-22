@@ -126,6 +126,23 @@ async fn main() -> Result<()> {
         return engine::reconcile::run(&eng).await;
     }
 
+    // The lock sleeve is always-on (unlike the daily weather cron): `lock` loops a
+    // scan pass every 15s; `lock-once` runs a single pass (for testing). Same
+    // Strategy contract as weather — the binary just chooses the cadence.
+    if which == "lock" || which == "lock-once" {
+        let strat = lock::strategy::Lock;
+        loop {
+            if let Err(e) = strat.run(&eng).await {
+                eprintln!("lock: scan error: {e}");
+            }
+            if which == "lock-once" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        }
+        return Ok(());
+    }
+
     let strat: Box<dyn Strategy> = match which.as_str() {
         "weather" => Box::new(weather::Weather),
         other => anyhow::bail!("unknown strategy: {other}"),

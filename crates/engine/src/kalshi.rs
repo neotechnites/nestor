@@ -29,18 +29,39 @@ pub struct Market {
     #[serde(default)]
     pub yes_ask_dollars: Option<String>,
     #[serde(default)]
+    pub no_ask_dollars: Option<String>,
+    #[serde(default)]
     pub yes_sub_title: Option<String>,
     #[serde(default)]
     pub result: Option<String>,
+    /// RFC3339 close time (e.g. "2026-07-16T04:00:00Z").
+    #[serde(default)]
+    pub close_time: Option<String>,
+}
+
+fn dollars_to_cents(s: &Option<String>) -> Option<i64> {
+    s.as_ref()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|d| (d * 100.0).round() as i64)
 }
 
 impl Market {
     /// YES ask in cents (0-100), or None if unpriced.
     pub fn yes_ask_cents(&self) -> Option<i64> {
-        self.yes_ask_dollars
+        dollars_to_cents(&self.yes_ask_dollars)
+    }
+
+    /// NO ask in cents (0-100), or None if unpriced.
+    pub fn no_ask_cents(&self) -> Option<i64> {
+        dollars_to_cents(&self.no_ask_dollars)
+    }
+
+    /// Close time as a unix timestamp (seconds), parsed from `close_time`.
+    pub fn close_unix(&self) -> Option<i64> {
+        self.close_time
             .as_ref()
-            .and_then(|s| s.parse::<f64>().ok())
-            .map(|d| (d * 100.0).round() as i64)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp())
     }
 }
 
