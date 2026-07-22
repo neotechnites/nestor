@@ -6,9 +6,12 @@
 pub mod config;
 pub mod kalshi;
 pub mod logging;
+pub mod risk;
 pub mod sizing;
+pub mod state;
 pub mod strategy;
 pub mod weather;
 
 pub use kalshi::Kalshi;
-pub use strategy::{Engine, Mode, Strategy};
+pub use risk::{Order, Rejection, RiskConfig, RiskManager, Side, Signal, SizingHint};
+pub use strategy::{Engine, ExecOutcome, Mode, Strategy};

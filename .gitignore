@@ -17,8 +17,7 @@ venv/
 # Runtime output
 logs/*.log
 logs/*.jsonl
-data/*.db
-data/*.json
+/data/
 
 # OS
 .DS_Store

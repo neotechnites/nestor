@@ -1,18 +1,34 @@
-//! Nestor entrypoint. Builds the shared Engine from env and runs the selected
-//! strategy. Called by cron/systemd on the VPS.
+//! Nestor entrypoint. Builds the shared Engine (Kalshi client + Risk layer) from
+//! env and runs the selected strategy. Called by cron/systemd on the VPS.
 //!
 //! Usage: `nestor [strategy]`  (default: weather)
 
+use std::sync::Mutex;
+
 use anyhow::{Context, Result};
-use engine::{Engine, Mode, Strategy};
+use engine::risk::RiskConfig;
+use engine::state::JsonStore;
+use engine::{Engine, Mode, RiskManager, Strategy};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let mode = Mode::from_env(&std::env::var("NESTOR_ENV").unwrap_or_else(|_| "paper".into()));
-    let stake_usd = env_f64("NESTOR_STAKE_USD", 10.0);
-    let max_daily_usd = env_f64("NESTOR_MAX_DAILY_USD", 80.0);
+
+    let cfg = RiskConfig {
+        fraction: env_f64("NESTOR_FRACTION", 0.05),
+        cluster_cap_frac: env_f64("NESTOR_CLUSTER_CAP", 0.15),
+        flat_usd: env_f64("NESTOR_STAKE_USD", 10.0),
+        daily_budget_usd: env_f64("NESTOR_MAX_DAILY_USD", 80.0),
+        max_drawdown_frac: env_f64("NESTOR_MAX_DRAWDOWN", 0.30),
+        daily_loss_limit_frac: env_f64("NESTOR_DAILY_LOSS_LIMIT", 0.15),
+    };
+    let bankroll = env_f64("NESTOR_BANKROLL", 1000.0);
+    let store = Box::new(JsonStore::new(
+        std::env::var("NESTOR_STATE_PATH").unwrap_or_else(|_| "data/state.json".into()),
+    ));
+    let risk = RiskManager::load_or_init(cfg, store, bankroll)?;
 
     let kalshi = if mode == Mode::Live {
         let key_id =
@@ -28,8 +44,7 @@ async fn main() -> Result<()> {
         kalshi,
         http: reqwest::Client::new(),
         mode,
-        stake_usd,
-        max_daily_usd,
+        risk: Mutex::new(risk),
     };
 
     let which = std::env::args().nth(1).unwrap_or_else(|| "weather".into());

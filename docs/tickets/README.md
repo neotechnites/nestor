@@ -5,7 +5,7 @@ See [../WORKFLOW.md](../WORKFLOW.md). Priority: P0 (now) → P2 (later/gated).
 
 | ID | Title | Pri | Status | Gated on |
 |----|-------|-----|--------|----------|
-| [T001](T001-risk-layer.md) | Risk layer + persistent state store | P0 | in-progress | — |
+| [T001](T001-risk-layer.md) | Risk layer + persistent state store | P0 | review | — |
 | [T002](T002-config-file.md) | TOML config (mode, sizing, risk, cities) | P0 | todo | — |
 | [T003](T003-bias-calibration.md) | Bias calibration job (the edge) | P0 | todo | — |
 | [T004](T004-settlement-reconcile.md) | Settlement / reconcile loop + P&L | P0 | todo | T001 |

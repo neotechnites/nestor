@@ -251,6 +251,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1567,7 +1568,6 @@ dependencies = [
  "engine",
  "serde_json",
  "tokio",
- "uuid",
 ]
 
 [[package]]

@@ -1,8 +1,9 @@
 //! Weather sleeve — the daily forecast-buy strategy.
 //!
 //! At ~9am ET, for each tradeable city: forecast -> bias-correct -> map to the
-//! correct day's 2F bucket -> skip wet days -> buy tiny (or paper-log) -> hold
-//! to settlement.
+//! correct day's 2F bucket -> skip wet days -> emit a Signal (flat sizing). The
+//! Risk layer decides size / approves; the engine executes (live) or simulates
+//! (paper). Hold to settlement (closed out by the reconcile job).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -10,8 +11,8 @@ use chrono::Datelike;
 use chrono_tz::America::New_York;
 use engine::config::{tradeable_cities, City};
 use engine::kalshi::Market;
-use engine::sizing::contracts_for;
-use engine::{logging, Engine, Mode, Strategy};
+use engine::strategy::ExecOutcome;
+use engine::{logging, Engine, Side, Signal, SizingHint, Strategy};
 use serde_json::json;
 
 const LOG: &str = "weather_trades.jsonl";
@@ -75,35 +76,30 @@ impl Strategy for Weather {
         let td = Self::target_date();
         let dcode = Self::date_code(td);
         let date_str = td.format("%Y-%m-%d").to_string();
+        eng.begin_day(&date_str);
+        let st = eng.risk.lock().unwrap().status();
         logging::info(format!(
-            "weather start — mode={:?} date={date_str} ({dcode}) stake=${} max_daily=${}",
-            eng.mode, eng.stake_usd, eng.max_daily_usd
+            "weather start — mode={:?} date={date_str} ({dcode}) bankroll=${:.2} halted={}",
+            eng.mode, st.bankroll, st.halted
         ));
 
-        let mut spent = 0.0_f64;
         for c in tradeable_cities() {
-            if let Err(e) = self.run_city(eng, &c, &dcode, &date_str, &mut spent).await {
+            if let Err(e) = self.run_city(eng, &c, &dcode, &date_str).await {
                 logging::info(format!("{}: error ({e}) — skip", c.code));
             }
-            if spent + eng.stake_usd > eng.max_daily_usd {
-                logging::info(format!("daily cap ${} reached — stop", eng.max_daily_usd));
-                break;
-            }
         }
-        logging::info(format!("weather done — deployed ${spent}"));
+        let st = eng.risk.lock().unwrap().status();
+        logging::info(format!(
+            "weather done — bankroll=${:.2} drawdown={:.1}%",
+            st.bankroll,
+            st.drawdown * 100.0
+        ));
         Ok(())
     }
 }
 
 impl Weather {
-    async fn run_city(
-        &self,
-        eng: &Engine,
-        c: &City,
-        dcode: &str,
-        date_str: &str,
-        spent: &mut f64,
-    ) -> Result<()> {
+    async fn run_city(&self, eng: &Engine, c: &City, dcode: &str, date_str: &str) -> Result<()> {
         let (fc, precip) = engine::weather::forecast_for(&eng.http, c.lat, c.lon, date_str).await?;
         let corrected = fc - c.bias;
 
@@ -129,52 +125,52 @@ impl Weather {
         };
 
         let ask = match mkt.yes_ask_cents() {
-            Some(a) if a > 2 && a < 98 => a,
-            other => {
-                let shown = other
-                    .map(|a| format!("{a}c"))
-                    .unwrap_or_else(|| "none".into());
-                logging::info(format!(
-                    "{}: {} ask={shown} out of band — skip",
-                    c.code, mkt.ticker
-                ));
+            Some(a) => a,
+            None => {
+                logging::info(format!("{}: {} unpriced — skip", c.code, mkt.ticker));
                 return Ok(());
             }
         };
 
-        let n = contracts_for(eng.stake_usd, ask);
-        let mut decision = json!({
-            "event":"signal","city":c.code,"fc":fc,"corrected":corrected,"precip":precip,
-            "ticker":mkt.ticker,"bucket":mkt.yes_sub_title,"ask_cents":ask,
-            "contracts":n,"stake":eng.stake_usd,"mode":format!("{:?}",eng.mode)
+        let signal = Signal {
+            strategy: "weather".into(),
+            ticker: mkt.ticker.clone(),
+            side: Side::Yes,
+            limit_cents: ask,
+            cluster: format!("weather:{date_str}"),
+            sizing: SizingHint::Flat,
+        };
+
+        let outcome = eng.execute(signal).await;
+        let mut rec = json!({
+            "event":"decision","city":c.code,"fc":fc,"corrected":corrected,"precip":precip,
+            "ticker":mkt.ticker,"bucket":mkt.yes_sub_title,"ask_cents":ask
         });
-
-        if eng.mode == Mode::Live && n > 0 {
-            let coid = uuid::Uuid::new_v4().to_string();
-            match eng
-                .kalshi
-                .place_limit_buy(&mkt.ticker, "yes", n, ask, &coid)
-                .await
-            {
-                Ok(resp) => {
-                    decision["order"] = resp;
-                    *spent += eng.stake_usd;
-                    logging::info(format!("{}: BOUGHT {n}x {} @ {ask}c", c.code, mkt.ticker));
-                }
-                Err(e) => {
-                    decision["error"] = json!(e.to_string());
-                    logging::info(format!("{}: ORDER FAILED ({e})", c.code));
-                }
+        match &outcome {
+            ExecOutcome::Paper(o) => {
+                rec["result"] = json!({"paper": true, "count": o.count});
+                logging::info(format!(
+                    "{}: [paper] buy {}x {} @ {ask}c (fc {fc:.1} -> {corrected:.1}F)",
+                    c.code, o.count, mkt.ticker
+                ));
             }
-        } else {
-            *spent += eng.stake_usd;
-            logging::info(format!(
-                "{}: [paper] would buy {n}x {} @ {ask}c (fc {fc:.1} -> {corrected:.1}F)",
-                c.code, mkt.ticker
-            ));
+            ExecOutcome::Filled { order, response } => {
+                rec["result"] = json!({"filled": true, "count": order.count, "order": response});
+                logging::info(format!(
+                    "{}: BOUGHT {}x {} @ {ask}c",
+                    c.code, order.count, mkt.ticker
+                ));
+            }
+            ExecOutcome::Rejected(r) => {
+                rec["result"] = json!({"rejected": format!("{r:?}")});
+                logging::info(format!("{}: rejected ({r:?}) — {}", c.code, mkt.ticker));
+            }
+            ExecOutcome::OrderError(e) => {
+                rec["result"] = json!({"error": e});
+                logging::info(format!("{}: ORDER FAILED ({e})", c.code));
+            }
         }
-
-        logging::record(LOG, decision);
+        logging::record(LOG, rec);
         Ok(())
     }
 }

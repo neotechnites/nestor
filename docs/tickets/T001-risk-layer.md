@@ -1,6 +1,6 @@
 # T001 — Risk layer + persistent state store
 
-**Priority:** P0 · **Status:** in-progress · **Spec:** [01-risk-layer](../specs/01-risk-layer.md)
+**Priority:** P0 · **Status:** review (PR open) · **Spec:** [01-risk-layer](../specs/01-risk-layer.md)
 
 ## Goal
 Add `engine::risk` (RiskManager) + a persistent StateStore so all orders route
