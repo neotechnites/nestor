@@ -1,0 +1,97 @@
+# Nestor runtime config. No secrets here (those live in .env / env).
+# Env overrides: NESTOR_ENV (mode), NESTOR_BANKROLL, NESTOR_STATE_PATH, NESTOR_CONFIG.
+
+[trading]
+env = "paper"          # paper | live  (NESTOR_ENV overrides)
+bankroll = 1000.0      # starting equity, used only to seed fresh state
+
+[risk]
+fraction = 0.05             # fraction of bankroll per fraction-sized trade
+cluster_cap_frac = 0.15     # max at-risk in one correlation cluster
+flat_usd = 10.0             # flat $ per flat-sized trade (weather)
+daily_budget_usd = 80.0     # daily flat-budget cap
+max_drawdown_frac = 0.30    # halt if drawdown from peak exceeds this
+daily_loss_limit_frac = 0.15 # halt if today's realized loss exceeds this * peak
+
+# Weather cities. series + station MUST be verified live (T005).
+# bias = mean(forecast - actual) deg F; placeholders until calibration (T003).
+[[cities]]
+code = "MIA"
+series = "KXHIGHMIA"
+lat = 25.79
+lon = -80.29
+station = "KMIA"
+network = "FL_ASOS"
+bias = 1.5
+tradeable = true
+
+[[cities]]
+code = "ATL"
+series = "KXHIGHTATL"
+lat = 33.63
+lon = -84.44
+station = "KATL"
+network = "GA_ASOS"
+bias = 1.5
+tradeable = true
+
+[[cities]]
+code = "NY"
+series = "KXHIGHNY"
+lat = 40.78
+lon = -73.97
+station = "KNYC"
+network = "NY_ASOS"
+bias = 1.5
+tradeable = true
+
+[[cities]]
+code = "BOS"
+series = "KXHIGHTBOS"
+lat = 42.36
+lon = -71.01
+station = "KBOS"
+network = "MA_ASOS"
+bias = 1.5
+tradeable = true
+
+[[cities]]
+code = "PHX"
+series = "KXHIGHTPHX"
+lat = 33.43
+lon = -112.00
+station = "KPHX"
+network = "AZ_ASOS"
+bias = 1.5
+tradeable = true
+
+[[cities]]
+code = "CHI"
+series = "KXHIGHCHI"
+lat = 41.79
+lon = -87.75
+station = "KMDW"
+network = "IL_ASOS"
+bias = 1.5
+tradeable = true
+
+# Negative controls — forecast too unreliable to trade (2yr MAE > 2F).
+[[cities]]
+code = "DEN"
+series = "KXHIGHDEN"
+lat = 39.85
+lon = -104.66
+station = "KDEN"
+network = "CO_ASOS"
+bias = 1.5
+tradeable = false
+
+[[cities]]
+code = "SEA"
+series = "KXHIGHTSEA"
+lat = 47.44
+lon = -122.31
+station = "KSEA"
+network = "WA_ASOS"
+bias = 1.5
+tradeable = false

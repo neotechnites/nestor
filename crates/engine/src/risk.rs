@@ -71,7 +71,8 @@ pub enum Rejection {
     ZeroSize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
 pub struct RiskConfig {
     pub fraction: f64,
     pub cluster_cap_frac: f64,

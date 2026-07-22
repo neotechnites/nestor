@@ -9,7 +9,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Datelike;
 use chrono_tz::America::New_York;
-use engine::config::{tradeable_cities, City};
+use engine::config::City;
 use engine::kalshi::Market;
 use engine::strategy::ExecOutcome;
 use engine::{logging, Engine, Side, Signal, SizingHint, Strategy};
@@ -83,8 +83,9 @@ impl Strategy for Weather {
             eng.mode, st.bankroll, st.halted
         ));
 
-        for c in tradeable_cities() {
-            if let Err(e) = self.run_city(eng, &c, &dcode, &date_str).await {
+        let cities: Vec<City> = eng.cities.iter().filter(|c| c.tradeable).cloned().collect();
+        for c in &cities {
+            if let Err(e) = self.run_city(eng, c, &dcode, &date_str).await {
                 logging::info(format!("{}: error ({e}) — skip", c.code));
             }
         }
@@ -112,7 +113,7 @@ impl Weather {
             return Ok(());
         }
 
-        let markets = eng.kalshi.markets(c.series, "open").await?;
+        let markets = eng.kalshi.markets(&c.series, "open").await?;
         let mkt = match Self::bucket_market(&markets, corrected, dcode) {
             Some(m) => m,
             None => {

@@ -1,12 +1,13 @@
-//! Nestor entrypoint. Builds the shared Engine (Kalshi client + Risk layer) from
-//! env and runs the selected strategy. Called by cron/systemd on the VPS.
+//! Nestor entrypoint. Loads config (nestor.toml + env), builds the shared Engine
+//! (Kalshi client + Risk layer + cities), and runs the selected strategy.
+//! Called by cron/systemd on the VPS.
 //!
 //! Usage: `nestor [strategy]`  (default: weather)
 
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use engine::risk::RiskConfig;
+use engine::config::Settings;
 use engine::state::JsonStore;
 use engine::{Engine, Mode, RiskManager, Strategy};
 
@@ -14,21 +15,17 @@ use engine::{Engine, Mode, RiskManager, Strategy};
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
-    let mode = Mode::from_env(&std::env::var("NESTOR_ENV").unwrap_or_else(|_| "paper".into()));
+    let settings = Settings::load(&env_str("NESTOR_CONFIG", "nestor.toml"))?;
 
-    let cfg = RiskConfig {
-        fraction: env_f64("NESTOR_FRACTION", 0.05),
-        cluster_cap_frac: env_f64("NESTOR_CLUSTER_CAP", 0.15),
-        flat_usd: env_f64("NESTOR_STAKE_USD", 10.0),
-        daily_budget_usd: env_f64("NESTOR_MAX_DAILY_USD", 80.0),
-        max_drawdown_frac: env_f64("NESTOR_MAX_DRAWDOWN", 0.30),
-        daily_loss_limit_frac: env_f64("NESTOR_DAILY_LOSS_LIMIT", 0.15),
-    };
-    let bankroll = env_f64("NESTOR_BANKROLL", 1000.0);
-    let store = Box::new(JsonStore::new(
-        std::env::var("NESTOR_STATE_PATH").unwrap_or_else(|_| "data/state.json".into()),
-    ));
-    let risk = RiskManager::load_or_init(cfg, store, bankroll)?;
+    // Secrets + mode come from env (env wins over the file's default).
+    let mode = Mode::from_env(&std::env::var("NESTOR_ENV").unwrap_or(settings.trading.env.clone()));
+    let bankroll = env_f64("NESTOR_BANKROLL", settings.trading.bankroll);
+
+    let store = Box::new(JsonStore::new(env_str(
+        "NESTOR_STATE_PATH",
+        "data/state.json",
+    )));
+    let risk = RiskManager::load_or_init(settings.risk, store, bankroll)?;
 
     let kalshi = if mode == Mode::Live {
         let key_id =
@@ -45,6 +42,7 @@ async fn main() -> Result<()> {
         http: reqwest::Client::new(),
         mode,
         risk: Mutex::new(risk),
+        cities: settings.cities,
     };
 
     let which = std::env::args().nth(1).unwrap_or_else(|| "weather".into());
@@ -61,4 +59,8 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+fn env_str(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.into())
 }

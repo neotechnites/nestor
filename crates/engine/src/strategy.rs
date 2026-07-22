@@ -47,6 +47,7 @@ pub struct Engine {
     pub http: reqwest::Client,
     pub mode: Mode,
     pub risk: Mutex<RiskManager>,
+    pub cities: Vec<crate::config::City>,
 }
 
 impl Engine {

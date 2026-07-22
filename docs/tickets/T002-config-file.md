@@ -1,6 +1,6 @@
 # T002 — TOML config
 
-**Priority:** P0 · **Status:** todo
+**Priority:** P0 · **Status:** built-local (PR pending personal remote)
 
 ## Goal
 Move runtime config out of env/hardcode into a versioned `nestor.toml` (with env
