@@ -126,9 +126,19 @@ async fn main() -> Result<()> {
         return engine::reconcile::run(&eng).await;
     }
 
+    // `run` = the production runtime: ONE process hosting every strategy as tokio
+    // tasks that share this ONE in-memory RiskManager. This is what makes the shared
+    // bankroll safe — no second process writes state.json concurrently (which would
+    // clobber updates and bypass the kill-switch), and settlement runs intraday so
+    // lock's losses actually feed the daily-loss halt.
+    if which == "run" {
+        return run_all(eng).await;
+    }
+
     // The lock sleeve is always-on (unlike the daily weather cron): `lock` loops a
     // scan pass every 15s; `lock-once` runs a single pass (for testing). Same
-    // Strategy contract as weather — the binary just chooses the cadence.
+    // Strategy contract as weather — the binary just chooses the cadence. In
+    // production use `run` (above); these are for manual/isolated operation.
     if which == "lock" || which == "lock-once" {
         let strat = lock::strategy::Lock;
         loop {
@@ -160,6 +170,72 @@ fn env_f64(key: &str, default: f64) -> f64 {
 
 fn env_str(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.into())
+}
+
+/// The production runtime: one process, one shared in-memory RiskManager, every
+/// strategy as a tokio task. No cross-process state race; kill-switch honored by all.
+async fn run_all(eng: Engine) -> Result<()> {
+    use engine::Strategy;
+    let eng = std::sync::Arc::new(eng);
+    engine::logging::info(
+        "nestor run — lock (15s) + weather (9am ET) + settlement (60s), one process",
+    );
+
+    // Settlement: sweep every 60s so lock's 15-min markets settle intraday (same
+    // trading day -> their losses feed the daily-loss kill-switch) and weather
+    // settles the morning after.
+    {
+        let e = eng.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(err) = engine::reconcile::run(&e).await {
+                    eprintln!("settlement task: {err}");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+    }
+
+    // Weather: fire once daily at ~9am ET.
+    {
+        let e = eng.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(until_next_9am_et()).await;
+                if let Err(err) = weather::Weather.run(&e).await {
+                    eprintln!("weather task: {err}");
+                }
+                // avoid re-firing within the same minute the timer landed on
+                tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+            }
+        });
+    }
+
+    // Lock: continuous scanner in the foreground (keeps the process alive).
+    let lock = lock::strategy::Lock;
+    loop {
+        if let Err(err) = lock.run(&eng).await {
+            eprintln!("lock task: {err}");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    }
+}
+
+/// Duration until the next 09:00 America/New_York (handles DST via the tz).
+fn until_next_9am_et() -> std::time::Duration {
+    use chrono::{Datelike, TimeZone};
+    use chrono_tz::America::New_York;
+    let now = chrono::Utc::now().with_timezone(&New_York);
+    let today_9 = New_York
+        .with_ymd_and_hms(now.year(), now.month(), now.day(), 9, 0, 0)
+        .single();
+    let target = match today_9 {
+        Some(t) if now < t => t,
+        Some(t) => t + chrono::Duration::days(1),
+        None => now + chrono::Duration::days(1), // DST edge; 9am isn't affected in practice
+    };
+    let secs = (target - now).num_seconds().max(0) as u64;
+    std::time::Duration::from_secs(secs)
 }
 
 /// Age of the biases file in whole days, or None if it doesn't exist / unreadable.

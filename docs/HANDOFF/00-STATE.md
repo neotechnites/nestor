@@ -67,8 +67,15 @@ docs/specs/, docs/tickets/ (markdown board), docs/WORKFLOW.md
 - **Config flow:** `nestor.toml` (risk params, cities, biases) + env overrides (`NESTOR_ENV`
   paper|live, `NESTOR_BANKROLL`, `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`, etc.) +
   `data/biases.json` overlay (from `calibrate`). `.env` holds secrets (gitignored).
-- **Subcommands:** `nestor weather` (default), `calibrate`, `reconcile`, `probe-weather`,
-  `selftest-order <ticker> <yes_price_cents> [count]`, `resume` (clear a halt).
+- **Subcommands:** **`nestor run`** = the PRODUCTION runtime (one process hosting every
+  strategy as tokio tasks sharing ONE in-memory RiskManager — lock 15s loop, weather 9am ET,
+  settlement 60s sweep). Also: `weather` (default, one-shot), `lock`/`lock-once`, `calibrate`,
+  `reconcile`, `probe-weather`, `backtest-lock`, `selftest-order`, `resume`.
+- **CRITICAL: deploy `nestor run` (single process), NOT separate weather/lock/reconcile
+  processes.** A code review found that separate processes sharing `state.json` clobber each
+  other's writes and bypass the kill-switch (the always-on lock process froze its in-memory
+  state). `run` fixes it by keeping everything in one process behind the Mutex. The VPS runs
+  ONE `nestor run` service (update T008 from three timers to one service).
 
 ## WHERE WE ARE (exact)
 - **Weather sleeve is code-complete**: forecast → per-city bias-correct → correct-day 2°F
