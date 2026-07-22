@@ -108,6 +108,33 @@ impl Kalshi {
         ])
     }
 
+    /// Probe a series with a single (non-paginated) request for up to `limit`
+    /// markets. Public, read-only. An empty result usually means the series
+    /// ticker is wrong or has no markets in that status. Parsing is delegated
+    /// to [`parse_markets`] so it can be unit-tested without the network.
+    pub async fn probe_series(
+        &self,
+        series_ticker: &str,
+        status: &str,
+        limit: u32,
+    ) -> Result<Vec<Market>> {
+        let limit = limit.to_string();
+        let body = self
+            .http
+            .get(format!("{BASE}{PREFIX}/markets"))
+            .query(&[
+                ("series_ticker", series_ticker),
+                ("status", status),
+                ("limit", limit.as_str()),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        parse_markets(&body)
+    }
+
     /// All markets for a series (paginated). Public.
     pub async fn markets(&self, series_ticker: &str, status: &str) -> Result<Vec<Market>> {
         let mut out = Vec::new();
@@ -169,5 +196,48 @@ impl Kalshi {
             req = req.header(k, v);
         }
         Ok(req.send().await?.error_for_status()?.json().await?)
+    }
+}
+
+/// Parse a `/markets` response body into its market list. Pure and network-free
+/// so probe/parse logic is unit-testable. A non-empty result confirms the
+/// series ticker resolved to live markets.
+pub fn parse_markets(body: &str) -> Result<Vec<Market>> {
+    let resp: MarketsResp = serde_json::from_str(body).context("parsing markets response")?;
+    Ok(resp.markets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_markets_detects_series_and_reads_sample() {
+        let body = r#"{
+            "markets": [
+                {
+                    "ticker": "KXHIGHMIA-26JUL21-B92.5",
+                    "floor_strike": 91.0,
+                    "cap_strike": 94.0,
+                    "yes_ask_dollars": "0.42",
+                    "yes_sub_title": "91° to 94°, Miami Intl (MIA)"
+                }
+            ],
+            "cursor": ""
+        }"#;
+        let markets = parse_markets(body).unwrap();
+        assert_eq!(markets.len(), 1);
+        assert_eq!(markets[0].ticker, "KXHIGHMIA-26JUL21-B92.5");
+        assert_eq!(markets[0].yes_ask_cents(), Some(42));
+        assert_eq!(
+            markets[0].yes_sub_title.as_deref(),
+            Some("91° to 94°, Miami Intl (MIA)")
+        );
+    }
+
+    #[test]
+    fn parse_markets_empty_means_series_absent() {
+        let markets = parse_markets(r#"{"markets": [], "cursor": ""}"#).unwrap();
+        assert!(markets.is_empty());
     }
 }

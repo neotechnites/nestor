@@ -9,7 +9,7 @@ See [../WORKFLOW.md](../WORKFLOW.md). Priority: P0 (now) → P2 (later/gated).
 | [T002](T002-config-file.md) | TOML config (mode, sizing, risk, cities) | P0 | built-local | — |
 | [T003](T003-bias-calibration.md) | Bias calibration job (the edge) | P0 | built-local | — |
 | [T004](T004-settlement-reconcile.md) | Settlement / reconcile loop + P&L | P0 | built-local | T001 |
-| [T005](T005-verify-tickers-stations.md) | Verify Kalshi series tickers + IEM stations | P1 | todo | — |
+| [T005](T005-verify-tickers-stations.md) | Verify Kalshi series tickers + IEM stations | P1 | built-local | — |
 | [T006](T006-ci-on-prs.md) | CI on PRs + test scaffolding | P0 | todo | — |
 | [T007](T007-live-order-path-test.md) | Live $1 order-path test | P1 | Kalshi keys | account |
 | [T008](T008-vps-provisioning.md) | VPS provisioning + systemd timer + deploy secrets | P1 | VPS pick | — |

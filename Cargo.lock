@@ -1639,6 +1639,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "engine",
+ "reqwest",
  "serde_json",
  "tokio",
 ]

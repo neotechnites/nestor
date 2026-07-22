@@ -26,6 +26,14 @@ async fn main() -> Result<()> {
         return engine::calibrate::run(&settings, 60, &out).await;
     }
 
+    // Read-only reality check for the weather config (T005). No orders, no risk
+    // layer, no state — just probes Kalshi + IEM and prints a report.
+    if which == "probe-weather" {
+        let kalshi = engine::Kalshi::public();
+        let http = reqwest::Client::new();
+        return weather::probe::run(&kalshi, &http, &settings.cities).await;
+    }
+
     // Secrets + mode come from env (env wins over the file's default).
     let mode = Mode::from_env(&std::env::var("NESTOR_ENV").unwrap_or(settings.trading.env.clone()));
     let bankroll = env_f64("NESTOR_BANKROLL", settings.trading.bankroll);
