@@ -15,6 +15,12 @@ pub struct Position {
     pub count: i64,
     pub entry_cents: i64,
     pub cluster: String,
+    /// ET trading day (YYYY-MM-DD) the position was opened on. Settlement uses
+    /// this to attribute a realized loss to the *right* day's daily-loss
+    /// counter, so a next-morning reconcile of a prior day can't trip today's
+    /// daily-loss kill-switch (T004). Defaulted for state files written pre-T004.
+    #[serde(default)]
+    pub day: String,
 }
 
 impl Position {

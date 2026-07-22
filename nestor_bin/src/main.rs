@@ -46,6 +46,13 @@ async fn main() -> Result<()> {
     };
 
     let which = std::env::args().nth(1).unwrap_or_else(|| "weather".into());
+
+    // `reconcile` is not a strategy: it closes open positions against Kalshi's
+    // settled result and realizes P&L (T004). Everything else is a strategy.
+    if which == "reconcile" {
+        return engine::reconcile::run(&eng).await;
+    }
+
     let strat: Box<dyn Strategy> = match which.as_str() {
         "weather" => Box::new(weather::Weather),
         other => anyhow::bail!("unknown strategy: {other}"),

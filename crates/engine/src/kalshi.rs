@@ -52,6 +52,11 @@ struct MarketsResp {
     cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct MarketResp {
+    market: Market,
+}
+
 pub struct Kalshi {
     http: reqwest::Client,
     key_id: Option<String>,
@@ -125,6 +130,22 @@ impl Kalshi {
             }
         }
         Ok(out)
+    }
+
+    /// Fetch a single market by ticker (public GET, no auth). The response
+    /// carries the authoritative settlement `result` ("yes"/"no" once settled,
+    /// empty while open) — the source of truth for the reconcile loop.
+    pub async fn market(&self, ticker: &str) -> Result<Market> {
+        let url = format!("{BASE}{PREFIX}/markets/{ticker}");
+        let resp: MarketResp = self
+            .http
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(resp.market)
     }
 
     /// Place a limit buy. `yes_price_cents` = YES price in cents (1-99). Signed.

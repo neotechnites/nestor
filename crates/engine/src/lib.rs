@@ -6,6 +6,7 @@
 pub mod config;
 pub mod kalshi;
 pub mod logging;
+pub mod reconcile;
 pub mod risk;
 pub mod sizing;
 pub mod state;
