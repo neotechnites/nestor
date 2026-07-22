@@ -12,6 +12,7 @@ flat_usd = 10.0             # flat $ per flat-sized trade (weather)
 daily_budget_usd = 80.0     # daily flat-budget cap
 max_drawdown_frac = 0.30    # halt if drawdown from peak exceeds this
 daily_loss_limit_frac = 0.15 # halt if today's realized loss exceeds this * peak
+max_portfolio_frac = 0.50   # total at-risk across ALL open positions <= this * bankroll
 
 # Weather cities. series + station MUST be verified live (T005).
 # bias = mean(forecast - actual) deg F; placeholders until calibration (T003).

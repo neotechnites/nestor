@@ -196,7 +196,7 @@ async fn calibrate_city(
 /// `window_days` is the trailing window (e.g. 60). The window ends yesterday
 /// (ET) so we never read a not-yet-settled actual.
 pub async fn run(settings: &Settings, window_days: i64, out_path: &str) -> Result<()> {
-    let http = reqwest::Client::new();
+    let http = crate::http_client();
     let today = Utc::now().with_timezone(&New_York).date_naive();
     let edate = today - Duration::days(1);
     let sdate = edate - Duration::days(window_days - 1);

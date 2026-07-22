@@ -67,7 +67,7 @@ impl Kalshi {
     /// Public-only client (market data, no orders).
     pub fn public() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
             key_id: None,
             signing_key: None,
         }
@@ -81,7 +81,7 @@ impl Kalshi {
             .or_else(|_| RsaPrivateKey::from_pkcs1_pem(&pem))
             .context("parsing Kalshi private key (expected PKCS#8 or PKCS#1 PEM)")?;
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client(),
             key_id: Some(key_id),
             signing_key: Some(SigningKey::<Sha256>::new(key)),
         })

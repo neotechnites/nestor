@@ -65,7 +65,12 @@ impl Engine {
         };
 
         if self.mode == Mode::Live {
-            let coid = uuid::Uuid::new_v4().to_string();
+            // Deterministic client_order_id (strategy + market ticker). If the
+            // process dies after Kalshi accepts the order but before we record
+            // the fill, a re-run resends the SAME id — Kalshi dedupes it instead
+            // of placing a duplicate. One order per market per run is the design
+            // (weather bets each market once/day; the ticker carries the date).
+            let coid = format!("{}-{}", order.strategy, order.ticker);
             match self
                 .kalshi
                 .place_limit_buy(

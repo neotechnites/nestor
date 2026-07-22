@@ -18,3 +18,13 @@ pub mod weather;
 pub use kalshi::Kalshi;
 pub use risk::{Order, Rejection, RiskConfig, RiskManager, Side, Signal, SizingHint};
 pub use strategy::{Engine, ExecOutcome, Mode, Strategy};
+
+/// Shared HTTP client with sane timeouts. Every network call in Nestor uses this
+/// so a hung request can never stall the live trading window indefinitely.
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("failed to build HTTP client")
+}

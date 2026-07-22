@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     // layer, no state — just probes Kalshi + IEM and prints a report.
     if which == "probe-weather" {
         let kalshi = engine::Kalshi::public();
-        let http = reqwest::Client::new();
+        let http = engine::http_client();
         return weather::probe::run(&kalshi, &http, &settings.cities).await;
     }
 
@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
 
     let eng = Engine {
         kalshi,
-        http: reqwest::Client::new(),
+        http: engine::http_client(),
         mode,
         risk: Mutex::new(risk),
         cities: settings.cities,

@@ -66,6 +66,7 @@ pub enum Rejection {
     Halted,
     DailyCapHit,
     ClusterCapHit,
+    PortfolioCapHit,
     BankrollTooLow,
     PriceOutOfBand,
     ZeroSize,
@@ -80,6 +81,11 @@ pub struct RiskConfig {
     pub daily_budget_usd: f64,
     pub max_drawdown_frac: f64,
     pub daily_loss_limit_frac: f64,
+    /// Portfolio-wide ceiling: total capital at risk across ALL open positions
+    /// (every cluster combined) may not exceed this fraction of bankroll. Guards
+    /// the case where many uncorrelated clusters each sit under the cluster cap
+    /// but together over-deploy the account (matters once >1 sleeve runs).
+    pub max_portfolio_frac: f64,
 }
 
 impl Default for RiskConfig {
@@ -91,6 +97,7 @@ impl Default for RiskConfig {
             daily_budget_usd: 80.0,
             max_drawdown_frac: 0.30,
             daily_loss_limit_frac: 0.15,
+            max_portfolio_frac: 0.50,
         }
     }
 }
@@ -163,6 +170,11 @@ impl RiskManager {
             .sum()
     }
 
+    /// Total capital at risk across every open position (all clusters).
+    fn total_at_risk(&self) -> f64 {
+        self.state.open.iter().map(|p| p.stake()).sum()
+    }
+
     /// Decide size for a signal, or reject. Does not mutate open positions;
     /// call `on_fill` after the order actually fills.
     pub fn evaluate(&self, s: &Signal) -> Result<Order, Rejection> {
@@ -194,6 +206,14 @@ impl RiskManager {
                 want.min(cluster_room)
             }
         };
+
+        // Portfolio-wide ceiling across all open positions (both sizing modes).
+        let portfolio_room =
+            self.cfg.max_portfolio_frac * self.state.bankroll - self.total_at_risk();
+        if portfolio_room <= 0.0 {
+            return Err(Rejection::PortfolioCapHit);
+        }
+        let stake = stake.min(portfolio_room);
 
         let count = crate::sizing::contracts_for(stake, s.limit_cents);
         if count <= 0 {
@@ -276,6 +296,13 @@ impl RiskManager {
             won,
             pnl,
         });
+        // Keep only the most recent settlements in live state — the full history
+        // lives in the JSONL trade log. Bounds state.json growth over time.
+        const MAX_SETTLED: usize = 1000;
+        let n = self.state.settled.len();
+        if n > MAX_SETTLED {
+            self.state.settled.drain(0..n - MAX_SETTLED);
+        }
 
         // kill-switch: drawdown (all-time peak) always applies; the daily-loss
         // limit only sees today's losses per the attribution rule above.
@@ -402,6 +429,33 @@ mod tests {
         assert_eq!(
             r.evaluate(&sig(SizingHint::Flat, 50, "d")),
             Err(Rejection::DailyCapHit)
+        );
+    }
+
+    #[test]
+    fn portfolio_cap_blocks_across_distinct_clusters() {
+        // max_portfolio_frac 0.5 of $1000 = $500 total. Fills of $50 in DISTINCT
+        // clusters each clear the 15% cluster cap, but together hit the portfolio
+        // ceiling at exactly 10 fills.
+        let mut r = rm(1000.0);
+        let mut filled = 0;
+        for i in 0..20 {
+            let s = sig(SizingHint::Fraction, 50, &format!("c{i}"));
+            match r.evaluate(&s) {
+                Ok(o) => {
+                    r.on_fill(&o);
+                    filled += 1;
+                }
+                Err(e) => {
+                    assert_eq!(e, Rejection::PortfolioCapHit);
+                    break;
+                }
+            }
+        }
+        assert_eq!(filled, 10);
+        assert_eq!(
+            r.evaluate(&sig(SizingHint::Fraction, 50, "cX")),
+            Err(Rejection::PortfolioCapHit)
         );
     }
 
