@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 engine = { path = "../engine" }
 tokio.workspace = true
+reqwest.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

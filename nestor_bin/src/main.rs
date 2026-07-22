@@ -17,6 +17,16 @@ async fn main() -> Result<()> {
 
     let settings = Settings::load(&env_str("NESTOR_CONFIG", "nestor.toml"))?;
 
+    let which = std::env::args().nth(1).unwrap_or_else(|| "weather".into());
+
+    // Read-only reality check for the weather config (T005). No orders, no risk
+    // layer, no state — just probes Kalshi + IEM and prints a report.
+    if which == "probe-weather" {
+        let kalshi = engine::Kalshi::public();
+        let http = reqwest::Client::new();
+        return weather::probe::run(&kalshi, &http, &settings.cities).await;
+    }
+
     // Secrets + mode come from env (env wins over the file's default).
     let mode = Mode::from_env(&std::env::var("NESTOR_ENV").unwrap_or(settings.trading.env.clone()));
     let bankroll = env_f64("NESTOR_BANKROLL", settings.trading.bankroll);
@@ -45,7 +55,6 @@ async fn main() -> Result<()> {
         cities: settings.cities,
     };
 
-    let which = std::env::args().nth(1).unwrap_or_else(|| "weather".into());
     let strat: Box<dyn Strategy> = match which.as_str() {
         "weather" => Box::new(weather::Weather),
         other => anyhow::bail!("unknown strategy: {other}"),

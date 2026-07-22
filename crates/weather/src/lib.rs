@@ -15,6 +15,8 @@ use engine::strategy::ExecOutcome;
 use engine::{logging, Engine, Side, Signal, SizingHint, Strategy};
 use serde_json::json;
 
+pub mod probe;
+
 const LOG: &str = "weather_trades.jsonl";
 
 pub struct Weather;
