@@ -9,6 +9,7 @@ pub mod kalshi;
 pub mod logging;
 pub mod reconcile;
 pub mod risk;
+pub mod selftest;
 pub mod sizing;
 pub mod state;
 pub mod strategy;

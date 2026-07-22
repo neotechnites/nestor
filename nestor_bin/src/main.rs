@@ -45,6 +45,29 @@ async fn main() -> Result<()> {
         return weather::probe::run(&kalshi, &http, &settings.cities).await;
     }
 
+    // Live order-path self-test (T007): places ONE tiny real order to prove auth
+    // + signing + order placement before any strategy trades live. Needs keys.
+    // Usage: nestor selftest-order <ticker> <yes_price_cents> [count]
+    if which == "selftest-order" {
+        let ticker = std::env::args()
+            .nth(2)
+            .context("usage: nestor selftest-order <ticker> <yes_price_cents> [count]")?;
+        let price: i64 = std::env::args()
+            .nth(3)
+            .context("need <yes_price_cents>")?
+            .parse()
+            .context("yes_price_cents must be an integer 1..=99")?;
+        let count: i64 = std::env::args()
+            .nth(4)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let key_id = std::env::var("KALSHI_API_KEY_ID").context("KALSHI_API_KEY_ID required")?;
+        let key_path =
+            std::env::var("KALSHI_PRIVATE_KEY_PATH").context("KALSHI_PRIVATE_KEY_PATH required")?;
+        let kalshi = engine::Kalshi::authenticated(key_id, &key_path)?;
+        return engine::selftest::run(&kalshi, &ticker, price, count).await;
+    }
+
     // Secrets + mode come from env (env wins over the file's default).
     let mode = Mode::from_env(&std::env::var("NESTOR_ENV").unwrap_or(settings.trading.env.clone()));
     let bankroll = env_f64("NESTOR_BANKROLL", settings.trading.bankroll);

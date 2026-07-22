@@ -1,6 +1,6 @@
 # T007 — Live $1 order-path test
 
-**Priority:** P1 · **Status:** todo · **Gated on:** Kalshi API keys + funded account (Ryan)
+**Priority:** P1 · **Status:** built (awaits live run with keys) · **Gated on:** Kalshi API keys + funded account (Ryan)
 
 ## Goal
 Prove the RSA signing + order placement actually works end-to-end against real

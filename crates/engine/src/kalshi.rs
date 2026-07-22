@@ -197,6 +197,37 @@ impl Kalshi {
         }
         Ok(req.send().await?.error_for_status()?.json().await?)
     }
+
+    /// Account cash balance in cents. Signed.
+    pub async fn balance_cents(&self) -> Result<i64> {
+        let path = format!("{PREFIX}/portfolio/balance");
+        let headers = self.sign_headers("GET", &path)?;
+        let mut req = self.http.get(format!("{BASE}{path}"));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let body = req.send().await?.error_for_status()?.text().await?;
+        parse_balance(&body)
+    }
+
+    /// Raw portfolio positions (signed) — used to confirm a fill in the self-test.
+    pub async fn positions(&self) -> Result<serde_json::Value> {
+        let path = format!("{PREFIX}/portfolio/positions");
+        let headers = self.sign_headers("GET", &path)?;
+        let mut req = self.http.get(format!("{BASE}{path}"));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        Ok(req.send().await?.error_for_status()?.json().await?)
+    }
+}
+
+/// Parse `/portfolio/balance` into cents. Kalshi returns `{"balance": <int cents>}`.
+pub fn parse_balance(body: &str) -> Result<i64> {
+    let v: serde_json::Value = serde_json::from_str(body).context("parsing balance")?;
+    v.get("balance")
+        .and_then(|b| b.as_i64())
+        .context("balance response missing integer `balance` field")
 }
 
 /// Parse a `/markets` response body into its market list. Pure and network-free
@@ -210,6 +241,13 @@ pub fn parse_markets(body: &str) -> Result<Vec<Market>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_balance_reads_cents() {
+        assert_eq!(parse_balance(r#"{"balance": 4237}"#).unwrap(), 4237);
+        assert!(parse_balance(r#"{"nope": 1}"#).is_err());
+        assert!(parse_balance("not json").is_err());
+    }
 
     #[test]
     fn parse_markets_detects_series_and_reads_sample() {
