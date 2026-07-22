@@ -30,15 +30,18 @@ pub fn spot(candles: &[(i64, f64)]) -> Option<f64> {
     candles.last().map(|x| x.1)
 }
 
-/// Median absolute 1-min move over the last 15 minutes.
+/// Median absolute 1-min move over the last 15 COMPLETED minutes. The newest
+/// candle is the in-progress minute (a partial move that would deflate the median
+/// and inflate Z), so it's excluded from the volatility estimate — `spot()` still
+/// uses it for the freshest price.
 pub fn median_move(candles: &[(i64, f64)]) -> Option<f64> {
-    let n = candles.len();
-    if n < 16 {
-        return None;
+    let m = candles.len();
+    if m < 17 {
+        return None; // need 16 completed bars for 15 diffs, plus the partial one
     }
-    let mut diffs: Vec<f64> = (n - 15..n)
-        .map(|j| (candles[j].1 - candles[j - 1].1).abs())
-        .collect();
+    let c = &candles[..m - 1]; // drop the in-progress bar
+    let n = c.len();
+    let mut diffs: Vec<f64> = (n - 15..n).map(|j| (c[j].1 - c[j - 1].1).abs()).collect();
     diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     Some(diffs[diffs.len() / 2])
 }

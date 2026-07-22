@@ -39,9 +39,42 @@ pub struct LockEntry {
     pub z: f64,
 }
 
-/// Evaluate one checkpoint. `Some(entry)` if it qualifies, else `None`.
-/// `yes_price` = the YES contract price in ¢ (0–100). `minutes_left` = seconds
-/// to close / 60.
+/// Core check on the FAVORITE you would actually pay for. `fav_ask` = the ask ¢
+/// of the favorite side (what the fill costs), deci-cent (f64) — NOT `100 -
+/// yes_ask` (that is `no_bid`, not `no_ask`). `fav_is_yes` says which side leads.
+pub fn evaluate_favorite(
+    fav_ask: f64,
+    fav_is_yes: bool,
+    spot: f64,
+    strike: f64,
+    median_1min_move: f64,
+    minutes_left: f64,
+    p: &LockParams,
+) -> Option<LockEntry> {
+    // Band-gate on the price actually paid, before any rounding, so a 92.9¢
+    // favorite is NOT admitted into [93,97) (below 93 the edge inverts, note 08).
+    if fav_ask < p.price_lo || fav_ask >= p.price_hi {
+        return None;
+    }
+    let z = z_score(spot, strike, median_1min_move, minutes_left);
+    if z < p.z_min {
+        return None;
+    }
+    // Distance must be on the favorite's side (don't buy a favorite the underlying
+    // contradicts). YES favorite ⇔ spot above strike.
+    if fav_is_yes != (spot > strike) {
+        return None;
+    }
+    Some(LockEntry {
+        fav_price: fav_ask,
+        fav_is_yes,
+        z,
+    })
+}
+
+/// Backtest convenience: derive the favorite from a single YES price (the cached
+/// tick data has trade prices, not separate yes/no asks). Live code uses
+/// `evaluate_favorite` with the real ask.
 pub fn evaluate(
     yes_price: f64,
     spot: f64,
@@ -51,25 +84,16 @@ pub fn evaluate(
     p: &LockParams,
 ) -> Option<LockEntry> {
     let fav = yes_price.max(100.0 - yes_price);
-    if fav < p.price_lo || fav >= p.price_hi {
-        return None;
-    }
-    let z = z_score(spot, strike, median_1min_move, minutes_left);
-    if z < p.z_min {
-        return None;
-    }
-    // Distance must be on the favorite's side (don't buy a favorite the underlying
-    // contradicts). YES favorite ⇔ spot above strike.
     let fav_is_yes = yes_price > 50.0;
-    let leader_up = spot > strike;
-    if fav_is_yes != leader_up {
-        return None;
-    }
-    Some(LockEntry {
-        fav_price: fav,
+    evaluate_favorite(
+        fav,
         fav_is_yes,
-        z,
-    })
+        spot,
+        strike,
+        median_1min_move,
+        minutes_left,
+        p,
+    )
 }
 
 #[cfg(test)]
@@ -108,6 +132,34 @@ mod tests {
     #[test]
     fn rejects_low_z() {
         assert!(evaluate(95.0, 1010.0, 1000.0, 10.0, 1.0, &LockParams::default()).is_none());
+    }
+
+    #[test]
+    fn favorite_gates_on_ask_and_decicent_floor() {
+        // NO favorite priced at its 95¢ ask, spot below strike -> qualifies at 95.
+        let e = evaluate_favorite(
+            95.0,
+            false,
+            900.0,
+            1000.0,
+            10.0,
+            1.0,
+            &LockParams::default(),
+        )
+        .unwrap();
+        assert!(!e.fav_is_yes);
+        assert!((e.fav_price - 95.0).abs() < 1e-9);
+        // 92.9¢ favorite is below the 93 floor (integer rounding would wrongly admit 93).
+        assert!(evaluate_favorite(
+            92.9,
+            true,
+            1100.0,
+            1000.0,
+            10.0,
+            1.0,
+            &LockParams::default()
+        )
+        .is_none());
     }
 
     #[test]

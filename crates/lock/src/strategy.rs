@@ -27,8 +27,6 @@ impl Strategy for Lock {
     }
 
     async fn run(&self, eng: &Engine) -> Result<()> {
-        let now = chrono::Utc::now().timestamp();
-
         let candles = coinbase::recent_1min(&eng.http).await?;
         let (spot, med) = match (coinbase::spot(&candles), coinbase::median_move(&candles)) {
             (Some(s), Some(m)) if m > 0.0 => (s, m),
@@ -50,6 +48,8 @@ impl Strategy for Lock {
                 .collect()
         };
 
+        // Capture `now` AFTER the network fetches so `sb` isn't stale at the 30s floor.
+        let now = chrono::Utc::now().timestamp();
         let (mut in_window, mut qualified) = (0usize, 0usize);
         for m in &markets {
             let close = match m.close_unix() {
@@ -64,13 +64,25 @@ impl Strategy for Lock {
                 Some(k) => k,
                 None => continue,
             };
-            let yes = match m.yes_ask_cents() {
-                Some(c) => c as f64,
-                None => continue,
+            // Deci-cent asks for both sides. The favorite is the higher-priced side;
+            // gate the band on the ACTUAL ask we would pay (not 100-yes_ask=no_bid).
+            let (yes_ask, no_ask) = match (m.yes_ask_cents_f64(), m.no_ask_cents_f64()) {
+                (Some(y), Some(n)) => (y, n),
+                _ => continue,
             };
             in_window += 1;
+            let fav_is_yes = yes_ask > 50.0;
+            let fav_ask = if fav_is_yes { yes_ask } else { no_ask };
 
-            let entry = match signal::evaluate(yes, spot, strike, med, sb as f64 / 60.0, &params) {
+            let entry = match signal::evaluate_favorite(
+                fav_ask,
+                fav_is_yes,
+                spot,
+                strike,
+                med,
+                sb as f64 / 60.0,
+                &params,
+            ) {
                 Some(e) => e,
                 None => continue,
             };
@@ -79,20 +91,8 @@ impl Strategy for Lock {
             if held.contains(&m.ticker) {
                 continue;
             }
-            // Pay the favorite's ask (yes_ask if YES favorite, else no_ask).
-            let ask = match if entry.fav_is_yes {
-                m.yes_ask_cents()
-            } else {
-                m.no_ask_cents()
-            } {
-                Some(a) => a,
-                None => continue,
-            };
-            let side = if entry.fav_is_yes {
-                Side::Yes
-            } else {
-                Side::No
-            };
+            let ask = fav_ask.round() as i64; // order price to Kalshi in whole cents
+            let side = if fav_is_yes { Side::Yes } else { Side::No };
             let sig = Signal {
                 strategy: "lock".into(),
                 ticker: m.ticker.clone(),

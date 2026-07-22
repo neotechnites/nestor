@@ -39,21 +39,31 @@ pub struct Market {
     pub close_time: Option<String>,
 }
 
-fn dollars_to_cents(s: &Option<String>) -> Option<i64> {
+fn dollars_to_cents_f64(s: &Option<String>) -> Option<f64> {
     s.as_ref()
         .and_then(|s| s.parse::<f64>().ok())
-        .map(|d| (d * 100.0).round() as i64)
+        .map(|d| d * 100.0)
 }
 
 impl Market {
-    /// YES ask in cents (0-100), or None if unpriced.
-    pub fn yes_ask_cents(&self) -> Option<i64> {
-        dollars_to_cents(&self.yes_ask_dollars)
+    /// YES ask in ¢ at deci-cent resolution (0-100), or None if unpriced.
+    pub fn yes_ask_cents_f64(&self) -> Option<f64> {
+        dollars_to_cents_f64(&self.yes_ask_dollars)
     }
 
-    /// NO ask in cents (0-100), or None if unpriced.
+    /// NO ask in ¢ at deci-cent resolution (0-100), or None if unpriced.
+    pub fn no_ask_cents_f64(&self) -> Option<f64> {
+        dollars_to_cents_f64(&self.no_ask_dollars)
+    }
+
+    /// YES ask rounded to whole cents (0-100), or None if unpriced.
+    pub fn yes_ask_cents(&self) -> Option<i64> {
+        self.yes_ask_cents_f64().map(|c| c.round() as i64)
+    }
+
+    /// NO ask rounded to whole cents (0-100), or None if unpriced.
     pub fn no_ask_cents(&self) -> Option<i64> {
-        dollars_to_cents(&self.no_ask_dollars)
+        self.no_ask_cents_f64().map(|c| c.round() as i64)
     }
 
     /// Close time as a unix timestamp (seconds), parsed from `close_time`.
@@ -196,22 +206,33 @@ impl Kalshi {
         Ok(resp.market)
     }
 
-    /// Place a limit buy. `yes_price_cents` = YES price in cents (1-99). Signed.
+    /// Place a limit buy. `price_cents` = the price in cents (1-99) for the chosen
+    /// `side` — placed as `yes_price` for a YES order, `no_price` for a NO order
+    /// (Kalshi keys the limit to the side being bought). Signed.
     pub async fn place_limit_buy(
         &self,
         ticker: &str,
         side: &str,
         count: i64,
-        yes_price_cents: i64,
+        price_cents: i64,
         client_order_id: &str,
     ) -> Result<serde_json::Value> {
         let path = format!("{PREFIX}/portfolio/orders");
         let headers = self.sign_headers("POST", &path)?;
-        let body = json!({
-            "ticker": ticker, "action": "buy", "side": side,
-            "type": "limit", "count": count,
-            "yes_price": yes_price_cents, "client_order_id": client_order_id,
-        });
+        let price_key = if side == "no" {
+            "no_price"
+        } else {
+            "yes_price"
+        };
+        let mut map = serde_json::Map::new();
+        map.insert("ticker".into(), json!(ticker));
+        map.insert("action".into(), json!("buy"));
+        map.insert("side".into(), json!(side));
+        map.insert("type".into(), json!("limit"));
+        map.insert("count".into(), json!(count));
+        map.insert(price_key.into(), json!(price_cents));
+        map.insert("client_order_id".into(), json!(client_order_id));
+        let body = serde_json::Value::Object(map);
         let mut req = self.http.post(format!("{BASE}{path}")).json(&body);
         for (k, v) in headers {
             req = req.header(k, v);
