@@ -1,7 +1,7 @@
-# Deploy Nestor to the VPS on every push to main.
+# CI + deploy Nestor to the VPS on every push to main.
 # FILL IN once the VPS exists: add repo secrets VPS_HOST, VPS_USER, VPS_SSH_KEY.
 # The daily run itself is scheduled by cron/systemd ON the VPS (not here) —
-# this workflow only ships new code to the box.
+# this workflow builds, checks, and ships the binary to the box.
 name: deploy
 
 on:
@@ -10,30 +10,41 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo build --release
+      - run: cargo test
 
-      - name: Copy code to VPS
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+      - name: Ship binary to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: "."
-          target: "~/nestor"
-          rm: false
+          source: "target/release/nestor"
+          target: "~/nestor/bin"
+          strip_components: 2
 
-      - name: Install deps + restart timer
+      - name: Restart timer
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            cd ~/nestor
-            python3 -m venv .venv || true
-            ./.venv/bin/pip install -q -r requirements.txt
-            # weather runs via the systemd timer set up during provisioning
             systemctl --user restart nestor-weather.timer || true

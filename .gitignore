@@ -4,7 +4,11 @@ secrets/
 *.pem
 *.key
 
-# Python
+# Rust
+/target/
+**/target/
+
+# Python (reference/)
 __pycache__/
 *.pyc
 .venv/

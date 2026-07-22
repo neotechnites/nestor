@@ -3,34 +3,37 @@
 Automated trading system for Kalshi retail-priced markets. Part of **Olympus**.
 
 Strategy research + forward-test results live in the Obsidian vault
-(`Documents/Obsidian/nestor`). This repo is the live implementation.
+(`Documents/Obsidian/nestor`). **Production is all Rust**; Python is kept only
+as research/backtest reference under `reference/`.
 
-## Sleeves
-- **Weather** (first build, this repo): daily forecast-buy on Kalshi high-temp
-  markets. Bias-correct Open-Meteo forecast → 2°F bucket → buy ~9am ET on dry
-  days in the 6 tradeable cities → hold to settlement.
-- **Lock** (later): always-on BTC favorite fade in the final 2–4 min of 15-min
-  markets. Needs a long-running poller (why we run on a VPS, not GitHub Actions).
+## Why Rust
+Nestor is an ever-growing platform. The engine is the permanent, shared
+infrastructure (exchange client, market-data, order router, risk, scheduling)
+and benefits from speed, memory safety, and single-binary deploys. Strategies
+that clear research become Rust modules — a deliberate quality gate before real
+money. Latency-sensitive future strategies (lock edge, cross-venue) get the fast
+path natively; no polyglot boundary to maintain.
 
-## Layout
+## Architecture (Cargo workspace)
 ```
-nestor/         core modules
-  weather.py    Open-Meteo forecast + IEM actuals
-  kalshi.py     Kalshi API client (public data + signed order placement)
-  sizing.py     stake -> contract count
-  weather_bot.py the daily job
-  logutil.py    stdout + JSONL trade log
-config/cities.py  tradeable cities (series ticker, station, lat/lon, bias)
-scripts/run_weather.py  cron entrypoint
-.github/workflows/deploy.yml  deploy-to-VPS on push (fill in once VPS exists)
+crates/engine/    the shared engine (a lib)
+  kalshi.rs       Kalshi API client: public market data + RSA-signed orders
+  weather.rs      Open-Meteo forecast + IEM actuals feeds
+  config.rs       tradeable cities (series, station, lat/lon, bias)
+  sizing.rs       stake -> contract count
+  strategy.rs     Strategy trait + shared Engine context  <- the extension point
+  logging.rs      stdout + JSONL trade log
+crates/weather/   the weather sleeve (implements Strategy)
+nestor_bin/       the `nestor` binary — wires engine + strategies, runs one
+reference/python/ the original Python scaffold, kept for reference only
 ```
+New strategy = new crate implementing `Strategy`, wired into `nestor_bin`.
 
-## Run locally
+## Build & run
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # NESTOR_ENV=paper by default
-python3 scripts/run_weather.py  # paper mode: logs picks, places no orders
+cargo build --release
+cp .env.example .env          # NESTOR_ENV=paper by default
+./target/release/nestor weather   # paper: logs picks, places no orders
 ```
 
 ## Modes
@@ -43,6 +46,11 @@ environment secrets, never in the repo.
 
 ## Before live
 - Verify each city's exact Kalshi series ticker + IEM settlement station.
-- Calibrate per-city `bias` from a trailing IEM window.
-- Test one $1 order round-trip (place → fill → settle → reconcile).
-- Confirm the live Open-Meteo `forecast` endpoint serves the morning run.
+- Calibrate per-city `bias` from a trailing IEM window (currently placeholder 1.5).
+- Test one $1 order round-trip (place -> fill -> settle -> reconcile).
+- Confirm the live Open-Meteo forecast endpoint serves the morning run.
+
+## Sleeves
+- **Weather** (this build): daily forecast-buy. Forward-test HELD 2026-07-15.
+- **Lock** (next): always-on BTC favorite fade in the final 2-4 min of 15-min
+  markets. Needs a long-running poller (why we run on a VPS, not GitHub Actions).
