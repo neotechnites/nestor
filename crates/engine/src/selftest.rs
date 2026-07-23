@@ -28,14 +28,47 @@ pub async fn run(kalshi: &Kalshi, ticker: &str, price_cents: i64, count: i64) ->
     }
 
     let coid = uuid::Uuid::new_v4().to_string();
+    let ts_submit = chrono::Utc::now().timestamp_millis();
     println!("placing {count} contract(s) of {ticker} @ {price_cents}c (client_order_id {coid})…");
     let resp = kalshi
         .place_limit_buy(ticker, "yes", count, price_cents, &coid)
         .await?;
     println!("order response:\n{}", serde_json::to_string_pretty(&resp)?);
+    let order_id = crate::kalshi::parse_order_id(&resp);
+    println!("parsed order_id: {order_id:?} (None = SCHEMA SURPRISE — report it)");
+
+    // Exercise the fills path the live execute() depends on: poll a few times
+    // and show BOTH the raw JSON (schema truth) and what our parser extracted.
+    for i in 0..5 {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let raw = kalshi.fills(ticker).await?;
+        let fills = crate::kalshi::parse_fills(&raw, order_id.as_deref(), "yes", ts_submit);
+        let (filled, avg, _) = crate::kalshi::fills_summary(&fills);
+        println!("fills poll {i}: parsed filled={filled} avg={avg:?}");
+        if filled >= count {
+            println!("raw fills JSON:\n{}", serde_json::to_string_pretty(&raw)?);
+            break;
+        }
+        if i == 4 {
+            println!("not filled after 5 polls — raw fills JSON for schema check:");
+            println!("{}", serde_json::to_string_pretty(&raw)?);
+            if let Some(id) = &order_id {
+                println!("canceling unfilled order {id}…");
+                let c = kalshi.cancel_order(id).await?;
+                println!("cancel response:\n{}", serde_json::to_string_pretty(&c)?);
+            }
+        }
+    }
 
     let pos = kalshi.positions().await?;
     println!("positions:\n{}", serde_json::to_string_pretty(&pos)?);
-    println!("self-test done — auth, signing, order placement, and position read all worked.");
+    println!(
+        "self-test done — auth, signing, order placement, fills read{} all worked.",
+        if order_id.is_some() {
+            ", cancel path"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }

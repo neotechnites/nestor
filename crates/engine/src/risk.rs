@@ -42,6 +42,11 @@ pub struct Signal {
     /// Correlation key; positions sharing it are capped as one bet.
     pub cluster: String,
     pub sizing: SizingHint,
+    /// Max seconds Engine::execute may spend verifying the fill before
+    /// canceling any unfilled remainder (clamped to ≤8s — "window close or a
+    /// few seconds, whichever comes first"). Strategies set this to the time
+    /// left in their entry window.
+    pub fill_wait_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -242,16 +247,32 @@ impl RiskManager {
     /// against the daily budget (fraction sleeves are governed by cluster caps),
     /// so the two sleeves don't consume each other's limits on shared state.
     pub fn on_fill(&mut self, o: &Order) {
+        self.on_fill_actual(o, o.count, o.limit_cents);
+    }
+
+    /// Record what ACTUALLY filled (EXECUTION TRUTH: accepted ≠ filled). Only
+    /// `filled_count` at `fill_price_cents` enters state — never the requested
+    /// count or assumed limit. The taker fee is charged HERE, at fill time
+    /// (ceil-per-order on the actual fill), deducted from bankroll immediately
+    /// and remembered on the Position so settle() reports net without
+    /// re-charging. No-op if nothing filled.
+    pub fn on_fill_actual(&mut self, o: &Order, filled_count: i64, fill_price_cents: i64) {
+        if filled_count <= 0 {
+            return;
+        }
+        let fee = taker_fee(fill_price_cents, filled_count);
+        self.state.bankroll -= fee;
         if matches!(o.sizing, SizingHint::Flat) {
-            self.state.day_spent += o.stake();
+            self.state.day_spent += filled_count as f64 * fill_price_cents as f64 / 100.0;
         }
         self.state.open.push(Position {
             strategy: o.strategy.clone(),
             ticker: o.ticker.clone(),
             side: o.side,
-            count: o.count,
-            entry_cents: o.limit_cents,
+            count: filled_count,
+            entry_cents: fill_price_cents,
             cluster: o.cluster.clone(),
+            fee,
             day: self.state.day.clone(),
         });
         self.persist();
@@ -288,9 +309,13 @@ impl RiskManager {
         } else {
             -(pos.count as f64 * entry)
         };
-        let pnl = gross - taker_fee(pos.entry_cents, pos.count);
+        // The taker fee was already deducted from bankroll at fill time
+        // (on_fill_actual) — only the settlement cash flow moves bankroll here.
+        // The REPORTED pnl is net of that fee so the trade's true economics
+        // appear in the settlement record.
+        let pnl = gross - pos.fee;
 
-        self.state.bankroll += pnl;
+        self.state.bankroll += gross;
         // Only a loss from a position opened on TODAY's trading day feeds the
         // daily-loss kill-switch; prior-day settlements are excluded (see above).
         if pnl < 0.0 && pos.day == self.state.day {
@@ -379,6 +404,7 @@ mod tests {
             limit_cents: price,
             cluster: cluster.into(),
             sizing,
+            fill_wait_secs: 5,
         }
     }
 
@@ -392,18 +418,32 @@ mod tests {
 
     #[test]
     fn cluster_cap_blocks_fourth() {
-        // cap = 15% of 1000 = $150. fraction want = 5% = $50; at 50c -> count 100
-        // -> stake $50. Three fills reach $150 == cap; the fourth has zero room.
+        // cap ≈ 15% of bankroll. fraction want = 5%; at 50c the first fill is
+        // 100 contracts ($50). Fees are charged at fill, so bankroll (and thus
+        // want/cap) shrinks slightly with each fill — after ~3 fills the cluster
+        // is effectively full and the 4th is refused (no room, or room smaller
+        // than one contract).
         let mut r = rm(1000.0);
-        for _ in 0..3 {
+        let o = r.evaluate(&sig(SizingHint::Fraction, 50, "cx")).unwrap();
+        assert_eq!(o.count, 100); // pre-fee sizing: 5% of $1000 at 50c
+        r.on_fill(&o);
+        for _ in 0..2 {
             let o = r.evaluate(&sig(SizingHint::Fraction, 50, "cx")).unwrap();
-            assert_eq!(o.count, 100);
+            assert!(o.count >= 98); // fee drag shaves a contract or two
             r.on_fill(&o);
         }
-        assert_eq!(
-            r.evaluate(&sig(SizingHint::Fraction, 50, "cx")),
-            Err(Rejection::ClusterCapHit)
+        let fourth = r.evaluate(&sig(SizingHint::Fraction, 50, "cx"));
+        assert!(
+            matches!(
+                fourth,
+                Err(Rejection::ClusterCapHit) | Err(Rejection::ZeroSize)
+            ),
+            "cluster should be effectively full: {fourth:?}"
         );
+        // And the cluster total respects the cap against the CURRENT bankroll.
+        let cap = 0.15 * r.status().bankroll;
+        let total: f64 = r.open_positions().iter().map(|p| p.stake()).sum();
+        assert!(total <= cap + 1.0, "cluster {total} vs cap {cap}");
     }
 
     #[test]
@@ -528,6 +568,7 @@ mod tests {
                 limit_cents: 40,
                 cluster: "streak-123".into(),
                 sizing: SizingHint::Flat,
+                fill_wait_secs: 5,
             };
             match r.evaluate(&s) {
                 Ok(o) => {
@@ -555,6 +596,46 @@ mod tests {
             total <= 15.0 + 1e-9,
             "cluster stake {total} exceeded the $15 cap"
         );
+    }
+
+    #[test]
+    fn partial_fill_records_filled_count_and_fee_at_fill() {
+        // EXECUTION TRUTH: only what filled enters state; the fee is charged at
+        // fill (on the actual price/count) and settle() reports net without
+        // re-charging bankroll.
+        let cfg = RiskConfig {
+            flat_usd: 4.0,
+            daily_budget_usd: 60.0,
+            ..RiskConfig::default()
+        };
+        let mut r =
+            RiskManager::load_or_init(cfg, Box::new(MemoryStore::default()), 100.0).unwrap();
+        let o = r.evaluate(&sig(SizingHint::Flat, 44, "w")).unwrap();
+        assert_eq!(o.count, 9); // $4 at 44c
+
+        // Only 5 of 9 filled, at 43c (better than limit).
+        r.on_fill_actual(&o, 5, 43);
+        let fee = taker_fee(43, 5); // raw 0.07*5*0.43*0.57 = 0.0858 -> 0.09
+        assert!((fee - 0.09).abs() < 1e-9);
+        assert!((r.status().bankroll - (100.0 - fee)).abs() < 1e-9);
+        let pos = &r.open_positions()[0];
+        assert_eq!(pos.count, 5);
+        assert_eq!(pos.entry_cents, 43);
+
+        // Win: settle adds gross only; reported pnl is net of the fill fee.
+        let out = r.settle(&o.ticker, true).unwrap();
+        let gross = 5.0 * (1.0 - 0.43);
+        assert!((out.pnl - (gross - fee)).abs() < 1e-9);
+        assert!((r.status().bankroll - (100.0 - fee + gross)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_fill_is_a_noop() {
+        let mut r = rm(1000.0);
+        let o = r.evaluate(&sig(SizingHint::Flat, 44, "w")).unwrap();
+        r.on_fill_actual(&o, 0, 44);
+        assert!(r.open_positions().is_empty());
+        assert!((r.status().bankroll - 1000.0).abs() < 1e-9);
     }
 
     #[test]
@@ -636,6 +717,7 @@ mod tests {
             limit_cents: 50,
             cluster: "k".into(),
             sizing: SizingHint::Fraction,
+            fill_wait_secs: 5,
         };
         let o = r.evaluate(&s).unwrap(); // 5% of 100 = $5 -> 10 @ 50c
         r.on_fill(&o);

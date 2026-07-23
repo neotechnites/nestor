@@ -12,9 +12,15 @@ pub struct Position {
     pub strategy: String,
     pub ticker: String,
     pub side: Side,
+    /// ACTUAL filled count (never the requested count — accepted ≠ filled).
     pub count: i64,
+    /// ACTUAL average fill price in cents (never assumed from the limit).
     pub entry_cents: i64,
     pub cluster: String,
+    /// Taker fee (dollars) charged at fill time — already deducted from
+    /// bankroll when the position opened; settle() must not re-charge it.
+    #[serde(default)]
+    pub fee: f64,
     /// ET trading day (YYYY-MM-DD) the position was opened on. Settlement uses
     /// this to attribute a realized loss to the *right* day's daily-loss
     /// counter, so a next-morning reconcile of a prior day can't trip today's

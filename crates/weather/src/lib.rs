@@ -152,6 +152,7 @@ impl Weather {
             limit_cents: ask,
             cluster: format!("weather:{date_str}"),
             sizing: SizingHint::Flat,
+            fill_wait_secs: 5,
         };
 
         let outcome = eng.execute(signal).await;
@@ -160,27 +161,40 @@ impl Weather {
             "ticker":mkt.ticker,"bucket":mkt.yes_sub_title,"ask_cents":ask
         });
         match &outcome {
-            ExecOutcome::Paper(o) => {
-                rec["result"] = json!({"paper": true, "count": o.count});
+            ExecOutcome::Filled { fill, response, .. } if fill.simulated => {
+                rec["result"] = json!({"paper": true, "count": fill.filled, "simulated": true, "order": response});
                 logging::info(format!(
                     "{}: [paper] buy {}x {} @ {ask}c (fc {fc:.1} -> {corrected:.1}F)",
-                    c.code, o.count, mkt.ticker
+                    c.code, fill.filled, mkt.ticker
                 ));
             }
-            ExecOutcome::Filled { order, response } => {
-                rec["result"] = json!({"filled": true, "count": order.count, "order": response});
+            ExecOutcome::Filled { fill, response, .. } => {
+                rec["result"] = json!({"filled": true, "count": fill.filled,
+                    "fill_price": fill.fill_price_cents, "partial": fill.partial,
+                    "canceled": fill.canceled, "order": response});
                 logging::info(format!(
-                    "{}: BOUGHT {}x {} @ {ask}c",
-                    c.code, order.count, mkt.ticker
+                    "{}: FILLED {}x {} @ {}c{}",
+                    c.code,
+                    fill.filled,
+                    mkt.ticker,
+                    fill.fill_price_cents,
+                    if fill.partial { " (partial)" } else { "" }
                 ));
                 alert::notify(
                     &eng.http,
                     &format!(
-                        "{}: BOUGHT {}x {} @ {ask}c",
-                        c.code, order.count, mkt.ticker
+                        "{}: FILLED {}x {} @ {}c",
+                        c.code, fill.filled, mkt.ticker, fill.fill_price_cents
                     ),
                 )
                 .await;
+            }
+            ExecOutcome::Missed { fill, .. } => {
+                rec["result"] = json!({"missed": true, "canceled": fill.canceled});
+                logging::info(format!(
+                    "{}: MISSED (no fill, canceled) {}",
+                    c.code, mkt.ticker
+                ));
             }
             ExecOutcome::Rejected(r) => {
                 rec["result"] = json!({"rejected": format!("{r:?}")});

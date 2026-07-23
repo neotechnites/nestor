@@ -149,8 +149,9 @@ async fn main() -> Result<()> {
         return run_all(eng).await;
     }
 
-    // Streak standalone: `streak` loops the scan every 15s (no settlement task —
-    // use `run` in production); `streak-once` runs a single pass for testing.
+    // Streak standalone: `streak` loops the scan at the adaptive cadence (1s in
+    // entry windows, lazy outside; no settlement task — use `run` in
+    // production); `streak-once` runs a single pass for testing.
     if which == "streak" || which == "streak-once" {
         let strat = streak::strategy::Streak::new();
         loop {
@@ -160,7 +161,10 @@ async fn main() -> Result<()> {
             if which == "streak-once" {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            tokio::time::sleep(streak::strategy::next_poll_delay(
+                chrono::Utc::now().timestamp(),
+            ))
+            .await;
         }
         return Ok(());
     }
@@ -210,7 +214,7 @@ async fn run_all(eng: Engine) -> Result<()> {
     use std::time::Duration;
 
     let eng = std::sync::Arc::new(eng);
-    engine::logging::info("nestor run — streak (15s) + settlement (60s), one process");
+    engine::logging::info("nestor run — streak (adaptive 1s-in-window/12s-lazy) + settlement (60s) + nightly compression, one process");
 
     // Settlement: sweep every 60s so streak's 15-min markets settle intraday
     // (same trading day -> losses feed the daily-loss kill-switch). Each
@@ -229,16 +233,63 @@ async fn run_all(eng: Engine) -> Result<()> {
         });
     }
 
-    // Streak: continuous scanner in the foreground (keeps the process alive).
-    // 15s cadence = ~4 evaluations inside each market's 60s entry window.
-    // Lock (decay-dead) and weather (unverdicted) are parked — NOT spawned.
+    // Nightly compression: gzip yesterday's (and older) dated observation logs
+    // (DATA CAPTURE 4 — keep everything, delete nothing; 10-20x shrink). Checks
+    // hourly; only compresses files whose date < today, so live files are never
+    // touched.
+    tokio::spawn(async move {
+        loop {
+            compress_old_obs_logs();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
+
+    // Streak: continuous scanner in the foreground (keeps the process alive) at
+    // the adaptive cadence — 1s inside each 60s entry window (60 looks at the
+    // ask vs 4 at lock's old 15s), lazy ~12s outside, never oversleeping a
+    // boundary. Lock (decay-dead) and weather (unverdicted) are parked — NOT
+    // spawned.
     let streak = streak::strategy::Streak::new();
     loop {
         let r = std::panic::AssertUnwindSafe(streak.run(&eng))
             .catch_unwind()
             .await;
         report("streak", r);
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        tokio::time::sleep(streak::strategy::next_poll_delay(
+            chrono::Utc::now().timestamp(),
+        ))
+        .await;
+    }
+}
+
+/// Gzip dated observation logs older than today (`data/obs/YYYY-MM-DD.jsonl`).
+/// Shells out to the system `gzip` (present on macOS + Linux) — no extra deps.
+/// Idempotent: already-compressed files end in .gz and are skipped.
+fn compress_old_obs_logs() {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let dir = std::path::Path::new("data/obs");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // no obs dir yet
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        // only dated .jsonl files strictly older than today
+        if let Some(date) = name.strip_suffix(".jsonl") {
+            if date.len() == 10 && date < today.as_str() {
+                let path = e.path();
+                match std::process::Command::new("gzip")
+                    .arg("-f")
+                    .arg(&path)
+                    .status()
+                {
+                    Ok(s) if s.success() => {
+                        engine::logging::info(format!("compressed {}", path.display()))
+                    }
+                    Ok(s) => eprintln!("gzip {} exited {s}", path.display()),
+                    Err(err) => eprintln!("gzip {} failed: {err}", path.display()),
+                }
+            }
+        }
     }
 }
 

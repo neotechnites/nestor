@@ -100,6 +100,7 @@ impl Strategy for Lock {
                 limit_cents: ask,
                 cluster: format!("btc:{close}"), // all positions in one 15-min window = one bet
                 sizing: SizingHint::Fraction,
+                fill_wait_secs: 5,
             };
 
             let outcome = eng.execute(sig).await;
@@ -110,24 +111,32 @@ impl Strategy for Lock {
                        "outcome":format!("{outcome:?}")}),
             );
             match &outcome {
-                ExecOutcome::Paper(o) => logging::info(format!(
+                ExecOutcome::Filled { fill, .. } if fill.simulated => logging::info(format!(
                     "lock: [paper] buy {}x {} @ {ask}c (Z={:.1}, {sb}s left)",
-                    o.count, m.ticker, entry.z
+                    fill.filled, m.ticker, entry.z
                 )),
-                ExecOutcome::Filled { order, .. } => {
+                ExecOutcome::Filled { fill, .. } => {
                     logging::info(format!(
-                        "lock: BOUGHT {}x {} @ {ask}c (Z={:.1})",
-                        order.count, m.ticker, entry.z
+                        "lock: FILLED {}x {} @ {}c (Z={:.1}){}",
+                        fill.filled,
+                        m.ticker,
+                        fill.fill_price_cents,
+                        entry.z,
+                        if fill.partial { " (partial)" } else { "" }
                     ));
                     alert::notify(
                         &eng.http,
                         &format!(
-                            "lock BOUGHT {}x {} @ {ask}c (Z={:.1})",
-                            order.count, m.ticker, entry.z
+                            "lock FILLED {}x {} @ {}c (Z={:.1})",
+                            fill.filled, m.ticker, fill.fill_price_cents, entry.z
                         ),
                     )
                     .await;
                 }
+                ExecOutcome::Missed { fill, .. } => logging::info(format!(
+                    "lock: MISSED (no fill, canceled {}) {}",
+                    fill.canceled, m.ticker
+                )),
                 ExecOutcome::Rejected(r) => {
                     logging::info(format!("lock: rejected ({r:?}) {}", m.ticker))
                 }

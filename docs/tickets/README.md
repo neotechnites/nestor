@@ -15,8 +15,8 @@ See [../WORKFLOW.md](../WORKFLOW.md). Priority: P0 (now) → P2 (later/gated).
 | [T008](T008-vps-provisioning.md) | VPS provisioning + systemd timer + deploy secrets | P1 | VPS pick | — |
 | [T009](T009-lock-sleeve.md) | Lock sleeve | — | **PARKED: decay-dead** (kill-scan +1.72¢→−1.07¢) | redirect |
 | [T010](T010-consume-biases.md) | Weather sleeve consumes calibrated biases + season-aware city filter | P0 | done | T003 |
-| [T011](T011-fill-verification.md) | Verify actual fills before recording positions | P0 (pre-unattended) | todo | T007 |
-| [T012](T012-streak-sleeve.md) | **Streak ≤44¢ (BUILD #1, redirect 2026-07-23)** | P0 | built (paper) | keys for live |
+| [T011](T011-fill-verification.md) | Verify actual fills before recording positions | P0 | done (schema check at selftest) | — |
+| [T012](T012-streak-sleeve.md) | **Streak ≤44¢ (BUILD #1, redirect 2026-07-23)** | P0 | built (paper; fill-verify + fees + data-capture + 1s cadence per updated redirect) | keys for live |
 
 **⚠️ REDIRECT 2026-07-23:** the vault redirect file (implementation/03) supersedes any
 conflicting plan here: lock=parked (decay-dead), weather=parked (unverdicted), streak=BUILD #1.

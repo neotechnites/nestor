@@ -273,6 +273,176 @@ impl Kalshi {
         }
         Ok(req.send().await?.error_for_status()?.json().await?)
     }
+
+    /// Raw fills for a ticker (signed). Used to verify what ACTUALLY filled after
+    /// an order is accepted — accepted ≠ filled (EXECUTION TRUTH, redirect
+    /// 2026-07-23). Parsing lives in [`parse_fills`] (tolerant, unit-tested);
+    /// callers keep the raw JSON in their records so week-1 validates the schema.
+    pub async fn fills(&self, ticker: &str) -> Result<serde_json::Value> {
+        let path = format!("{PREFIX}/portfolio/fills?ticker={ticker}&limit=200");
+        let headers = self.sign_headers("GET", &path)?;
+        let mut req = self.http.get(format!("{BASE}{path}"));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        Ok(req.send().await?.error_for_status()?.json().await?)
+    }
+
+    /// Cancel a resting order (signed). Mandatory cleanup for any unfilled
+    /// remainder — a stranded resting order violates the taker-only doctrine.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<serde_json::Value> {
+        let path = format!("{PREFIX}/portfolio/orders/{order_id}");
+        let headers = self.sign_headers("DELETE", &path)?;
+        let mut req = self.http.delete(format!("{BASE}{path}"));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        Ok(req.send().await?.error_for_status()?.json().await?)
+    }
+
+    /// Order book for a market (public). Captured as the decision snapshot at
+    /// every signal moment (DATA CAPTURE, redirect 2026-07-23).
+    pub async fn orderbook(&self, ticker: &str) -> Result<serde_json::Value> {
+        let url = format!("{BASE}{PREFIX}/markets/{ticker}/orderbook");
+        Ok(self
+            .http
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+}
+
+/// One parsed fill relevant to an order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedFill {
+    pub count: i64,
+    /// Price paid for OUR side, in whole cents.
+    pub price_cents: i64,
+    /// Fill creation time in unix ms (None if unparseable).
+    pub ts_ms: Option<i64>,
+}
+
+/// Extract the order id from a place-order response, tolerating schema variants
+/// (`{"order":{"order_id":..}}`, `{"order":{"id":..}}`, `{"order_id":..}`).
+pub fn parse_order_id(resp: &serde_json::Value) -> Option<String> {
+    let cands = [
+        resp.get("order").and_then(|o| o.get("order_id")),
+        resp.get("order").and_then(|o| o.get("id")),
+        resp.get("order_id"),
+    ];
+    cands
+        .into_iter()
+        .flatten()
+        .find_map(|v| v.as_str().map(|s| s.to_string()))
+}
+
+/// Price field → whole cents, tolerating integer-cents (e.g. 44), float-dollars
+/// (0.44), or string-dollars ("0.44"). Values < 1.0 are dollars (a real fill
+/// price is 1–99¢, i.e. ≥1 in cents form).
+fn price_to_cents(v: &serde_json::Value) -> Option<i64> {
+    if let Some(n) = v.as_f64() {
+        return Some(if n < 1.0 {
+            (n * 100.0).round() as i64
+        } else {
+            n.round() as i64
+        });
+    }
+    if let Some(s) = v.as_str() {
+        let n: f64 = s.parse().ok()?;
+        return Some(if n < 1.0 {
+            (n * 100.0).round() as i64
+        } else {
+            n.round() as i64
+        });
+    }
+    None
+}
+
+fn count_to_i64(v: &serde_json::Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    if let Some(f) = v.as_f64() {
+        return Some(f.round() as i64);
+    }
+    v.as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|f| f.round() as i64)
+}
+
+/// Parse a `/portfolio/fills` response into the fills belonging to one order.
+/// Match by `order_id` when available; otherwise fall back to (side matches AND
+/// created_time ≥ since_ms) — our orders are the only ones we place on a ticker.
+/// Tolerant of cents-vs-dollars and numeric-vs-string field encodings.
+pub fn parse_fills(
+    body: &serde_json::Value,
+    order_id: Option<&str>,
+    side: &str,
+    since_ms: i64,
+) -> Vec<ParsedFill> {
+    let empty = vec![];
+    let fills = body
+        .get("fills")
+        .and_then(|f| f.as_array())
+        .unwrap_or(&empty);
+    let mut out = Vec::new();
+    for f in fills {
+        // order match
+        let matches = match order_id {
+            Some(id) => f.get("order_id").and_then(|v| v.as_str()) == Some(id),
+            None => {
+                let side_ok = f.get("side").and_then(|v| v.as_str()) == Some(side);
+                let ts_ok = fill_ts_ms(f).is_none_or(|t| t >= since_ms - 2_000);
+                side_ok && ts_ok
+            }
+        };
+        if !matches {
+            continue;
+        }
+        let count = f
+            .get("count")
+            .or_else(|| f.get("count_fp"))
+            .and_then(count_to_i64)
+            .unwrap_or(0);
+        if count <= 0 {
+            continue;
+        }
+        // Our side's price: <side>_price, falling back to <side>_price_dollars.
+        let price_key = format!("{side}_price");
+        let price = f.get(&price_key).and_then(price_to_cents).or_else(|| {
+            f.get(format!("{price_key}_dollars").as_str())
+                .and_then(price_to_cents)
+        });
+        let Some(price_cents) = price else { continue };
+        out.push(ParsedFill {
+            count,
+            price_cents,
+            ts_ms: fill_ts_ms(f),
+        });
+    }
+    out
+}
+
+fn fill_ts_ms(f: &serde_json::Value) -> Option<i64> {
+    f.get("created_time")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis())
+}
+
+/// Summarize fills: (total filled count, weighted-avg price in cents, latest ts_ms).
+pub fn fills_summary(fills: &[ParsedFill]) -> (i64, Option<i64>, Option<i64>) {
+    let total: i64 = fills.iter().map(|f| f.count).sum();
+    if total == 0 {
+        return (0, None, None);
+    }
+    let weighted: i64 = fills.iter().map(|f| f.count * f.price_cents).sum();
+    let avg = (weighted as f64 / total as f64).round() as i64;
+    let ts = fills.iter().filter_map(|f| f.ts_ms).max();
+    (total, Some(avg), ts)
 }
 
 /// Parse `/portfolio/balance` into cents. Kalshi returns `{"balance": <int cents>}`.
@@ -294,6 +464,62 @@ pub fn parse_markets(body: &str) -> Result<Vec<Market>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_order_id_tolerates_variants() {
+        let a = serde_json::json!({"order": {"order_id": "abc"}});
+        let b = serde_json::json!({"order": {"id": "def"}});
+        let c = serde_json::json!({"order_id": "ghi"});
+        let d = serde_json::json!({"something": 1});
+        assert_eq!(parse_order_id(&a).as_deref(), Some("abc"));
+        assert_eq!(parse_order_id(&b).as_deref(), Some("def"));
+        assert_eq!(parse_order_id(&c).as_deref(), Some("ghi"));
+        assert_eq!(parse_order_id(&d), None);
+    }
+
+    #[test]
+    fn parse_fills_by_order_id_cents_and_dollars() {
+        // Two fills for our order (one integer-cents, one string-dollars), one
+        // foreign fill that must be excluded.
+        let body = serde_json::json!({"fills": [
+            {"order_id": "A", "side": "no", "count": 5, "no_price": 44,
+             "created_time": "2026-07-23T18:00:01Z"},
+            {"order_id": "A", "side": "no", "count": 4, "no_price": "0.43",
+             "created_time": "2026-07-23T18:00:02Z"},
+            {"order_id": "B", "side": "no", "count": 9, "no_price": 44},
+        ]});
+        let fills = parse_fills(&body, Some("A"), "no", 0);
+        assert_eq!(fills.len(), 2);
+        let (total, avg, ts) = fills_summary(&fills);
+        assert_eq!(total, 9);
+        // 5*44 + 4*43 = 392 / 9 = 43.56 -> 44 rounded
+        assert_eq!(avg, Some(44));
+        assert!(ts.is_some());
+    }
+
+    #[test]
+    fn parse_fills_fallback_matches_side_and_time() {
+        let body = serde_json::json!({"fills": [
+            {"side": "yes", "count": 9, "yes_price": 41,
+             "created_time": "2026-07-23T18:00:05Z"},
+            {"side": "no", "count": 3, "no_price": 60,
+             "created_time": "2026-07-23T18:00:05Z"},
+            {"side": "yes", "count": 2, "yes_price": 40,
+             "created_time": "2026-07-23T17:00:00Z"}, // too old — excluded
+        ]});
+        let since = chrono::DateTime::parse_from_rfc3339("2026-07-23T18:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let fills = parse_fills(&body, None, "yes", since);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].count, 9);
+        assert_eq!(fills[0].price_cents, 41);
+    }
+
+    #[test]
+    fn fills_summary_empty_is_zero() {
+        assert_eq!(fills_summary(&[]), (0, None, None));
+    }
 
     #[test]
     fn parse_balance_reads_cents() {

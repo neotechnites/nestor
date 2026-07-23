@@ -1,6 +1,6 @@
 # T011 — Verify actual fills before recording positions
 
-**Priority:** P0 before unattended/scaled live · **Status:** todo · **Gated on:** T007 (live order-response schema)
+**Priority:** P0 · **Status:** DONE (2026-07-23, redirect EXECUTION TRUTH) — implemented in Engine::execute: fills polled after placement, actual price/count/timestamps recorded, partial fills feed risk with filled count only, unfilled remainder canceled at deadline, paper marks simulated:true. Fill-schema parsing is tolerant (cents/dollars, id variants) and unit-tested; `selftest-order` prints raw fills JSON to confirm the real schema at the $1 test.
 
 ## Problem (from the full-repo review)
 `Engine::execute` records `on_fill(&order)` on a successful `place_limit_buy`
