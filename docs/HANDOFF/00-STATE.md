@@ -1,5 +1,7 @@
 # Nestor — Session Handoff (STATE)
 
+> 🛑 **SUPERSEDED IN PART (2026-07-23): read the vault's `18 - LIVE STATE (2026-07-23).md` and `implementation/03 - REDIRECT - Build Streak (2026-07-23).md` FIRST — they outrank this file.** Lock = DEAD by decay (parked, unscheduled). Weather = unverdicted (parked). **Streak ≤44¢ = BUILD #1, built 2026-07-23 (`crates/streak`, `nestor run` = streak+settlement).** Engine layer below remains accurate. Verdicts are dated — always check the latest LIVE STATE before acting.
+
 > Written 2026-07-22 so a fresh Claude (new account, SAME Mac) continues seamlessly.
 > Read this first, then `01-CONVERSATION.md` (verbatim history). You have local
 > access to BOTH locations below. Nothing here is theoretical — it's all built + pushed.

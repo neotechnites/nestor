@@ -1,15 +1,18 @@
 # Nestor runtime config. No secrets here (those live in .env / env).
 # Env overrides: NESTOR_ENV (mode), NESTOR_BANKROLL, NESTOR_STATE_PATH, NESTOR_CONFIG.
+#
+# WEEK-1 STREAK MECHANICS CONFIG (redirect 2026-07-23): $100 bankroll, $4 flat
+# per trade, $60/day. Purpose is mechanics measurement, not efficacy.
 
 [trading]
 env = "paper"          # paper | live  (NESTOR_ENV overrides)
-bankroll = 1000.0      # starting equity, used only to seed fresh state
+bankroll = 100.0       # starting equity, used only to seed fresh state
 
 [risk]
-fraction = 0.05             # fraction of bankroll per fraction-sized trade
-cluster_cap_frac = 0.15     # max at-risk in one correlation cluster
-flat_usd = 10.0             # flat $ per flat-sized trade (weather)
-daily_budget_usd = 80.0     # daily flat-budget cap
+fraction = 0.05             # fraction of bankroll per fraction-sized trade (unused by streak)
+cluster_cap_frac = 0.15     # max at-risk in one correlation cluster (streak: BTC+ETH same window = one bet)
+flat_usd = 4.0              # flat $ per flat-sized trade (streak week-1)
+daily_budget_usd = 60.0     # daily flat-budget cap (streak week-1)
 max_drawdown_frac = 0.30    # halt if drawdown from peak exceeds this
 daily_loss_limit_frac = 0.15 # halt if today's realized loss exceeds this * peak
 max_portfolio_frac = 0.50   # total at-risk across ALL open positions <= this * bankroll

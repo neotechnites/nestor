@@ -34,6 +34,9 @@ pub struct Market {
     pub yes_sub_title: Option<String>,
     #[serde(default)]
     pub result: Option<String>,
+    /// RFC3339 open time.
+    #[serde(default)]
+    pub open_time: Option<String>,
     /// RFC3339 close time (e.g. "2026-07-16T04:00:00Z").
     #[serde(default)]
     pub close_time: Option<String>,
@@ -68,11 +71,19 @@ impl Market {
 
     /// Close time as a unix timestamp (seconds), parsed from `close_time`.
     pub fn close_unix(&self) -> Option<i64> {
-        self.close_time
-            .as_ref()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.timestamp())
+        parse_rfc3339_unix(&self.close_time)
     }
+
+    /// Open time as a unix timestamp (seconds), parsed from `open_time`.
+    pub fn open_unix(&self) -> Option<i64> {
+        parse_rfc3339_unix(&self.open_time)
+    }
+}
+
+fn parse_rfc3339_unix(s: &Option<String>) -> Option<i64> {
+    s.as_ref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp())
 }
 
 #[derive(Debug, Deserialize)]

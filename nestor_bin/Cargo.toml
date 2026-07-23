@@ -11,6 +11,7 @@ path = "src/main.rs"
 engine = { path = "../crates/engine" }
 weather = { path = "../crates/weather" }
 lock = { path = "../crates/lock" }
+streak = { path = "../crates/streak" }
 tokio.workspace = true
 anyhow.workspace = true
 dotenvy.workspace = true

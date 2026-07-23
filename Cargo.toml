@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/engine", "crates/weather", "crates/lock", "nestor_bin"]
+members = ["crates/engine", "crates/weather", "crates/lock", "crates/streak", "nestor_bin"]
 
 [workspace.package]
 version = "0.1.0"

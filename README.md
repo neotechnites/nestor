@@ -1,5 +1,9 @@
 # Nestor
 
+> **REDIRECT 2026-07-23:** production = `nestor run` (streak ≤44¢ scanner + settlement).
+> Lock is parked (decay-dead), weather parked (unverdicted). The vault redirect file
+> (`Obsidian/nestor/implementation/03 - REDIRECT...`) supersedes older plans below.
+
 Automated trading system for Kalshi retail-priced markets. Part of **Olympus**.
 
 Strategy research + forward-test results live in the Obsidian vault

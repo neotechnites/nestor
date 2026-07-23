@@ -119,11 +119,15 @@ pub struct SettleOutcome {
     pub pnl: f64,
 }
 
-/// Kalshi taker fee in dollars for `count` contracts at `price_cents`.
-/// fee/contract = 0.07 * p * (1-p), p in dollars.
+/// Kalshi taker fee in dollars for one ORDER of `count` contracts at
+/// `price_cents`: `ceil-to-next-cent( 0.07 × count × P × (1−P) )`, P in dollars.
+/// The ceil is applied once per ORDER (Kalshi's actual billing), not per
+/// contract — an un-ceiled formula understates the fee and overstates P&L
+/// (redirect 2026-07-23; vault note 18 gotchas).
 pub fn taker_fee(price_cents: i64, count: i64) -> f64 {
     let p = price_cents as f64 / 100.0;
-    0.07 * p * (1.0 - p) * count as f64
+    let raw = 0.07 * count as f64 * p * (1.0 - p);
+    (raw * 100.0).ceil() / 100.0
 }
 
 pub struct RiskManager {
@@ -188,21 +192,25 @@ impl RiskManager {
             return Err(Rejection::PriceOutOfBand);
         }
 
+        // Cluster cap applies to BOTH sizing modes: correlated positions sharing a
+        // cluster key (e.g. streak entries on BTC+ETH in the same 15-min window)
+        // are one bet regardless of how each is sized.
+        let cluster_room =
+            self.cfg.cluster_cap_frac * self.state.bankroll - self.cluster_at_risk(&s.cluster);
+        if cluster_room <= 0.0 {
+            return Err(Rejection::ClusterCapHit);
+        }
+
         let stake = match s.sizing {
             SizingHint::Flat => {
                 let remaining = self.cfg.daily_budget_usd - self.state.day_spent;
                 if remaining <= 0.0 {
                     return Err(Rejection::DailyCapHit);
                 }
-                self.cfg.flat_usd.min(remaining)
+                self.cfg.flat_usd.min(remaining).min(cluster_room)
             }
             SizingHint::Fraction => {
                 let want = self.cfg.fraction * self.state.bankroll;
-                let cluster_room = self.cfg.cluster_cap_frac * self.state.bankroll
-                    - self.cluster_at_risk(&s.cluster);
-                if cluster_room <= 0.0 {
-                    return Err(Rejection::ClusterCapHit);
-                }
                 want.min(cluster_room)
             }
         };
@@ -479,8 +487,9 @@ mod tests {
         let o = r.evaluate(&sig(SizingHint::Fraction, 95, "c")).unwrap();
         r.on_fill(&o);
         r.on_settlement(&o.ticker, true);
-        // win: 52*(1-0.95) - fee ; fee = 0.07*0.95*0.05*52
-        let fee = 0.07 * 0.95 * 0.05 * 52.0;
+        // win: 52*(1-0.95) - fee ; fee = ceil-per-order(0.07*52*0.95*0.05)
+        let fee = taker_fee(95, 52); // raw 0.17290 -> 0.18
+        assert!((fee - 0.18).abs() < 1e-9);
         let expected = 1000.0 + 52.0 * 0.05 - fee;
         assert!((r.status().bankroll - expected).abs() < 1e-6);
     }
@@ -493,9 +502,70 @@ mod tests {
         assert_eq!(o.count, 52);
         r.on_fill(&o);
         r.on_settlement(&o.ticker, false);
-        let fee = 0.07 * 0.95 * 0.05 * 52.0; // 0.07*p*(1-p)*count
+        let fee = taker_fee(95, 52);
         let expected = 1000.0 - 52.0 * 0.95 - fee;
         assert!((r.status().bankroll - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn flat_entries_respect_cluster_cap() {
+        // Cluster cap binds Flat sizing too (streak: BTC+ETH same window = one
+        // bet). Cap = 15% of $100 = $15; flat $4 fills in ONE cluster stop once
+        // the cluster is full, well before the $60 daily budget.
+        let cfg = RiskConfig {
+            flat_usd: 4.0,
+            daily_budget_usd: 60.0,
+            ..RiskConfig::default()
+        };
+        let mut r =
+            RiskManager::load_or_init(cfg, Box::new(MemoryStore::default()), 100.0).unwrap();
+        let mut filled = 0;
+        for i in 0..10 {
+            let s = Signal {
+                strategy: "streak".into(),
+                ticker: format!("T{i}"),
+                side: Side::Yes,
+                limit_cents: 40,
+                cluster: "streak-123".into(),
+                sizing: SizingHint::Flat,
+            };
+            match r.evaluate(&s) {
+                Ok(o) => {
+                    // Every approved order must fit inside the cluster's room.
+                    r.on_fill(&o);
+                    filled += 1;
+                }
+                Err(e) => {
+                    // Once the cluster is (effectively) full: either no room at
+                    // all (ClusterCapHit) or room smaller than one contract
+                    // (clamped stake -> ZeroSize). Both mean the cap bound.
+                    assert!(
+                        e == Rejection::ClusterCapHit || e == Rejection::ZeroSize,
+                        "unexpected rejection: {e:?}"
+                    );
+                    break;
+                }
+            }
+        }
+        // $4 per fill -> cluster full somewhere before 10 fills (cap $15 with
+        // clamping allows ~4 fills: 4+4+4+2.8 = $14.80, then room < 1 contract).
+        assert!(filled < 10, "cluster cap never bound");
+        let total: f64 = r.open_positions().iter().map(|p| p.stake()).sum();
+        assert!(
+            total <= 15.0 + 1e-9,
+            "cluster stake {total} exceeded the $15 cap"
+        );
+    }
+
+    #[test]
+    fn taker_fee_ceils_per_order() {
+        // Streak-typical order: 9 contracts @ 44c -> raw 0.07*9*0.44*0.56 =
+        // 0.15523 -> ceil to next cent = $0.16 (redirect: ~1.73c/contract at 44c).
+        assert!((taker_fee(44, 9) - 0.16).abs() < 1e-9);
+        // Exact-cent raw stays (no over-ceil): 0.07*10*0.50*0.50 = 0.175 -> 0.18.
+        assert!((taker_fee(50, 10) - 0.18).abs() < 1e-9);
+        // Single tiny contract still pays a whole cent: 0.07*1*0.05*0.95=0.003325 -> 0.01.
+        assert!((taker_fee(5, 1) - 0.01).abs() < 1e-9);
     }
 
     #[test]

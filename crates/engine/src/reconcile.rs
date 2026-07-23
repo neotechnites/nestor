@@ -14,7 +14,9 @@ use crate::logging;
 use crate::risk::Side;
 use crate::strategy::Engine;
 
-const LOG: &str = "weather_trades.jsonl";
+/// Settlements from ALL strategies land here (strategy-tagged), so per-strategy
+/// reports (e.g. streak week-1) can join their entry logs by ticker.
+const LOG: &str = "settlements.jsonl";
 
 /// Decide the settlement action for a position given the market's raw `result`.
 /// `None` = not settled yet (or void/unknown) → skip and retry next run.
@@ -42,13 +44,13 @@ pub async fn run(eng: &Engine) -> Result<()> {
         .to_string();
     eng.begin_day(&today);
 
-    // Snapshot open tickers+sides so we never hold the risk lock across the
-    // network fetch (mirrors Engine::execute's discipline).
-    let open: Vec<(String, Side)> = {
+    // Snapshot open tickers+sides+strategy so we never hold the risk lock across
+    // the network fetch (mirrors Engine::execute's discipline).
+    let open: Vec<(String, Side, String)> = {
         let r = eng.risk.lock().unwrap_or_else(|e| e.into_inner());
         r.open_positions()
             .iter()
-            .map(|p| (p.ticker.clone(), p.side))
+            .map(|p| (p.ticker.clone(), p.side, p.strategy.clone()))
             .collect()
     };
 
@@ -59,7 +61,7 @@ pub async fn run(eng: &Engine) -> Result<()> {
     let mut settled = 0usize;
     let mut pending = 0usize;
 
-    for (ticker, side) in open {
+    for (ticker, side, strategy) in open {
         let market = match eng.kalshi.market(&ticker).await {
             Ok(m) => m,
             Err(e) => {
@@ -90,6 +92,7 @@ pub async fn run(eng: &Engine) -> Result<()> {
                     LOG,
                     json!({
                         "event": "settlement",
+                        "strategy": strategy,
                         "ticker": o.ticker,
                         "won": o.won,
                         "pnl": o.pnl,

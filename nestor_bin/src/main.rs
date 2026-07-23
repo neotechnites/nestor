@@ -1,8 +1,13 @@
 //! Nestor entrypoint. Loads config (nestor.toml + env), builds the shared Engine
-//! (Kalshi client + Risk layer + cities), and runs the selected strategy.
-//! Called by cron/systemd on the VPS.
+//! (Kalshi client + Risk layer), and runs the selected subcommand.
 //!
-//! Usage: `nestor [strategy]`  (default: weather)
+//! PRODUCTION = `nestor run`: streak scanner (15s) + settlement sweep (60s) in
+//! one process (redirect 2026-07-23). Lock (decay-dead) and weather (unverdicted)
+//! are PARKED — their subcommands remain for manual/re-entry checks, but nothing
+//! schedules them.
+//!
+//! Usage: `nestor <run|streak|streak-once|calibrate|reconcile|probe-weather|
+//!                 backtest-lock|selftest-order|resume|weather|lock|lock-once>`
 
 use std::sync::Mutex;
 
@@ -33,10 +38,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    let which = std::env::args().nth(1).unwrap_or_else(|| "weather".into());
+    // No default subcommand: with lock/weather parked and streak live-gated,
+    // a bare invocation should never silently pick a strategy.
+    let which = std::env::args().nth(1).context(
+        "usage: nestor <run|streak|streak-once|calibrate|reconcile|probe-weather|\
+         backtest-lock|selftest-order|resume|weather|lock|lock-once>",
+    )?;
 
-    // `backtest-lock` re-confirms the lock edge in-code against cached data.
-    // Read-only, no keys, no engine.
+    // `backtest-lock` re-confirms the (parked) lock edge in-code against cached
+    // data — kept as a re-entry check. Read-only, no keys, no engine.
     if which == "backtest-lock" {
         return lock::backtest::run();
     }
@@ -130,19 +140,35 @@ async fn main() -> Result<()> {
         return engine::reconcile::run(&eng).await;
     }
 
-    // `run` = the production runtime: ONE process hosting every strategy as tokio
-    // tasks that share this ONE in-memory RiskManager. This is what makes the shared
-    // bankroll safe — no second process writes state.json concurrently (which would
-    // clobber updates and bypass the kill-switch), and settlement runs intraday so
-    // lock's losses actually feed the daily-loss halt.
+    // `run` = the production runtime: ONE process, tokio tasks over ONE in-memory
+    // RiskManager (no second state.json writer; kill-switch honored everywhere;
+    // settlement runs intraday so same-day losses feed the daily-loss halt).
+    // Per the 2026-07-23 redirect it schedules STREAK ONLY — lock and weather are
+    // parked and never scheduled here.
     if which == "run" {
         return run_all(eng).await;
     }
 
-    // The lock sleeve is always-on (unlike the daily weather cron): `lock` loops a
-    // scan pass every 15s; `lock-once` runs a single pass (for testing). Same
-    // Strategy contract as weather — the binary just chooses the cadence. In
-    // production use `run` (above); these are for manual/isolated operation.
+    // Streak standalone: `streak` loops the scan every 15s (no settlement task —
+    // use `run` in production); `streak-once` runs a single pass for testing.
+    if which == "streak" || which == "streak-once" {
+        let strat = streak::strategy::Streak::new();
+        loop {
+            if let Err(e) = strat.run(&eng).await {
+                eprintln!("streak: scan error: {e}");
+            }
+            if which == "streak-once" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        }
+        return Ok(());
+    }
+
+    // PARKED sleeves — manual invocation only, nothing schedules them.
+    // lock: decay-dead (kill-scan +1.72¢→−1.07¢/contract); kept for re-entry checks.
+    // weather: unverdicted (forward capture running, ~3-4 wks); do not calibrate/run
+    // for production until the vault verdicts TRADE.
     if which == "lock" || which == "lock-once" {
         let strat = lock::strategy::Lock;
         loop {
@@ -184,14 +210,12 @@ async fn run_all(eng: Engine) -> Result<()> {
     use std::time::Duration;
 
     let eng = std::sync::Arc::new(eng);
-    engine::logging::info(
-        "nestor run — lock (15s) + weather (9am ET) + settlement (60s), one process",
-    );
+    engine::logging::info("nestor run — streak (15s) + settlement (60s), one process");
 
-    // Settlement: sweep every 60s so lock's 15-min markets settle intraday (same
-    // trading day -> their losses feed the daily-loss kill-switch) and weather
-    // settles the morning after. Each iteration is panic-caught so one bad cycle
-    // can't silently kill the loop (which would disable the kill-switch).
+    // Settlement: sweep every 60s so streak's 15-min markets settle intraday
+    // (same trading day -> losses feed the daily-loss kill-switch). Each
+    // iteration is panic-caught so one bad cycle can't silently kill the loop
+    // (which would disable the kill-switch).
     {
         let e = eng.clone();
         tokio::spawn(async move {
@@ -205,29 +229,15 @@ async fn run_all(eng: Engine) -> Result<()> {
         });
     }
 
-    // Weather: fire once daily at ~9am ET.
-    {
-        let e = eng.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(until_next_9am_et()).await;
-                let r = std::panic::AssertUnwindSafe(weather::Weather.run(&e))
-                    .catch_unwind()
-                    .await;
-                report("weather", r);
-                // avoid re-firing within the same minute the timer landed on
-                tokio::time::sleep(Duration::from_secs(90)).await;
-            }
-        });
-    }
-
-    // Lock: continuous scanner in the foreground (keeps the process alive).
-    let lock = lock::strategy::Lock;
+    // Streak: continuous scanner in the foreground (keeps the process alive).
+    // 15s cadence = ~4 evaluations inside each market's 60s entry window.
+    // Lock (decay-dead) and weather (unverdicted) are parked — NOT spawned.
+    let streak = streak::strategy::Streak::new();
     loop {
-        let r = std::panic::AssertUnwindSafe(lock.run(&eng))
+        let r = std::panic::AssertUnwindSafe(streak.run(&eng))
             .catch_unwind()
             .await;
-        report("lock", r);
+        report("streak", r);
         tokio::time::sleep(Duration::from_secs(15)).await;
     }
 }
@@ -262,26 +272,6 @@ fn acquire_state_lock(state_path: &str) -> Result<std::fs::File> {
         )
     })?;
     Ok(f)
-}
-
-/// Duration until the next 09:00 America/New_York (DST-correct: 09:00 wall-clock
-/// on the target date, not now+24h which drifts across a DST transition).
-fn until_next_9am_et() -> std::time::Duration {
-    use chrono::{Datelike, TimeZone};
-    use chrono_tz::America::New_York;
-    let now = chrono::Utc::now().with_timezone(&New_York);
-    let at_9 = |d: chrono::NaiveDate| {
-        New_York
-            .with_ymd_and_hms(d.year(), d.month(), d.day(), 9, 0, 0)
-            .single()
-    };
-    let target = match at_9(now.date_naive()) {
-        Some(t) if now < t => t,
-        _ => at_9(now.date_naive() + chrono::Duration::days(1))
-            .unwrap_or(now + chrono::Duration::days(1)),
-    };
-    let secs = (target - now).num_seconds().max(0) as u64;
-    std::time::Duration::from_secs(secs)
 }
 
 /// Age of the biases file in whole days, or None if it doesn't exist / unreadable.
