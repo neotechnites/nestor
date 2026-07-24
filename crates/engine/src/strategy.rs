@@ -47,7 +47,7 @@ pub struct FillReport {
     /// ACTUAL total fee in cents from the exchange's `average_fee_paid` (None in
     /// paper mode or when nothing filled). Recorded ALONGSIDE our own taker-fee
     /// estimate — real fees are the mechanics-week deliverable.
-    pub actual_fee_cents: Option<i64>,
+    pub actual_fee_cents: Option<f64>,
     /// True for paper-mode simulated fills.
     pub simulated: bool,
     /// Unix-ms timestamps for latency measurement (week-1 deliverable).

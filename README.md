@@ -4,10 +4,10 @@
 > Lock is parked (decay-dead), weather parked (unverdicted). The vault redirect file
 > (`Obsidian/nestor/implementation/03 - REDIRECT...`) supersedes older plans below.
 
-Automated trading system for Kalshi retail-priced markets. Part of **Pantheon**.
+Automated trading system for Kalshi retail-priced markets. Part of **the Senate**.
 
 Strategy research + forward-test results live in the Obsidian vault
-(`Documents/Obsidian/nestor`). **Production is all Rust**; Python is kept only
+(`Documents/senate/enchiridion`). **Production is all Rust**; Python is kept only
 as research/backtest reference under `reference/`.
 
 ## Why Rust

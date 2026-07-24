@@ -418,7 +418,9 @@ pub struct PlacedOrder {
     pub fill_price_cents: Option<i64>,
     /// ACTUAL total fee paid in cents (average_fee_paid × fill_count). Gold for
     /// the mechanics week — recorded alongside our own estimate. None if unfilled.
-    pub actual_fee_cents: Option<i64>,
+    /// Total fee actually charged, in CENTS with sub-cent resolution
+    /// (exchange reports per-contract dollars like "0.0046" = 0.46c).
+    pub actual_fee_cents: Option<f64>,
     /// Matching-engine timestamp (unix ms) — used as ts_ack / ts_fill.
     pub ts_ms: Option<i64>,
 }
@@ -444,8 +446,10 @@ pub fn parse_place_response(resp: &serde_json::Value, side: &str) -> PlacedOrder
             .map(|d| yes_dollars_to_side_cents(side, d));
         let fee = get("average_fee_paid")
             .and_then(dollars_f64)
-            // average_fee_paid is per-contract dollars -> total cents.
-            .map(|per| (per * fill_count as f64 * 100.0).round() as i64);
+            // average_fee_paid is per-contract dollars -> total cents, KEEPING
+            // sub-cent resolution (demo-observed: 1ct @ 7c fill -> "0.0046" = 0.46c;
+            // an i64 round would report 0).
+            .map(|per| per * fill_count as f64 * 100.0);
         (px, fee)
     } else {
         (None, None)
@@ -668,7 +672,7 @@ mod tests {
         assert_eq!(p.remaining_count, 0);
         assert_eq!(p.fill_price_cents, Some(41));
         // 0.0145 * 2 contracts = 0.029 -> 3¢
-        assert_eq!(p.actual_fee_cents, Some(3));
+        assert!((p.actual_fee_cents.unwrap() - 3.0).abs() < 1e-9);
         assert_eq!(p.ts_ms, Some(1_752_000_000_123));
     }
 
@@ -689,7 +693,7 @@ mod tests {
         assert_eq!(p.order_id.as_deref(), Some("ord_2"));
         assert_eq!(p.fill_count, 5);
         assert_eq!(p.fill_price_cents, Some(38)); // 100 - 62
-        assert_eq!(p.actual_fee_cents, Some(5)); // 0.01 * 5 = 0.05 -> 5¢
+        assert!((p.actual_fee_cents.unwrap() - 5.0).abs() < 1e-9); // 0.01 * 5 = 0.05 -> 5¢
     }
 
     #[test]

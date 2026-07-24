@@ -18,7 +18,16 @@ use crate::kalshi::Kalshi;
 /// The order is immediate_or_cancel: on an empty/uncrossable book it returns
 /// fill_count 0 and the exchange has already canceled the remainder — that is a
 /// PASS (we are proving request shape + auth + response parse, not fills).
-pub async fn run(kalshi: &Kalshi, ticker: &str, price_cents: i64, count: i64) -> Result<()> {
+pub async fn run(
+    kalshi: &Kalshi,
+    ticker: &str,
+    price_cents: i64,
+    count: i64,
+    side: &str,
+) -> Result<()> {
+    if side != "yes" && side != "no" {
+        bail!("side must be yes|no (got {side})");
+    }
     if !(1..=99).contains(&price_cents) {
         bail!("price_cents must be 1..=99 (got {price_cents})");
     }
@@ -37,9 +46,9 @@ pub async fn run(kalshi: &Kalshi, ticker: &str, price_cents: i64, count: i64) ->
     // Show the exact V2 body we are about to POST (YES -> bid, price in dollars).
     let preview = serde_json::json!({
         "ticker": ticker,
-        "side": crate::kalshi::book_side("yes"),
+        "side": crate::kalshi::book_side(side),
         "count": crate::kalshi::count_fp(count),
-        "price": crate::kalshi::order_price_dollars("yes", price_cents),
+        "price": crate::kalshi::order_price_dollars(side, price_cents),
         "time_in_force": "immediate_or_cancel",
         "self_trade_prevention_type": "taker_at_cross",
         "client_order_id": coid,
@@ -50,11 +59,11 @@ pub async fn run(kalshi: &Kalshi, ticker: &str, price_cents: i64, count: i64) ->
     );
 
     let resp = kalshi
-        .place_limit_buy(ticker, "yes", count, price_cents, &coid)
+        .place_limit_buy(ticker, side, count, price_cents, &coid)
         .await?;
     println!("raw response:\n{}", serde_json::to_string_pretty(&resp)?);
 
-    let placed = crate::kalshi::parse_place_response(&resp, "yes");
+    let placed = crate::kalshi::parse_place_response(&resp, side);
     println!("parsed placement: {placed:?}");
     println!(
         "  order_id={:?} fill_count={} remaining_count={} fill_price={:?}c actual_fee={:?}c ts_ms={:?}",
@@ -75,7 +84,7 @@ pub async fn run(kalshi: &Kalshi, ticker: &str, price_cents: i64, count: i64) ->
     // Reconciliation cross-check: the fills API is still live in V2. Show BOTH the
     // raw JSON (schema truth) and what our parser extracted.
     let raw_fills = kalshi.fills(ticker).await?;
-    let fills = crate::kalshi::parse_fills(&raw_fills, placed.order_id.as_deref(), "yes", 0);
+    let fills = crate::kalshi::parse_fills(&raw_fills, placed.order_id.as_deref(), side, 0);
     let (filled, avg, _) = crate::kalshi::fills_summary(&fills);
     println!("fills cross-check: parsed filled={filled} avg={avg:?}");
     println!("raw fills JSON:\n{}", serde_json::to_string_pretty(&raw_fills)?);
