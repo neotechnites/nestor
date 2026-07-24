@@ -10,7 +10,10 @@
 use std::time::Duration;
 
 /// Walk the error chain and return the first `reqwest` HTTP status, if any.
-/// Works even when the reqwest error was wrapped by `?`/`.context(..)`.
+/// Works even when the reqwest error was wrapped by `?`/`.context(..)`. Falls back
+/// to parsing an "HTTP <code>" token out of the message so status is still
+/// recoverable for errors we build by hand from a raw body (kalshi::text_or_error,
+/// place-order failures) where the live `reqwest::Error` no longer exists.
 pub fn http_status(err: &anyhow::Error) -> Option<u16> {
     for cause in err.chain() {
         if let Some(re) = cause.downcast_ref::<reqwest::Error>() {
@@ -19,7 +22,45 @@ pub fn http_status(err: &anyhow::Error) -> Option<u16> {
             }
         }
     }
-    None
+    status_in_message(&err.to_string())
+}
+
+/// Recover an HTTP status from an error message containing an "HTTP <code>" token
+/// (the shape produced by our hand-built body errors). None if absent/implausible.
+pub fn status_in_message(msg: &str) -> Option<u16> {
+    let idx = msg.find("HTTP ")?;
+    let rest = &msg[idx + "HTTP ".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits
+        .parse::<u16>()
+        .ok()
+        .filter(|&s| (100..600).contains(&s))
+}
+
+/// Parse a `Retry-After` header value into seconds-to-wait, relative to `now`.
+/// Supports BOTH RFC forms: integer delta-seconds ("120") and an HTTP-date
+/// ("Wed, 21 Oct 2026 07:28:00 GMT"). A date in the past clamps to 0 (retry now).
+/// Returns None only when the value parses as neither form.
+pub fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    let v = value.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(secs);
+    }
+    // HTTP-date form (RFC 7231 §7.1.3 uses the RFC 5322 / IMF-fixdate shape).
+    let dt = chrono::DateTime::parse_from_rfc2822(v).ok()?;
+    let secs = (dt.with_timezone(&chrono::Utc) - now).num_seconds();
+    Some(secs.max(0) as u64)
+}
+
+/// Recover an already-resolved Retry-After (whole seconds) from an error message
+/// carrying a "retry-after-secs=<n>" token (attached by kalshi::text_or_error when
+/// a 429 response included the header). Loops take max(this, exp-backoff).
+pub fn retry_after_secs_in_message(msg: &str) -> Option<u64> {
+    const KEY: &str = "retry-after-secs=";
+    let idx = msg.find(KEY)?;
+    let rest = &msg[idx + KEY.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().ok()
 }
 
 /// A retryable status: 429 (rate limit) or any 5xx (server-class).
@@ -82,5 +123,49 @@ mod tests {
     fn http_status_none_for_plain_error() {
         let e = anyhow::anyhow!("not an http error");
         assert_eq!(http_status(&e), None);
+    }
+
+    #[test]
+    fn http_status_recovered_from_message() {
+        // Errors we build from a raw body carry the status as an "HTTP <code>"
+        // token; http_status must still classify them for backoff.
+        let e = anyhow::anyhow!("markets HTTP 429 request-id=abc: rate limited");
+        assert_eq!(http_status(&e), Some(429));
+        let e2 = anyhow::anyhow!("order placement HTTP 409 (request-id r): body");
+        assert_eq!(http_status(&e2), Some(409));
+        assert!(is_retryable_status(http_status(&e).unwrap()));
+        // no token → None
+        assert_eq!(status_in_message("plain old error"), None);
+        // implausible code rejected
+        assert_eq!(status_in_message("HTTP 99999"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_integer_seconds() {
+        let now = chrono::Utc::now();
+        assert_eq!(parse_retry_after("120", now), Some(120));
+        assert_eq!(parse_retry_after("  0 ", now), Some(0));
+        assert_eq!(parse_retry_after("not-a-number", now), None);
+    }
+
+    #[test]
+    fn parse_retry_after_http_date() {
+        // Anchor "now" so the delta is deterministic.
+        let now = chrono::DateTime::parse_from_rfc2822("Wed, 21 Oct 2026 07:28:00 GMT")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // 90s in the future.
+        let future = "Wed, 21 Oct 2026 07:29:30 GMT";
+        assert_eq!(parse_retry_after(future, now), Some(90));
+        // A date in the past clamps to 0 (retry now), not None.
+        let past = "Wed, 21 Oct 2026 07:27:00 GMT";
+        assert_eq!(parse_retry_after(past, now), Some(0));
+    }
+
+    #[test]
+    fn retry_after_secs_recovered_from_message() {
+        let e = "markets HTTP 429 request-id=x retry-after-secs=42: {\"error\":{}}";
+        assert_eq!(retry_after_secs_in_message(e), Some(42));
+        assert_eq!(retry_after_secs_in_message("no token here"), None);
     }
 }

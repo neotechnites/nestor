@@ -129,13 +129,31 @@ impl Strategy for Streak {
     }
 
     async fn run(&self, eng: &Engine) -> Result<()> {
-        // Surface the FIRST rate-limit/server-class error so the driving loop can
-        // back off (fix 5); non-retryable per-series errors stay logged+swallowed
-        // (one coin's bad pass shouldn't abort the other's).
+        // CONCURRENT SCAN (item 4): the two series' scans are independent
+        // read-heavy network round-trips; running them serially spent two RTTs per
+        // pass inside a 60s entry window. `tokio::join!` drives both concurrently
+        // on THIS task — while one awaits the network the other proceeds. This is
+        // safe: the only place→record critical section runs through
+        // `Engine::execute`, which serializes it under `exec_lock` (an async
+        // Mutex held across the whole evaluate→place→verify→on_fill), so two
+        // concurrent scans can never both clear a cap before either records its
+        // fill. The shared `seen`/`settled_cache` mutexes are only ever held for
+        // short, await-free critical sections, so concurrency can't deadlock them.
+        let results = futures::future::join(
+            self.scan_series(eng, SERIES[0]),
+            self.scan_series(eng, SERIES[1]),
+        )
+        .await;
+
+        // Per-series error isolation preserved: surface the FIRST rate-limit/
+        // server-class error so the driving loop can back off (fix 5);
+        // non-retryable per-series errors stay logged+swallowed (one coin's bad
+        // pass must not abort the other's — already run above, independently).
         let mut retryable: Option<anyhow::Error> = None;
-        for series in SERIES {
-            if let Err(e) = self.scan_series(eng, series).await {
-                let is_retryable = engine::net::http_status(&e).is_some_and(engine::net::is_retryable_status);
+        for (series, res) in [(SERIES[0], results.0), (SERIES[1], results.1)] {
+            if let Err(e) = res {
+                let is_retryable = engine::net::http_status(&e)
+                    .is_some_and(engine::net::is_retryable_status);
                 if is_retryable && retryable.is_none() {
                     retryable = Some(e);
                 } else {
