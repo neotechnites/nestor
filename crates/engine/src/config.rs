@@ -21,19 +21,62 @@ pub struct City {
     pub tradeable: bool,
 }
 
+/// Hard ceiling on the live-money bankroll seed. Refuse to start live with a
+/// bankroll above this — a lost/oversized nestor.toml must never set halts at a
+/// multiple of the real account or make it drainable (fix 4). Bump deliberately
+/// as the live program scales; $100 is the current pre-live cap.
+pub const MAX_LIVE_BANKROLL: f64 = 100.0;
+
+/// Default bankroll used ONLY in paper mode when nothing is configured. Live mode
+/// has NO default — it must be set explicitly and within [`MAX_LIVE_BANKROLL`].
+pub const PAPER_DEFAULT_BANKROLL: f64 = 1000.0;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Trading {
     pub env: String,
-    pub bankroll: f64,
+    /// Bankroll seed. `None` = unset (no `[trading] bankroll` in config). Live
+    /// mode REQUIRES an explicit value (config or env) — see
+    /// [`resolve_bankroll`]; paper falls back to [`PAPER_DEFAULT_BANKROLL`].
+    pub bankroll: Option<f64>,
 }
 
 impl Default for Trading {
     fn default() -> Self {
         Trading {
             env: "paper".into(),
-            bankroll: 1000.0,
+            bankroll: None,
         }
+    }
+}
+
+/// Resolve the starting bankroll, enforcing the live seed-pinning rules (fix 4).
+/// Precedence: env `NESTOR_BANKROLL` > config `[trading] bankroll`.
+/// - Live: a value is MANDATORY and must be in `(0, MAX_LIVE_BANKROLL]` — else
+///   refuse (a silent $1000 default would set the kill-switch at 10× the account).
+/// - Paper: falls back to [`PAPER_DEFAULT_BANKROLL`] when unset.
+pub fn resolve_bankroll(
+    live: bool,
+    env_bankroll: Option<f64>,
+    cfg_bankroll: Option<f64>,
+) -> anyhow::Result<f64> {
+    let chosen = env_bankroll.or(cfg_bankroll);
+    if live {
+        let b = chosen.ok_or_else(|| {
+            anyhow::anyhow!(
+                "live mode requires an explicit bankroll (set NESTOR_BANKROLL or \
+                 [trading] bankroll in nestor.toml) — refusing to start on a default"
+            )
+        })?;
+        if !(b > 0.0 && b <= MAX_LIVE_BANKROLL) {
+            anyhow::bail!(
+                "live bankroll ${b:.2} out of range (0, ${MAX_LIVE_BANKROLL:.2}] — refusing to \
+                 start (guards against an oversized/lost config draining the account)"
+            );
+        }
+        Ok(b)
+    } else {
+        Ok(chosen.unwrap_or(PAPER_DEFAULT_BANKROLL))
     }
 }
 
@@ -167,10 +210,30 @@ mod tests {
     }
 
     #[test]
+    fn resolve_bankroll_seed_pinning() {
+        // Paper: unset → paper default; set → honored.
+        assert_eq!(
+            resolve_bankroll(false, None, None).unwrap(),
+            PAPER_DEFAULT_BANKROLL
+        );
+        assert_eq!(resolve_bankroll(false, Some(250.0), None).unwrap(), 250.0);
+        // Live: unset (would silently default to $1000) → REFUSE.
+        assert!(resolve_bankroll(true, None, None).is_err());
+        // Live: oversized config bankroll → REFUSE.
+        assert!(resolve_bankroll(true, None, Some(1000.0)).is_err());
+        assert!(resolve_bankroll(true, None, Some(100.01)).is_err());
+        // Live: zero/negative → REFUSE.
+        assert!(resolve_bankroll(true, Some(0.0), None).is_err());
+        // Live: valid explicit seed → accepted; env overrides config.
+        assert_eq!(resolve_bankroll(true, None, Some(100.0)).unwrap(), 100.0);
+        assert_eq!(resolve_bankroll(true, Some(50.0), Some(1000.0)).unwrap(), 50.0);
+    }
+
+    #[test]
     fn missing_file_uses_defaults() {
         let s = Settings::load("/nonexistent/nestor.toml").unwrap();
         assert_eq!(s.trading.env, "paper");
-        assert_eq!(s.trading.bankroll, 1000.0);
+        assert_eq!(s.trading.bankroll, None); // unset → resolved to paper default
         assert_eq!(s.risk.fraction, 0.05);
         assert_eq!(s.cities.len(), 8);
         assert_eq!(s.tradeable_cities().len(), 6);
@@ -196,7 +259,7 @@ mod tests {
         "#;
         let s: Settings = toml::from_str(toml).unwrap();
         assert_eq!(s.trading.env, "live");
-        assert_eq!(s.trading.bankroll, 5000.0);
+        assert_eq!(s.trading.bankroll, Some(5000.0));
         assert_eq!(s.risk.fraction, 0.10);
         // unset risk fields keep defaults
         assert_eq!(s.risk.cluster_cap_frac, 0.15);

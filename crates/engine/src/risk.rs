@@ -42,11 +42,6 @@ pub struct Signal {
     /// Correlation key; positions sharing it are capped as one bet.
     pub cluster: String,
     pub sizing: SizingHint,
-    /// Max seconds Engine::execute may spend verifying the fill before
-    /// canceling any unfilled remainder (clamped to ≤8s — "window close or a
-    /// few seconds, whichever comes first"). Strategies set this to the time
-    /// left in their entry window.
-    pub fill_wait_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,24 +134,63 @@ pub struct RiskManager {
     cfg: RiskConfig,
     state: State,
     store: Box<dyn StateStore>,
+    /// Live-money mode. Changes fail-closed behavior: a persist failure HALTS
+    /// (a lost kill-switch flip is unacceptable with real money), and a missing
+    /// state file is refused rather than silently re-armed.
+    live: bool,
 }
 
 impl RiskManager {
     /// Load existing state or initialize with `initial_bankroll`.
+    ///
+    /// `live` selects fail-closed behavior (see [`RiskManager::live`] field).
+    /// `allow_fresh` lets an operator explicitly accept a brand-new ledger in
+    /// live mode; without it, a MISSING state file in live is a hard refusal —
+    /// re-arming a halted bot with a fresh bankroll is a money-loss footgun
+    /// (fix 3b). In paper mode a missing file always initializes fresh.
     pub fn load_or_init(
         cfg: RiskConfig,
         store: Box<dyn StateStore>,
         initial_bankroll: f64,
+        live: bool,
+        allow_fresh: bool,
     ) -> Result<Self> {
-        let state = store
-            .load()?
-            .unwrap_or_else(|| State::new(initial_bankroll));
-        Ok(Self { cfg, state, store })
+        let state = match store.load()? {
+            Some(s) => s,
+            None => {
+                if live && !allow_fresh {
+                    anyhow::bail!(
+                        "live mode: no state file found — refusing to start with a fresh \
+                         ledger. If this is intentional (first live run), pass --fresh-state."
+                    );
+                }
+                State::new(initial_bankroll)
+            }
+        };
+        Ok(Self {
+            cfg,
+            state,
+            store,
+            live,
+        })
     }
 
-    fn persist(&self) {
+    /// Persist state. In LIVE mode a save failure is treated as critical: we HALT
+    /// in memory (so the kill-switch can never be silently lost to e.g. a full
+    /// disk) and log loudly. Subsequent operations keep retrying the save (fix 3a).
+    fn persist(&mut self) {
         if let Err(e) = self.store.save(&self.state) {
-            eprintln!("risk: state save failed: {e}");
+            if self.live {
+                self.state.halted = true;
+                eprintln!(
+                    "risk: CRITICAL state save failed in LIVE mode: {e} — HALTING trading \
+                     in memory and retrying persist on the next operation"
+                );
+                // Best-effort: try once more to at least persist the halt flag.
+                let _ = self.store.save(&self.state);
+            } else {
+                eprintln!("risk: state save failed: {e}");
+            }
         }
     }
 
@@ -260,6 +294,21 @@ impl RiskManager {
         if filled_count <= 0 {
             return;
         }
+        // IDEMPOTENCY GUARD (fix 2a): one open position per ticker. Streak is a
+        // one-shot order per market — a second on_fill for a ticker we already
+        // hold open means a duplicate (in-window restart re-fire, or a
+        // recovery path booking the same fill twice). Refuse and log loudly;
+        // NEVER double-add (and never double-charge the fee, since we return
+        // before touching bankroll). A genuine partial-fill continuation is not
+        // a case here: an IOC order fills once, synchronously.
+        if self.state.open.iter().any(|p| p.ticker == o.ticker) {
+            eprintln!(
+                "risk: DUPLICATE FILL REFUSED for {} — a position on this ticker is already \
+                 open; not double-adding (idempotency guard)",
+                o.ticker
+            );
+            return;
+        }
         let fee = taker_fee(fill_price_cents, filled_count);
         self.state.bankroll -= fee;
         if matches!(o.sizing, SizingHint::Flat) {
@@ -282,6 +331,60 @@ impl RiskManager {
     /// this to fetch each market's authoritative result).
     pub fn open_positions(&self) -> &[Position] {
         &self.state.open
+    }
+
+    /// True if a position on `ticker` is currently open in local state.
+    pub fn has_open(&self, ticker: &str) -> bool {
+        self.state.open.iter().any(|p| p.ticker == ticker)
+    }
+
+    /// Adopt an ORPHAN position discovered on the exchange but missing from local
+    /// state (fix 1b) — e.g. a fill that landed after a lost ack. Conservative:
+    /// no fee is charged (already paid on the exchange), `entry_cents` is the
+    /// exchange cost basis when known else a worst-case, and it counts toward the
+    /// daily budget so caps see the real exposure. Idempotent: a no-op if a
+    /// position on `ticker` is already tracked. Returns true if newly adopted.
+    pub fn adopt_orphan(
+        &mut self,
+        ticker: &str,
+        side: Side,
+        count: i64,
+        entry_cents: Option<i64>,
+        cluster: &str,
+    ) -> bool {
+        if count <= 0 || self.has_open(ticker) {
+            return false;
+        }
+        // Worst-case entry: assume we paid the top of the band, so the position's
+        // at-risk stake (and thus the kill-switch's view of exposure) is maximal.
+        const WORST_CASE_ENTRY_CENTS: i64 = 99;
+        let entry = entry_cents.unwrap_or(WORST_CASE_ENTRY_CENTS).clamp(1, 99);
+        self.state.day_spent += count as f64 * entry as f64 / 100.0;
+        self.state.open.push(Position {
+            strategy: "orphan-adopted".into(),
+            ticker: ticker.to_string(),
+            side,
+            count,
+            entry_cents: entry,
+            cluster: cluster.to_string(),
+            fee: 0.0,
+            day: self.state.day.clone(),
+        });
+        self.persist();
+        true
+    }
+
+    /// Cash the account SHOULD hold if every open position is valued at its entry
+    /// cost: `bankroll − Σ(open stakes)`. Compared against the real Kalshi balance
+    /// by the divergence breaker (fix 1c) — the two must track within a threshold.
+    pub fn expected_cash(&self) -> f64 {
+        self.state.bankroll - self.total_at_risk()
+    }
+
+    /// Force the kill-switch on (divergence breaker / operator). Persisted.
+    pub fn halt(&mut self) {
+        self.state.halted = true;
+        self.persist();
     }
 
     /// Realize P&L for the open position `ticker` given the authoritative
@@ -392,6 +495,8 @@ mod tests {
             RiskConfig::default(),
             Box::new(MemoryStore::default()),
             bankroll,
+            false,
+            true,
         )
         .unwrap()
     }
@@ -404,7 +509,15 @@ mod tests {
             limit_cents: price,
             cluster: cluster.into(),
             sizing,
-            fill_wait_secs: 5,
+        }
+    }
+
+    /// Signal with a UNIQUE ticker (idempotency guard refuses a second open
+    /// position on the same ticker; cap-accumulation tests need distinct markets).
+    fn sig_uniq(sizing: SizingHint, price: i64, cluster: &str, nonce: usize) -> Signal {
+        Signal {
+            ticker: format!("TKR-{cluster}-{price}-{nonce}"),
+            ..sig(sizing, price, cluster)
         }
     }
 
@@ -424,15 +537,17 @@ mod tests {
         // is effectively full and the 4th is refused (no room, or room smaller
         // than one contract).
         let mut r = rm(1000.0);
-        let o = r.evaluate(&sig(SizingHint::Fraction, 50, "cx")).unwrap();
+        let o = r.evaluate(&sig_uniq(SizingHint::Fraction, 50, "cx", 0)).unwrap();
         assert_eq!(o.count, 100); // pre-fee sizing: 5% of $1000 at 50c
         r.on_fill(&o);
-        for _ in 0..2 {
-            let o = r.evaluate(&sig(SizingHint::Fraction, 50, "cx")).unwrap();
+        for i in 1..3 {
+            let o = r
+                .evaluate(&sig_uniq(SizingHint::Fraction, 50, "cx", i))
+                .unwrap();
             assert!(o.count >= 98); // fee drag shaves a contract or two
             r.on_fill(&o);
         }
-        let fourth = r.evaluate(&sig(SizingHint::Fraction, 50, "cx"));
+        let fourth = r.evaluate(&sig_uniq(SizingHint::Fraction, 50, "cx", 3));
         assert!(
             matches!(
                 fourth,
@@ -450,12 +565,12 @@ mod tests {
     fn flat_daily_budget() {
         // budget $80, flat $10 -> 8 fills allowed, 9th rejected
         let mut r = rm(1000.0);
-        for _ in 0..8 {
-            let o = r.evaluate(&sig(SizingHint::Flat, 50, "d")).unwrap();
+        for i in 0..8 {
+            let o = r.evaluate(&sig_uniq(SizingHint::Flat, 50, "d", i)).unwrap();
             r.on_fill(&o);
         }
         assert_eq!(
-            r.evaluate(&sig(SizingHint::Flat, 50, "d")),
+            r.evaluate(&sig_uniq(SizingHint::Flat, 50, "d", 99)),
             Err(Rejection::DailyCapHit)
         );
     }
@@ -465,17 +580,19 @@ mod tests {
         // A fraction-sized fill (lock-style) must NOT eat the flat daily budget
         // (weather). Fill several fraction orders, then confirm flat budget intact.
         let mut r = rm(1000.0);
-        for _ in 0..3 {
-            let o = r.evaluate(&sig(SizingHint::Fraction, 50, "cx")).unwrap();
+        for i in 0..3 {
+            let o = r
+                .evaluate(&sig_uniq(SizingHint::Fraction, 50, "cx", i))
+                .unwrap();
             r.on_fill(&o);
         }
         // full flat budget ($80) still available: 8 flat $10 trades allowed
-        for _ in 0..8 {
-            let o = r.evaluate(&sig(SizingHint::Flat, 50, "d")).unwrap();
+        for i in 0..8 {
+            let o = r.evaluate(&sig_uniq(SizingHint::Flat, 50, "d", i)).unwrap();
             r.on_fill(&o);
         }
         assert_eq!(
-            r.evaluate(&sig(SizingHint::Flat, 50, "d")),
+            r.evaluate(&sig_uniq(SizingHint::Flat, 50, "d", 99)),
             Err(Rejection::DailyCapHit)
         );
     }
@@ -558,7 +675,8 @@ mod tests {
             ..RiskConfig::default()
         };
         let mut r =
-            RiskManager::load_or_init(cfg, Box::new(MemoryStore::default()), 100.0).unwrap();
+            RiskManager::load_or_init(cfg, Box::new(MemoryStore::default()), 100.0, false, true)
+                .unwrap();
         let mut filled = 0;
         for i in 0..10 {
             let s = Signal {
@@ -568,7 +686,6 @@ mod tests {
                 limit_cents: 40,
                 cluster: "streak-123".into(),
                 sizing: SizingHint::Flat,
-                fill_wait_secs: 5,
             };
             match r.evaluate(&s) {
                 Ok(o) => {
@@ -609,7 +726,8 @@ mod tests {
             ..RiskConfig::default()
         };
         let mut r =
-            RiskManager::load_or_init(cfg, Box::new(MemoryStore::default()), 100.0).unwrap();
+            RiskManager::load_or_init(cfg, Box::new(MemoryStore::default()), 100.0, false, true)
+                .unwrap();
         let o = r.evaluate(&sig(SizingHint::Flat, 44, "w")).unwrap();
         assert_eq!(o.count, 9); // $4 at 44c
 
@@ -717,7 +835,6 @@ mod tests {
             limit_cents: 50,
             cluster: "k".into(),
             sizing: SizingHint::Fraction,
-            fill_wait_secs: 5,
         };
         let o = r.evaluate(&s).unwrap(); // 5% of 100 = $5 -> 10 @ 50c
         r.on_fill(&o);
@@ -740,11 +857,134 @@ mod tests {
     }
 
     #[test]
+    fn on_fill_actual_refuses_duplicate_ticker() {
+        // IDEMPOTENCY (fix 2a): a second fill on an already-open ticker is
+        // refused — no double-add, no double fee.
+        let mut r = rm(1000.0);
+        let o = r.evaluate(&sig(SizingHint::Flat, 44, "w")).unwrap();
+        r.on_fill_actual(&o, o.count, 44);
+        assert_eq!(r.open_positions().len(), 1);
+        let bankroll_after_first = r.status().bankroll;
+        // Same ticker again (restart re-fire / recovery double-book): no-op.
+        r.on_fill_actual(&o, o.count, 44);
+        assert_eq!(r.open_positions().len(), 1, "duplicate must not add");
+        assert_eq!(
+            r.status().bankroll,
+            bankroll_after_first,
+            "duplicate must not re-charge the fee"
+        );
+    }
+
+    #[test]
+    fn missing_state_file_refused_in_live() {
+        // fix 3b: live + no state file + no --fresh-state → hard refusal.
+        let err = RiskManager::load_or_init(
+            RiskConfig::default(),
+            Box::new(MemoryStore::default()), // empty store => load() == None
+            100.0,
+            true,  // live
+            false, // allow_fresh
+        );
+        assert!(err.is_err(), "live must refuse a missing state file");
+        // With --fresh-state it is allowed.
+        assert!(RiskManager::load_or_init(
+            RiskConfig::default(),
+            Box::new(MemoryStore::default()),
+            100.0,
+            true,
+            true,
+        )
+        .is_ok());
+        // Paper never refuses.
+        assert!(RiskManager::load_or_init(
+            RiskConfig::default(),
+            Box::new(MemoryStore::default()),
+            100.0,
+            false,
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn adopt_orphans_from_canned_positions_json() {
+        // fix 1b: parse an exchange /portfolio/positions payload and adopt any
+        // position missing from local state; skip ones we already hold.
+        let mut r = rm(100.0);
+        r.begin_day("2026-07-23");
+        // We already hold KNOWN locally.
+        let known = Order {
+            strategy: "streak".into(),
+            ticker: "KXBTC15M-KNOWN".into(),
+            side: Side::Yes,
+            count: 9,
+            limit_cents: 44,
+            cluster: "streak-1".into(),
+            sizing: SizingHint::Flat,
+        };
+        r.on_fill(&known);
+        assert_eq!(r.open_positions().len(), 1);
+
+        let body = serde_json::json!({
+            "market_positions": [
+                {"ticker": "KXBTC15M-KNOWN", "position": 9, "market_exposure": 396},
+                {"ticker": "KXETH15M-ORPH", "position": -5, "market_exposure": 200},
+                {"ticker": "KXBTC15M-FLAT", "position": 0, "market_exposure": 0},
+            ]
+        });
+        let exch = crate::kalshi::parse_positions(&body);
+        let mut adopted = 0;
+        for p in &exch {
+            if r.adopt_orphan(&p.ticker, p.side, p.count, p.entry_cents, "orphan") {
+                adopted += 1;
+            }
+        }
+        assert_eq!(adopted, 1, "only the unknown ORPH is adopted");
+        assert_eq!(r.open_positions().len(), 2);
+        let orph = r
+            .open_positions()
+            .iter()
+            .find(|p| p.ticker == "KXETH15M-ORPH")
+            .unwrap();
+        assert_eq!(orph.side, Side::No);
+        assert_eq!(orph.count, 5);
+        assert_eq!(orph.entry_cents, 40); // 200c / 5
+        assert_eq!(orph.fee, 0.0); // fee already paid on-exchange
+                                   // Re-running is idempotent (no duplicate adopt).
+        assert!(!r.adopt_orphan("KXETH15M-ORPH", Side::No, 5, Some(40), "orphan"));
+        assert_eq!(r.open_positions().len(), 2);
+    }
+
+    #[test]
+    fn adopt_orphan_worst_case_entry_when_unknown() {
+        // No cost basis from the exchange → worst-case 99c entry (maximal
+        // at-risk stake, so the kill-switch errs conservative).
+        let mut r = rm(100.0);
+        assert!(r.adopt_orphan("T", Side::Yes, 3, None, "c"));
+        let p = &r.open_positions()[0];
+        assert_eq!(p.entry_cents, 99);
+    }
+
+    #[test]
+    fn expected_cash_tracks_bankroll_minus_stakes() {
+        // fix 1c divergence basis: expected cash = bankroll − open stakes.
+        let mut r = rm(100.0);
+        assert!((r.expected_cash() - 100.0).abs() < 1e-9);
+        let o = r.evaluate(&sig(SizingHint::Flat, 44, "w")).unwrap();
+        let stake = o.stake();
+        let fee = taker_fee(44, o.count);
+        r.on_fill(&o);
+        // bankroll dropped by the fee; expected cash = bankroll − stake.
+        assert!((r.expected_cash() - (100.0 - fee - stake)).abs() < 1e-9);
+    }
+
+    #[test]
     fn state_persists_across_reload() {
         let store = Box::new(MemoryStore::default());
         // share the same underlying store by cloning the Arc-like handle:
         // MemoryStore isn't Clone, so drive it through one manager then reload.
-        let mut r = RiskManager::load_or_init(RiskConfig::default(), store, 500.0).unwrap();
+        let mut r =
+            RiskManager::load_or_init(RiskConfig::default(), store, 500.0, false, true).unwrap();
         let o = r.evaluate(&sig(SizingHint::Fraction, 90, "p")).unwrap();
         r.on_fill(&o);
         r.on_settlement(&o.ticker, true);

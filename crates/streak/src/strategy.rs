@@ -21,7 +21,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use engine::kalshi::Market;
 use engine::risk::taker_fee;
-use engine::strategy::ExecOutcome;
+use engine::strategy::{in_window, ExecOutcome, IN_WINDOW_TIMEOUT};
 use engine::{alert, logging, Engine, Side, Signal, SizingHint, Strategy};
 use serde_json::json;
 
@@ -129,12 +129,24 @@ impl Strategy for Streak {
     }
 
     async fn run(&self, eng: &Engine) -> Result<()> {
+        // Surface the FIRST rate-limit/server-class error so the driving loop can
+        // back off (fix 5); non-retryable per-series errors stay logged+swallowed
+        // (one coin's bad pass shouldn't abort the other's).
+        let mut retryable: Option<anyhow::Error> = None;
         for series in SERIES {
             if let Err(e) = self.scan_series(eng, series).await {
-                logging::info(format!("streak {series}: scan error ({e}) — skip"));
+                let is_retryable = engine::net::http_status(&e).is_some_and(engine::net::is_retryable_status);
+                if is_retryable && retryable.is_none() {
+                    retryable = Some(e);
+                } else {
+                    logging::info(format!("streak {series}: scan error ({e}) — skip"));
+                }
             }
         }
-        Ok(())
+        match retryable {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -177,7 +189,18 @@ impl Streak {
         // (flagged by a prior pass's PrevNotSettled), else serve from cache.
         let force = self.seen_contains(&Self::refetch_key(series, window_id));
         let settled = self.settled_for(eng, series, window_id, force).await?;
-        let opens = eng.kalshi.markets(series, "open").await?;
+        // Fail fast in-window (addendum #5): a 5s deadline beats the client's 30s
+        // (half an entry window). A timeout skips THIS pass; the loop retries.
+        let opens = match in_window(eng.kalshi.markets(series, "open")).await {
+            Ok(r) => r?,
+            Err(_) => {
+                logging::info(format!(
+                    "streak {series}: open-markets fetch exceeded {}s — skip pass",
+                    IN_WINDOW_TIMEOUT.as_secs()
+                ));
+                return Ok(());
+            }
+        };
 
         let cur = match current_market(&opens, now) {
             Some(m) => m,
@@ -264,18 +287,13 @@ impl Streak {
 
         // DATA CAPTURE 2 — decision snapshot at the entry moment (fetched before
         // the order so the book reflects what we saw when deciding).
-        let book = eng
-            .kalshi
-            .orderbook(&cur.ticker)
-            .await
-            .unwrap_or(json!(null));
+        let book = match in_window(eng.kalshi.orderbook(&cur.ticker)).await {
+            Ok(Ok(b)) => b,
+            _ => json!(null), // timeout or error: book snapshot is best-effort
+        };
 
         let side = if entry.buy_yes { Side::Yes } else { Side::No };
         let limit = entry.ask.round() as i64;
-        // Fill-verification budget: time left in the entry window (execute caps
-        // it at 8s — "window close or a few seconds, whichever comes first").
-        let entry_window_end = cand.close_unix - signal::WINDOW_SECS + 60;
-        let fill_wait = (entry_window_end - now).clamp(2, 60) as u64;
         let sig = Signal {
             strategy: "streak".into(),
             ticker: cur.ticker.clone(),
@@ -284,7 +302,6 @@ impl Streak {
             // Window close shared across coins: simultaneous BTC+ETH = ONE bet.
             cluster: format!("streak-{}", cand.close_unix),
             sizing: SizingHint::Flat,
-            fill_wait_secs: fill_wait,
         };
 
         let outcome = eng.execute(sig).await;
@@ -307,6 +324,7 @@ impl Streak {
                 rec["filled"] = json!(true);
                 rec["partial"] = json!(fill.partial);
                 rec["simulated"] = json!(fill.simulated);
+                rec["price_estimated"] = json!(fill.price_estimated);
                 rec["ts_submit"] = json!(fill.ts_submit_ms);
                 rec["ts_ack"] = json!(fill.ts_ack_ms);
                 rec["ts_fill"] = json!(fill.ts_fill_ms);
@@ -345,6 +363,35 @@ impl Streak {
                     )
                     .await;
                 }
+            }
+            ExecOutcome::RecoveredFill { fill, .. } => {
+                // Lost-ack recovery (fix 1a): a fill that landed despite a placement
+                // error, recovered via the fills API. Recorded exactly like a normal
+                // fill, tagged `recovered` so week-1 accounting can see it happened.
+                let fee_cents = taker_fee(fill.fill_price_cents, fill.filled) * 100.0;
+                rec["filled"] = json!(true);
+                rec["recovered"] = json!(true);
+                rec["partial"] = json!(fill.partial);
+                rec["simulated"] = json!(false);
+                rec["price_estimated"] = json!(fill.price_estimated);
+                rec["ts_submit"] = json!(fill.ts_submit_ms);
+                rec["ts_ack"] = json!(fill.ts_ack_ms);
+                rec["ts_fill"] = json!(fill.ts_fill_ms);
+                rec["fill_price"] = json!(fill.fill_price_cents);
+                rec["filled_count"] = json!(fill.filled);
+                rec["canceled_count"] = json!(fill.canceled);
+                rec["fee_cents"] = json!(fee_cents);
+                rec["actual_fee_cents"] = json!(fill.actual_fee_cents);
+                rec["order_id"] = json!(fill.order_id);
+                logging::info(format!(
+                    "streak {series}: RECOVERED FILL {}x {} {} @ {}c (fade {}, lost-ack)",
+                    fill.filled,
+                    side.as_str(),
+                    cur.ticker,
+                    fill.fill_price_cents,
+                    entry.streak_dir,
+                ));
+                // execute_live already fired a recovery alert; no second alert here.
             }
             ExecOutcome::Missed { order, fill } => {
                 rec["partial"] = json!(false);
@@ -458,11 +505,4 @@ mod tests {
         assert_eq!(next_poll_delay(boundary + 899).as_secs(), 1);
     }
 
-    #[test]
-    fn entry_window_end_math() {
-        // close = open + 900; entry window ends open + 60 = close - 840.
-        let close = 1_000_900i64;
-        let end = close - signal::WINDOW_SECS + 60;
-        assert_eq!(end, close - 840);
-    }
 }

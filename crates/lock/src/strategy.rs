@@ -100,7 +100,6 @@ impl Strategy for Lock {
                 limit_cents: ask,
                 cluster: format!("btc:{close}"), // all positions in one 15-min window = one bet
                 sizing: SizingHint::Fraction,
-                fill_wait_secs: 5,
             };
 
             let outcome = eng.execute(sig).await;
@@ -133,6 +132,10 @@ impl Strategy for Lock {
                     )
                     .await;
                 }
+                ExecOutcome::RecoveredFill { fill, .. } => logging::info(format!(
+                    "lock: RECOVERED FILL {}x {} @ {}c (lost-ack)",
+                    fill.filled, m.ticker, fill.fill_price_cents
+                )),
                 ExecOutcome::Missed { fill, .. } => logging::info(format!(
                     "lock: MISSED (no fill, canceled {}) {}",
                     fill.canceled, m.ticker
