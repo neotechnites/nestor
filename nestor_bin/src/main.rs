@@ -181,10 +181,14 @@ async fn main() -> Result<()> {
         let strat = streak::strategy::Streak::new();
         let mut backoff = 0u32;
         loop {
+            let mut retry_after = 0u64;
             match strat.run(&eng).await {
                 Ok(()) => backoff = 0,
                 Err(e) => {
                     eprintln!("streak: scan error: {e}");
+                    // Honor a server-sent Retry-After (item 3) if the 429 carried it.
+                    retry_after = engine::net::retry_after_secs_in_message(&e.to_string())
+                        .unwrap_or(0);
                     // Only rate-limit/server-class errors back off (fix 5).
                     backoff = next_backoff(&e, backoff);
                 }
@@ -194,7 +198,7 @@ async fn main() -> Result<()> {
             }
             let base =
                 streak::strategy::next_poll_delay(chrono::Utc::now().timestamp());
-            tokio::time::sleep(base.max(engine::net::backoff_delay(backoff))).await;
+            tokio::time::sleep(backoff_sleep(base, backoff, retry_after)).await;
         }
         return Ok(());
     }
@@ -239,6 +243,19 @@ fn next_backoff(err: &anyhow::Error, current: u32) -> u32 {
     }
 }
 
+/// Combined loop sleep (item 3): the larger of the adaptive poll `base`, the
+/// exponential backoff for `backoff` consecutive retryable errors, and any
+/// server-sent `Retry-After` (whole seconds). Honoring Retry-After keeps a
+/// rate-limit ban from being prolonged by retrying before the server said to.
+fn backoff_sleep(
+    base: std::time::Duration,
+    backoff: u32,
+    retry_after_secs: u64,
+) -> std::time::Duration {
+    base.max(engine::net::backoff_delay(backoff))
+        .max(std::time::Duration::from_secs(retry_after_secs))
+}
+
 /// The production runtime: one process, one shared in-memory RiskManager, every
 /// strategy as a tokio task. No cross-process state race; kill-switch honored by all.
 async fn run_all(eng: Engine) -> Result<()> {
@@ -264,6 +281,7 @@ async fn run_all(eng: Engine) -> Result<()> {
                 // reconcile's exchange-truth pass uses SIGNED calls (positions/
                 // balance): feed the consecutive-failure + 401 breakers (fix 5,
                 // addendum #3) and back off on rate-limit/server-class errors.
+                let mut retry_after = 0u64;
                 match r {
                     Ok(Ok(())) => {
                         e.note_signed_success();
@@ -273,12 +291,15 @@ async fn run_all(eng: Engine) -> Result<()> {
                         eprintln!("settlement task error: {err}");
                         let status = engine::net::http_status(&err);
                         e.note_signed_failure(status).await;
+                        retry_after =
+                            engine::net::retry_after_secs_in_message(&err.to_string())
+                                .unwrap_or(0);
                         backoff = next_backoff(&err, backoff);
                     }
                     Err(_) => eprintln!("settlement task PANICKED — continuing"),
                 }
-                let base = Duration::from_secs(60);
-                tokio::time::sleep(base.max(engine::net::backoff_delay(backoff))).await;
+                tokio::time::sleep(backoff_sleep(Duration::from_secs(60), backoff, retry_after))
+                    .await;
             }
         });
     }
@@ -310,14 +331,19 @@ async fn run_all(eng: Engine) -> Result<()> {
         let r = std::panic::AssertUnwindSafe(streak.run(&eng))
             .catch_unwind()
             .await;
+        let mut retry_after = 0u64;
         match &r {
             Ok(Ok(())) => backoff = 0,
-            Ok(Err(err)) => backoff = next_backoff(err, backoff),
+            Ok(Err(err)) => {
+                retry_after =
+                    engine::net::retry_after_secs_in_message(&err.to_string()).unwrap_or(0);
+                backoff = next_backoff(err, backoff);
+            }
             Err(_) => {}
         }
         report("streak", r);
         let base = streak::strategy::next_poll_delay(chrono::Utc::now().timestamp());
-        tokio::time::sleep(base.max(engine::net::backoff_delay(backoff))).await;
+        tokio::time::sleep(backoff_sleep(base, backoff, retry_after)).await;
     }
 }
 

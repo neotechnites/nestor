@@ -336,10 +336,12 @@ impl Engine {
         let ts_submit_ms = now_ms();
         // Fail fast in-window (OSS addendum #5): a 5s deadline, not the client's
         // 30s. NOTE: the order POST is NEVER retried (double-submit risk) — a
-        // timeout/error goes down the lost-ack recovery path (a fills GET).
+        // timeout/error goes down the lost-ack recovery path (a fills GET). We use
+        // the RAW placement so we can inspect (status, body) directly and classify
+        // a benign 409 `order_already_exists` (item 2) before recovery.
         let place_res = tokio::time::timeout(
             IN_WINDOW_TIMEOUT,
-            self.kalshi.place_limit_buy(
+            self.kalshi.place_limit_buy_raw(
                 &order.ticker,
                 order.side.as_str(),
                 order.count,
@@ -349,18 +351,46 @@ impl Engine {
         )
         .await;
         let response = match place_res {
-            Ok(Ok(r)) => r,
-            // LOST-ACK RECOVERY (fix 1a): the POST errored/timed out, but Kalshi
-            // may have ACCEPTED and FILLED it. A real position booked as "nothing
-            // happened" would make the kill-switch compute on a lie. Query the
-            // truth (a fills GET) before giving up.
-            Ok(Err(e)) => return self.recover_lost_ack(order, ts_submit_ms, &e).await,
+            Ok(Ok((status, text, reqid))) if (200..300).contains(&status) => {
+                match serde_json::from_str::<serde_json::Value>(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // 2xx but unparseable: something filled, treat as lost-ack.
+                        let rid =
+                            reqid.map(|r| format!(" (request-id {r})")).unwrap_or_default();
+                        let err = anyhow::anyhow!(
+                            "create-order 2xx unparseable{rid}: {e}: {text}"
+                        );
+                        return self.recover_lost_ack(order, ts_submit_ms, &err, false).await;
+                    }
+                }
+            }
+            // Non-2xx: build a rich error (keep raw body + request-id, item 5) and
+            // classify a benign duplicate (409 order_already_exists, item 2) — the
+            // deterministic coid means the order is ALREADY safely placed; do not
+            // let it trip the sticky-halt breaker.
+            Ok(Ok((status, text, reqid))) => {
+                let api = kalshi::parse_api_error(&text);
+                let benign =
+                    status == 409 && api.code.as_deref() == Some("order_already_exists");
+                let rid = reqid.map(|r| format!(" (request-id {r})")).unwrap_or_default();
+                let err =
+                    anyhow::anyhow!("order placement HTTP {status}{rid}: {text}");
+                return self
+                    .recover_lost_ack(order, ts_submit_ms, &err, benign)
+                    .await;
+            }
+            // LOST-ACK RECOVERY (fix 1a): the POST errored/timed out at the network
+            // layer, but Kalshi may have ACCEPTED and FILLED it. A real position
+            // booked as "nothing happened" would make the kill-switch compute on a
+            // lie. Query the truth (a fills GET) before giving up.
+            Ok(Err(e)) => return self.recover_lost_ack(order, ts_submit_ms, &e, false).await,
             Err(_elapsed) => {
                 let e = anyhow::anyhow!(
                     "order placement timed out after {}s",
                     IN_WINDOW_TIMEOUT.as_secs()
                 );
-                return self.recover_lost_ack(order, ts_submit_ms, &e).await;
+                return self.recover_lost_ack(order, ts_submit_ms, &e, false).await;
             }
         };
 
@@ -450,6 +480,7 @@ impl Engine {
         order: Order,
         ts_submit_ms: i64,
         place_err: &anyhow::Error,
+        benign_duplicate: bool,
     ) -> ExecOutcome {
         let coid = format!("{}-{}", order.strategy, order.ticker);
         // fills(&ticker) is scoped to this market; match by side + submit-time
@@ -518,6 +549,20 @@ impl Engine {
                 order_id: None,
             };
             return ExecOutcome::RecoveredFill { order, fill };
+        }
+
+        // BENIGN DUPLICATE (item 2): a 409 `order_already_exists` means the order
+        // was ALREADY safely placed under our deterministic coid (a prior attempt
+        // landed). The fills probe above already booked whatever filled; nothing is
+        // resting (IOC). This is NOT a failure — do NOT feed the sticky-halt
+        // breaker (a benign 409 must never contribute to a consecutive-error halt).
+        if benign_duplicate {
+            eprintln!(
+                "[recover] {} 409 order_already_exists (coid {coid}) — order already \
+                 placed; benign, NOT counted toward the error breaker",
+                order.ticker
+            );
+            return ExecOutcome::OrderError(place_err.to_string());
         }
 
         // No fill found: a genuine placement failure. Feed the consecutive-error

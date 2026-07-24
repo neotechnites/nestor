@@ -38,6 +38,51 @@ fn settlement_won(side: Side, result: &str) -> Option<bool> {
     }
 }
 
+/// Whether a market is settleable NOW (item 6). Kalshi status progresses
+/// `active` → `closed` → `determined` → `finalized`; both `determined` and
+/// `finalized` mean the outcome is KNOWN, so we free exposure + feed the
+/// kill-switch as soon as `determined` lands (not only at `finalized`). Guards:
+///   - an EMPTY `result` is NEVER settleable, even at status=="determined" (no
+///     outcome to book — determined-with-empty-result is a transient state);
+///   - a missing/empty `status` is tolerated as long as `result` is populated
+///     (`result` is the authoritative outcome; some payloads omit status).
+fn is_settleable(status: &str, result: &str) -> bool {
+    if result.trim().is_empty() {
+        return false;
+    }
+    match status.trim().to_ascii_lowercase().as_str() {
+        "" | "determined" | "finalized" | "settled" => true,
+        // active/closed/paused/etc. with a result present is anomalous — don't
+        // settle on it; wait for the status to reach determined/finalized.
+        _ => false,
+    }
+}
+
+/// Sample the exchange clock once per live reconcile pass (item 7). A Mac sleep
+/// desyncs the local clock; public data still flows but EVERY signed call then
+/// 401s. Reading the server's HTTP `Date` header makes that failure PROACTIVE
+/// (a loud alert) instead of reactive (the 401 breaker after 5 failures).
+async fn check_clock_skew(eng: &Engine) {
+    match eng.kalshi.server_time().await {
+        Ok(server) => {
+            let local = chrono::Utc::now().timestamp();
+            let skew = (local - server).abs();
+            if skew > 30 {
+                let msg = format!(
+                    "CLOCK SKEW {skew}s (local {local} vs server {server}) — signed calls WILL \
+                     401 (likely Mac sleep); resync NTP before the bot can trade"
+                );
+                logging::info(format!("ALERT: {msg}"));
+                eprintln!("[reconcile] ALERT: {msg}");
+                alert::notify(&eng.http, &msg).await;
+            } else {
+                logging::info(format!("clock-skew check OK ({skew}s)"));
+            }
+        }
+        Err(e) => logging::info(format!("clock-skew check failed ({e}) — skip")),
+    }
+}
+
 /// Settle every open position whose Kalshi market has a final `result`.
 pub async fn run(eng: &Engine) -> Result<()> {
     // Roll the risk layer to today (ET) first. This resets the daily counters
@@ -77,6 +122,16 @@ pub async fn run(eng: &Engine) -> Result<()> {
             }
         };
         let result = market.result.unwrap_or_default();
+        let status = market.status.unwrap_or_default();
+        // Gate on status too (item 6): determined/finalized with a non-empty
+        // result is settleable now; determined with an EMPTY result is not.
+        if !is_settleable(&status, &result) {
+            pending += 1;
+            logging::info(format!(
+                "{ticker}: not settled (status={status:?} result={result:?}) — skip"
+            ));
+            continue;
+        }
         let won = match settlement_won(side, &result) {
             Some(w) => w,
             None => {
@@ -125,6 +180,10 @@ pub async fn run(eng: &Engine) -> Result<()> {
     // block realizing settled P&L. May return Err (signed-call failure) so the
     // caller's loop can classify/backoff/count 401s.
     if eng.mode == Mode::Live {
+        // Proactive clock-skew alert (item 7) — once per pass, BEFORE the signed
+        // exchange-truth calls that clock skew would 401. Best-effort (never
+        // blocks settlement): a failed/absent Date header just logs.
+        check_clock_skew(eng).await;
         reconcile_exchange_truth(eng).await?;
     }
 
@@ -223,6 +282,28 @@ mod tests {
         // Our NO wins on "no", loses on "yes".
         assert_eq!(settlement_won(Side::No, "no"), Some(true));
         assert_eq!(settlement_won(Side::No, "yes"), Some(false));
+    }
+
+    #[test]
+    fn settleable_on_determined_and_finalized_with_result() {
+        // Both terminal-ish statuses settle as soon as a result is present.
+        assert!(is_settleable("determined", "yes"));
+        assert!(is_settleable("finalized", "no"));
+        assert!(is_settleable("FINALIZED", "yes")); // case-insensitive
+        assert!(is_settleable("settled", "no"));
+        // Missing/empty status tolerated when result is authoritative.
+        assert!(is_settleable("", "yes"));
+    }
+
+    #[test]
+    fn not_settleable_on_determined_with_empty_result() {
+        // The critical guard: determined but NO result yet = nothing to book.
+        assert!(!is_settleable("determined", ""));
+        assert!(!is_settleable("finalized", "   "));
+        assert!(!is_settleable("", ""));
+        // A result present but status still active/closed is anomalous — wait.
+        assert!(!is_settleable("active", "yes"));
+        assert!(!is_settleable("closed", "no"));
     }
 
     #[test]

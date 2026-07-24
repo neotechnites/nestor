@@ -25,6 +25,90 @@ fn api_base() -> String {
 }
 const PREFIX: &str = "/trade-api/v2";
 
+/// Read a response header as an owned String (case-insensitive name lookup is
+/// handled by reqwest's `HeaderMap`).
+fn header(resp: &reqwest::Response, name: &str) -> Option<String> {
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// A parsed Kalshi error body (item 5). Kalshi returns errors as
+/// `{"error":{"code","message"}}`, occasionally flat (`{"code","message"}`),
+/// `{"message":..}`, or `{"error":"..."}`. Non-JSON leaves both fields None.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ApiError {
+    pub code: Option<String>,
+    pub message: Option<String>,
+}
+
+fn str_field(v: &serde_json::Value, k: &str) -> Option<String> {
+    v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+/// Parse a Kalshi error body into `{code, message}`, tolerating the nested and
+/// flat encodings. Pure + unit-tested; used for logging AND branching (e.g. the
+/// benign-409 `order_already_exists` classification in strategy::execute_live).
+pub fn parse_api_error(body: &str) -> ApiError {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return ApiError::default();
+    };
+    match v.get("error") {
+        Some(e @ serde_json::Value::Object(_)) => ApiError {
+            code: str_field(e, "code"),
+            message: str_field(e, "message"),
+        },
+        Some(serde_json::Value::String(s)) => ApiError {
+            code: None,
+            message: Some(s.clone()),
+        },
+        // flat {"code","message"} / {"message"} at the top level
+        _ => ApiError {
+            code: str_field(&v, "code"),
+            message: str_field(&v, "message"),
+        },
+    }
+}
+
+/// Consume a response into its body text, turning a non-2xx into a rich anyhow
+/// error carrying: the status as an "HTTP <code>" token (so `net::http_status`
+/// recovers it for backoff), the parsed error `code`, the `x-request-id` (support
+/// forensics, item 5), an already-resolved `retry-after-secs` when the 429 sent a
+/// `Retry-After` (item 3), and the RAW body. Signed AND public calls share it.
+async fn text_or_error(resp: reqwest::Response, ctx: &str) -> Result<String> {
+    let status = resp.status().as_u16();
+    let reqid = header(&resp, "x-request-id").or_else(|| header(&resp, "request-id"));
+    let retry_after = header(&resp, "retry-after");
+    let body = resp.text().await?;
+    if (200..300).contains(&status) {
+        return Ok(body);
+    }
+    let api = parse_api_error(&body);
+    let mut msg = format!("{ctx} HTTP {status}");
+    if let Some(code) = api.code.as_deref() {
+        msg.push_str(&format!(" code={code}"));
+    }
+    if let Some(r) = reqid.as_deref() {
+        msg.push_str(&format!(" request-id={r}"));
+    }
+    if let Some(ra) = retry_after.as_deref() {
+        if let Some(secs) = crate::net::parse_retry_after(ra, chrono::Utc::now()) {
+            msg.push_str(&format!(" retry-after-secs={secs}"));
+        }
+    }
+    msg.push_str(&format!(": {body}"));
+    Err(anyhow!(msg))
+}
+
+/// Parse an HTTP `Date` header (RFC 7231 IMF-fixdate, e.g.
+/// "Sun, 06 Nov 1994 08:49:37 GMT") to unix seconds. Pure + unit-tested (item 7).
+pub fn parse_http_date_unix(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc2822(s.trim())
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Market {
     pub ticker: String,
@@ -40,6 +124,11 @@ pub struct Market {
     pub yes_sub_title: Option<String>,
     #[serde(default)]
     pub result: Option<String>,
+    /// Lifecycle status. Kalshi progresses `active` → `closed` → `determined` →
+    /// `finalized`; both `determined` and `finalized` mean the outcome is known
+    /// (settlement gate, item 6). Absent on some payloads → treated as unknown.
+    #[serde(default)]
+    pub status: Option<String>,
     /// RFC3339 open time.
     #[serde(default)]
     pub open_time: Option<String>,
@@ -167,7 +256,7 @@ impl Kalshi {
         limit: u32,
     ) -> Result<Vec<Market>> {
         let limit = limit.to_string();
-        let body = self
+        let resp = self
             .http
             .get(format!("{}{PREFIX}/markets", api_base()))
             .query(&[
@@ -176,10 +265,8 @@ impl Kalshi {
                 ("limit", limit.as_str()),
             ])
             .send()
-            .await?
-            .error_for_status()?
-            .text()
             .await?;
+        let body = text_or_error(resp, "probe_series markets").await?;
         parse_markets(&body)
     }
 
@@ -196,7 +283,9 @@ impl Kalshi {
             if let Some(c) = &cursor {
                 req = req.query(&[("cursor", c)]);
             }
-            let resp: MarketsResp = req.send().await?.error_for_status()?.json().await?;
+            let text = text_or_error(req.send().await?, "markets").await?;
+            let resp: MarketsResp =
+                serde_json::from_str(&text).context("parsing markets response")?;
             let got = resp.markets.len();
             out.extend(resp.markets);
             match resp.cursor {
@@ -212,14 +301,9 @@ impl Kalshi {
     /// empty while open) — the source of truth for the reconcile loop.
     pub async fn market(&self, ticker: &str) -> Result<Market> {
         let url = format!("{}{PREFIX}/markets/{ticker}", api_base());
-        let resp: MarketResp = self
-            .http
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let text = text_or_error(self.http.get(url).send().await?, "market").await?;
+        let resp: MarketResp =
+            serde_json::from_str(&text).context("parsing market response")?;
         Ok(resp.market)
     }
 
@@ -257,20 +341,26 @@ impl Kalshi {
         price_cents: i64,
         client_order_id: &str,
     ) -> Result<serde_json::Value> {
-        let (status, text) = self
+        let (status, text, reqid) = self
             .place_limit_buy_raw(ticker, side, count, price_cents, client_order_id)
             .await?;
         if !(200..300).contains(&status) {
             // Keep the raw body in the error so the lost-ack recovery path
-            // (strategy::execute_live) and operators can see WHAT Kalshi said.
-            return Err(anyhow!("order placement HTTP {status}: {text}"));
+            // (strategy::execute_live) and operators can see WHAT Kalshi said;
+            // capture x-request-id for support forensics (item 5).
+            let rid = reqid
+                .map(|r| format!(" (request-id {r})"))
+                .unwrap_or_default();
+            return Err(anyhow!("order placement HTTP {status}{rid}: {text}"));
         }
         serde_json::from_str(&text).context("parsing create-order response JSON")
     }
 
-    /// Low-level create-order POST returning `(http_status, raw_body_text)` WITHOUT
-    /// treating a non-2xx as an error — so callers can inspect the exact response
-    /// (e.g. the duplicate-`client_order_id` demo probe, fix 2b). Signed.
+    /// Low-level create-order POST returning `(http_status, raw_body_text,
+    /// x_request_id)` WITHOUT treating a non-2xx as an error — so callers can
+    /// inspect the exact response (e.g. the duplicate-`client_order_id` demo
+    /// probe, fix 2b; the benign-409 classification in execute_live, item 2). The
+    /// request-id is captured for support forensics (item 5). Signed.
     pub async fn place_limit_buy_raw(
         &self,
         ticker: &str,
@@ -278,7 +368,7 @@ impl Kalshi {
         count: i64,
         price_cents: i64,
         client_order_id: &str,
-    ) -> Result<(u16, String)> {
+    ) -> Result<(u16, String, Option<String>)> {
         let path = format!("{PREFIX}/portfolio/events/orders");
         let headers = self.sign_headers("POST", &path)?;
         let mut map = serde_json::Map::new();
@@ -299,8 +389,9 @@ impl Kalshi {
         }
         let resp = req.send().await?;
         let status = resp.status().as_u16();
+        let reqid = header(&resp, "x-request-id").or_else(|| header(&resp, "request-id"));
         let text = resp.text().await?;
-        Ok((status, text))
+        Ok((status, text, reqid))
     }
 
     /// Account cash balance in cents. Signed.
@@ -311,7 +402,7 @@ impl Kalshi {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let body = req.send().await?.error_for_status()?.text().await?;
+        let body = text_or_error(req.send().await?, "balance").await?;
         parse_balance(&body)
     }
 
@@ -323,7 +414,8 @@ impl Kalshi {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        Ok(req.send().await?.error_for_status()?.json().await?)
+        let text = text_or_error(req.send().await?, "positions").await?;
+        serde_json::from_str(&text).context("parsing positions response")
     }
 
     /// Raw fills for a ticker (signed). Used to verify what ACTUALLY filled after
@@ -343,7 +435,8 @@ impl Kalshi {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        Ok(req.send().await?.error_for_status()?.json().await?)
+        let text = text_or_error(req.send().await?, "fills").await?;
+        serde_json::from_str(&text).context("parsing fills response")
     }
 
     /// Cancel an order via the V2 endpoint
@@ -359,21 +452,28 @@ impl Kalshi {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        Ok(req.send().await?.error_for_status()?.json().await?)
+        let text = text_or_error(req.send().await?, "cancel_order").await?;
+        serde_json::from_str(&text).context("parsing cancel response")
     }
 
     /// Order book for a market (public). Captured as the decision snapshot at
     /// every signal moment (DATA CAPTURE, redirect 2026-07-23).
     pub async fn orderbook(&self, ticker: &str) -> Result<serde_json::Value> {
         let url = format!("{}{PREFIX}/markets/{ticker}/orderbook", api_base());
-        Ok(self
-            .http
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        let text = text_or_error(self.http.get(url).send().await?, "orderbook").await?;
+        serde_json::from_str(&text).context("parsing orderbook response")
+    }
+
+    /// Server clock (unix seconds) from the HTTP `Date` header of a public GET
+    /// (`/exchange/status`) — no auth, no signing (item 7). Used once per live
+    /// reconcile pass to detect clock skew BEFORE it 401s every signed call (a Mac
+    /// sleep desyncs the clock; public data still flows, signed calls fail).
+    pub async fn server_time(&self) -> Result<i64> {
+        let url = format!("{}{PREFIX}/exchange/status", api_base());
+        let resp = self.http.get(url).send().await?;
+        let date =
+            header(&resp, "date").ok_or_else(|| anyhow!("no Date header on /exchange/status"))?;
+        parse_http_date_unix(&date).ok_or_else(|| anyhow!("unparseable Date header: {date}"))
     }
 }
 
@@ -569,11 +669,17 @@ pub fn parse_fills(
         .unwrap_or(&empty);
     let mut out = Vec::new();
     for f in fills {
+        // Side: legacy `side` OR the current generation's `outcome_side`
+        // (yes/no in both). Same field feeds both order-match fallback and price.
+        let fill_side = f
+            .get("side")
+            .or_else(|| f.get("outcome_side"))
+            .and_then(|v| v.as_str());
         // order match
         let matches = match order_id {
             Some(id) => f.get("order_id").and_then(|v| v.as_str()) == Some(id),
             None => {
-                let side_ok = f.get("side").and_then(|v| v.as_str()) == Some(side);
+                let side_ok = fill_side == Some(side);
                 let ts_ok = fill_ts_ms(f).is_none_or(|t| t >= since_ms - 2_000);
                 side_ok && ts_ok
             }
@@ -589,12 +695,31 @@ pub fn parse_fills(
         if count <= 0 {
             continue;
         }
-        // Our side's price: <side>_price, falling back to <side>_price_dollars.
+        // Our side's price, tolerating BOTH schema generations:
+        //   (a) legacy per-side field: `<side>_price` / `<side>_price_dollars`
+        //   (b) current single YES-space field: `yes_price_dollars` / `yes_price`
+        //       — fold to our side (NO price = 100 − yes-cents).
+        // (a) also transparently catches the current YES fill, whose
+        // `yes_price_dollars` IS `<side>_price_dollars` when side=="yes".
         let price_key = format!("{side}_price");
-        let price = f.get(&price_key).and_then(price_to_cents).or_else(|| {
-            f.get(format!("{price_key}_dollars").as_str())
-                .and_then(price_to_cents)
-        });
+        let price = f
+            .get(&price_key)
+            .and_then(price_to_cents)
+            .or_else(|| {
+                f.get(format!("{price_key}_dollars").as_str())
+                    .and_then(price_to_cents)
+            })
+            .or_else(|| {
+                let yes = f
+                    .get("yes_price_dollars")
+                    .and_then(price_to_cents)
+                    .or_else(|| f.get("yes_price").and_then(price_to_cents))?;
+                Some(if side.eq_ignore_ascii_case("no") {
+                    100 - yes
+                } else {
+                    yes
+                })
+            });
         let Some(price_cents) = price else { continue };
         out.push(ParsedFill {
             count,
@@ -859,8 +984,95 @@ mod tests {
     }
 
     #[test]
+    fn parse_fills_current_schema_outcome_side_yes() {
+        // Current generation: `outcome_side`, single YES-space `yes_price_dollars`,
+        // `count_fp`, `fill_id`, `order_id`. A YES fill reads yes_price_dollars
+        // directly (it IS <side>_price_dollars when side=="yes").
+        let body = serde_json::json!({"fills": [
+            {"order_id": "O1", "fill_id": "F1", "outcome_side": "yes",
+             "count_fp": "3.00", "yes_price_dollars": "0.41",
+             "created_time": "2026-07-23T18:00:01Z"},
+            // foreign order, excluded by order_id match
+            {"order_id": "O2", "fill_id": "F2", "outcome_side": "yes",
+             "count_fp": "9.00", "yes_price_dollars": "0.50"},
+        ]});
+        let fills = parse_fills(&body, Some("O1"), "yes", 0);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].count, 3);
+        assert_eq!(fills[0].price_cents, 41);
+    }
+
+    #[test]
+    fn parse_fills_current_schema_no_side_folds_yes_price() {
+        // Current generation NO fill: the exchange reports the YES-book price in
+        // `yes_price_dollars`; our NO cost = 100 − yes-cents. 0.62 -> NO 38c.
+        let body = serde_json::json!({"fills": [
+            {"order_id": "N1", "fill_id": "FN1", "outcome_side": "no",
+             "count_fp": "5.00", "yes_price_dollars": "0.6200",
+             "created_time": "2026-07-23T18:00:03Z"},
+        ]});
+        let fills = parse_fills(&body, Some("N1"), "no", 0);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].count, 5);
+        assert_eq!(fills[0].price_cents, 38); // 100 - 62
+    }
+
+    #[test]
+    fn parse_fills_current_schema_no_fold_via_time_fallback() {
+        // NO fold AND the order_id-less fallback path (lost-ack recovery): match by
+        // outcome_side + submit-time window, fold yes_price_dollars to NO cents.
+        let body = serde_json::json!({"fills": [
+            {"fill_id": "F", "outcome_side": "no", "count_fp": "2.00",
+             "yes_price_dollars": "0.55", "created_time": "2026-07-23T18:00:05Z"},
+            // wrong side, excluded
+            {"fill_id": "G", "outcome_side": "yes", "count_fp": "4.00",
+             "yes_price_dollars": "0.50", "created_time": "2026-07-23T18:00:05Z"},
+        ]});
+        let since = chrono::DateTime::parse_from_rfc3339("2026-07-23T18:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let fills = parse_fills(&body, None, "no", since);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].count, 2);
+        assert_eq!(fills[0].price_cents, 45); // 100 - 55
+    }
+
+    #[test]
     fn fills_summary_empty_is_zero() {
         assert_eq!(fills_summary(&[]), (0, None, None));
+    }
+
+    #[test]
+    fn parse_api_error_nested_flat_and_string() {
+        // Nested (the common Kalshi shape).
+        let a = parse_api_error(r#"{"error":{"code":"order_already_exists","message":"dup"}}"#);
+        assert_eq!(a.code.as_deref(), Some("order_already_exists"));
+        assert_eq!(a.message.as_deref(), Some("dup"));
+        // Flat.
+        let b = parse_api_error(r#"{"code":"insufficient_balance","message":"broke"}"#);
+        assert_eq!(b.code.as_deref(), Some("insufficient_balance"));
+        // {"error":"string"} variant.
+        let c = parse_api_error(r#"{"error":"rate limited"}"#);
+        assert_eq!(c.code, None);
+        assert_eq!(c.message.as_deref(), Some("rate limited"));
+        // Non-JSON → empty.
+        let d = parse_api_error("<html>502</html>");
+        assert_eq!(d, ApiError::default());
+    }
+
+    #[test]
+    fn parse_http_date_reads_imf_fixdate() {
+        // RFC 7231 IMF-fixdate (the HTTP Date header form). 1994-11-06 08:49:37Z.
+        assert_eq!(
+            parse_http_date_unix("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        // Trailing/leading whitespace tolerated.
+        assert_eq!(
+            parse_http_date_unix("  Sun, 06 Nov 1994 08:49:37 GMT "),
+            Some(784_111_777)
+        );
+        assert_eq!(parse_http_date_unix("not a date"), None);
     }
 
     #[test]
@@ -989,12 +1201,12 @@ mod tests {
         // FIXED coid so both requests are byte-identical.
         let coid = "nestor-dup-probe-fixed-0001";
 
-        let (s1, b1) = k
+        let (s1, b1, _r1) = k
             .place_limit_buy_raw(&ticker, "yes", 1, 2, coid)
             .await
             .expect("first POST");
         println!("=== DUP-COID PROBE first  === HTTP {s1}\n{b1}");
-        let (s2, b2) = k
+        let (s2, b2, _r2) = k
             .place_limit_buy_raw(&ticker, "yes", 1, 2, coid)
             .await
             .expect("second POST");
