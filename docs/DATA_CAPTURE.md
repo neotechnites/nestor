@@ -13,6 +13,24 @@ Nothing is deleted.
 | `data/streak_week1.jsonl` | `streak::strategy::enter` / `log_skip` | every signal — traded, skipped, or risk-rejected | participation record (below), each carrying the order-book snapshot (`book`) taken at the decision moment |
 | `settlements.jsonl` | `engine::reconcile::run` | 60s sweep | `event=settlement, strategy, ticker, won, pnl, result, ts` |
 | `data/state.json` | risk layer (atomic) | on every fill/settlement | live bankroll, open positions, settled tail, kill-switch |
+| `data/streak_week1.jsonl` (derive rows) | `streak::strategy::derive_prev` | each decisive derivation | `event=streak_derive, series, ticker, close_unix, predicted, derived_avg, derived_margin_bp, strike, buf_samples, used` |
+| `data/derive_verify.jsonl` | `streak::strategy::verify_pending` | when official result lands for a derived window | `event=derive_verify, series, ticker, close_unix, predicted, official, used, agree, derived_avg, derived_margin_bp` |
+| `data/derive_disabled` (marker) | `streak::strategy::verify_pending` | on a USED-derivation disagreement | presence disables derivation at startup AND at every runtime check; contents note the offending ticker/prediction |
+
+### Derived fourth result (derive-fourth)
+
+Kalshi's REST result lags the close (closed 0-10s → finalized+`result` ~10s →
+settled-filter 36s+), often past the streak sleeve's 60s entry window. Since
+Kalshi crypto settles on a **60s BRTI average ending at close**, the sampler
+takes one Coinbase spot tick per coin per second across the final
+`SAMPLE_WINDOW_SECS` (75s) before each boundary and `derive::derive` reconstructs
+that average, comparing it to the just-closed market's `floor_strike` with a
+`DERIVE_MARGIN` (5bp) decisiveness band. A decisive result synthesizes the 4th
+window so the streak can be evaluated at close+0s; entries built on it carry
+`derived_fourth:true, derived_avg, derived_margin_bp` in their `streak_signal`
+row. Every derivation is verified against the official result when it arrives; a
+used-derivation disagreement is a CRITICAL alert and trips `data/derive_disabled`
+(the already-risk-managed position stays).
 
 Order-book snapshots (`GET /markets/{ticker}/orderbook`) are fetched **only at
 decision moments** (one extra request per signal), never per poll.
