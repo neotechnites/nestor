@@ -671,8 +671,8 @@ mod tests {
         assert_eq!(p.fill_count, 2);
         assert_eq!(p.remaining_count, 0);
         assert_eq!(p.fill_price_cents, Some(41));
-        // 0.0145 * 2 contracts = 0.029 -> 3¢
-        assert!((p.actual_fee_cents.unwrap() - 3.0).abs() < 1e-9);
+        // 0.0145 * 2 contracts = 0.029 dollars = 2.9¢ — kept at sub-cent truth.
+        assert!((p.actual_fee_cents.unwrap() - 2.9).abs() < 1e-9);
         assert_eq!(p.ts_ms, Some(1_752_000_000_123));
     }
 
