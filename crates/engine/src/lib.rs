@@ -13,6 +13,7 @@ pub mod reconcile;
 pub mod risk;
 pub mod selftest;
 pub mod sizing;
+pub mod spot;
 pub mod state;
 pub mod strategy;
 pub mod weather;

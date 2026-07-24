@@ -4,5 +4,6 @@
 //! both coins, fees in). Week-1 live purpose is MECHANICS measurement, not
 //! efficacy — see `data/streak_week1.jsonl`.
 
+pub mod derive;
 pub mod signal;
 pub mod strategy;
