@@ -6,7 +6,7 @@
 
 [trading]
 env = "paper"          # paper | live  (NESTOR_ENV overrides)
-bankroll = 84.0       # starting equity, used only to seed fresh state
+bankroll = 100.0       # starting equity, used only to seed fresh state
 
 [risk]
 fraction = 0.05             # fraction of bankroll per fraction-sized trade (unused by streak)
