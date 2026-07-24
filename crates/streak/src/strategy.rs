@@ -313,7 +313,8 @@ impl Streak {
                 rec["fill_price"] = json!(fill.fill_price_cents);
                 rec["filled_count"] = json!(fill.filled);
                 rec["canceled_count"] = json!(fill.canceled);
-                rec["fee_cents"] = json!(fee_cents);
+                rec["fee_cents"] = json!(fee_cents); // our pre-trade estimate
+                rec["actual_fee_cents"] = json!(fill.actual_fee_cents); // exchange truth
                 rec["order_id"] = json!(fill.order_id);
                 if !fill.simulated {
                     rec["order"] = response.clone();

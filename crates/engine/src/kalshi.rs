@@ -223,9 +223,32 @@ impl Kalshi {
         Ok(resp.market)
     }
 
-    /// Place a limit buy. `price_cents` = the price in cents (1-99) for the chosen
-    /// `side` — placed as `yes_price` for a YES order, `no_price` for a NO order
-    /// (Kalshi keys the limit to the side being bought). Signed.
+    /// Place a taker limit buy via the V2 create-order endpoint
+    /// (`POST /trade-api/v2/portfolio/events/orders`). The legacy
+    /// `POST /trade-api/v2/portfolio/orders` was retired (410 on prod AND demo;
+    /// docs list it deprecated no earlier than 2026-05-06 but it is already dead).
+    ///
+    /// The call boundary stays strategy-friendly: `side` is "yes"/"no" and
+    /// `price_cents` is the whole-cent price (1-99) for THAT side. We translate to
+    /// the V2 single-book YES-leg semantics internally.
+    ///
+    /// V2 SEMANTICS (docs.kalshi.com/api-reference/orders/create-order-v2):
+    /// "bid means buy YES, ask means sell YES. Selling YES economically equals
+    /// buying NO at 1 - price, but you express it as an ask on the YES book at the
+    /// corresponding YES price. For example, buying NO at 0.40 would be posting an
+    /// ask at 0.60 on the YES side." So:
+    ///   - buy YES @ p¢  -> side "bid",  price = p/100 dollars
+    ///   - buy NO  @ p¢  -> side "ask",  price = (100 - p)/100 dollars  (YES price)
+    ///
+    /// Get this wrong and every NO order is catastrophically mispriced.
+    ///
+    /// count/price are fixed-point STRINGS ("1.00", "0.6000"). ALL orders are
+    /// taker-only: `time_in_force=immediate_or_cancel` +
+    /// `self_trade_prevention_type=taker_at_cross` — the exchange fills what it can
+    /// against resting liquidity and cancels the remainder itself, natively
+    /// enforcing our no-resting-orders doctrine. The 201 response carries
+    /// SYNCHRONOUS fill truth (fill_count/remaining_count/average_fill_price/
+    /// average_fee_paid/ts_ms) — see [`parse_place_response`]. Signed.
     pub async fn place_limit_buy(
         &self,
         ticker: &str,
@@ -234,20 +257,18 @@ impl Kalshi {
         price_cents: i64,
         client_order_id: &str,
     ) -> Result<serde_json::Value> {
-        let path = format!("{PREFIX}/portfolio/orders");
+        let path = format!("{PREFIX}/portfolio/events/orders");
         let headers = self.sign_headers("POST", &path)?;
-        let price_key = if side == "no" {
-            "no_price"
-        } else {
-            "yes_price"
-        };
         let mut map = serde_json::Map::new();
         map.insert("ticker".into(), json!(ticker));
-        map.insert("action".into(), json!("buy"));
-        map.insert("side".into(), json!(side));
-        map.insert("type".into(), json!("limit"));
-        map.insert("count".into(), json!(count));
-        map.insert(price_key.into(), json!(price_cents));
+        map.insert("side".into(), json!(book_side(side)));
+        map.insert("count".into(), json!(count_fp(count)));
+        map.insert("price".into(), json!(order_price_dollars(side, price_cents)));
+        map.insert("time_in_force".into(), json!("immediate_or_cancel"));
+        map.insert(
+            "self_trade_prevention_type".into(),
+            json!("taker_at_cross"),
+        );
         map.insert("client_order_id".into(), json!(client_order_id));
         let body = serde_json::Value::Object(map);
         let mut req = self.http.post(format!("{}{path}", api_base())).json(&body);
@@ -285,19 +306,29 @@ impl Kalshi {
     /// 2026-07-23). Parsing lives in [`parse_fills`] (tolerant, unit-tested);
     /// callers keep the raw JSON in their records so week-1 validates the schema.
     pub async fn fills(&self, ticker: &str) -> Result<serde_json::Value> {
-        let path = format!("{PREFIX}/portfolio/fills?ticker={ticker}&limit=200");
+        // Kalshi signs `timestamp + METHOD + path` over the PATH ONLY — the query
+        // string must NOT be in the signed message (including it returns 401).
+        // Sign the bare path; attach the filters via reqwest's query builder.
+        let path = format!("{PREFIX}/portfolio/fills");
         let headers = self.sign_headers("GET", &path)?;
-        let mut req = self.http.get(format!("{}{path}", api_base()));
+        let mut req = self
+            .http
+            .get(format!("{}{path}", api_base()))
+            .query(&[("ticker", ticker), ("limit", "200")]);
         for (k, v) in headers {
             req = req.header(k, v);
         }
         Ok(req.send().await?.error_for_status()?.json().await?)
     }
 
-    /// Cancel a resting order (signed). Mandatory cleanup for any unfilled
-    /// remainder — a stranded resting order violates the taker-only doctrine.
+    /// Cancel an order via the V2 endpoint
+    /// (`DELETE /trade-api/v2/portfolio/events/orders/{order_id}`; the legacy
+    /// `/portfolio/orders/{id}` path shares the retired-order deprecation). With
+    /// IOC taker orders the exchange already cancels any remainder for us, so this
+    /// is now a belt-and-suspenders cleanup rather than the primary mechanism.
+    /// Signed.
     pub async fn cancel_order(&self, order_id: &str) -> Result<serde_json::Value> {
-        let path = format!("{PREFIX}/portfolio/orders/{order_id}");
+        let path = format!("{PREFIX}/portfolio/events/orders/{order_id}");
         let headers = self.sign_headers("DELETE", &path)?;
         let mut req = self.http.delete(format!("{}{path}", api_base()));
         for (k, v) in headers {
@@ -329,6 +360,119 @@ pub struct ParsedFill {
     pub price_cents: i64,
     /// Fill creation time in unix ms (None if unparseable).
     pub ts_ms: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
+// V2 create-order translation (call boundary: side "yes"/"no" + whole cents).
+// ---------------------------------------------------------------------------
+
+/// Map our side ("yes"/"no") to the V2 single-book YES-leg `side`.
+/// bid = buy YES; ask = sell YES = buy NO. (create-order-v2 docs.)
+pub fn book_side(side: &str) -> &'static str {
+    if side.eq_ignore_ascii_case("no") {
+        "ask"
+    } else {
+        "bid"
+    }
+}
+
+/// Count as a fixed-point string ("1" -> "1.00"), per FixedPointCount.
+pub fn count_fp(count: i64) -> String {
+    format!("{count}.00")
+}
+
+/// The YES-book limit price (fixed-point dollars string) for buying `side` at
+/// `price_cents`. YES: p/100. NO: (100 - p)/100 — you post an ASK at the
+/// corresponding YES price (buy NO @ 40¢ -> ask @ "0.6000"). Getting this
+/// inverted mis-prices every NO order, so it is unit-tested below.
+pub fn order_price_dollars(side: &str, price_cents: i64) -> String {
+    let yes_cents = if side.eq_ignore_ascii_case("no") {
+        100 - price_cents
+    } else {
+        price_cents
+    };
+    format!("{:.4}", yes_cents as f64 / 100.0)
+}
+
+/// Translate a YES-book fill price (dollars) back into OUR side's whole cents.
+/// YES: round(p*100). NO: 100 - round(p*100) (inverse of [`order_price_dollars`]).
+fn yes_dollars_to_side_cents(side: &str, yes_dollars: f64) -> i64 {
+    let yes_cents = (yes_dollars * 100.0).round() as i64;
+    if side.eq_ignore_ascii_case("no") {
+        100 - yes_cents
+    } else {
+        yes_cents
+    }
+}
+
+/// Synchronous fill truth parsed from the 201 create-order-v2 response — the
+/// PRIMARY record of what happened (fills poll is only a cross-check now).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedOrder {
+    pub order_id: Option<String>,
+    /// Contracts filled immediately (0 for an IOC that crossed nothing).
+    pub fill_count: i64,
+    /// Unfilled remainder — the exchange has already canceled it for an IOC.
+    pub remaining_count: i64,
+    /// VWAP fill price in OUR side's whole cents (None when fill_count == 0).
+    pub fill_price_cents: Option<i64>,
+    /// ACTUAL total fee paid in cents (average_fee_paid × fill_count). Gold for
+    /// the mechanics week — recorded alongside our own estimate. None if unfilled.
+    pub actual_fee_cents: Option<i64>,
+    /// Matching-engine timestamp (unix ms) — used as ts_ack / ts_fill.
+    pub ts_ms: Option<i64>,
+}
+
+/// Parse the create-order-v2 201 response. `side` ("yes"/"no") is needed to map
+/// the YES-book `average_fill_price` back to our side's cents. Tolerant of the
+/// response being wrapped in an `{"order": {...}}` envelope vs flat.
+pub fn parse_place_response(resp: &serde_json::Value, side: &str) -> PlacedOrder {
+    // Fields may sit at the top level or under an "order" envelope.
+    let get = |k: &str| resp.get(k).or_else(|| resp.get("order").and_then(|o| o.get(k)));
+
+    let order_id = get("order_id")
+        .or_else(|| resp.get("order").and_then(|o| o.get("id")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let fill_count = get("fill_count").and_then(count_to_i64).unwrap_or(0);
+    let remaining_count = get("remaining_count").and_then(count_to_i64).unwrap_or(0);
+
+    let (fill_price_cents, actual_fee_cents) = if fill_count > 0 {
+        let px = get("average_fill_price")
+            .and_then(dollars_f64)
+            .map(|d| yes_dollars_to_side_cents(side, d));
+        let fee = get("average_fee_paid")
+            .and_then(dollars_f64)
+            // average_fee_paid is per-contract dollars -> total cents.
+            .map(|per| (per * fill_count as f64 * 100.0).round() as i64);
+        (px, fee)
+    } else {
+        (None, None)
+    };
+
+    let ts_ms = get("ts_ms").and_then(|v| v.as_i64()).or_else(|| {
+        get("ts_ms")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i64>().ok())
+    });
+
+    PlacedOrder {
+        order_id,
+        fill_count,
+        remaining_count,
+        fill_price_cents,
+        actual_fee_cents,
+        ts_ms,
+    }
+}
+
+/// A fixed-point-dollars field ("0.6000" or 0.6) -> f64 dollars.
+fn dollars_f64(v: &serde_json::Value) -> Option<f64> {
+    if let Some(n) = v.as_f64() {
+        return Some(n);
+    }
+    v.as_str().and_then(|s| s.parse::<f64>().ok())
 }
 
 /// Extract the order id from a place-order response, tolerating schema variants
@@ -470,6 +614,100 @@ pub fn parse_markets(body: &str) -> Result<Vec<Market>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn book_side_maps_yes_bid_no_ask() {
+        assert_eq!(book_side("yes"), "bid");
+        assert_eq!(book_side("YES"), "bid");
+        assert_eq!(book_side("no"), "ask");
+        assert_eq!(book_side("NO"), "ask");
+        // anything not "no" is a YES bid (defensive default)
+        assert_eq!(book_side("weird"), "bid");
+    }
+
+    #[test]
+    fn count_fp_is_two_decimals() {
+        assert_eq!(count_fp(1), "1.00");
+        assert_eq!(count_fp(52), "52.00");
+    }
+
+    #[test]
+    fn order_price_yes_is_identity_no_is_complement() {
+        // YES @ 40¢ -> post bid at 0.40 on the YES book.
+        assert_eq!(order_price_dollars("yes", 40), "0.4000");
+        assert_eq!(order_price_dollars("yes", 2), "0.0200");
+        assert_eq!(order_price_dollars("yes", 99), "0.9900");
+        // NO @ 40¢ -> post ASK at 0.60 on the YES book (docs example).
+        assert_eq!(order_price_dollars("no", 40), "0.6000");
+        assert_eq!(order_price_dollars("no", 2), "0.9800");
+        assert_eq!(order_price_dollars("no", 95), "0.0500");
+    }
+
+    #[test]
+    fn fill_price_translation_round_trips_our_side() {
+        // YES fill at YES-book 0.4100 -> 41¢ for us.
+        assert_eq!(yes_dollars_to_side_cents("yes", 0.41), 41);
+        // NO order filled at YES-book 0.6200 -> our NO cost is 38¢ (a BETTER
+        // fill than the 40¢ limit, exactly as the ask semantics intend).
+        assert_eq!(yes_dollars_to_side_cents("no", 0.62), 38);
+    }
+
+    #[test]
+    fn parse_place_response_filled_yes() {
+        let resp = serde_json::json!({
+            "order_id": "ord_1",
+            "fill_count": "2.00",
+            "remaining_count": "0.00",
+            "average_fill_price": "0.4100",
+            "average_fee_paid": "0.0145",
+            "ts_ms": 1_752_000_000_123i64
+        });
+        let p = parse_place_response(&resp, "yes");
+        assert_eq!(p.order_id.as_deref(), Some("ord_1"));
+        assert_eq!(p.fill_count, 2);
+        assert_eq!(p.remaining_count, 0);
+        assert_eq!(p.fill_price_cents, Some(41));
+        // 0.0145 * 2 contracts = 0.029 -> 3¢
+        assert_eq!(p.actual_fee_cents, Some(3));
+        assert_eq!(p.ts_ms, Some(1_752_000_000_123));
+    }
+
+    #[test]
+    fn parse_place_response_filled_no_translates_price() {
+        // NO order: response average_fill_price is the YES-book price 0.6200.
+        let resp = serde_json::json!({
+            "order": {
+                "order_id": "ord_2",
+                "fill_count": "5.00",
+                "remaining_count": "0.00",
+                "average_fill_price": "0.6200",
+                "average_fee_paid": "0.0100",
+                "ts_ms": 1_752_000_000_999i64
+            }
+        });
+        let p = parse_place_response(&resp, "no");
+        assert_eq!(p.order_id.as_deref(), Some("ord_2"));
+        assert_eq!(p.fill_count, 5);
+        assert_eq!(p.fill_price_cents, Some(38)); // 100 - 62
+        assert_eq!(p.actual_fee_cents, Some(5)); // 0.01 * 5 = 0.05 -> 5¢
+    }
+
+    #[test]
+    fn parse_place_response_ioc_no_fill_empty_book() {
+        // IOC that crossed nothing: 201 with fill_count 0, no price/fee fields.
+        let resp = serde_json::json!({
+            "order_id": "ord_3",
+            "fill_count": "0.00",
+            "remaining_count": "1.00",
+            "ts_ms": 1_752_000_001_000i64
+        });
+        let p = parse_place_response(&resp, "yes");
+        assert_eq!(p.fill_count, 0);
+        assert_eq!(p.remaining_count, 1);
+        assert_eq!(p.fill_price_cents, None);
+        assert_eq!(p.actual_fee_cents, None);
+        assert_eq!(p.order_id.as_deref(), Some("ord_3"));
+    }
 
     #[test]
     fn parse_order_id_tolerates_variants() {
