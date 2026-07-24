@@ -662,10 +662,17 @@ pub fn parse_positions(body: &serde_json::Value) -> Vec<ExchangePosition> {
         }
         let side = if net > 0 { Side::Yes } else { Side::No };
         let count = net.abs();
-        // market_exposure: total CENTS of cost basis for the open side.
+        // Cost basis: Kalshi is migrating fixed-point fields to `_dollars`
+        // strings ("3.96"). Prefer `market_exposure_dollars` (dollars -> cents),
+        // fall back to legacy integer-cents `market_exposure`. Reading the
+        // dollar string through the int path would book "3.96" as 4 CENTS —
+        // a ~100x cost-basis error feeding orphan adoption + the divergence
+        // breaker (found via openpx comparative review, 2026-07-23).
         let exposure = r
-            .get("market_exposure")
-            .and_then(count_to_i64)
+            .get("market_exposure_dollars")
+            .and_then(dollars_f64)
+            .map(|d| (d * 100.0).round() as i64)
+            .or_else(|| r.get("market_exposure").and_then(count_to_i64))
             .filter(|&e| e > 0);
         let entry_cents = exposure.map(|e| ((e as f64 / count as f64).round() as i64).clamp(1, 99));
         out.push(ExchangePosition {
@@ -874,6 +881,21 @@ mod tests {
         assert_eq!(ps[1].entry_cents, Some(40));
         assert_eq!(ps[2].ticker, "KXBTC15M-D");
         assert_eq!(ps[2].entry_cents, None);
+    }
+
+    #[test]
+    fn parse_positions_prefers_dollars_fixed_point() {
+        // Kalshi fixed-point migration: `market_exposure_dollars: "3.96"` must
+        // read as 396 cents, NOT fall through the int path as 4 cents (~100x
+        // cost-basis error). Legacy int rows must still work.
+        let body = serde_json::json!({"market_positions": [
+            {"ticker": "A", "position": "9.00", "market_exposure_dollars": "3.96"},
+            {"ticker": "B", "position": -2, "market_exposure": 146}
+        ]});
+        let ps = parse_positions(&body);
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0].entry_cents, Some(44)); // 396c / 9 contracts
+        assert_eq!(ps[1].entry_cents, Some(73)); // legacy int path intact
     }
 
     #[test]
