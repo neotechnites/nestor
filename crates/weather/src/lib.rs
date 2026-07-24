@@ -152,7 +152,6 @@ impl Weather {
             limit_cents: ask,
             cluster: format!("weather:{date_str}"),
             sizing: SizingHint::Flat,
-            fill_wait_secs: 5,
         };
 
         let outcome = eng.execute(signal).await;
@@ -188,6 +187,14 @@ impl Weather {
                     ),
                 )
                 .await;
+            }
+            ExecOutcome::RecoveredFill { fill, .. } => {
+                rec["result"] = json!({"recovered": true, "count": fill.filled,
+                    "fill_price": fill.fill_price_cents});
+                logging::info(format!(
+                    "{}: RECOVERED FILL {}x {} (lost-ack)",
+                    c.code, fill.filled, mkt.ticker
+                ));
             }
             ExecOutcome::Missed { fill, .. } => {
                 rec["result"] = json!({"missed": true, "canceled": fill.canceled});

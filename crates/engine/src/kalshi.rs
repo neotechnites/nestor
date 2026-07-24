@@ -257,6 +257,28 @@ impl Kalshi {
         price_cents: i64,
         client_order_id: &str,
     ) -> Result<serde_json::Value> {
+        let (status, text) = self
+            .place_limit_buy_raw(ticker, side, count, price_cents, client_order_id)
+            .await?;
+        if !(200..300).contains(&status) {
+            // Keep the raw body in the error so the lost-ack recovery path
+            // (strategy::execute_live) and operators can see WHAT Kalshi said.
+            return Err(anyhow!("order placement HTTP {status}: {text}"));
+        }
+        serde_json::from_str(&text).context("parsing create-order response JSON")
+    }
+
+    /// Low-level create-order POST returning `(http_status, raw_body_text)` WITHOUT
+    /// treating a non-2xx as an error — so callers can inspect the exact response
+    /// (e.g. the duplicate-`client_order_id` demo probe, fix 2b). Signed.
+    pub async fn place_limit_buy_raw(
+        &self,
+        ticker: &str,
+        side: &str,
+        count: i64,
+        price_cents: i64,
+        client_order_id: &str,
+    ) -> Result<(u16, String)> {
         let path = format!("{PREFIX}/portfolio/events/orders");
         let headers = self.sign_headers("POST", &path)?;
         let mut map = serde_json::Map::new();
@@ -275,7 +297,10 @@ impl Kalshi {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        Ok(req.send().await?.error_for_status()?.json().await?)
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await?;
+        Ok((status, text))
     }
 
     /// Account cash balance in cents. Signed.
@@ -599,6 +624,60 @@ pub fn fills_summary(fills: &[ParsedFill]) -> (i64, Option<i64>, Option<i64>) {
     (total, Some(avg), ts)
 }
 
+/// One open position as the EXCHANGE sees it (from `/portfolio/positions`),
+/// normalized to our side/count/entry vocabulary. Kalshi's `market_positions`
+/// entries carry a signed net `position` (+ = net long YES, − = net long NO) and
+/// a `market_exposure` = current cost basis in CENTS of the open side. Zero-net
+/// rows (fully closed/settled) are dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExchangePosition {
+    pub ticker: String,
+    pub side: crate::risk::Side,
+    /// Absolute contract count held.
+    pub count: i64,
+    /// Average entry price per contract in whole cents, if derivable from
+    /// `market_exposure` (else None → the caller uses a conservative worst-case).
+    pub entry_cents: Option<i64>,
+}
+
+/// Parse a `/portfolio/positions` response into the currently-held positions.
+/// Tolerant of numeric-vs-string encodings. `market_exposure` is total cents at
+/// risk for the row; dividing by the contract count yields per-contract entry.
+pub fn parse_positions(body: &serde_json::Value) -> Vec<ExchangePosition> {
+    use crate::risk::Side;
+    let empty = vec![];
+    let rows = body
+        .get("market_positions")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let mut out = Vec::new();
+    for r in rows {
+        let ticker = match r.get("ticker").and_then(|v| v.as_str()) {
+            Some(t) => t.to_string(),
+            None => continue,
+        };
+        let net = r.get("position").and_then(count_to_i64).unwrap_or(0);
+        if net == 0 {
+            continue; // flat / settled row
+        }
+        let side = if net > 0 { Side::Yes } else { Side::No };
+        let count = net.abs();
+        // market_exposure: total CENTS of cost basis for the open side.
+        let exposure = r
+            .get("market_exposure")
+            .and_then(count_to_i64)
+            .filter(|&e| e > 0);
+        let entry_cents = exposure.map(|e| ((e as f64 / count as f64).round() as i64).clamp(1, 99));
+        out.push(ExchangePosition {
+            ticker,
+            side,
+            count,
+            entry_cents,
+        });
+    }
+    out
+}
+
 /// Parse `/portfolio/balance` into cents. Kalshi returns `{"balance": <int cents>}`.
 pub fn parse_balance(body: &str) -> Result<i64> {
     let v: serde_json::Value = serde_json::from_str(body).context("parsing balance")?;
@@ -770,6 +849,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_positions_reads_side_count_and_entry() {
+        use crate::risk::Side;
+        let body = serde_json::json!({
+            "market_positions": [
+                // net long YES 9 contracts, $3.96 exposure -> 44c entry
+                {"ticker": "KXBTC15M-A", "position": 9, "market_exposure": 396},
+                // net long NO 5 contracts, $2.00 exposure -> 40c entry
+                {"ticker": "KXETH15M-B", "position": -5, "market_exposure": 200},
+                // flat row dropped
+                {"ticker": "KXBTC15M-C", "position": 0, "market_exposure": 0},
+                // no exposure -> entry None
+                {"ticker": "KXBTC15M-D", "position": 2},
+            ]
+        });
+        let ps = parse_positions(&body);
+        assert_eq!(ps.len(), 3);
+        assert_eq!(ps[0].ticker, "KXBTC15M-A");
+        assert_eq!(ps[0].side, Side::Yes);
+        assert_eq!(ps[0].count, 9);
+        assert_eq!(ps[0].entry_cents, Some(44));
+        assert_eq!(ps[1].side, Side::No);
+        assert_eq!(ps[1].count, 5);
+        assert_eq!(ps[1].entry_cents, Some(40));
+        assert_eq!(ps[2].ticker, "KXBTC15M-D");
+        assert_eq!(ps[2].entry_cents, None);
+    }
+
+    #[test]
+    fn parse_positions_empty_is_empty() {
+        assert!(parse_positions(&serde_json::json!({})).is_empty());
+        assert!(parse_positions(&serde_json::json!({"market_positions": []})).is_empty());
+    }
+
+    #[test]
     fn parse_balance_reads_cents() {
         assert_eq!(parse_balance(r#"{"balance": 4237}"#).unwrap(), 4237);
         assert!(parse_balance(r#"{"nope": 1}"#).is_err());
@@ -804,5 +917,46 @@ mod tests {
     fn parse_markets_empty_means_series_absent() {
         let markets = parse_markets(r#"{"markets": [], "cursor": ""}"#).unwrap();
         assert!(markets.is_empty());
+    }
+
+    /// EMPIRICAL duplicate-`client_order_id` probe (fix 2b). Places the SAME 1ct
+    /// 2¢ IOC order twice with a FIXED client_order_id against an empty demo book,
+    /// printing BOTH raw (status, body) responses — settling whether Kalshi
+    /// rejects a duplicate coid (error, safe) or echoes the original order (200,
+    /// the dangerous branch that would let a re-fire double-book P&L).
+    ///
+    /// Ignored (needs demo keys + network). Run with:
+    ///   KALSHI_API_BASE=https://demo-api.kalshi.co \
+    ///   KALSHI_API_KEY_ID=<id> KALSHI_PRIVATE_KEY_PATH=secrets/Demo.txt \
+    ///   NESTOR_TEST_TICKER=<open-demo-ticker> \
+    ///   cargo test -p engine demo_duplicate_coid -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn demo_duplicate_coid_behavior() {
+        let key_id = std::env::var("KALSHI_API_KEY_ID").expect("KALSHI_API_KEY_ID");
+        let key_path = std::env::var("KALSHI_PRIVATE_KEY_PATH").expect("KALSHI_PRIVATE_KEY_PATH");
+        let ticker = std::env::var("NESTOR_TEST_TICKER").expect("NESTOR_TEST_TICKER");
+        let k = Kalshi::authenticated(key_id, &key_path).unwrap();
+        // FIXED coid so both requests are byte-identical.
+        let coid = "nestor-dup-probe-fixed-0001";
+
+        let (s1, b1) = k
+            .place_limit_buy_raw(&ticker, "yes", 1, 2, coid)
+            .await
+            .expect("first POST");
+        println!("=== DUP-COID PROBE first  === HTTP {s1}\n{b1}");
+        let (s2, b2) = k
+            .place_limit_buy_raw(&ticker, "yes", 1, 2, coid)
+            .await
+            .expect("second POST");
+        println!("=== DUP-COID PROBE second === HTTP {s2}\n{b2}");
+        println!(
+            "=== VERDICT === first={s1} second={s2} — {}",
+            if s2 >= 400 {
+                "duplicate REJECTED (safe: a re-fire cannot double-book)"
+            } else {
+                "duplicate ECHOED/ACCEPTED (verify order_id identity before trusting re-fires)"
+            }
+        );
     }
 }

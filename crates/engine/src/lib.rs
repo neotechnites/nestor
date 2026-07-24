@@ -8,6 +8,7 @@ pub mod calibrate;
 pub mod config;
 pub mod kalshi;
 pub mod logging;
+pub mod net;
 pub mod reconcile;
 pub mod risk;
 pub mod selftest;

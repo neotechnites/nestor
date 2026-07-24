@@ -9,10 +9,8 @@
 //! Usage: `nestor <run|streak|streak-once|calibrate|reconcile|probe-weather|
 //!                 backtest-lock|selftest-order|resume|weather|lock|lock-once>`
 
-use std::sync::Mutex;
-
 use anyhow::{Context, Result};
-use engine::config::Settings;
+use engine::config::{self, Settings};
 use engine::state::JsonStore;
 use engine::{Engine, Mode, RiskManager, Strategy};
 
@@ -69,6 +67,11 @@ async fn main() -> Result<()> {
     // Live order-path self-test (T007): places ONE tiny real order to prove auth
     // + signing + order placement before any strategy trades live. Needs keys.
     // Usage: nestor selftest-order <ticker> <yes_price_cents> [count]
+    //
+    // OPERATOR-ONLY: this places a real order that BYPASSES the risk layer
+    // entirely (no sizing, no caps, no kill-switch, no state) — it talks straight
+    // to the Kalshi client. Only run it by hand with a tiny known price/count to
+    // validate plumbing; never wire it into an automated path.
     if which == "selftest-order" {
         let ticker = std::env::args()
             .nth(2)
@@ -92,7 +95,32 @@ async fn main() -> Result<()> {
 
     // Secrets + mode come from env (env wins over the file's default).
     let mode = Mode::from_env(&std::env::var("NESTOR_ENV").unwrap_or(settings.trading.env.clone()));
-    let bankroll = env_f64("NESTOR_BANKROLL", settings.trading.bankroll);
+    let live = mode == Mode::Live;
+
+    // GATE STANDALONE STRATEGIES OUT OF LIVE (fix 6): a standalone strategy loop
+    // has NO reconcile task, so there is NO kill-switch (settlement never runs
+    // intraday and the divergence/orphan checks never fire). Only `run` wires the
+    // reconcile task. Paper standalone stays allowed. `streak-once`/`lock-once`
+    // are gated too — they still place a real order with no kill-switch.
+    if live
+        && matches!(
+            which.as_str(),
+            "streak" | "streak-once" | "lock" | "lock-once" | "weather"
+        )
+    {
+        anyhow::bail!(
+            "`{which}` standalone is disabled in live mode — use `run` (the kill-switch \
+             requires the reconcile task). Paper standalone is still allowed."
+        );
+    }
+
+    // SEED PINNING (fix 4): live bankroll MUST be explicit (env or config) and
+    // within the hard cap; paper falls back to the built-in default. Refuses to
+    // start on a silent/oversized seed.
+    let env_bankroll = std::env::var("NESTOR_BANKROLL")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
+    let bankroll = config::resolve_bankroll(live, env_bankroll, settings.trading.bankroll)?;
 
     // Single-writer lock: only one process may hold the state file. Refuses to
     // start if another nestor (e.g. a stray `lock` or `weather`) is already writing
@@ -101,7 +129,10 @@ async fn main() -> Result<()> {
     let state_path = env_str("NESTOR_STATE_PATH", "data/state.json");
     let _state_lock = acquire_state_lock(&state_path)?;
     let store = Box::new(JsonStore::new(state_path));
-    let mut risk = RiskManager::load_or_init(settings.risk, store, bankroll)?;
+    // STATE INTEGRITY (fix 3b): in live, a MISSING state file is refused unless the
+    // operator explicitly passes `--fresh-state` (accepting a fresh ledger).
+    let allow_fresh = std::env::args().any(|a| a == "--fresh-state");
+    let mut risk = RiskManager::load_or_init(settings.risk, store, bankroll, live, allow_fresh)?;
 
     // `resume` clears a persisted kill-switch halt (operator action after review).
     if which == "resume" {
@@ -126,14 +157,7 @@ async fn main() -> Result<()> {
         engine::Kalshi::public()
     };
 
-    let eng = Engine {
-        kalshi,
-        http: engine::http_client(),
-        mode,
-        risk: Mutex::new(risk),
-        cities: settings.cities,
-        exec_lock: tokio::sync::Mutex::new(()),
-    };
+    let eng = Engine::new(kalshi, engine::http_client(), mode, risk, settings.cities);
 
     // `reconcile` is not a strategy: it closes open positions against Kalshi's
     // settled result and realizes P&L (T004). Everything else is a strategy.
@@ -155,17 +179,22 @@ async fn main() -> Result<()> {
     // production); `streak-once` runs a single pass for testing.
     if which == "streak" || which == "streak-once" {
         let strat = streak::strategy::Streak::new();
+        let mut backoff = 0u32;
         loop {
-            if let Err(e) = strat.run(&eng).await {
-                eprintln!("streak: scan error: {e}");
+            match strat.run(&eng).await {
+                Ok(()) => backoff = 0,
+                Err(e) => {
+                    eprintln!("streak: scan error: {e}");
+                    // Only rate-limit/server-class errors back off (fix 5).
+                    backoff = next_backoff(&e, backoff);
+                }
             }
             if which == "streak-once" {
                 break;
             }
-            tokio::time::sleep(streak::strategy::next_poll_delay(
-                chrono::Utc::now().timestamp(),
-            ))
-            .await;
+            let base =
+                streak::strategy::next_poll_delay(chrono::Utc::now().timestamp());
+            tokio::time::sleep(base.max(engine::net::backoff_delay(backoff))).await;
         }
         return Ok(());
     }
@@ -196,15 +225,18 @@ async fn main() -> Result<()> {
     strat.run(&eng).await
 }
 
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
 fn env_str(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.into())
+}
+
+/// Next backoff step for a loop error (fix 5): increment only for retryable
+/// (429/5xx) statuses so a rate-limit/outage backs off exponentially; any other
+/// error resets to 0 (backoff is for bans/outages, not logic errors).
+fn next_backoff(err: &anyhow::Error, current: u32) -> u32 {
+    match engine::net::http_status(err) {
+        Some(s) if engine::net::is_retryable_status(s) => current.saturating_add(1),
+        _ => 0,
+    }
 }
 
 /// The production runtime: one process, one shared in-memory RiskManager, every
@@ -224,12 +256,29 @@ async fn run_all(eng: Engine) -> Result<()> {
     {
         let e = eng.clone();
         tokio::spawn(async move {
+            let mut backoff = 0u32;
             loop {
                 let r = std::panic::AssertUnwindSafe(engine::reconcile::run(&e))
                     .catch_unwind()
                     .await;
-                report("settlement", r);
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                // reconcile's exchange-truth pass uses SIGNED calls (positions/
+                // balance): feed the consecutive-failure + 401 breakers (fix 5,
+                // addendum #3) and back off on rate-limit/server-class errors.
+                match r {
+                    Ok(Ok(())) => {
+                        e.note_signed_success();
+                        backoff = 0;
+                    }
+                    Ok(Err(err)) => {
+                        eprintln!("settlement task error: {err}");
+                        let status = engine::net::http_status(&err);
+                        e.note_signed_failure(status).await;
+                        backoff = next_backoff(&err, backoff);
+                    }
+                    Err(_) => eprintln!("settlement task PANICKED — continuing"),
+                }
+                let base = Duration::from_secs(60);
+                tokio::time::sleep(base.max(engine::net::backoff_delay(backoff))).await;
             }
         });
     }
@@ -237,10 +286,15 @@ async fn run_all(eng: Engine) -> Result<()> {
     // Nightly compression: gzip yesterday's (and older) dated observation logs
     // (DATA CAPTURE 4 — keep everything, delete nothing; 10-20x shrink). Checks
     // hourly; only compresses files whose date < today, so live files are never
-    // touched.
+    // touched. Panic-caught like the other loops so a bad cycle can't kill it.
     tokio::spawn(async move {
         loop {
-            compress_old_obs_logs();
+            let r = std::panic::AssertUnwindSafe(async { compress_old_obs_logs() })
+                .catch_unwind()
+                .await;
+            if r.is_err() {
+                eprintln!("compress task PANICKED — continuing");
+            }
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });
@@ -251,15 +305,19 @@ async fn run_all(eng: Engine) -> Result<()> {
     // boundary. Lock (decay-dead) and weather (unverdicted) are parked — NOT
     // spawned.
     let streak = streak::strategy::Streak::new();
+    let mut backoff = 0u32;
     loop {
         let r = std::panic::AssertUnwindSafe(streak.run(&eng))
             .catch_unwind()
             .await;
+        match &r {
+            Ok(Ok(())) => backoff = 0,
+            Ok(Err(err)) => backoff = next_backoff(err, backoff),
+            Err(_) => {}
+        }
         report("streak", r);
-        tokio::time::sleep(streak::strategy::next_poll_delay(
-            chrono::Utc::now().timestamp(),
-        ))
-        .await;
+        let base = streak::strategy::next_poll_delay(chrono::Utc::now().timestamp());
+        tokio::time::sleep(base.max(engine::net::backoff_delay(backoff))).await;
     }
 }
 
