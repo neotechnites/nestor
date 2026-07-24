@@ -656,7 +656,15 @@ pub fn parse_positions(body: &serde_json::Value) -> Vec<ExchangePosition> {
             Some(t) => t.to_string(),
             None => continue,
         };
-        let net = r.get("position").and_then(count_to_i64).unwrap_or(0);
+        // Field-name migration (EMPIRICALLY OBSERVED on demo 2026-07-24): the
+        // live API returns `position_fp` ("-1.00" fixed-point string), NOT the
+        // legacy `position` int. Reading only `position` drops every row and
+        // silently blinds orphan adoption + the divergence breaker. Read both.
+        let net = r
+            .get("position")
+            .or_else(|| r.get("position_fp"))
+            .and_then(count_to_i64)
+            .unwrap_or(0);
         if net == 0 {
             continue; // flat / settled row
         }
@@ -899,6 +907,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_positions_reads_live_fp_schema_verbatim() {
+        // VERBATIM capture from demo /portfolio/positions 2026-07-24 — the
+        // schema that returned PARSED:[] before the position_fp fix.
+        let body = serde_json::json!({"cursor":"","market_positions":[
+            {"fees_paid_dollars":"0.013800","market_exposure_dollars":"0.730000",
+             "position_fp":"-1.00","realized_pnl_dollars":"0.000000",
+             "ticker":"KXHIGHNY-26JUL24-T81","total_traded_dollars":"0.730000"},
+            {"fees_paid_dollars":"0.004600","market_exposure_dollars":"0.070000",
+             "position_fp":"1.00","realized_pnl_dollars":"0.000000",
+             "ticker":"KXHIGHNY-26JUL24-B87.5","total_traded_dollars":"0.070000"}
+        ]});
+        let ps = parse_positions(&body);
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[0].count, 1);
+        assert_eq!(ps[0].entry_cents, Some(73)); // NO held at 73c
+        assert_eq!(ps[1].entry_cents, Some(7)); // YES held at 7c
+    }
+
+    #[test]
     fn parse_positions_empty_is_empty() {
         assert!(parse_positions(&serde_json::json!({})).is_empty());
         assert!(parse_positions(&serde_json::json!({"market_positions": []})).is_empty());
@@ -980,5 +1007,27 @@ mod tests {
                 "duplicate ECHOED/ACCEPTED (verify order_id identity before trusting re-fires)"
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod schema_probes {
+    use super::*;
+
+    /// Ignored network probe: print the RAW /portfolio/positions JSON from demo
+    /// (we hold real demo positions) to settle the position vs position_fp /
+    /// market_exposure vs _dollars field-name question empirically.
+    #[tokio::test]
+    #[ignore]
+    async fn demo_positions_schema_probe() {
+        let k = Kalshi::authenticated(
+            std::env::var("KALSHI_API_KEY_ID").unwrap(),
+            &std::env::var("KALSHI_PRIVATE_KEY_PATH").unwrap(),
+        )
+        .unwrap();
+        let raw = k.positions().await.unwrap();
+        println!("RAW POSITIONS:\n{}", serde_json::to_string_pretty(&raw).unwrap());
+        let parsed = parse_positions(&raw);
+        println!("PARSED: {parsed:?}");
     }
 }
