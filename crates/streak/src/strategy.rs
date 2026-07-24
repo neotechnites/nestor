@@ -185,7 +185,9 @@ impl Streak {
                 }
             }
         }
-        let raw = eng.kalshi.probe_series(series, "settled", 8).await?;
+        // Status-agnostic: settled-filter lags results (2026-07-24 live finding);
+        // fetch by close-time window, settled_windows() keeps non-empty results.
+        let raw = eng.kalshi.recent_closed(series, 3 * 3600, 12).await?;
         let windows = settled_windows(&raw);
         self.settled_cache
             .lock()

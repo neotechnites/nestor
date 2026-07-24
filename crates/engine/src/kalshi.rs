@@ -296,6 +296,37 @@ impl Kalshi {
         Ok(out)
     }
 
+    /// Recently-closed markets for a series, STATUS-AGNOSTIC (time-bounded).
+    /// The `status=settled` filter lags the actual result: post-close markets
+    /// progress closed→determined→finalized and carry a usable `result` before
+    /// the settled filter includes them (live finding 2026-07-24 — 3/3 streak
+    /// entries skipped `prev_not_settled` inside the 60s window). Callers filter
+    /// on non-empty `result`, so status is irrelevant here.
+    pub async fn recent_closed(
+        &self,
+        series_ticker: &str,
+        lookback_secs: i64,
+        limit: u32,
+    ) -> Result<Vec<Market>> {
+        let now = chrono::Utc::now().timestamp();
+        let limit = limit.to_string();
+        let min_ts = (now - lookback_secs).to_string();
+        let max_ts = now.to_string();
+        let body = self
+            .http
+            .get(format!("{}{PREFIX}/markets", api_base()))
+            .query(&[
+                ("series_ticker", series_ticker),
+                ("min_close_ts", min_ts.as_str()),
+                ("max_close_ts", max_ts.as_str()),
+                ("limit", limit.as_str()),
+            ])
+            .send()
+            .await?;
+        let text = text_or_error(body, "recent_closed").await?;
+        parse_markets(&text)
+    }
+
     /// Fetch a single market by ticker (public GET, no auth). The response
     /// carries the authoritative settlement `result` ("yes"/"no" once settled,
     /// empty while open) — the source of truth for the reconcile loop.
