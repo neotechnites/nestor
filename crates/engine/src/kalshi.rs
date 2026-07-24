@@ -16,7 +16,13 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::Sha256;
 
-const BASE: &str = "https://api.elections.kalshi.com";
+/// Kalshi API host. Override with KALSHI_API_BASE for the demo environment
+/// (https://demo-api.kalshi.co) — demo needs its own account + API key, and its
+/// books have no real counterparties: plumbing-grade only, never fill-truth.
+fn api_base() -> String {
+    std::env::var("KALSHI_API_BASE")
+        .unwrap_or_else(|_| "https://api.elections.kalshi.com".to_string())
+}
 const PREFIX: &str = "/trade-api/v2";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,7 +169,7 @@ impl Kalshi {
         let limit = limit.to_string();
         let body = self
             .http
-            .get(format!("{BASE}{PREFIX}/markets"))
+            .get(format!("{}{PREFIX}/markets", api_base()))
             .query(&[
                 ("series_ticker", series_ticker),
                 ("status", status),
@@ -182,7 +188,7 @@ impl Kalshi {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let mut req = self.http.get(format!("{BASE}{PREFIX}/markets")).query(&[
+            let mut req = self.http.get(format!("{}{PREFIX}/markets", api_base())).query(&[
                 ("series_ticker", series_ticker),
                 ("status", status),
                 ("limit", "1000"),
@@ -205,7 +211,7 @@ impl Kalshi {
     /// carries the authoritative settlement `result` ("yes"/"no" once settled,
     /// empty while open) — the source of truth for the reconcile loop.
     pub async fn market(&self, ticker: &str) -> Result<Market> {
-        let url = format!("{BASE}{PREFIX}/markets/{ticker}");
+        let url = format!("{}{PREFIX}/markets/{ticker}", api_base());
         let resp: MarketResp = self
             .http
             .get(url)
@@ -244,7 +250,7 @@ impl Kalshi {
         map.insert(price_key.into(), json!(price_cents));
         map.insert("client_order_id".into(), json!(client_order_id));
         let body = serde_json::Value::Object(map);
-        let mut req = self.http.post(format!("{BASE}{path}")).json(&body);
+        let mut req = self.http.post(format!("{}{path}", api_base())).json(&body);
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -255,7 +261,7 @@ impl Kalshi {
     pub async fn balance_cents(&self) -> Result<i64> {
         let path = format!("{PREFIX}/portfolio/balance");
         let headers = self.sign_headers("GET", &path)?;
-        let mut req = self.http.get(format!("{BASE}{path}"));
+        let mut req = self.http.get(format!("{}{path}", api_base()));
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -267,7 +273,7 @@ impl Kalshi {
     pub async fn positions(&self) -> Result<serde_json::Value> {
         let path = format!("{PREFIX}/portfolio/positions");
         let headers = self.sign_headers("GET", &path)?;
-        let mut req = self.http.get(format!("{BASE}{path}"));
+        let mut req = self.http.get(format!("{}{path}", api_base()));
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -281,7 +287,7 @@ impl Kalshi {
     pub async fn fills(&self, ticker: &str) -> Result<serde_json::Value> {
         let path = format!("{PREFIX}/portfolio/fills?ticker={ticker}&limit=200");
         let headers = self.sign_headers("GET", &path)?;
-        let mut req = self.http.get(format!("{BASE}{path}"));
+        let mut req = self.http.get(format!("{}{path}", api_base()));
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -293,7 +299,7 @@ impl Kalshi {
     pub async fn cancel_order(&self, order_id: &str) -> Result<serde_json::Value> {
         let path = format!("{PREFIX}/portfolio/orders/{order_id}");
         let headers = self.sign_headers("DELETE", &path)?;
-        let mut req = self.http.delete(format!("{BASE}{path}"));
+        let mut req = self.http.delete(format!("{}{path}", api_base()));
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -303,7 +309,7 @@ impl Kalshi {
     /// Order book for a market (public). Captured as the decision snapshot at
     /// every signal moment (DATA CAPTURE, redirect 2026-07-23).
     pub async fn orderbook(&self, ticker: &str) -> Result<serde_json::Value> {
-        let url = format!("{BASE}{PREFIX}/markets/{ticker}/orderbook");
+        let url = format!("{}{PREFIX}/markets/{ticker}/orderbook", api_base());
         Ok(self
             .http
             .get(url)
