@@ -1243,3 +1243,40 @@ mod schema_probes {
         println!("PARSED: {parsed:?}");
     }
 }
+
+#[cfg(test)]
+mod admin_probes {
+    use super::*;
+
+    /// Ignored operator probe: upgrade the account to Advanced tier (free,
+    /// POST /account/api_usage_level/upgrade, needs 1 API order in last 100 —
+    /// satisfied by tonight's selftest orders), then read /account/limits.
+    #[tokio::test]
+    #[ignore]
+    async fn admin_upgrade_tier_and_read_limits() {
+        let k = Kalshi::authenticated(
+            std::env::var("KALSHI_API_KEY_ID").unwrap(),
+            &std::env::var("KALSHI_PRIVATE_KEY_PATH").unwrap(),
+        )
+        .unwrap();
+        for (method, path, is_post) in [
+            ("POST", "/trade-api/v2/account/api_usage_level/upgrade", true),
+            ("GET", "/trade-api/v2/account/limits", false),
+        ] {
+            let headers = k.sign_headers(method, path).unwrap();
+            let url = format!("{}{}", api_base(), path);
+            let mut req = if is_post {
+                k.http.post(&url).json(&serde_json::json!({}))
+            } else {
+                k.http.get(&url)
+            };
+            for (h, v) in headers {
+                req = req.header(h, v);
+            }
+            let resp = req.send().await.unwrap();
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            println!("{method} {path} -> {status}\n{body}\n");
+        }
+    }
+}
