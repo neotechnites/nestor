@@ -92,6 +92,42 @@ fn derive_enabled() -> bool {
     !std::path::Path::new(DERIVE_DISABLED_MARKER).exists()
 }
 
+/// Repeat-skip alarm thresholds (item 5). A settlement-lag stall shows as
+/// consecutive `prev_not_settled` skips — 2 in a row is already worth a shout;
+/// any other reason repeating 5× (e.g. a market stuck unpriced) also warrants
+/// one. Both are counted per series across scan passes.
+const PREV_NOT_SETTLED_ALARM: u32 = 2;
+const ANY_REASON_ALARM: u32 = 5;
+
+/// The alarm/log kind for a skip, or None for the silent no-signal skips that
+/// must NOT feed the repeat-skip alarm (they are the normal resting state, not a
+/// malfunction). Shared by `log_skip` and the alarm so the two stay in step.
+fn skip_kind(skip: &Skip) -> Option<&'static str> {
+    match skip {
+        Skip::NoStreak | Skip::InsufficientHistory | Skip::NotConsecutive => None,
+        Skip::PrevNotSettled => Some("prev_not_settled"),
+        Skip::WindowMismatch => Some("window_mismatch"),
+        Skip::NotEntryWindow { .. } => Some("missed_entry_window"),
+        Skip::Unpriced => Some("unpriced"),
+        Skip::PriceAboveGate { .. } => Some("price_above_gate"),
+    }
+}
+
+/// Advance the per-series consecutive-skip counter. Same `reason` as last
+/// increments; a different reason resets to 1. Fires (once) on the exact
+/// threshold crossing — at `PREV_NOT_SETTLED_ALARM` for a prev_not_settled run
+/// and at `ANY_REASON_ALARM` for any run — so a stuck series alerts without
+/// spamming every 1s pass. Pure — unit-tested.
+fn skip_alarm_step(prev: Option<(&str, u32)>, reason: &str) -> (u32, bool) {
+    let count = match prev {
+        Some((r, c)) if r == reason => c + 1,
+        _ => 1,
+    };
+    let fire = (reason == "prev_not_settled" && count == PREV_NOT_SETTLED_ALARM)
+        || count == ANY_REASON_ALARM;
+    (count, fire)
+}
+
 /// A derivation logged for later verification against the official result.
 #[derive(Clone)]
 struct PendingDerive {
@@ -122,6 +158,9 @@ pub struct Streak {
     spot_buf: Mutex<HashMap<String, Vec<(i64, f64)>>>,
     /// Derivations awaiting the official result, keyed "{series}|{close_unix}".
     derive_pending: Mutex<HashMap<String, PendingDerive>>,
+    /// Per-series consecutive-skip run: (reason_kind, count) for the repeat-skip
+    /// alarm. Reset on any successful evaluation / no-signal pass.
+    skip_alarm: Mutex<HashMap<String, (String, u32)>>,
 }
 
 impl Streak {
@@ -131,6 +170,37 @@ impl Streak {
             settled_cache: Mutex::new(HashMap::new()),
             spot_buf: Mutex::new(HashMap::new()),
             derive_pending: Mutex::new(HashMap::new()),
+            skip_alarm: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Advance (or reset) the repeat-skip alarm for `series`. `None` reason =
+    /// successful evaluation / no-signal → reset. A `Some(kind)` that crosses a
+    /// threshold emits a loud line and fires a webhook alert if configured.
+    async fn note_skip_alarm(&self, eng: &Engine, series: &str, reason: Option<&str>) {
+        let reason = match reason {
+            Some(r) => r,
+            None => {
+                self.skip_alarm
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(series);
+                return;
+            }
+        };
+        let (count, fire) = {
+            let mut st = self.skip_alarm.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = st.get(series).map(|(r, c)| (r.as_str(), *c));
+            let (count, fire) = skip_alarm_step(prev, reason);
+            st.insert(series.to_string(), (reason.to_string(), count));
+            (count, fire)
+        };
+        if fire {
+            let msg = format!(
+                "streak {series}: REPEAT-SKIP ALARM — {count} consecutive '{reason}' skips"
+            );
+            logging::info(format!("!!! {msg}"));
+            alert::notify(&eng.http, &msg).await;
         }
     }
 
@@ -334,17 +404,22 @@ impl Streak {
         );
 
         match signal::detect(&settled, &cand, now) {
-            Ok(entry) => self.enter(eng, series, cur, &cand, entry, now, None).await,
+            Ok(entry) => {
+                self.note_skip_alarm(eng, series, None).await; // evaluated → reset
+                self.enter(eng, series, cur, &cand, entry, now, None).await
+            }
             Err(Skip::PrevNotSettled) => {
                 // Ask subsequent passes in this window to refetch settled (the
                 // official result may still arrive and supersede any derivation).
                 self.first_time(Self::refetch_key(series, window_id));
                 // DERIVE-FOURTH (item 3): synthesize the just-closed window's
                 // result from our spot buffer rather than waiting out the lag.
+                // derive_prev notes the skip alarm on its own non-entry paths.
                 self.derive_prev(eng, series, cur, &cand, &raw, &settled, now)
                     .await
             }
             Err(skip) => {
+                self.note_skip_alarm(eng, series, skip_kind(&skip)).await;
                 self.log_skip(eng, series, &cur.ticker, &skip).await;
                 Ok(())
             }
@@ -481,14 +556,17 @@ impl Streak {
             .open_unix()
             .unwrap_or(cand.close_unix - signal::WINDOW_SECS);
 
-        // Gate: feature on, coin mapped, strike known. Any miss → normal skip.
+        // Gate: feature on, coin mapped, strike known. Any miss → normal skip
+        // (still a prev_not_settled-class skip for the repeat-skip alarm).
         if !derive_enabled() {
+            self.note_skip_alarm(eng, series, Some("prev_not_settled")).await;
             self.log_skip(eng, series, &cur.ticker, &Skip::PrevNotSettled).await;
             return Ok(());
         }
         let product = match coin_product(series) {
             Some(p) => p,
             None => {
+                self.note_skip_alarm(eng, series, Some("prev_not_settled")).await;
                 self.log_skip(eng, series, &cur.ticker, &Skip::PrevNotSettled).await;
                 return Ok(());
             }
@@ -496,6 +574,7 @@ impl Streak {
         let strike = match strike_for_close(raw, jc_close) {
             Some(s) if s > 0.0 => s,
             _ => {
+                self.note_skip_alarm(eng, series, Some("prev_not_settled")).await;
                 self.log_skip(eng, series, &cur.ticker, &Skip::PrevNotSettled).await;
                 return Ok(());
             }
@@ -560,10 +639,13 @@ impl Streak {
 
                 match redetect {
                     Ok(entry) => {
+                        // Derived result completed the streak → a real evaluation.
+                        self.note_skip_alarm(eng, series, None).await;
                         self.enter(eng, series, cur, cand, entry, now, Some((avg, margin_bp)))
                             .await
                     }
                     Err(skip) => {
+                        self.note_skip_alarm(eng, series, Some("prev_not_settled")).await;
                         self.log_skip(eng, series, &cur.ticker, &skip).await;
                         Ok(())
                     }
@@ -575,6 +657,7 @@ impl Streak {
                      {margin_bp:.1}bp < gate) — normal skip",
                     cur.ticker
                 ));
+                self.note_skip_alarm(eng, series, Some("prev_not_settled")).await;
                 self.log_skip(eng, series, &cur.ticker, &Skip::PrevNotSettled).await;
                 Ok(())
             }
@@ -587,6 +670,7 @@ impl Streak {
                      span) — normal skip",
                     cur.ticker
                 ));
+                self.note_skip_alarm(eng, series, Some("prev_not_settled")).await;
                 self.log_skip(eng, series, &cur.ticker, &Skip::PrevNotSettled).await;
                 Ok(())
             }
@@ -596,13 +680,9 @@ impl Streak {
     /// Log a skip once per (ticker, kind), with the order-book decision snapshot.
     /// No-signal cases stay silent — only streak-relevant dispositions are data.
     async fn log_skip(&self, eng: &Engine, series: &str, ticker: &str, skip: &Skip) {
-        let kind = match skip {
-            Skip::NoStreak | Skip::InsufficientHistory | Skip::NotConsecutive => return,
-            Skip::PrevNotSettled => "prev_not_settled",
-            Skip::WindowMismatch => "window_mismatch",
-            Skip::NotEntryWindow { .. } => "missed_entry_window",
-            Skip::Unpriced => "unpriced",
-            Skip::PriceAboveGate { .. } => "price_above_gate",
+        let kind = match skip_kind(skip) {
+            Some(k) => k,
+            None => return, // silent no-signal skips
         };
         if !self.first_time(format!("{ticker}|{kind}")) {
             return;
@@ -877,6 +957,51 @@ mod tests {
         assert_eq!(coin_product("KXBTC15M"), Some("BTC-USD"));
         assert_eq!(coin_product("KXETH15M"), Some("ETH-USD"));
         assert_eq!(coin_product("KXDOGE15M"), None);
+    }
+
+    #[test]
+    fn skip_alarm_prev_not_settled_fires_at_two() {
+        // First prev_not_settled → count 1, no fire.
+        let (c1, f1) = skip_alarm_step(None, "prev_not_settled");
+        assert_eq!((c1, f1), (1, false));
+        // Second consecutive → count 2, FIRE.
+        let (c2, f2) = skip_alarm_step(Some(("prev_not_settled", 1)), "prev_not_settled");
+        assert_eq!((c2, f2), (2, true));
+        // Third → count 3, no re-fire (only the exact threshold crossing alerts).
+        let (c3, f3) = skip_alarm_step(Some(("prev_not_settled", 2)), "prev_not_settled");
+        assert_eq!((c3, f3), (3, false));
+        // Fifth → count 5, fires again on the any-reason threshold.
+        let (c5, f5) = skip_alarm_step(Some(("prev_not_settled", 4)), "prev_not_settled");
+        assert_eq!((c5, f5), (5, true));
+    }
+
+    #[test]
+    fn skip_alarm_other_reason_fires_at_five_only() {
+        // A non-prev_not_settled reason must NOT fire at 2.
+        let (_, f2) = skip_alarm_step(Some(("price_above_gate", 1)), "price_above_gate");
+        assert!(!f2);
+        // Five in a row → fire.
+        let (c5, f5) = skip_alarm_step(Some(("price_above_gate", 4)), "price_above_gate");
+        assert_eq!((c5, f5), (5, true));
+    }
+
+    #[test]
+    fn skip_alarm_different_reason_resets() {
+        // Switching reason resets the run to 1 regardless of prior count.
+        let (c, f) = skip_alarm_step(Some(("prev_not_settled", 4)), "unpriced");
+        assert_eq!((c, f), (1, false));
+    }
+
+    #[test]
+    fn skip_kind_silences_no_signal() {
+        assert_eq!(skip_kind(&Skip::NoStreak), None);
+        assert_eq!(skip_kind(&Skip::InsufficientHistory), None);
+        assert_eq!(skip_kind(&Skip::NotConsecutive), None);
+        assert_eq!(skip_kind(&Skip::PrevNotSettled), Some("prev_not_settled"));
+        assert_eq!(
+            skip_kind(&Skip::PriceAboveGate { ask: 50.0 }),
+            Some("price_above_gate")
+        );
     }
 
     #[test]
