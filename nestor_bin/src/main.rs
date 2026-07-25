@@ -39,8 +39,8 @@ async fn main() -> Result<()> {
     // No default subcommand: with lock/weather parked and streak live-gated,
     // a bare invocation should never silently pick a strategy.
     let which = std::env::args().nth(1).context(
-        "usage: nestor <run|streak|streak-once|calibrate|reconcile|probe-weather|\
-         backtest-lock|selftest-order|resume|weather|lock|lock-once>",
+        "usage: nestor <run|streak|streak-once|volbook|volbook-once|calibrate|reconcile|\
+         probe-weather|backtest-lock|selftest-order|resume|weather|lock|lock-once>",
     )?;
 
     // `backtest-lock` re-confirms the (parked) lock edge in-code against cached
@@ -105,7 +105,13 @@ async fn main() -> Result<()> {
     if live
         && matches!(
             which.as_str(),
-            "streak" | "streak-once" | "lock" | "lock-once" | "weather"
+            "streak"
+                | "streak-once"
+                | "lock"
+                | "lock-once"
+                | "weather"
+                | "volbook"
+                | "volbook-once"
         )
     {
         anyhow::bail!(
@@ -199,6 +205,26 @@ async fn main() -> Result<()> {
             let base =
                 streak::strategy::next_poll_delay(chrono::Utc::now().timestamp());
             tokio::time::sleep(backoff_sleep(base, backoff, retry_after)).await;
+        }
+        return Ok(());
+    }
+
+    // Volbook standalone (strategy #2, metal daily-wing seller): PAPER-SHADOW
+    // only. `volbook` loops the scan at 60s (T-3h entry window is hourly-scale, not
+    // sub-second); `volbook-once` runs a single pass. Live standalone is banned
+    // above; the sleeve is deliberately NOT scheduled in `run` and additionally
+    // refuses to place a real order unless VOLBOOK_LIVE=1 — paper-only until sized.
+    if which == "volbook" || which == "volbook-once" {
+        let strat = volbook::strategy::Volbook::new()?;
+        engine::logging::info(format!("volbook — {}", strat.universe_summary()));
+        loop {
+            if let Err(e) = strat.run(&eng).await {
+                eprintln!("volbook: scan error: {e}");
+            }
+            if which == "volbook-once" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
         return Ok(());
     }

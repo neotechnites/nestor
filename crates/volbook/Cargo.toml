@@ -1,0 +1,15 @@
+[package]
+name = "volbook"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+engine = { path = "../engine" }
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+futures.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+tokio.workspace = true
