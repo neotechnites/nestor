@@ -13,7 +13,8 @@ weather = { path = "../crates/weather" }
 lock = { path = "../crates/lock" }
 streak = { path = "../crates/streak" }
 volbook = { path = "../crates/volbook" }
-tokio.workspace = true
+house = { path = "../crates/house" }
+tokio = { workspace = true, features = ["signal"] }
 anyhow.workspace = true
 dotenvy.workspace = true
 reqwest.workspace = true

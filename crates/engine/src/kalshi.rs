@@ -502,6 +502,7 @@ impl Kalshi {
     ///   - `expiration_ts` in the future → order rests until then, then auto-cancels
     ///   - `expiration_ts` omitted        → GTC, rests forever (WE NEVER DO THIS)
     ///   - `expiration_ts` in the past    → treated as IOC
+    ///
     /// We ALWAYS pass a future ts, so a crashed process can leave nothing resting
     /// beyond the expiry. `time_in_force` is intentionally OMITTED (its presence as
     /// immediate_or_cancel would make the order a taker). `side`/`price_cents` use
@@ -526,14 +527,18 @@ impl Kalshi {
         map.insert("side".into(), json!(book_side(side)));
         map.insert("count".into(), json!(count_fp(count)));
         map.insert("price".into(), json!(order_price_dollars(side, price_cents)));
-        // GTD resting: a FUTURE expiration_ts and NO immediate_or_cancel. This is
-        // the safety property — never omit expiration_ts (that would be GTC).
+        // GTD resting: time_in_force is REQUIRED by the API (demo-proven 2026-07-25:
+        // omitting it -> 400 "failed on the 'required' tag"); a resting order uses
+        // good_till_cancelled + a FUTURE expiration_ts, which bounds its life (the
+        // safety property — never omit expiration_ts, that would rest forever).
+        map.insert("time_in_force".into(), json!("good_till_canceled"));
         map.insert("expiration_ts".into(), json!(expiration_ts));
-        // Two-sided quote legs (bid mid-1, ask mid+1) never cross; cancel_both is
-        // the safe-if-they-ever-do choice for self-trade prevention.
+        // Demo-proven: "cancel_both" fails the API's oneof validation; use the same
+        // taker_at_cross the IOC path uses (our two legs sit 2c apart and never
+        // cross each other, so STP should never fire at all).
         map.insert(
             "self_trade_prevention_type".into(),
-            json!("cancel_both"),
+            json!("taker_at_cross"),
         );
         map.insert("client_order_id".into(), json!(client_order_id));
         let body = serde_json::Value::Object(map);
@@ -932,6 +937,142 @@ pub fn parse_positions(body: &serde_json::Value) -> Vec<ExchangePosition> {
     out
 }
 
+/// One resting (open, unfilled-remainder) order as the exchange sees it, from
+/// `/portfolio/orders?status=resting`. The startup orphan sweep only needs
+/// `order_id` (to cancel) + `ticker` (to log); side/price/remaining/expiration
+/// are best-effort for the participation record and expiration-audit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestingOrder {
+    pub order_id: String,
+    pub ticker: String,
+    /// Our-side ("yes"/"no") folded from the YES-book bid/ask, when derivable.
+    pub side: Option<String>,
+    /// Unfilled contracts still resting.
+    pub remaining_count: i64,
+    /// Our-side limit in whole cents, when derivable.
+    pub price_cents: Option<i64>,
+    /// Expiration deadline as unix seconds, when present (the safety property).
+    pub expiration_ts: Option<i64>,
+}
+
+/// Parse a `/portfolio/orders` response into resting orders. TOLERANT of schema
+/// variants (Kalshi's fixed-point `_dollars` migration + numeric/string encodings)
+/// because the exact resting-order schema is confirmed only on the demo shakeout —
+/// `order_id` is the sole hard requirement (it is what the sweep cancels). Rows
+/// without an order_id, or with remaining_count <= 0, are dropped.
+pub fn parse_resting_orders(body: &serde_json::Value) -> Vec<RestingOrder> {
+    let empty = vec![];
+    let rows = body
+        .get("orders")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let mut out = Vec::new();
+    for r in rows {
+        let order_id = match r
+            .get("order_id")
+            .or_else(|| r.get("id"))
+            .and_then(|v| v.as_str())
+        {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let ticker = r
+            .get("ticker")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        // remaining: prefer remaining_count[_fp]; fall back to count.
+        let remaining_count = r
+            .get("remaining_count")
+            .or_else(|| r.get("remaining_count_fp"))
+            .or_else(|| r.get("count"))
+            .or_else(|| r.get("count_fp"))
+            .and_then(count_to_i64)
+            .unwrap_or(0);
+        if remaining_count <= 0 {
+            continue;
+        }
+        // Side: prefer an explicit yes/no `side`; else fold the YES-book bid/ask
+        // action (bid = buy YES, ask = sell YES = our NO).
+        let side = r.get("side").and_then(|v| v.as_str()).map(|s| {
+            if s.eq_ignore_ascii_case("ask") {
+                "no".to_string()
+            } else if s.eq_ignore_ascii_case("bid") {
+                "yes".to_string()
+            } else {
+                s.to_ascii_lowercase()
+            }
+        });
+        // Price: prefer our-side field, else fold the YES price.
+        let price_cents = r
+            .get("yes_price_dollars")
+            .and_then(price_to_cents)
+            .or_else(|| r.get("yes_price").and_then(price_to_cents))
+            .map(|yes| match side.as_deref() {
+                Some("no") => 100 - yes,
+                _ => yes,
+            })
+            .or_else(|| r.get("price").and_then(price_to_cents));
+        // Expiration: numeric unix seconds, or an RFC3339 `expiration_time`.
+        let expiration_ts = r
+            .get("expiration_ts")
+            .and_then(|v| v.as_i64())
+            .or_else(|| {
+                r.get("expiration_time")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.timestamp())
+            });
+        out.push(RestingOrder {
+            order_id,
+            ticker,
+            side,
+            remaining_count,
+            price_cents,
+            expiration_ts,
+        });
+    }
+    out
+}
+
+/// Best YES bid/ask (whole cents) from a `/markets/{ticker}/orderbook` response,
+/// and the derived mid. The LIVE schema (verified 2026-07-25) is
+/// `{"orderbook_fp":{"yes_dollars":[["0.4800","30.00"],...],
+/// "no_dollars":[["0.0100","130.00"],...]}}` — string-DOLLAR prices under an
+/// `_fp` envelope. We also tolerate the legacy `{"orderbook":{"yes":[[48,..]]}}`
+/// integer-cents form (`price_to_cents` handles both encodings). Each price level
+/// is a resting BUY: the best YES bid is the highest yes price; the best YES ask =
+/// 100 − (highest NO buy price), since a NO bid at n offers YES at 100−n. Returns
+/// `(best_bid, best_ask, mid)` in whole cents; any component is None when that
+/// side is empty. Pure + unit-tested so the quote loop's mid never depends on the
+/// network to be tested.
+pub fn orderbook_mid(body: &serde_json::Value) -> (Option<i64>, Option<i64>, Option<i64>) {
+    let ob = body
+        .get("orderbook_fp")
+        .or_else(|| body.get("orderbook"))
+        .unwrap_or(body);
+    // Try the `_dollars` key first (live), then the bare key (legacy).
+    let best = |dollars_key: &str, bare_key: &str| -> Option<i64> {
+        ob.get(dollars_key)
+            .or_else(|| ob.get(bare_key))
+            .and_then(|v| v.as_array())
+            .and_then(|levels| {
+                levels
+                    .iter()
+                    .filter_map(|lvl| lvl.as_array().and_then(|a| a.first()))
+                    .filter_map(price_to_cents)
+                    .max()
+            })
+    };
+    let best_bid = best("yes_dollars", "yes");
+    let best_ask = best("no_dollars", "no").map(|no| 100 - no);
+    let mid = match (best_bid, best_ask) {
+        (Some(b), Some(a)) => Some(((b + a) as f64 / 2.0).round() as i64),
+        _ => None,
+    };
+    (best_bid, best_ask, mid)
+}
+
 /// Parse `/portfolio/balance` into cents. Kalshi returns `{"balance": <int cents>}`.
 pub fn parse_balance(body: &str) -> Result<i64> {
     let v: serde_json::Value = serde_json::from_str(body).context("parsing balance")?;
@@ -1265,6 +1406,78 @@ mod tests {
     }
 
     #[test]
+    fn parse_resting_orders_reads_id_ticker_side_price_expiry() {
+        // A YES bid @ 49c and a NO leg (YES-book ask, side "ask") @ our-NO 49c
+        // (yes_price 51 -> 100-51). A filled/zero-remaining row is dropped, and a
+        // row with no order_id is dropped (can't be swept).
+        let body = serde_json::json!({"orders": [
+            {"order_id": "O1", "ticker": "KXAPRPOTUS-T50", "side": "bid",
+             "remaining_count": 1, "yes_price_dollars": "0.49",
+             "expiration_ts": 1_800_000_075},
+            {"order_id": "O2", "ticker": "KXAPRPOTUS-T50", "side": "ask",
+             "remaining_count_fp": "1.00", "yes_price_dollars": "0.51",
+             "expiration_time": "2027-01-15T00:00:00Z"},
+            {"order_id": "O3", "ticker": "KXAPRPOTUS-T50", "side": "bid",
+             "remaining_count": 0, "yes_price_dollars": "0.49"}, // filled -> drop
+            {"ticker": "NOID", "remaining_count": 1}, // no id -> drop
+        ]});
+        let ords = parse_resting_orders(&body);
+        assert_eq!(ords.len(), 2);
+        assert_eq!(ords[0].order_id, "O1");
+        assert_eq!(ords[0].side.as_deref(), Some("yes"));
+        assert_eq!(ords[0].price_cents, Some(49));
+        assert_eq!(ords[0].remaining_count, 1);
+        assert_eq!(ords[0].expiration_ts, Some(1_800_000_075));
+        assert_eq!(ords[1].order_id, "O2");
+        assert_eq!(ords[1].side.as_deref(), Some("no"));
+        assert_eq!(ords[1].price_cents, Some(49)); // 100 - 51
+        assert!(ords[1].expiration_ts.is_some());
+    }
+
+    #[test]
+    fn parse_resting_orders_empty_and_missing() {
+        assert!(parse_resting_orders(&serde_json::json!({})).is_empty());
+        assert!(parse_resting_orders(&serde_json::json!({"orders": []})).is_empty());
+    }
+
+    #[test]
+    fn orderbook_mid_from_yes_and_no_books() {
+        // YES best bid = highest yes price = 48. NO best = 50 -> YES ask = 50.
+        // mid = (48+50)/2 = 49.
+        let body = serde_json::json!({"orderbook": {
+            "yes": [[45, 100], [48, 30]],
+            "no":  [[49, 20], [50, 10]],
+        }});
+        let (bid, ask, mid) = orderbook_mid(&body);
+        assert_eq!(bid, Some(48));
+        assert_eq!(ask, Some(50)); // 100 - 50
+        assert_eq!(mid, Some(49));
+    }
+
+    #[test]
+    fn orderbook_mid_one_sided_has_no_mid() {
+        let body = serde_json::json!({"orderbook": {"yes": [[48, 10]], "no": []}});
+        let (bid, ask, mid) = orderbook_mid(&body);
+        assert_eq!(bid, Some(48));
+        assert_eq!(ask, None);
+        assert_eq!(mid, None);
+    }
+
+    #[test]
+    fn orderbook_mid_live_fp_dollars_schema() {
+        // VERBATIM live shape (2026-07-25): orderbook_fp with string-dollar prices.
+        // YES best bid = 0.48 = 48. NO best = 0.50 = 50 -> YES ask 50. mid 49.
+        let body = serde_json::json!({"orderbook_fp": {
+            "yes_dollars": [["0.4500", "100.00"], ["0.4800", "30.00"]],
+            "no_dollars":  [["0.4900", "20.00"], ["0.5000", "10.00"]],
+        }});
+        let (bid, ask, mid) = orderbook_mid(&body);
+        assert_eq!(bid, Some(48));
+        assert_eq!(ask, Some(50));
+        assert_eq!(mid, Some(49));
+    }
+
+    #[test]
     fn parse_markets_detects_series_and_reads_sample() {
         let body = r#"{
             "markets": [
@@ -1355,6 +1568,112 @@ mod schema_probes {
         println!("RAW POSITIONS:\n{}", serde_json::to_string_pretty(&raw).unwrap());
         let parsed = parse_positions(&raw);
         println!("PARSED: {parsed:?}");
+    }
+}
+
+#[cfg(test)]
+mod maker_demo_probes {
+    use super::*;
+
+    /// EMPIRICAL maker-mechanics probe (the house-probe demo shakeout). Proves the
+    /// five load-bearing behaviors on DEMO before any prod maker order exists:
+    ///   1. RESTING placement — a create with a FUTURE expiration_ts and NO
+    ///      immediate_or_cancel returns 201, fill_count 0, remaining == count,
+    ///      status resting, an order_id (i.e. it did NOT instantly IOC).
+    ///   2. It appears in /portfolio/orders?status=resting.
+    ///   3. cancel-by-id removes it (resting_orders no longer lists it).
+    ///   4. expiration auto-cancel — place a SHORT-expiry (now+8s) order, sleep
+    ///      past it, confirm it is gone from resting_orders WITHOUT us cancelling.
+    ///   5. startup orphan sweep — place one, then cancel EVERY resting order the
+    ///      account shows (the sweep), confirm none remain.
+    /// Fill detection is proven by the existing fills() path (a resting order that
+    /// crosses shows up in /portfolio/fills by order_id, same parser as the taker).
+    ///
+    /// Ignored (needs the DEMO account's key id + network). Run with:
+    ///   KALSHI_API_BASE=https://demo-api.kalshi.co \
+    ///   KALSHI_API_KEY_ID=<DEMO key id> KALSHI_PRIVATE_KEY_PATH=secrets/Demo.txt \
+    ///   NESTOR_TEST_TICKER=<open demo ticker, priced ~40-60c> \
+    ///   cargo test -p engine maker_demo_resting_lifecycle -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn maker_demo_resting_lifecycle() {
+        let key_id = std::env::var("KALSHI_API_KEY_ID").expect("KALSHI_API_KEY_ID (demo)");
+        let key_path = std::env::var("KALSHI_PRIVATE_KEY_PATH").expect("KALSHI_PRIVATE_KEY_PATH");
+        let ticker = std::env::var("NESTOR_TEST_TICKER").expect("NESTOR_TEST_TICKER");
+        let k = Kalshi::authenticated(key_id, &key_path).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        // (1) RESTING placement: a far-from-market YES bid at 2c (won't cross an
+        // ~40-60c book) with expiration_ts = now+75s.
+        let exp = now + 75;
+        let coid = format!("nestor-house-demo-{now}");
+        let (s1, b1, _r1) = k
+            .place_resting_limit_raw(&ticker, "yes", 1, 2, exp, &coid)
+            .await
+            .expect("resting POST");
+        println!("=== (1) RESTING PLACE === HTTP {s1}\n{b1}");
+        let placed = parse_place_response(
+            &serde_json::from_str(&b1).unwrap_or(serde_json::Value::Null),
+            "yes",
+        );
+        println!(
+            "    fill_count={} remaining={} order_id={:?} (expect 0 / 1 / Some — did NOT IOC)",
+            placed.fill_count, placed.remaining_count, placed.order_id
+        );
+        let oid = placed.order_id.clone();
+
+        // (2) appears in resting_orders.
+        let resting = k.resting_orders(Some(&ticker)).await.expect("resting GET");
+        let parsed = parse_resting_orders(&resting);
+        println!("=== (2) RESTING LIST === {} order(s): {parsed:?}", parsed.len());
+
+        // (3) cancel-by-id, confirm gone.
+        if let Some(id) = &oid {
+            let c = k.cancel_order(id).await;
+            println!("=== (3) CANCEL BY ID === {c:?}");
+            let after = parse_resting_orders(&k.resting_orders(Some(&ticker)).await.unwrap());
+            let still = after.iter().any(|o| Some(&o.order_id) == oid.as_ref());
+            println!("    still resting after cancel: {still} (expect false)");
+        }
+
+        // (4) expiration auto-cancel: place now+8s, sleep 12s, confirm gone.
+        let exp2 = chrono::Utc::now().timestamp() + 8;
+        let coid2 = format!("nestor-house-demo-exp-{}", chrono::Utc::now().timestamp());
+        let (s4, b4, _r4) = k
+            .place_resting_limit_raw(&ticker, "yes", 1, 2, exp2, &coid2)
+            .await
+            .expect("short-expiry POST");
+        let oid2 = parse_place_response(
+            &serde_json::from_str(&b4).unwrap_or(serde_json::Value::Null),
+            "yes",
+        )
+        .order_id;
+        println!("=== (4) SHORT-EXPIRY PLACE === HTTP {s4} order_id={oid2:?} exp={exp2}");
+        // Poll up to ~2.5 min past expiry: measures the enforcement LAG, not just
+        // a single point (demo 2026-07-25: 12s past expiry was NOT enough).
+        let mut survived = true;
+        for i in 1..=10 {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let after_exp =
+                parse_resting_orders(&k.resting_orders(Some(&ticker)).await.unwrap());
+            survived = after_exp.iter().any(|o| Some(&o.order_id) == oid2.as_ref());
+            let elapsed = chrono::Utc::now().timestamp() - exp2;
+            println!("    +{elapsed}s past expiry (poll {i}): survived={survived}");
+            if !survived {
+                break;
+            }
+        }
+        println!("    FINAL: survived={survived} (expect false — AUTO-CANCELLED)");
+
+        // (5) startup orphan sweep: cancel EVERY resting order, confirm none remain.
+        let all = parse_resting_orders(&k.resting_orders(None).await.unwrap());
+        println!("=== (5) ORPHAN SWEEP === {} resting to cancel", all.len());
+        for o in &all {
+            let _ = k.cancel_order(&o.order_id).await;
+        }
+        let remaining = parse_resting_orders(&k.resting_orders(None).await.unwrap());
+        println!("    remaining after sweep: {} (expect 0)", remaining.len());
+        println!("=== VERDICT === record HTTP/fill_count/survived/remaining above into the charter Decisions section.");
     }
 }
 

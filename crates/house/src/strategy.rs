@@ -1,0 +1,632 @@
+//! House fill-probe (H10/H9) — the maker sleeve: two-sided RESTING quotes on the
+//! two vehicles the trade-print markout could not settle (KXAPRPOTUS front-weekly
+//! in-band strike; KXCPIYOY nearest "Exactly" rung). It measures ONLY fill
+//! realization + between-print gap risk (protocol work/probe-house.md).
+//!
+//! SAFETY (all non-negotiable, charter §§1-5):
+//!   1. Every resting order carries `expiration_ts = now + 75s` — a dead process
+//!      leaves NOTHING resting beyond ~75s. THE load-bearing property.
+//!   2. Cancel-all-house-orders on startup (orphan sweep) AND on shutdown
+//!      (ctrl-c/SIGTERM handler wired in nestor_bin for the `house` subcommand).
+//!   3. −$20 cumulative hard stop IN CODE (probe cent-ledger incl. fees) + the
+//!      protocol's −5¢-markout-in-60s gap-through stop → sticky halt + cancel all.
+//!   4. Spread gate ≥2¢, catalyst-window pull (T±15min), 1-5 contracts/side.
+//!   5. Live-gated: real orders only when mode==Live AND HOUSE_PROBE=1. Standalone
+//!      `house` is banned in live by nestor_bin. Paper / live-without-the-flag =
+//!      log-only SHADOW quoting (no real orders, no fills).
+//!
+//! DATA CAPTURE: every quote-live tick, fill, markout, gate-pull and shadow is
+//! logged to `data/house_probe.jsonl` — the `house-report` subcommand summarizes
+//! the four protocol metrics from it.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use chrono_tz::America::New_York;
+use engine::kalshi::{self, Market};
+use engine::risk::taker_fee;
+use engine::strategy::{in_window, Mode};
+use engine::{alert, logging, Engine, Side, Strategy};
+use serde_json::json;
+
+use crate::signal::{self, ProbeLedger, ORDER_TTL_SECS};
+
+pub const LOG: &str = "data/house_probe.jsonl";
+/// Env flag that must be `1` for the sleeve to place a REAL (live) maker order.
+const LIVE_ENABLE_ENV: &str = "HOUSE_PROBE";
+/// Optional operator-supplied catalyst timestamps (comma-separated unix seconds).
+const CATALYST_ENV: &str = "HOUSE_CATALYST_TS";
+/// Contracts per side (1-5; charter §4). Override with HOUSE_SIZE.
+const SIZE_ENV: &str = "HOUSE_SIZE";
+const DEFAULT_SIZE: i64 = 1;
+
+/// A probe book (vehicle) to quote.
+struct Book {
+    /// Kalshi series ticker (UNDERIVED — confirm against live /markets).
+    series: &'static str,
+    label: &'static str,
+    /// In-band YES-mid selection window (whole cents).
+    band_lo: i64,
+    band_hi: i64,
+    /// PREFER an "Exactly" rung when the ladder has them (CPI nearest-print), but
+    /// fall back to the nearest-centre in-band rung when it does not. EMPIRICAL
+    /// (2026-07-25): KXCPIYOY currently exposes ONLY "Above X%" cumulative rungs —
+    /// zero "Exactly" rungs — so a hard requirement would mean the CPI book never
+    /// quotes; the in-band "Above" rungs near 50¢ are valid balanced targets.
+    prefer_exactly: bool,
+}
+
+fn books() -> Vec<Book> {
+    vec![
+        Book {
+            series: "KXAPRPOTUS",
+            label: "potus",
+            band_lo: 30,
+            band_hi: 70,
+            prefer_exactly: false,
+        },
+        Book {
+            series: "KXCPIYOY",
+            label: "cpi",
+            band_lo: 10,
+            band_hi: 90,
+            prefer_exactly: true,
+        },
+    ]
+}
+
+/// Live per-market quote state.
+#[derive(Default)]
+struct BookQuote {
+    bid_order_id: Option<String>,
+    ask_order_id: Option<String>,
+    bid_price: i64,
+    ask_price: i64,
+    quoted_mid: i64,
+    quoted_ts: i64,
+    since_ms: i64,
+    /// Contracts already booked from each leg (to book only the per-pass delta).
+    booked_bid: i64,
+    booked_ask: i64,
+}
+
+/// A fill awaiting its +60s markout stamp.
+struct Pending {
+    ticker: String,
+    label: String,
+    side: Side,
+    entry_cents: i64,
+    ts_ms: i64,
+    in_catalyst: bool,
+}
+
+#[derive(Default)]
+struct HouseState {
+    ledger: ProbeLedger,
+    quotes: HashMap<String, BookQuote>, // ticker -> live quote
+    pending: Vec<Pending>,
+    /// ticker -> last known mid, for the cross-book −$20 ledger mark.
+    last_mid: HashMap<String, i64>,
+    halted: bool,
+}
+
+pub struct House {
+    books: Vec<Book>,
+    catalysts: Vec<i64>,
+    size: i64,
+    state: Mutex<HouseState>,
+    swept: AtomicBool,
+}
+
+impl Default for House {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl House {
+    pub fn new() -> Self {
+        let catalysts = std::env::var(CATALYST_ENV)
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|x| x.trim().parse::<i64>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let size = std::env::var(SIZE_ENV)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(DEFAULT_SIZE)
+            .clamp(1, 5);
+        House {
+            books: books(),
+            catalysts,
+            size,
+            state: Mutex::new(HouseState::default()),
+            swept: AtomicBool::new(false),
+        }
+    }
+
+    fn live_enabled(eng: &Engine) -> bool {
+        eng.mode == Mode::Live && std::env::var(LIVE_ENABLE_ENV).ok().as_deref() == Some("1")
+    }
+
+    /// Cancel EVERY resting order the account shows (startup orphan sweep AND the
+    /// shutdown handler). Best-effort: logs failures, never panics. Public so the
+    /// nestor_bin ctrl-c/SIGTERM handler can call it on shutdown.
+    pub async fn cancel_all_house_orders(eng: &Engine) {
+        let body = match eng.kalshi.resting_orders(None).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[house] resting_orders read failed during sweep: {e}");
+                return;
+            }
+        };
+        let orders = kalshi::parse_resting_orders(&body);
+        if orders.is_empty() {
+            return;
+        }
+        logging::info(format!("house: sweeping {} resting order(s)", orders.len()));
+        for o in &orders {
+            match eng.kalshi.cancel_order(&o.order_id).await {
+                Ok(_) => {}
+                Err(e) => eprintln!("[house] cancel {} failed during sweep: {e}", o.order_id),
+            }
+        }
+    }
+
+    async fn halt(&self, eng: &Engine, reason: &str) {
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.halted {
+                return;
+            }
+            st.halted = true;
+            st.quotes.clear();
+        }
+        Self::cancel_all_house_orders(eng).await;
+        logging::info(format!("house: STICKY HALT — {reason}"));
+        logging::record_path(LOG, json!({"event": "house_halt", "reason": reason}));
+        alert::notify(&eng.http, &format!("house probe HALTED — {reason}")).await;
+    }
+}
+
+#[async_trait]
+impl Strategy for House {
+    fn name(&self) -> &str {
+        "house"
+    }
+
+    async fn run(&self, eng: &Engine) -> Result<()> {
+        // STARTUP ORPHAN SWEEP (charter §2): cancel anything a prior crash left
+        // resting, exactly once, before the first quote. Only meaningful when we
+        // can actually place/cancel (live+flag); harmless otherwise.
+        if !self.swept.swap(true, Ordering::SeqCst) && Self::live_enabled(eng) {
+            Self::cancel_all_house_orders(eng).await;
+        }
+        if self.state.lock().unwrap_or_else(|e| e.into_inner()).halted {
+            return Ok(());
+        }
+
+        for book in &self.books {
+            if let Err(e) = self.run_book(eng, book).await {
+                let retryable =
+                    engine::net::http_status(&e).is_some_and(engine::net::is_retryable_status);
+                if retryable {
+                    return Err(e); // let the caller back off
+                }
+                logging::info(format!("house {}: {e} — skip pass", book.label));
+            }
+        }
+        // Process any pending markouts that have aged past the 60s horizon.
+        self.settle_markouts(eng).await;
+        Ok(())
+    }
+}
+
+impl House {
+    /// One book pass: select the in-band market, apply gates, detect fills,
+    /// re-quote. Returns Err only for retryable network faults (so the loop can
+    /// back off); everything else is logged and swallowed.
+    async fn run_book(&self, eng: &Engine, book: &Book) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+
+        // Select the in-band target market.
+        let opens = match in_window(eng.kalshi.markets(book.series, "open")).await {
+            Ok(r) => r?,
+            Err(_) => {
+                logging::info(format!("house {}: markets fetch timed out", book.label));
+                return Ok(());
+            }
+        };
+        let debug = std::env::var("HOUSE_DEBUG").is_ok();
+        let Some(m) = self.pick_market(book, &opens) else {
+            if debug {
+                eprintln!("[house-dbg] {}: {} open, NO in-band pick", book.label, opens.len());
+            }
+            return Ok(()); // no in-band market right now
+        };
+        let ticker = m.ticker.clone();
+
+        // Live orderbook → best bid/ask/mid.
+        let ob = match in_window(eng.kalshi.orderbook(&ticker)).await {
+            Ok(Ok(b)) => b,
+            _ => return Ok(()),
+        };
+        let (best_bid, best_ask, mid) = kalshi::orderbook_mid(&ob);
+        if debug {
+            eprintln!(
+                "[house-dbg] {}: pick {ticker} bid={best_bid:?} ask={best_ask:?} mid={mid:?} spread_ok={}",
+                book.label,
+                signal::spread_ok(best_bid, best_ask)
+            );
+        }
+        let Some(mid) = mid else {
+            self.pull_quotes(eng, &ticker, "no_two_sided_book").await;
+            return Ok(());
+        };
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_mid
+            .insert(ticker.clone(), mid);
+
+        // GATE: catalyst window (protocol §2) — pull all quotes T±15min.
+        if signal::in_catalyst_window(now, &self.catalysts) {
+            self.pull_quotes(eng, &ticker, "catalyst_window").await;
+            logging::record_path(
+                LOG,
+                json!({"event": "house_gate", "book": book.label, "ticker": ticker,
+                       "reason": "catalyst_window"}),
+            );
+            return Ok(());
+        }
+        // GATE: spread ≥2¢ (protocol §1).
+        if !signal::spread_ok(best_bid, best_ask) {
+            self.pull_quotes(eng, &ticker, "spread_lt_2c").await;
+            return Ok(());
+        }
+
+        let live = Self::live_enabled(eng);
+
+        // Detect own fills on the currently-resting legs (live only).
+        if live {
+            self.detect_fills(eng, book, &ticker, mid, now).await;
+        }
+
+        // −$20 hard stop (charter §3): mark the whole ledger at per-ticker mids.
+        let breached = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.ledger.hard_stop_breached(&st.last_mid)
+        };
+        if breached {
+            self.halt(eng, "−$20 cumulative hard stop").await;
+            return Ok(());
+        }
+
+        // Re-quote decision.
+        let (need, age) = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            match st.quotes.get(&ticker) {
+                Some(q) => (
+                    signal::should_requote(Some(q.quoted_mid), mid, now - q.quoted_ts),
+                    now - q.quoted_ts,
+                ),
+                None => (true, 0),
+            }
+        };
+        let legs = signal::quote_legs(mid);
+        if need {
+            if live {
+                self.requote(eng, book, &ticker, mid, legs, now).await;
+            } else {
+                // SHADOW (paper / live-without-flag): log the intended quote only.
+                logging::record_path(
+                    LOG,
+                    json!({"event": "house_shadow", "book": book.label, "ticker": ticker,
+                           "mid": mid, "bid": legs.bid_price_cents, "ask": legs.ask_price_cents,
+                           "spread": best_ask.zip(best_bid).map(|(a, b)| a - b), "size": self.size}),
+                );
+            }
+        } else {
+            // Quote still good — accrue quote-live time for metric 1.
+            logging::record_path(
+                LOG,
+                json!({"event": "house_quote_live", "book": book.label, "ticker": ticker,
+                       "quote_secs": age.max(0), "mid": mid}),
+            );
+        }
+        Ok(())
+    }
+
+    /// Select the in-band market: within [band_lo,band_hi] YES-mid, nearest to the
+    /// band centre (proxy for the deepest-churn / most-balanced rung); CPI requires
+    /// an "Exactly" rung.
+    fn pick_market<'a>(&self, book: &Book, opens: &'a [Market]) -> Option<&'a Market> {
+        let centre = (book.band_lo + book.band_hi) / 2;
+        // In-band candidates with distance-to-centre and an "exactly" flag.
+        let mut cands: Vec<(&Market, i64, bool)> = opens
+            .iter()
+            .filter_map(|m| {
+                let mid = signal::market_mid_cents(m.yes_ask_cents_f64(), m.no_ask_cents_f64())?;
+                if mid < book.band_lo || mid > book.band_hi {
+                    return None;
+                }
+                let exactly = m
+                    .yes_sub_title
+                    .as_deref()
+                    .is_some_and(|s| s.to_ascii_lowercase().contains("exactly"));
+                Some((m, (mid - centre).abs(), exactly))
+            })
+            .collect();
+        // Prefer "Exactly" rungs when the ladder has any; else fall back to all
+        // in-band rungs (KXCPIYOY has only "Above" rungs — see Book.prefer_exactly).
+        if book.prefer_exactly && cands.iter().any(|(_, _, ex)| *ex) {
+            cands.retain(|(_, _, ex)| *ex);
+        }
+        cands.into_iter().min_by_key(|(_, d, _)| *d).map(|(m, _, _)| m)
+    }
+
+    /// Cancel any live legs on `ticker` and forget the quote (gate pull / stand-down).
+    async fn pull_quotes(&self, eng: &Engine, ticker: &str, reason: &str) {
+        let ids: Vec<String> = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            match st.quotes.remove(ticker) {
+                Some(q) => q.bid_order_id.into_iter().chain(q.ask_order_id).collect(),
+                None => return,
+            }
+        };
+        if !Self::live_enabled(eng) {
+            return;
+        }
+        for id in ids {
+            if let Err(e) = eng.kalshi.cancel_order(&id).await {
+                eprintln!("[house] pull {ticker} cancel {id} failed ({reason}): {e}");
+            }
+        }
+    }
+
+    /// Cancel existing legs and post a fresh two-sided quote around `mid` with
+    /// `expiration_ts = now + 75s`.
+    async fn requote(
+        &self,
+        eng: &Engine,
+        book: &Book,
+        ticker: &str,
+        mid: i64,
+        legs: signal::QuoteLegs,
+        now: i64,
+    ) {
+        // Cancel old legs first.
+        let old: Vec<String> = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.quotes
+                .get(ticker)
+                .into_iter()
+                .flat_map(|q| q.bid_order_id.iter().chain(q.ask_order_id.iter()).cloned())
+                .collect()
+        };
+        for id in old {
+            let _ = eng.kalshi.cancel_order(&id).await;
+        }
+
+        let exp = now + ORDER_TTL_SECS;
+        let (_, bid_px) = legs.bid();
+        let (_, ask_px) = legs.ask();
+        let bid_id = self
+            .place_leg(eng, ticker, Side::Yes, bid_px, exp, now)
+            .await;
+        let ask_id = self
+            .place_leg(eng, ticker, Side::No, ask_px, exp, now)
+            .await;
+
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.quotes.insert(
+            ticker.to_string(),
+            BookQuote {
+                bid_order_id: bid_id.clone(),
+                ask_order_id: ask_id.clone(),
+                bid_price: bid_px,
+                ask_price: ask_px,
+                quoted_mid: mid,
+                quoted_ts: now,
+                since_ms: chrono::Utc::now().timestamp_millis(),
+                booked_bid: 0,
+                booked_ask: 0,
+            },
+        );
+        drop(st);
+        logging::record_path(
+            LOG,
+            json!({"event": "house_quote", "book": book.label, "ticker": ticker, "mid": mid,
+                   "bid": bid_px, "ask": ask_px, "size": self.size, "expiration_ts": exp,
+                   "bid_order_id": bid_id, "ask_order_id": ask_id}),
+        );
+    }
+
+    /// Place one resting leg; returns its order_id (None on failure — logged).
+    async fn place_leg(
+        &self,
+        eng: &Engine,
+        ticker: &str,
+        side: Side,
+        price_cents: i64,
+        exp: i64,
+        now: i64,
+    ) -> Option<String> {
+        let coid = format!("house-{ticker}-{}-{now}", side.as_str());
+        match eng
+            .kalshi
+            .place_resting_limit_raw(ticker, side.as_str(), self.size, price_cents, exp, &coid)
+            .await
+        {
+            Ok((status, body, _)) if (200..300).contains(&status) => {
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(json!(null));
+                let placed = kalshi::parse_place_response(&v, side.as_str());
+                eng.note_signed_success();
+                if placed.order_id.is_none() {
+                    eprintln!("[house] no order_id posting {side:?} leg on {ticker}: {body}");
+                }
+                placed.order_id
+            }
+            Ok((status, body, _)) => {
+                eprintln!("[house] place {side:?} {ticker} HTTP {status}: {body}");
+                eng.note_order_failure(Some(status)).await;
+                None
+            }
+            Err(e) => {
+                eprintln!("[house] place {side:?} {ticker} error: {e}");
+                eng.note_order_failure(engine::net::http_status(&e)).await;
+                None
+            }
+        }
+    }
+
+    /// Poll fills for the resting legs and book only the per-pass DELTA. A booked
+    /// fill registers a pending markout and (per protocol) triggers a flatten —
+    /// implemented here as pulling the quote so the next pass re-posts fresh.
+    async fn detect_fills(&self, eng: &Engine, book: &Book, ticker: &str, mid: i64, now: i64) {
+        let (bid_id, ask_id, since_ms, booked_bid, booked_ask, bid_px, ask_px) = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            match st.quotes.get(ticker) {
+                Some(q) => (
+                    q.bid_order_id.clone(),
+                    q.ask_order_id.clone(),
+                    q.since_ms,
+                    q.booked_bid,
+                    q.booked_ask,
+                    q.bid_price,
+                    q.ask_price,
+                ),
+                None => return,
+            }
+        };
+        if bid_id.is_none() && ask_id.is_none() {
+            return;
+        }
+        let body = match eng.kalshi.fills(ticker).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[house] fills read {ticker} failed: {e}");
+                return;
+            }
+        };
+        let mut any = false;
+        for (side, oid, prev, px) in [
+            (Side::Yes, &bid_id, booked_bid, bid_px),
+            (Side::No, &ask_id, booked_ask, ask_px),
+        ] {
+            let Some(oid) = oid else { continue };
+            let fills = kalshi::parse_fills(&body, Some(oid), side.as_str(), since_ms);
+            let (total, avg, ts) = kalshi::fills_summary(&fills);
+            let delta = total - prev;
+            if delta <= 0 {
+                continue;
+            }
+            any = true;
+            let entry = avg.unwrap_or(px);
+            let fee = taker_fee(entry, delta) * 100.0; // cents
+            let in_catalyst = signal::in_catalyst_window(now, &self.catalysts);
+            {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.ledger
+                    .on_fill(ticker, side, delta, entry, fee, ts.unwrap_or(now * 1000));
+                if let Some(q) = st.quotes.get_mut(ticker) {
+                    match side {
+                        Side::Yes => q.booked_bid = total,
+                        Side::No => q.booked_ask = total,
+                    }
+                }
+                st.pending.push(Pending {
+                    ticker: ticker.to_string(),
+                    label: book.label.to_string(),
+                    side,
+                    entry_cents: entry,
+                    ts_ms: ts.unwrap_or(now * 1000),
+                    in_catalyst,
+                });
+            }
+            logging::info(format!(
+                "house {}: FILLED {delta}x {side:?} {ticker} @ {entry}c (mid {mid})",
+                book.label
+            ));
+            logging::record_path(
+                LOG,
+                json!({"event": "house_fill", "book": book.label, "ticker": ticker,
+                       "side": side.as_str(), "count": delta, "entry_cents": entry,
+                       "mid_at_fill": mid, "fee_cents": fee, "in_catalyst": in_catalyst,
+                       "order_id": oid}),
+            );
+            alert::notify(
+                &eng.http,
+                &format!("house FILLED {delta}x {side:?} {ticker} @ {entry}c"),
+            )
+            .await;
+        }
+        // Own fill → flatten: pull the quote so the next pass re-posts around the
+        // (post-fill) mid, re-establishing the opposite side (protocol §Re-quote b).
+        if any {
+            self.pull_quotes(eng, ticker, "own_fill_flatten").await;
+        }
+    }
+
+    /// Stamp +60s markouts on aged pending fills: compute markout at the current
+    /// mid, log it with the gap-through flag, and fire the −5¢ gap-through stop.
+    async fn settle_markouts(&self, eng: &Engine) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut done: Vec<(String, String, Side, i64, f64, bool, bool)> = Vec::new();
+        let mut trip_stop = false;
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mids = st.last_mid.clone();
+            let mut keep = Vec::new();
+            for p in std::mem::take(&mut st.pending) {
+                let age_secs = (now_ms - p.ts_ms) / 1000;
+                if age_secs < signal::MARKOUT_HORIZON_SECS {
+                    keep.push(p);
+                    continue;
+                }
+                let mid = mids.get(&p.ticker).copied().unwrap_or(p.entry_cents);
+                let mk = signal::markout_cents(p.side, p.entry_cents, mid);
+                let gap = signal::is_gap_through(mk);
+                if signal::gap_through_stop(mk, age_secs) {
+                    trip_stop = true;
+                }
+                done.push((p.ticker, p.label, p.side, p.entry_cents, mk, gap, p.in_catalyst));
+            }
+            st.pending = keep;
+        } // guard released here
+        for d in &done {
+            Self::log_markout(d);
+        }
+        if trip_stop {
+            self.halt(eng, "−5¢ gap-through markout within 60s").await;
+        }
+    }
+
+    fn log_markout(d: &(String, String, Side, i64, f64, bool, bool)) {
+        let (ticker, label, side, entry, mk, gap, in_catalyst) = d;
+        // Realized half-spread proxy: a favorable markout on a maker fill IS the
+        // captured half-spread (entry sat inside the mid by the markout).
+        let half_spread = if *mk > 0.0 { Some(*mk) } else { None };
+        logging::record_path(
+            LOG,
+            json!({"event": "house_markout", "book": label, "ticker": ticker,
+                   "side": side.as_str(), "entry_cents": entry, "markout_cents": mk,
+                   "gap_through": gap, "in_catalyst": in_catalyst,
+                   "half_spread_cents": half_spread}),
+        );
+    }
+}
+
+/// ET calendar day (YYYY-MM-DD) of a unix time — used by the CPI catalyst helper.
+#[allow(dead_code)]
+fn et_day(unix: i64) -> String {
+    chrono::DateTime::from_timestamp(unix, 0)
+        .map(|dt| dt.with_timezone(&New_York).format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}

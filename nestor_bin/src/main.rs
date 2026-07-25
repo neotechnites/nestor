@@ -39,14 +39,22 @@ async fn main() -> Result<()> {
     // No default subcommand: with lock/weather parked and streak live-gated,
     // a bare invocation should never silently pick a strategy.
     let which = std::env::args().nth(1).context(
-        "usage: nestor <run|streak|streak-once|volbook|volbook-once|calibrate|reconcile|\
-         probe-weather|backtest-lock|selftest-order|resume|weather|lock|lock-once>",
+        "usage: nestor <run|streak|streak-once|volbook|volbook-once|house|house-once|\
+         house-report|calibrate|reconcile|probe-weather|backtest-lock|selftest-order|\
+         resume|weather|lock|lock-once>",
     )?;
 
     // `backtest-lock` re-confirms the (parked) lock edge in-code against cached
     // data — kept as a re-entry check. Read-only, no keys, no engine.
     if which == "backtest-lock" {
         return lock::backtest::run();
+    }
+
+    // `house-report` summarizes the four house-probe metrics from the
+    // participation log. Read-only, no keys, no engine.
+    if which == "house-report" {
+        let path = env_str("HOUSE_LOG_PATH", house::strategy::LOG);
+        return house::report::run(&path);
     }
 
     // `calibrate` is a maintenance job (not a strategy): it needs neither the
@@ -112,6 +120,8 @@ async fn main() -> Result<()> {
                 | "weather"
                 | "volbook"
                 | "volbook-once"
+                | "house"
+                | "house-once"
         )
     {
         anyhow::bail!(
@@ -226,6 +236,44 @@ async fn main() -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
         return Ok(());
+    }
+
+    // House fill-probe (maker sleeve): standalone is paper/SHADOW-only (live
+    // standalone banned above; production runs inside `run` under HOUSE_PROBE=1).
+    // `house` loops the quote/fill/markout pass at 3s; `house-once` is a single
+    // pass. A ctrl-c handler cancels every resting house order on shutdown
+    // (charter §2) — belt-and-suspenders, since expiration_ts auto-cancels in 75s.
+    if which == "house" || which == "house-once" {
+        let strat = house::House::new();
+        engine::logging::info(format!(
+            "house probe — mode={:?} live_orders={} (HOUSE_PROBE={})",
+            eng.mode,
+            eng.mode == Mode::Live && std::env::var("HOUSE_PROBE").ok().as_deref() == Some("1"),
+            std::env::var("HOUSE_PROBE").unwrap_or_default()
+        ));
+        if which == "house-once" {
+            if let Err(e) = strat.run(&eng).await {
+                eprintln!("house: scan error: {e}");
+            }
+            return Ok(());
+        }
+        loop {
+            // ctrl-c races the scan+sleep: on shutdown, sweep every resting house
+            // order before exiting (charter §2). `&eng` only — no move.
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    engine::logging::info("house: ctrl-c — sweeping resting orders before exit");
+                    house::House::cancel_all_house_orders(&eng).await;
+                    return Ok(());
+                }
+                _ = async {
+                    if let Err(e) = strat.run(&eng).await {
+                        eprintln!("house: scan error: {e}");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                } => {}
+            }
+        }
     }
 
     // PARKED sleeves — manual invocation only, nothing schedules them.
@@ -354,6 +402,28 @@ async fn run_all(eng: Engine) -> Result<()> {
                     _ => {}
                 }
                 tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
+
+    // House fill-probe (maker sleeve): scheduled in `run` ONLY when HOUSE_PROBE=1
+    // (charter §5). At 3s cadence it quotes/detects fills/marks out; real orders
+    // require mode==Live AND HOUSE_PROBE=1 (the strategy's own gate) — otherwise it
+    // SHADOW-logs. On startup it sweeps orphan resting orders; expiration_ts (75s)
+    // is the load-bearing auto-cancel. Panic-caught like the other loops.
+    if std::env::var("HOUSE_PROBE").ok().as_deref() == Some("1") {
+        let e = eng.clone();
+        tokio::spawn(async move {
+            let strat = house::House::new();
+            engine::logging::info("house probe scheduled — HOUSE_PROBE=1 (maker two-sided quotes)");
+            loop {
+                let r = std::panic::AssertUnwindSafe(strat.run(&e)).catch_unwind().await;
+                match r {
+                    Ok(Err(err)) => eprintln!("house task error: {err}"),
+                    Err(_) => eprintln!("house task PANICKED — continuing"),
+                    _ => {}
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
         });
     }
