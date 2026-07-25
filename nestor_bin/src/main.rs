@@ -209,11 +209,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Volbook standalone (strategy #2, metal daily-wing seller): PAPER-SHADOW
-    // only. `volbook` loops the scan at 60s (T-3h entry window is hourly-scale, not
-    // sub-second); `volbook-once` runs a single pass. Live standalone is banned
-    // above; the sleeve is deliberately NOT scheduled in `run` and additionally
-    // refuses to place a real order unless VOLBOOK_LIVE=1 — paper-only until sized.
+    // Volbook standalone: paper-mode inspection (`volbook` loops at 60s,
+    // `volbook-once` single pass; live standalone banned above). PRODUCTION
+    // volbook runs inside `run` (scheduled 2026-07-25) where real orders
+    // additionally require VOLBOOK_LIVE=1.
     if which == "volbook" || which == "volbook-once" {
         let strat = volbook::strategy::Volbook::new()?;
         engine::logging::info(format!("volbook — {}", strat.universe_summary()));
@@ -290,7 +289,7 @@ async fn run_all(eng: Engine) -> Result<()> {
     use std::time::Duration;
 
     let eng = std::sync::Arc::new(eng);
-    engine::logging::info("nestor run — streak (adaptive 1s-in-window/12s-lazy) + settlement (60s) + nightly compression, one process");
+    engine::logging::info("nestor run — streak (adaptive 1s-in-window/12s-lazy) + volbook (60s, VOLBOOK_LIVE-gated) + settlement (60s) + nightly compression, one process");
 
     // Settlement: sweep every 60s so streak's 15-min markets settle intraday
     // (same trading day -> losses feed the daily-loss kill-switch). Each
@@ -326,6 +325,35 @@ async fn run_all(eng: Engine) -> Result<()> {
                 }
                 tokio::time::sleep(backoff_sleep(Duration::from_secs(60), backoff, retry_after))
                     .await;
+            }
+        });
+    }
+
+    // Volbook (strategy #2, metal daily-wing seller): 60s-cadence scan task —
+    // scheduled in `run` as of 2026-07-25 (Ryan authorized implementation; sizing
+    // derivation in enchiridion R148). Real orders ADDITIONALLY require
+    // VOLBOOK_LIVE=1 (the strategy's own gate) — live without the flag
+    // shadow-logs would-be entries; paper mode simulates. Panic-caught like the
+    // other loops.
+    {
+        let e = eng.clone();
+        tokio::spawn(async move {
+            let strat = match volbook::strategy::Volbook::new() {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("volbook: failed to load calibration — NOT scheduling: {err}");
+                    return;
+                }
+            };
+            engine::logging::info(format!("volbook scheduled — {}", strat.universe_summary()));
+            loop {
+                let r = std::panic::AssertUnwindSafe(strat.run(&e)).catch_unwind().await;
+                match r {
+                    Ok(Err(err)) => eprintln!("volbook task error: {err}"),
+                    Err(_) => eprintln!("volbook task PANICKED — continuing"),
+                    _ => {}
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
     }

@@ -487,6 +487,89 @@ impl Kalshi {
         serde_json::from_str(&text).context("parsing cancel response")
     }
 
+    // -----------------------------------------------------------------------
+    // MAKER capability (house probe) — RESTING two-sided quotes. Parallel to the
+    // IOC taker path; NEVER shares its risk semantics. The load-bearing safety
+    // property is `expiration_ts`: every resting order auto-cancels at a future
+    // unix-second deadline, so a dead process leaves NOTHING resting beyond ~75s.
+    // -----------------------------------------------------------------------
+
+    /// Place a RESTING limit order via the V2 create-order endpoint
+    /// (`POST /trade-api/v2/portfolio/events/orders`), the maker analogue of
+    /// [`place_limit_buy_raw`]. The critical difference: instead of
+    /// `time_in_force=immediate_or_cancel`, we set **`expiration_ts`** to a FUTURE
+    /// unix-second deadline (GTD, good-till-date). Kalshi V2 semantics:
+    ///   - `expiration_ts` in the future → order rests until then, then auto-cancels
+    ///   - `expiration_ts` omitted        → GTC, rests forever (WE NEVER DO THIS)
+    ///   - `expiration_ts` in the past    → treated as IOC
+    /// We ALWAYS pass a future ts, so a crashed process can leave nothing resting
+    /// beyond the expiry. `time_in_force` is intentionally OMITTED (its presence as
+    /// immediate_or_cancel would make the order a taker). `side`/`price_cents` use
+    /// the same call boundary as the taker path (yes/no + our-side whole cents),
+    /// translated to the single-book YES-leg via [`book_side`]/[`order_price_dollars`].
+    /// Returns `(http_status, raw_body, x_request_id)` WITHOUT erroring on non-2xx
+    /// so the caller can inspect the response (resting orders return fill_count 0,
+    /// remaining_count == count, status "resting", and an order_id). Signed.
+    pub async fn place_resting_limit_raw(
+        &self,
+        ticker: &str,
+        side: &str,
+        count: i64,
+        price_cents: i64,
+        expiration_ts: i64,
+        client_order_id: &str,
+    ) -> Result<(u16, String, Option<String>)> {
+        let path = format!("{PREFIX}/portfolio/events/orders");
+        let headers = self.sign_headers("POST", &path)?;
+        let mut map = serde_json::Map::new();
+        map.insert("ticker".into(), json!(ticker));
+        map.insert("side".into(), json!(book_side(side)));
+        map.insert("count".into(), json!(count_fp(count)));
+        map.insert("price".into(), json!(order_price_dollars(side, price_cents)));
+        // GTD resting: a FUTURE expiration_ts and NO immediate_or_cancel. This is
+        // the safety property — never omit expiration_ts (that would be GTC).
+        map.insert("expiration_ts".into(), json!(expiration_ts));
+        // Two-sided quote legs (bid mid-1, ask mid+1) never cross; cancel_both is
+        // the safe-if-they-ever-do choice for self-trade prevention.
+        map.insert(
+            "self_trade_prevention_type".into(),
+            json!("cancel_both"),
+        );
+        map.insert("client_order_id".into(), json!(client_order_id));
+        let body = serde_json::Value::Object(map);
+        let mut req = self.http.post(format!("{}{path}", api_base())).json(&body);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        let reqid = header(&resp, "x-request-id").or_else(|| header(&resp, "request-id"));
+        let text = resp.text().await?;
+        Ok((status, text, reqid))
+    }
+
+    /// List the account's currently-resting orders (signed GET
+    /// `/portfolio/orders?status=resting[&ticker=...]`). Used for the startup
+    /// orphan sweep (cancel any quote a prior crash left alive) and to confirm a
+    /// resting order actually auto-cancelled at its `expiration_ts` on demo.
+    /// Returns the raw JSON; parsing is delegated to [`parse_resting_orders`].
+    pub async fn resting_orders(&self, ticker: Option<&str>) -> Result<serde_json::Value> {
+        let path = format!("{PREFIX}/portfolio/orders");
+        let headers = self.sign_headers("GET", &path)?;
+        let mut req = self
+            .http
+            .get(format!("{}{path}", api_base()))
+            .query(&[("status", "resting"), ("limit", "200")]);
+        if let Some(t) = ticker {
+            req = req.query(&[("ticker", t)]);
+        }
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let text = text_or_error(req.send().await?, "resting_orders").await?;
+        serde_json::from_str(&text).context("parsing resting orders response")
+    }
+
     /// Order book for a market (public). Captured as the decision snapshot at
     /// every signal moment (DATA CAPTURE, redirect 2026-07-23).
     pub async fn orderbook(&self, ticker: &str) -> Result<serde_json::Value> {
