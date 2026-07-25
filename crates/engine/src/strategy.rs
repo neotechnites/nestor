@@ -108,6 +108,19 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Deterministic client_order_id for entry attempt `attempt` (1-based).
+/// Attempt 1 keeps the historical `{strategy}-{ticker}` form (restart-dedupe
+/// compatible with every order placed before retries existed); attempts ≥2
+/// append `-r{n}` so Kalshi's duplicate-coid 409 doesn't block a deliberate
+/// retry after a clean zero-fill IOC cancel.
+fn entry_coid(order: &Order, attempt: u32) -> String {
+    if attempt <= 1 {
+        format!("{}-{}", order.strategy, order.ticker)
+    } else {
+        format!("{}-{}-r{attempt}", order.strategy, order.ticker)
+    }
+}
+
 /// Run `fut` under the in-window network deadline ([`IN_WINDOW_TIMEOUT`]). Lets
 /// strategy crates fail fast on hot-path calls without depending on tokio
 /// directly. `Err(Elapsed)` = the deadline passed (OSS addendum #5).
@@ -243,6 +256,16 @@ impl Engine {
     /// verification) or simulate (paper). Never holds the std risk lock across
     /// a network await.
     pub async fn execute(&self, signal: Signal) -> ExecOutcome {
+        self.execute_attempt(signal, 1).await
+    }
+
+    /// Like [`execute`], but for retry attempt `attempt` (1-based) of the same
+    /// logical entry. Attempts ≥2 get a distinct client_order_id suffix so
+    /// Kalshi's duplicate-coid 409 doesn't block the retry (verify-streak-retry:
+    /// the ask flickers and returns — one IOC per window leaves fills on the
+    /// table). Callers own the retry policy; the engine just routes each attempt
+    /// through risk + execution like any order.
+    pub async fn execute_attempt(&self, signal: Signal, attempt: u32) -> ExecOutcome {
         // Serialize evaluate→place→verify→on_fill across concurrent tasks so
         // two strategies can't both pass a cap before either records its fill.
         let _exec = self.exec_lock.lock().await;
@@ -257,7 +280,7 @@ impl Engine {
         };
 
         if self.mode == Mode::Live {
-            self.execute_live(order).await
+            self.execute_live(order, attempt).await
         } else {
             // Paper: simulate an immediate full fill at the limit. Same
             // accounting path (fee charged at fill) so paper P&L is honest.
@@ -294,10 +317,11 @@ impl Engine {
     /// remainder — there is no resting order to clean up (taker-only doctrine is
     /// enforced by the exchange, not a follow-up cancel). We keep one best-effort
     /// fills read as a reconciliation cross-check and log any discrepancy.
-    async fn execute_live(&self, order: Order) -> ExecOutcome {
-        // Deterministic client_order_id (strategy + market ticker): if we die
-        // after Kalshi accepts but before recording, a re-run resends the SAME
-        // id and Kalshi dedupes it. One order per market is the design.
+    async fn execute_live(&self, order: Order, attempt: u32) -> ExecOutcome {
+        // Deterministic client_order_id (strategy + market ticker, plus an
+        // -r{n} suffix for retry attempts ≥2): if we die after Kalshi accepts
+        // but before recording, a re-run resends the SAME id and Kalshi dedupes
+        // it. One order per (market, attempt) is the design.
         //
         // EMPIRICALLY VERIFIED on demo 2026-07-23 (kalshi::tests::
         // demo_duplicate_coid_behavior, fix 2b): a duplicate client_order_id is
@@ -305,8 +329,9 @@ impl Engine {
         // echo the original order as a 2xx. So a re-fire with the same coid can
         // never double-book P&L: the safe branch. (We still never auto-re-POST an
         // order — a lost ack is resolved by the fills-query recovery below, not a
-        // retry.)
-        let coid = format!("{}-{}", order.strategy, order.ticker);
+        // blind repost; deliberate retries after a CLEAN zero-fill IOC cancel use
+        // the attempt suffix and are safe because nothing rested from the miss.)
+        let coid = entry_coid(&order, attempt);
 
         // Pre-order affordability check (OSS addendum #4): don't fire a doomed
         // order the account can't cover. One balance read per scan pass (cached).
@@ -361,7 +386,7 @@ impl Engine {
                         let err = anyhow::anyhow!(
                             "create-order 2xx unparseable{rid}: {e}: {text}"
                         );
-                        return self.recover_lost_ack(order, ts_submit_ms, &err, false).await;
+                        return self.recover_lost_ack(order, &coid, ts_submit_ms, &err, false).await;
                     }
                 }
             }
@@ -377,20 +402,20 @@ impl Engine {
                 let err =
                     anyhow::anyhow!("order placement HTTP {status}{rid}: {text}");
                 return self
-                    .recover_lost_ack(order, ts_submit_ms, &err, benign)
+                    .recover_lost_ack(order, &coid, ts_submit_ms, &err, benign)
                     .await;
             }
             // LOST-ACK RECOVERY (fix 1a): the POST errored/timed out at the network
             // layer, but Kalshi may have ACCEPTED and FILLED it. A real position
             // booked as "nothing happened" would make the kill-switch compute on a
             // lie. Query the truth (a fills GET) before giving up.
-            Ok(Err(e)) => return self.recover_lost_ack(order, ts_submit_ms, &e, false).await,
+            Ok(Err(e)) => return self.recover_lost_ack(order, &coid, ts_submit_ms, &e, false).await,
             Err(_elapsed) => {
                 let e = anyhow::anyhow!(
                     "order placement timed out after {}s",
                     IN_WINDOW_TIMEOUT.as_secs()
                 );
-                return self.recover_lost_ack(order, ts_submit_ms, &e, false).await;
+                return self.recover_lost_ack(order, &coid, ts_submit_ms, &e, false).await;
             }
         };
 
@@ -478,11 +503,11 @@ impl Engine {
     async fn recover_lost_ack(
         &self,
         order: Order,
+        coid: &str,
         ts_submit_ms: i64,
         place_err: &anyhow::Error,
         benign_duplicate: bool,
     ) -> ExecOutcome {
-        let coid = format!("{}-{}", order.strategy, order.ticker);
         // fills(&ticker) is scoped to this market; match by side + submit-time
         // window (we don't hold the exchange order_id — the ack was lost — and
         // one order per market is the design, so this is unambiguous).
@@ -577,4 +602,39 @@ impl Engine {
 pub trait Strategy {
     fn name(&self) -> &str;
     async fn run(&self, eng: &Engine) -> anyhow::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::risk::{Side, SizingHint};
+
+    fn order() -> Order {
+        Order {
+            strategy: "streak".into(),
+            ticker: "KXBTC15M-26JUL251000-00".into(),
+            side: Side::No,
+            count: 9,
+            limit_cents: 44,
+            cluster: "streak-1784987100".into(),
+            sizing: SizingHint::Flat,
+        }
+    }
+
+    #[test]
+    fn entry_coid_attempt_1_keeps_historical_form() {
+        // Restart-dedupe compatibility: attempt 1 must be byte-identical to the
+        // pre-retry coid so a crash re-run still 409s against the original.
+        assert_eq!(entry_coid(&order(), 1), "streak-KXBTC15M-26JUL251000-00");
+        assert_eq!(entry_coid(&order(), 0), "streak-KXBTC15M-26JUL251000-00");
+    }
+
+    #[test]
+    fn entry_coid_retries_get_distinct_suffixes() {
+        // Each retry needs a coid Kalshi has never seen, or the duplicate-coid
+        // 409 blocks the retry outright (demo_duplicate_coid_behavior).
+        assert_eq!(entry_coid(&order(), 2), "streak-KXBTC15M-26JUL251000-00-r2");
+        assert_eq!(entry_coid(&order(), 3), "streak-KXBTC15M-26JUL251000-00-r3");
+        assert_ne!(entry_coid(&order(), 2), entry_coid(&order(), 3));
+    }
 }

@@ -21,7 +21,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use engine::kalshi::Market;
 use engine::risk::taker_fee;
-use engine::strategy::{in_window, ExecOutcome, IN_WINDOW_TIMEOUT};
+use engine::strategy::{in_window, ExecOutcome, Mode, IN_WINDOW_TIMEOUT};
 use engine::{alert, logging, Engine, Side, Signal, SizingHint, Strategy};
 use serde_json::json;
 
@@ -44,6 +44,16 @@ const SAMPLE_WINDOW_SECS: i64 = 75;
 /// minute's samples survive across the boundary into the next window's entry
 /// phase, where the derivation for the just-closed window consumes them.
 const SPOT_RETENTION_SECS: i64 = 2 * SAMPLE_WINDOW_SECS;
+
+/// Entry attempts per market episode: 1 initial IOC + 3 retries. The ≤44¢ ask
+/// flickers and RETURNS — P(still/again ≤44 at +5s | ≤44 at t) = 0.926 on the
+/// 100ms week-1 tape; measured fill-rate 70.5% (one shot at ask) → 88.5%
+/// (gate limit + 3 retries) for +0.66¢ avg price, retry fills non-toxic
+/// (verify-streak-retry 2026-07-25). One IOC per window forfeits the edge.
+const MAX_ENTRY_ATTEMPTS: u32 = 4;
+/// Spacing between entry retries (2s: past most sub-second flicker, 4 attempts
+/// still span only ~7s of the 60s window).
+const RETRY_SPACING_MS: u64 = 2000;
 
 /// Marker file whose PRESENCE disables derivation — checked both at startup and
 /// live on every attempt. A USED-derivation disagreement with the official
@@ -719,8 +729,11 @@ impl Streak {
         // tags the participation record derived_fourth:true (item 3).
         derived: Option<(f64, f64)>,
     ) -> Result<()> {
-        // One order attempt per market, ever (missed fills are DATA, never
-        // chased; the deterministic client_order_id also dedupes across restarts).
+        // One entry EPISODE per market (dedupes across restarts). Within the
+        // episode, a zero-fill IOC is RETRIED while the entry window lasts —
+        // the old "missed fills are DATA, never chased" doctrine measurably
+        // forfeited fills the book still offered (verify-streak-retry; live
+        // miss KXETH15M-26JUL251000-00: the 31¢ ask was back 300ms later).
         if !self.first_time(cur.ticker.clone()) {
             return Ok(());
         }
@@ -733,7 +746,18 @@ impl Streak {
         };
 
         let side = if entry.buy_yes { Side::Yes } else { Side::No };
-        let limit = entry.ask.round() as i64;
+        // LIVE: limit at the 44¢ gate, not the observed ask. IOC price
+        // improvement pays the resting ask, never our limit (verified live:
+        // 28¢ fill on a higher limit), so the gate limit only widens flicker
+        // tolerance — it can't worsen the price of liquidity already there.
+        // Sizing at 44 keeps the flat-$4 worst case exact (9 contracts).
+        // PAPER: keep the observed ask — simulated fills price at the limit,
+        // and paper must not pretend it paid 44 for a 31¢ ask.
+        let limit = if eng.mode == Mode::Live {
+            signal::MAX_ASK_CENTS as i64
+        } else {
+            entry.ask.round() as i64
+        };
         let sig = Signal {
             strategy: "streak".into(),
             ticker: cur.ticker.clone(),
@@ -744,7 +768,25 @@ impl Streak {
             sizing: SizingHint::Flat,
         };
 
-        let outcome = eng.execute(sig).await;
+        let mut attempts: u32 = 1;
+        let outcome = loop {
+            let out = eng.execute_attempt(sig.clone(), attempts).await;
+            if !matches!(&out, ExecOutcome::Missed { .. }) || attempts >= MAX_ENTRY_ATTEMPTS {
+                break out;
+            }
+            // Next attempt must still land inside the entry window: 2s spacing
+            // + ~1s of order round-trip margin.
+            let ttc = cand.close_unix - chrono::Utc::now().timestamp();
+            if ttc < signal::MIN_TTC_SECS + 3 {
+                break out;
+            }
+            logging::info(format!(
+                "streak {series}: {} zero-fill IOC (attempt {attempts}/{MAX_ENTRY_ATTEMPTS}) — retrying in {RETRY_SPACING_MS}ms",
+                cur.ticker
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(RETRY_SPACING_MS)).await;
+            attempts += 1;
+        };
         let mut rec = json!({
             "event": "streak_signal",
             "ts_signal": now,
@@ -762,6 +804,7 @@ impl Streak {
             rec["derived_avg"] = json!(avg);
             rec["derived_margin_bp"] = json!(margin_bp);
         }
+        rec["attempts"] = json!(attempts);
 
         match &outcome {
             ExecOutcome::Filled { fill, response, .. } => {
