@@ -754,7 +754,7 @@ impl Streak {
         // PAPER: keep the observed ask — simulated fills price at the limit,
         // and paper must not pretend it paid 44 for a 31¢ ask.
         let limit = if eng.mode == Mode::Live {
-            signal::MAX_ASK_CENTS as i64
+            signal::ENTRY_LIMIT_CENTS
         } else {
             entry.ask.round() as i64
         };

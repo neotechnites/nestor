@@ -89,6 +89,19 @@ pub const MIN_TTC_SECS: i64 = 840;
 /// Price gate: reversal ask must be ≤ 44¢.
 pub const MAX_ASK_CENTS: f64 = 44.0;
 
+/// Willingness-to-pay CEILING for the entry order (¢) — deliberately ABOVE the
+/// signal gate (Ryan, 2026-07-26: "having a bid with a positive EV is better
+/// than having no bid... if we cant get 44, get what we can"). The tape proved
+/// the demand curve: at boundary signals, thousands of contracts of the SAME
+/// reversal side trade at 45-46 while a 44-limit order stands empty-handed
+/// (R155). EV at 46 = +7.0¢ at the measured 54.7% win rate, +4.3¢ at the
+/// conservative 52% origin estimate — still multiples of the fee — and 46 stays
+/// inside the origin research's validated cheap-side population (<~48¢).
+/// The 44 gate remains the SIGNAL (selectivity unchanged); this is only what
+/// we'll pay once the signal exists. IOC price improvement still fills at the
+/// real ask whenever it's lower.
+pub const ENTRY_LIMIT_CENTS: i64 = 46;
+
 /// Evaluate one candidate market against the newest settled windows.
 /// `settled_desc` must be sorted newest-first with non-empty results.
 pub fn detect(settled_desc: &[SettledWindow], cur: &Candidate, now: i64) -> Result<Entry, Skip> {
