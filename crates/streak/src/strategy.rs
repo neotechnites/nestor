@@ -769,6 +769,7 @@ impl Streak {
         };
 
         let mut attempts: u32 = 1;
+        let mut retry_books: Vec<serde_json::Value> = Vec::new();
         let outcome = loop {
             let out = eng.execute_attempt(sig.clone(), attempts).await;
             if !matches!(&out, ExecOutcome::Missed { .. }) || attempts >= MAX_ENTRY_ATTEMPTS {
@@ -785,6 +786,15 @@ impl Streak {
                 cur.ticker
             ));
             tokio::time::sleep(std::time::Duration::from_millis(RETRY_SPACING_MS)).await;
+            // DIAGNOSTIC (2026-07-26): three consecutive boundary-ask signals went
+            // 0-for-4 — snapshot the book at each retry so the record shows what
+            // was actually resting at ≤gate when each order arrived (phantom-quote
+            // vs real-but-taken vs repricing-away are distinguishable post-hoc).
+            let snap = match in_window(eng.kalshi.orderbook(&cur.ticker)).await {
+                Ok(Ok(b)) => b,
+                _ => json!(null),
+            };
+            retry_books.push(json!({"attempt": attempts + 1, "ts_ms": chrono::Utc::now().timestamp_millis(), "book": snap}));
             attempts += 1;
         };
         let mut rec = json!({
@@ -805,6 +815,9 @@ impl Streak {
             rec["derived_margin_bp"] = json!(margin_bp);
         }
         rec["attempts"] = json!(attempts);
+        if !retry_books.is_empty() {
+            rec["retry_books"] = json!(retry_books);
+        }
 
         match &outcome {
             ExecOutcome::Filled { fill, response, .. } => {
