@@ -194,7 +194,18 @@ async fn main() -> Result<()> {
     // entry windows, lazy outside; no settlement task — use `run` in
     // production); `streak-once` runs a single pass for testing.
     if which == "streak" || which == "streak-once" {
-        let strat = streak::strategy::Streak::new();
+        // Websocket market-data maintainer (always spawned — divergence logging is
+        // flag-independent; STREAK_WS=1 additionally drives the entry ask). Public
+        // clients have no ws auth and may be rejected; a dead ws never blocks a
+        // pass (REST is the floor).
+        let ws_book = std::sync::Arc::new(engine::ws::WsBook::new());
+        {
+            let b = ws_book.clone();
+            let auth = eng.kalshi.ws_auth();
+            let url = engine::kalshi::ws_url();
+            tokio::spawn(async move { engine::ws::run(b, url, auth).await });
+        }
+        let strat = streak::strategy::Streak::new().with_ws(ws_book);
         let mut backoff = 0u32;
         loop {
             let mut retry_after = 0u64;
@@ -339,6 +350,18 @@ async fn run_all(eng: Engine) -> Result<()> {
     let eng = std::sync::Arc::new(eng);
     engine::logging::info("nestor run — streak (adaptive 1s-in-window/12s-lazy) + volbook (60s, VOLBOOK_LIVE-gated) + settlement (60s) + nightly compression, one process");
 
+    // Websocket market-data maintainer: always spawned so the ws-vs-REST
+    // divergence tape (data/ws_divergence.jsonl) accrues immediately, regardless
+    // of the STREAK_WS flag. With STREAK_WS=1 the fresh ws book additionally
+    // drives streak's entry ask. A dead ws NEVER halts trading — REST is the floor.
+    let ws_book = std::sync::Arc::new(engine::ws::WsBook::new());
+    {
+        let b = ws_book.clone();
+        let auth = eng.kalshi.ws_auth();
+        let url = engine::kalshi::ws_url();
+        tokio::spawn(async move { engine::ws::run(b, url, auth).await });
+    }
+
     // Settlement: sweep every 60s so streak's 15-min markets settle intraday
     // (same trading day -> losses feed the daily-loss kill-switch). Each
     // iteration is panic-caught so one bad cycle can't silently kill the loop
@@ -449,7 +472,7 @@ async fn run_all(eng: Engine) -> Result<()> {
     // ask vs 4 at lock's old 15s), lazy ~12s outside, never oversleeping a
     // boundary. Lock (decay-dead) and weather (unverdicted) are parked — NOT
     // spawned.
-    let streak = streak::strategy::Streak::new();
+    let streak = streak::strategy::Streak::new().with_ws(ws_book);
     let mut backoff = 0u32;
     loop {
         let r = std::panic::AssertUnwindSafe(streak.run(&eng))

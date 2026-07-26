@@ -24,6 +24,52 @@ fn api_base() -> String {
         .unwrap_or_else(|_| "https://api.elections.kalshi.com".to_string())
 }
 const PREFIX: &str = "/trade-api/v2";
+/// Websocket v2 path (the string that is RSA-signed for the ws handshake, and the
+/// suffix of [`ws_url`]). Distinct from [`PREFIX`] — the ws lives under `/ws/`.
+const WS_PATH: &str = "/trade-api/ws/v2";
+
+/// Websocket URL derived from [`api_base`]: same host (so KALSHI_API_BASE selects
+/// prod vs demo exactly as REST does), https->wss, plus [`WS_PATH`]. Prod
+/// `api.elections.kalshi.com` empirically serves the ws (OSS note 26; demo mirror
+/// `demo-api.kalshi.co`). Verify the handshake on demo (`ws::demo_ws_connect_and_book`).
+pub fn ws_url() -> String {
+    let base = api_base();
+    let ws = base
+        .strip_prefix("https://")
+        .map(|h| format!("wss://{h}"))
+        .or_else(|| base.strip_prefix("http://").map(|h| format!("ws://{h}")))
+        .unwrap_or_else(|| base.clone());
+    format!("{ws}{WS_PATH}")
+}
+
+/// Owned, cloneable signer for the websocket handshake. Carries just the key id +
+/// signing key so the ws maintainer (a spawned task that outlives any borrow of
+/// [`Kalshi`]) can re-sign fresh auth headers on every reconnect. Same RSA-PSS
+/// scheme and same 3 `KALSHI-ACCESS-*` headers as the REST [`Kalshi::sign_headers`],
+/// signing `{ts_ms}GET/trade-api/ws/v2` (path only — no query, per the bare-path
+/// signing rule the REST client already relies on).
+#[derive(Clone)]
+pub struct WsAuth {
+    key_id: String,
+    signing_key: SigningKey<Sha256>,
+}
+
+impl WsAuth {
+    /// Freshly-signed handshake headers (regenerate per (re)connect so the
+    /// timestamp stays inside Kalshi's replay window).
+    pub fn headers(&self) -> Vec<(String, String)> {
+        let ts = chrono::Utc::now().timestamp_millis().to_string();
+        let msg = format!("{ts}GET{WS_PATH}");
+        let mut rng = rand::thread_rng();
+        let sig = self.signing_key.sign_with_rng(&mut rng, msg.as_bytes());
+        let b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+        vec![
+            ("KALSHI-ACCESS-KEY".into(), self.key_id.clone()),
+            ("KALSHI-ACCESS-SIGNATURE".into(), b64),
+            ("KALSHI-ACCESS-TIMESTAMP".into(), ts),
+        ]
+    }
+}
 
 /// Read a response header as an owned String (case-insensitive name lookup is
 /// handled by reqwest's `HeaderMap`).
@@ -222,6 +268,18 @@ impl Kalshi {
             key_id: Some(key_id),
             signing_key: Some(SigningKey::<Sha256>::new(key)),
         })
+    }
+
+    /// A cloneable websocket signer, or None on a public (unauthenticated)
+    /// client. The ws maintainer uses it to re-sign the handshake per reconnect.
+    pub fn ws_auth(&self) -> Option<WsAuth> {
+        match (&self.key_id, &self.signing_key) {
+            (Some(k), Some(s)) => Some(WsAuth {
+                key_id: k.clone(),
+                signing_key: s.clone(),
+            }),
+            _ => None,
+        }
     }
 
     fn sign_headers(&self, method: &str, path: &str) -> Result<Vec<(String, String)>> {

@@ -15,13 +15,14 @@
 //! (`data/streak_week1.jsonl`). Nestor keeps everything it generates.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use engine::kalshi::Market;
 use engine::risk::taker_fee;
 use engine::strategy::{in_window, ExecOutcome, Mode, IN_WINDOW_TIMEOUT};
+use engine::ws::WsBook;
 use engine::{alert, logging, Engine, Side, Signal, SizingHint, Strategy};
 use serde_json::json;
 
@@ -29,6 +30,10 @@ use crate::derive::{self, Derivation, Verify};
 use crate::signal::{self, Candidate, SettledWindow, Skip};
 
 const WEEK1_LOG: &str = "data/streak_week1.jsonl";
+/// WS-vs-REST ask divergence tape (charter VALIDATION LOGGING). One line per
+/// in-entry-window pass, ALWAYS (flag-independent) — one day of this proves the
+/// latency win and any correctness gap before STREAK_WS flips.
+const WS_DIVERGENCE_LOG: &str = "data/ws_divergence.jsonl";
 const SERIES: [&str; 2] = ["KXBTC15M", "KXETH15M"];
 /// Fast-poll horizon after each 15-min boundary: covers the 60s entry window
 /// plus settlement-lag slack (a late-settling previous window can still convert
@@ -171,6 +176,10 @@ pub struct Streak {
     /// Per-series consecutive-skip run: (reason_kind, count) for the repeat-skip
     /// alarm. Reset on any successful evaluation / no-signal pass.
     skip_alarm: Mutex<HashMap<String, (String, u32)>>,
+    /// Shared websocket book, when the maintainer task is running. Reads are
+    /// non-blocking and a dead ws NEVER halts an entry — REST is the floor.
+    /// Present regardless of the STREAK_WS flag (divergence logging is always on).
+    ws: Option<Arc<WsBook>>,
 }
 
 impl Streak {
@@ -181,7 +190,15 @@ impl Streak {
             spot_buf: Mutex::new(HashMap::new()),
             derive_pending: Mutex::new(HashMap::new()),
             skip_alarm: Mutex::new(HashMap::new()),
+            ws: None,
         }
+    }
+
+    /// Attach the shared websocket book (built + spawned by the binary). The book
+    /// feeds always-on divergence logging and, behind STREAK_WS=1, the entry ask.
+    pub fn with_ws(mut self, ws: Arc<WsBook>) -> Self {
+        self.ws = Some(ws);
+        self
     }
 
     /// Advance (or reset) the repeat-skip alarm for `series`. `None` reason =
@@ -353,6 +370,51 @@ impl Streak {
         format!("refetch|{series}|{window_id}")
     }
 
+    /// WS integration for one candidate market. No-op when no ws book is attached.
+    /// (1) marks the ticker wanted so the maintainer subscribes it; (2) inside the
+    /// entry window, appends a ws-vs-REST divergence line ALWAYS (flag-independent);
+    /// (3) behind STREAK_WS=1, overrides the candidate asks with the ws book ONLY
+    /// when it is synced and fresh (<1s). Any miss leaves the REST asks untouched.
+    fn apply_ws(&self, cur: &Market, cand: &mut Candidate, now: i64) {
+        let Some(ws) = &self.ws else { return };
+        ws.want(&cur.ticker);
+        let q = ws.quote(&cur.ticker);
+
+        // Divergence tape, gated to the entry window (first 60s) to bound volume.
+        let ttc = cand.close_unix - now;
+        if (signal::MIN_TTC_SECS..=signal::WINDOW_SECS).contains(&ttc) {
+            logging::record_path(
+                WS_DIVERGENCE_LOG,
+                json!({
+                    "ts_ms": chrono::Utc::now().timestamp_millis(),
+                    "ticker": cur.ticker,
+                    "ws_yes_ask": q.as_ref().and_then(|x| x.yes_ask),
+                    "ws_no_ask": q.as_ref().and_then(|x| x.no_ask),
+                    "rest_yes_ask": cand.yes_ask,
+                    "rest_no_ask": cand.no_ask,
+                    "ws_age_ms": q.as_ref().map(|x| x.age.as_millis() as u64),
+                    "ws_synced": q.as_ref().map(|x| x.synced),
+                }),
+            );
+        }
+
+        // Flag-gated override: fresh, synced ws book drives the entry ask.
+        if std::env::var("STREAK_WS").as_deref() != Ok("1") {
+            return;
+        }
+        if let Some(q) = q {
+            let fresh = q.synced && q.age < std::time::Duration::from_secs(1);
+            if fresh {
+                if let Some(a) = q.yes_ask {
+                    cand.yes_ask = Some(a as f64);
+                }
+                if let Some(a) = q.no_ask {
+                    cand.no_ask = Some(a as f64);
+                }
+            }
+        }
+    }
+
     async fn scan_series(&self, eng: &Engine, series: &str) -> Result<()> {
         let now_dt = chrono::Utc::now();
         let now = now_dt.timestamp();
@@ -395,7 +457,7 @@ impl Streak {
             Some(m) => m,
             None => return Ok(()),
         };
-        let cand = Candidate {
+        let mut cand = Candidate {
             open_unix: cur.open_unix(),
             close_unix: cur.close_unix().unwrap_or(now + signal::WINDOW_SECS),
             yes_ask: cur.yes_ask_cents_f64(),
@@ -403,6 +465,7 @@ impl Streak {
         };
 
         // DATA CAPTURE 1 — observation log: one compact line per poll, always.
+        // Records the REST asks (the ws override below happens after this).
         logging::record_path(
             &obs_path(now_dt),
             json!({
@@ -412,6 +475,12 @@ impl Streak {
                 "no_ask": cand.no_ask,
             }),
         );
+
+        // WEBSOCKET: register interest, log ws-vs-REST divergence (ALWAYS, in the
+        // entry window), and — only behind STREAK_WS=1 with a fresh synced book —
+        // let the ws ask drive the entry. A dead/stale ws silently falls back to
+        // the REST asks already in `cand` (never blocks an entry).
+        self.apply_ws(cur, &mut cand, now);
 
         match signal::detect(&settled, &cand, now) {
             Ok(entry) => {

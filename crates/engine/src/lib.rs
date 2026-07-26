@@ -17,6 +17,7 @@ pub mod spot;
 pub mod state;
 pub mod strategy;
 pub mod weather;
+pub mod ws;
 
 pub use kalshi::Kalshi;
 pub use risk::{Order, Rejection, RiskConfig, RiskManager, Side, Signal, SizingHint};
