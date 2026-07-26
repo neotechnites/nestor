@@ -25,6 +25,56 @@ const LOG: &str = "settlements.jsonl";
 /// positions without masking a genuine miscount.
 const DIVERGENCE_THRESHOLD_USD: f64 = 2.0;
 
+/// Tape of what `/portfolio/balance` actually did while an order rested. One
+/// line per divergence check that saw a non-zero resting reservation — the
+/// cheapest possible way to convert reality-F1's INFERRED into PROVEN: the
+/// first live maker leg answers it for free.
+const RESTING_COLLATERAL_LOG: &str = "data/resting_collateral.jsonl";
+
+/// The divergence breaker's tolerance for this pass, in dollars (FIX 1 —
+/// reality F1, constants F1, moneypath F3).
+///
+/// `DIVERGENCE_THRESHOLD_USD` alone is WRONG whenever a maker leg is resting,
+/// and it is wrong in a way that HALTS THE WHOLE BOT on either answer to an
+/// exchange fact we have never proven in prod: does `/portfolio/balance` debit
+/// the collateral of a RESTING (unfilled) buy order?
+///   - if it does NOT (demo, 2026-07-26): real cash is unmoved while
+///     `expected_cash` has already dropped by the reservation → Δ = the full
+///     resting notional ($4.00 for a streak maker leg) → halt.
+///   - if it DOES (prod, unverified): Δ = 0 for streak, but house's two-sided
+///     quotes reserve nothing at all → their notional shows up as Δ instead.
+///
+/// Widening by the CURRENTLY-RESTING reservations is robust to BOTH branches:
+/// the true divergence attributable to unproven collateral treatment is bounded
+/// by exactly that number, so `$2.00 + Σ resting` cannot false-halt, while any
+/// miscount LARGER than the resting notional still trips.
+///
+/// Deliberately NOT "exclude reservations from expected_cash": that inverts the
+/// halt if prod does debit on rest. Deliberately NOT the full `reserved_total`:
+/// a reservation held past a KNOWN fill (cancel-404) covers cash that certainly
+/// moved, and widening for it would mask a genuine miscount for minutes.
+fn divergence_threshold(resting_reserved: f64) -> f64 {
+    DIVERGENCE_THRESHOLD_USD + resting_reserved.max(0.0)
+}
+
+/// Which branch of the unproven resting-collateral question this observation is
+/// consistent with. Only meaningful when `resting_reserved > 0`.
+fn collateral_branch(real_cash: f64, expected_cash: f64, resting_reserved: f64) -> &'static str {
+    if resting_reserved <= 0.0 {
+        return "no_resting_orders";
+    }
+    let delta = real_cash - expected_cash;
+    // Locking ⇒ real tracks expected (Δ≈0). Not locking ⇒ real is HIGHER than
+    // expected by the resting notional. Split at the midpoint.
+    if delta > resting_reserved / 2.0 {
+        "does_not_lock_collateral"
+    } else if delta.abs() <= resting_reserved / 2.0 {
+        "locks_collateral"
+    } else {
+        "inconsistent_with_both"
+    }
+}
+
 /// Decide the settlement action for a position given the market's raw `result`.
 /// `None` = not settled yet (or void/unknown) → skip and retry next run.
 /// `Some(won)` = settled; `won` is whether our `side` matches the outcome.
@@ -244,15 +294,43 @@ async fn reconcile_exchange_truth(eng: &Engine) -> Result<()> {
         .await
         .context("balance read (divergence check)")?;
     let real_cash = bal_cents as f64 / 100.0;
-    let expected_cash = {
+    let (expected_cash, resting_reserved, house_cash) = {
         let r = eng.risk.lock().unwrap_or_else(|e| e.into_inner());
-        r.expected_cash()
+        (r.expected_cash(), r.resting_reserved(), r.house_cash())
     };
     let divergence = (real_cash - expected_cash).abs();
-    if divergence > DIVERGENCE_THRESHOLD_USD {
+    let threshold = divergence_threshold(resting_reserved);
+
+    // FREE EVIDENCE (reality F1): the first live pass that lands while an order
+    // rests answers the resting-collateral question outright. Record it.
+    if resting_reserved > 0.0 {
+        let branch = collateral_branch(real_cash, expected_cash, resting_reserved);
+        logging::record_path(
+            RESTING_COLLATERAL_LOG,
+            json!({
+                "event": "resting_collateral_observation",
+                "real_cash": real_cash,
+                "expected_cash": expected_cash,
+                "resting_reserved": resting_reserved,
+                "house_cash": house_cash,
+                "delta": real_cash - expected_cash,
+                "threshold": threshold,
+                "branch": branch,
+            }),
+        );
+        logging::info(format!(
+            "resting-collateral observation — resting ${resting_reserved:.2}, real \
+             ${real_cash:.2} vs expected ${expected_cash:.2} (Δ${:.2}) → {branch}",
+            real_cash - expected_cash
+        ));
+    }
+
+    if divergence > threshold {
         let msg = format!(
-            "BANKROLL DIVERGENCE ${divergence:.2} > ${DIVERGENCE_THRESHOLD_USD:.2} — real cash \
-             ${real_cash:.2} vs expected ${expected_cash:.2}. HALTING (state/exchange disagree).",
+            "BANKROLL DIVERGENCE ${divergence:.2} > ${threshold:.2} (base \
+             ${DIVERGENCE_THRESHOLD_USD:.2} + ${resting_reserved:.2} resting) — real cash \
+             ${real_cash:.2} vs expected ${expected_cash:.2} (house bridge ${house_cash:.2}). \
+             HALTING (state/exchange disagree).",
         );
         logging::info(format!("ALERT: {msg}"));
         eprintln!("[reconcile] ALERT: {msg}");
@@ -260,7 +338,8 @@ async fn reconcile_exchange_truth(eng: &Engine) -> Result<()> {
         alert::notify(&eng.http, &msg).await;
     } else {
         logging::info(format!(
-            "divergence check OK — real ${real_cash:.2} vs expected ${expected_cash:.2} (Δ${divergence:.2})"
+            "divergence check OK — real ${real_cash:.2} vs expected ${expected_cash:.2} \
+             (Δ${divergence:.2} ≤ ${threshold:.2})"
         ));
     }
     Ok(())
@@ -304,6 +383,67 @@ mod tests {
         // A result present but status still active/closed is anomalous — wait.
         assert!(!is_settleable("active", "yes"));
         assert!(!is_settleable("closed", "no"));
+    }
+
+    /// Would the breaker HALT on this observation?
+    fn halts(real: f64, expected: f64, resting: f64) -> bool {
+        (real - expected).abs() > divergence_threshold(resting)
+    }
+
+    #[test]
+    fn divergence_tolerance_absorbs_a_resting_maker_leg_on_both_branches() {
+        // FIX 1. Streak maker leg: 10 @ 40c = $4.00 reserved on a $106.03
+        // bankroll, plus the standing +$0.25 offset present in all 2730 live
+        // checks to date (reality F13). expected_cash = 106.03 − 4.00 = 102.03.
+        let expected = 102.03;
+        let resting = 4.00;
+        // Branch A — balance does NOT debit resting collateral (demo-proven):
+        // real cash is still 106.28 (106.03 + 0.25). Δ = $4.25.
+        assert!(
+            !halts(106.28, expected, resting),
+            "must not halt on the no-lock branch"
+        );
+        // Branch B — balance DOES debit it (prod unverified): real = 102.28.
+        assert!(
+            !halts(102.28, expected, resting),
+            "must not halt on the locking branch"
+        );
+        // Without the widening, branch A is a $4.25 > $2.00 HALT — the confirmed
+        // defect this fix exists to remove.
+        assert!((106.28f64 - expected).abs() > DIVERGENCE_THRESHOLD_USD);
+    }
+
+    #[test]
+    fn divergence_still_halts_on_a_real_miscount() {
+        // The breaker is WIDENED, not disabled: anything beyond the resting
+        // notional plus the base tolerance still trips, on either branch.
+        // Δ = 4.25 + 2.01 = 6.26 > 6.00; and 102.28 − 6.30 → Δ = 6.05 > 6.00.
+        assert!(halts(106.28 + 2.01, 102.03, 4.00));
+        assert!(halts(102.28 - 6.30, 102.03, 4.00));
+        // And with nothing resting the threshold is exactly the old one.
+        assert!((divergence_threshold(0.0) - DIVERGENCE_THRESHOLD_USD).abs() < 1e-9);
+        assert!(halts(106.28, 102.03, 0.0));
+        assert!(!halts(106.28, 106.03, 0.0)); // the standing Δ$0.25 stays OK
+        // A garbage negative never shrinks the tolerance below the base.
+        assert!((divergence_threshold(-5.0) - DIVERGENCE_THRESHOLD_USD).abs() < 1e-9);
+    }
+
+    #[test]
+    fn collateral_branch_classifies_the_free_evidence() {
+        // The observation that converts reality-F1 INFERRED → PROVEN.
+        // $4 resting; real unmoved vs expected already debited → no lock.
+        assert_eq!(
+            collateral_branch(106.28, 102.03, 4.0),
+            "does_not_lock_collateral"
+        );
+        // Real moved with expected → the exchange locked the collateral.
+        assert_eq!(collateral_branch(102.28, 102.03, 4.0), "locks_collateral");
+        // Cash gone that neither branch explains — worth seeing in the tape.
+        assert_eq!(
+            collateral_branch(95.00, 102.03, 4.0),
+            "inconsistent_with_both"
+        );
+        assert_eq!(collateral_branch(106.28, 106.03, 0.0), "no_resting_orders");
     }
 
     #[test]

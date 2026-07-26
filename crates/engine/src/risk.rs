@@ -119,15 +119,31 @@ pub struct SettleOutcome {
     pub pnl: f64,
 }
 
+/// Precision Kalshi rounds a taker fee UP to. MEASURED, not assumed:
+/// `work/verify-house-truth.md` Q3 matched `ceil(0.07·P·(1−P)·C, $0.0001)`
+/// EXACTLY on 5/5 demo fills — one hundredth of a cent, **NOT** the whole cent
+/// the old published fee tables (and this function until 2026-07-26) asserted.
+/// Ceiling at the whole cent over-charged up to $0.0099 per order, always in the
+/// same direction, against a $2.00 divergence budget.
+const FEE_ROUNDING_DOLLARS: f64 = 0.0001;
+
 /// Kalshi taker fee in dollars for one ORDER of `count` contracts at
-/// `price_cents`: `ceil-to-next-cent( 0.07 × count × P × (1−P) )`, P in dollars.
-/// The ceil is applied once per ORDER (Kalshi's actual billing), not per
+/// `price_cents`: `ceil( 0.07 × count × P × (1−P), $0.0001 )`, P in dollars.
+/// The ceil is applied once per ORDER (Kalshi's billing granularity), not per
 /// contract — an un-ceiled formula understates the fee and overstates P&L
-/// (redirect 2026-07-23; vault note 18 gotchas).
+/// (redirect 2026-07-23; precision proven demo 2026-07-26, reality F7).
 pub fn taker_fee(price_cents: i64, count: i64) -> f64 {
     let p = price_cents as f64 / 100.0;
     let raw = 0.07 * count as f64 * p * (1.0 - p);
-    (raw * 100.0).ceil() / 100.0
+    let steps = raw / FEE_ROUNDING_DOLLARS;
+    // Guard against a float representation a hair above an exact multiple
+    // (e.g. 0.175/0.0001 = 1749.9999999999998) ceiling to a spurious extra step.
+    let steps = if (steps - steps.round()).abs() < 1e-6 {
+        steps.round()
+    } else {
+        steps.ceil()
+    };
+    steps * FEE_ROUNDING_DOLLARS
 }
 
 /// Capital committed to a RESTING (maker) order that has not filled yet. The
@@ -149,6 +165,18 @@ struct Reservation {
     stake: f64,
     /// Flat-sized: also consumes the daily budget while it rests.
     flat: bool,
+    /// TRUE while the order this reservation covers may still be UNFILLED on the
+    /// exchange (in-flight POST, or confirmed resting). Flipped FALSE the moment
+    /// we learn the order left the book by FILLING (cancel-404 / partial cancel),
+    /// even though the reservation itself is deliberately held for a while
+    /// longer so the cap cannot be double-spent while the fill surfaces.
+    ///
+    /// The distinction is load-bearing for the divergence breaker: an UNFILLED
+    /// resting order's collateral treatment by `/portfolio/balance` is UNPROVEN
+    /// (reality F1), so it must widen the breaker's tolerance; a FILLED one's is
+    /// proven (cash moved) and must NOT — widening there would mask a real
+    /// miscount for as long as the reservation is held.
+    resting: bool,
 }
 
 pub struct RiskManager {
@@ -161,6 +189,22 @@ pub struct RiskManager {
     live: bool,
     /// In-flight resting-order commitments (see [`Reservation`]).
     reserved: Vec<Reservation>,
+    /// SIGNED cash the HOUSE sleeve has moved on the exchange that no `Position`
+    /// yet accounts for, in cents, keyed by ticker (moneypath F2 / constants F1).
+    /// House is two-sided by design and deliberately does NOT route through
+    /// `evaluate`/`reserve` (one-position-per-ticker would break it), but its
+    /// fills are real cash: without this the divergence breaker sees house's
+    /// spending as unexplained and HALTS the whole bot.
+    ///
+    /// Negative = cash spent. A ticker's entry is DROPPED the moment
+    /// [`adopt_orphan`](Self::adopt_orphan) books that ticker as a position,
+    /// because the position's stake then carries the same dollars through
+    /// `total_at_risk` — keeping both would double-count.
+    ///
+    /// NOT PERSISTED, deliberately — same doctrine as [`Reservation`]: it is a
+    /// bridge between "cash left the account" and "reconcile adopted the
+    /// position", and a restart re-derives exchange truth from `/portfolio/positions`.
+    house_cash_cents: std::collections::HashMap<String, i64>,
 }
 
 impl RiskManager {
@@ -196,6 +240,7 @@ impl RiskManager {
             store,
             live,
             reserved: Vec::new(),
+            house_cash_cents: std::collections::HashMap::new(),
         })
     }
 
@@ -269,6 +314,8 @@ impl RiskManager {
             cluster: o.cluster.clone(),
             stake: o.stake(),
             flat: matches!(o.sizing, SizingHint::Flat),
+            // A freshly-placed order is unfilled until proven otherwise.
+            resting: true,
         });
     }
 
@@ -277,9 +324,52 @@ impl RiskManager {
         self.reserved.retain(|r| r.key != key);
     }
 
+    /// Mark a reservation's order as NO LONGER RESTING — we have learned it left
+    /// the book by filling (cancel-404, or a cancel whose `reduced_by` shows a
+    /// partial). The reservation stays (the cap must not be re-spent while the
+    /// fill surfaces) but it stops widening the divergence breaker's tolerance.
+    /// No-op for an unknown key.
+    pub fn mark_reservation_off_book(&mut self, key: &str) {
+        if let Some(r) = self.reserved.iter_mut().find(|r| r.key == key) {
+            r.resting = false;
+        }
+    }
+
     /// Dollars currently committed to unfilled resting orders (diagnostics).
     pub fn reserved_total(&self) -> f64 {
         self.reserved.iter().map(|r| r.stake).sum()
+    }
+
+    /// Dollars committed to orders that may STILL BE UNFILLED on the exchange.
+    /// This is exactly the amount by which `/portfolio/balance` and our
+    /// `expected_cash` may legitimately disagree while the unproven
+    /// resting-collateral question (reality F1) stands: if Kalshi locks the
+    /// collateral of a resting bid, real and expected both drop and Δ = 0; if it
+    /// does not, only expected drops and Δ = this number. The divergence breaker
+    /// widens by it so the bot cannot halt on EITHER answer.
+    pub fn resting_reserved(&self) -> f64 {
+        self.reserved
+            .iter()
+            .filter(|r| r.resting)
+            .map(|r| r.stake)
+            .sum()
+    }
+
+    /// Book a signed HOUSE cash movement (cents; negative = spent) against
+    /// `ticker`. See [`house_cash_cents`](Self::house_cash_cents).
+    pub fn note_house_cash_cents(&mut self, ticker: &str, delta_cents: i64) {
+        if delta_cents == 0 {
+            return;
+        }
+        *self
+            .house_cash_cents
+            .entry(ticker.to_string())
+            .or_insert(0) += delta_cents;
+    }
+
+    /// Signed dollars of house cash not yet represented by an open position.
+    pub fn house_cash(&self) -> f64 {
+        self.house_cash_cents.values().sum::<i64>() as f64 / 100.0
     }
 
     /// Decide size for a signal, or reject. Does not mutate open positions;
@@ -446,6 +536,9 @@ impl RiskManager {
         // at-risk stake (and thus the kill-switch's view of exposure) is maximal.
         const WORST_CASE_ENTRY_CENTS: i64 = 99;
         let entry = entry_cents.unwrap_or(WORST_CASE_ENTRY_CENTS).clamp(1, 99);
+        // The position's stake now carries this ticker's cash through
+        // `total_at_risk`; the house bridge ledger must stop carrying it too.
+        self.house_cash_cents.remove(ticker);
         self.state.day_spent += count as f64 * entry as f64 / 100.0;
         self.state.open.push(Position {
             strategy: "orphan-adopted".into(),
@@ -462,10 +555,13 @@ impl RiskManager {
     }
 
     /// Cash the account SHOULD hold if every open position is valued at its entry
-    /// cost: `bankroll − Σ(open stakes)`. Compared against the real Kalshi balance
-    /// by the divergence breaker (fix 1c) — the two must track within a threshold.
+    /// cost: `bankroll − Σ(open stakes + reservations) + house cash delta`.
+    /// Compared against the real Kalshi balance by the divergence breaker (fix
+    /// 1c) — the two must track within a threshold. The house term is what keeps
+    /// a sleeve that deliberately sits outside the position ledger from reading
+    /// as unexplained drift (moneypath F2).
     pub fn expected_cash(&self) -> f64 {
-        self.state.bankroll - self.total_at_risk()
+        self.state.bankroll - self.total_at_risk() + self.house_cash()
     }
 
     /// Force the kill-switch on (divergence breaker / operator). Persisted.
@@ -794,8 +890,8 @@ mod tests {
         r.on_fill(&o);
         r.on_settlement(&o.ticker, true);
         // win: 52*(1-0.95) - fee ; fee = ceil-per-order(0.07*52*0.95*0.05)
-        let fee = taker_fee(95, 52); // raw 0.17290 -> 0.18
-        assert!((fee - 0.18).abs() < 1e-9);
+        let fee = taker_fee(95, 52); // raw 0.1729 -> exact at $0.0001 granularity
+        assert!((fee - 0.1729).abs() < 1e-9);
         let expected = 1000.0 + 52.0 * 0.05 - fee;
         assert!((r.status().bankroll - expected).abs() < 1e-6);
     }
@@ -882,8 +978,8 @@ mod tests {
 
         // Only 5 of 9 filled, at 43c (better than limit).
         r.on_fill_actual(&o, 5, 43);
-        let fee = taker_fee(43, 5); // raw 0.07*5*0.43*0.57 = 0.0858 -> 0.09
-        assert!((fee - 0.09).abs() < 1e-9);
+        let fee = taker_fee(43, 5); // raw 0.085785 -> ceil($0.0001) = 0.0858
+        assert!((fee - 0.0858).abs() < 1e-9);
         assert!((r.status().bankroll - (100.0 - fee)).abs() < 1e-9);
         let pos = &r.open_positions()[0];
         assert_eq!(pos.count, 5);
@@ -906,14 +1002,27 @@ mod tests {
     }
 
     #[test]
-    fn taker_fee_ceils_per_order() {
-        // Streak-typical order: 9 contracts @ 44c -> raw 0.07*9*0.44*0.56 =
-        // 0.15523 -> ceil to next cent = $0.16 (redirect: ~1.73c/contract at 44c).
-        assert!((taker_fee(44, 9) - 0.16).abs() < 1e-9);
-        // Exact-cent raw stays (no over-ceil): 0.07*10*0.50*0.50 = 0.175 -> 0.18.
-        assert!((taker_fee(50, 10) - 0.18).abs() < 1e-9);
-        // Single tiny contract still pays a whole cent: 0.07*1*0.05*0.95=0.003325 -> 0.01.
-        assert!((taker_fee(5, 1) - 0.01).abs() < 1e-9);
+    fn taker_fee_ceils_to_a_hundredth_of_a_cent_not_a_whole_cent() {
+        // reality F7 / verify-house-truth Q3: Kalshi ceils to $0.0001, exact on
+        // 5/5 demo fills. Whole-cent ceiling over-charged up to $0.0099/order.
+        // Streak maker leg: 9 @ 44c -> raw 0.155232 -> $0.1553 (was $0.16).
+        assert!((taker_fee(44, 9) - 0.1553).abs() < 1e-9);
+        // Exact multiple of the rounding step is NOT pushed up a step:
+        // 0.07*10*0.50*0.50 = 0.175 exactly.
+        assert!((taker_fee(50, 10) - 0.175).abs() < 1e-9);
+        // Sub-cent orders are no longer rounded up to a whole cent:
+        // 0.07*1*0.05*0.95 = 0.003325 -> $0.0034 (was $0.01, 3x over).
+        assert!((taker_fee(5, 1) - 0.0034).abs() < 1e-9);
+        // Streak backstop: 8 @ 46c -> 0.139104 -> $0.1392 = 1.74c/contract,
+        // the number the ledger's EV(46) = +4.3c is derived against (S11).
+        assert!((taker_fee(46, 8) - 0.1392).abs() < 1e-9);
+        // The fee is never UNDER the raw formula (it ceils, never floors).
+        for (p, c) in [(3, 1), (17, 7), (44, 9), (46, 8), (95, 52), (97, 3)] {
+            let raw = 0.07 * c as f64 * (p as f64 / 100.0) * (1.0 - p as f64 / 100.0);
+            let fee = taker_fee(p, c);
+            assert!(fee >= raw - 1e-12, "fee {fee} under raw {raw} at {p}c x{c}");
+            assert!(fee - raw < 0.0001 + 1e-12, "over-ceiled at {p}c x{c}");
+        }
     }
 
     #[test]
@@ -1125,6 +1234,95 @@ mod tests {
         r.on_fill(&o);
         // bankroll dropped by the fee; expected cash = bankroll − stake.
         assert!((r.expected_cash() - (100.0 - fee - stake)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resting_reserved_covers_unfilled_orders_only() {
+        // FIX 1 (reality F1 / constants F1 / moneypath F3). A reservation widens
+        // the divergence breaker ONLY while its order may still be unfilled: the
+        // resting-collateral question is unproven, so Δ may legitimately be
+        // anywhere in [0, stake]. Once we know it FILLED, cash definitely moved
+        // and the tolerance must snap back or a real miscount hides behind it.
+        let mut r = rm(100.0);
+        let o = r.evaluate(&sig(SizingHint::Flat, 40, "c")).unwrap();
+        r.reserve("streak-maker|T", &o);
+        assert!((r.resting_reserved() - o.stake()).abs() < 1e-9);
+        assert!((r.reserved_total() - o.stake()).abs() < 1e-9);
+
+        // Cancel-404: the bid left the book by filling. The cap stays committed
+        // (the fill has not surfaced yet) but the breaker must not widen.
+        r.mark_reservation_off_book("streak-maker|T");
+        assert_eq!(r.resting_reserved(), 0.0);
+        assert!((r.reserved_total() - o.stake()).abs() < 1e-9);
+
+        r.release("streak-maker|T");
+        assert_eq!(r.resting_reserved(), 0.0);
+        assert_eq!(r.reserved_total(), 0.0);
+        // Unknown key is a no-op, never a panic.
+        r.mark_reservation_off_book("nope");
+    }
+
+    #[test]
+    fn divergence_stays_inside_tolerance_on_both_collateral_branches() {
+        // The arithmetic the breaker's widened threshold rests on, for a $4.00
+        // maker leg on a $100 bankroll, under BOTH unproven exchange behaviours.
+        // Streak's live sizing: flat $4.00 per entry (nestor.toml).
+        let cfg = RiskConfig {
+            flat_usd: 4.0,
+            daily_budget_usd: 60.0,
+            ..RiskConfig::default()
+        };
+        let mut r =
+            RiskManager::load_or_init(cfg, Box::new(MemoryStore::default()), 100.0, false, true)
+                .unwrap();
+        let o = r.evaluate(&sig(SizingHint::Flat, 40, "c")).unwrap();
+        assert!((o.stake() - 4.0).abs() < 1e-9);
+        r.reserve("k", &o);
+        let expected = r.expected_cash();
+        assert!((expected - 96.0).abs() < 1e-9);
+        let widened = 2.0 + r.resting_reserved(); // = $6.00
+
+        // Branch A — Kalshi does NOT lock resting collateral (demo 2026-07-26).
+        let real_a = 100.0;
+        assert!((real_a - expected).abs() <= widened);
+        // Branch B — Kalshi DOES lock it (prod unverified).
+        let real_b = 96.0;
+        assert!((real_b - expected).abs() <= widened);
+        // A genuine miscount LARGER than the resting notional still breaks
+        // through on either branch (the breaker is widened, not disabled).
+        assert!((real_a + 2.01 - expected).abs() > widened);
+        assert!((real_b - 6.01 - expected).abs() > widened);
+    }
+
+    #[test]
+    fn house_cash_moves_expected_cash_and_is_handed_off_to_adoption() {
+        // FIX 2b (moneypath F2). House spends real cash outside the position
+        // ledger; expected_cash must follow it, and must NOT double-count once
+        // reconcile adopts the resulting position.
+        let mut r = rm(100.0);
+        r.begin_day("2026-07-27");
+        assert!((r.expected_cash() - 100.0).abs() < 1e-9);
+
+        // Two-sided 1-lot quote both legs fill: 49c YES + 49c NO = 98c out.
+        r.note_house_cash_cents("KXAPRPOTUS-X", -49);
+        r.note_house_cash_cents("KXAPRPOTUS-X", -49);
+        assert!((r.expected_cash() - 99.02).abs() < 1e-9);
+        // Net position is ZERO, so no orphan is ever adopted — the bridge ledger
+        // is the only thing that explains the missing 98c, and it holds.
+        assert!(!r.adopt_orphan("KXAPRPOTUS-OTHER", Side::Yes, 0, None, "c"));
+        assert!((r.expected_cash() - 99.02).abs() < 1e-9);
+
+        // A one-sided fill that DOES leave a net position: 2 @ 49c on another
+        // rung, later adopted by reconcile. The stake takes over from the bridge.
+        r.note_house_cash_cents("KXCPIYOY-Y", -98);
+        assert!((r.expected_cash() - 98.04).abs() < 1e-9);
+        assert!(r.adopt_orphan("KXCPIYOY-Y", Side::Yes, 2, Some(49), "orphan"));
+        // 100 − 0.98 (position stake) − 0.98 (unadopted house pair) = 98.04.
+        assert!(
+            (r.expected_cash() - 98.04).abs() < 1e-9,
+            "adoption must hand off, not double-count: {}",
+            r.expected_cash()
+        );
     }
 
     #[test]

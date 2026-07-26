@@ -144,6 +144,37 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Classify a NON-2xx on the RESTING (maker) placement POST into
+/// `(may_be_resting, benign)` — FIX 4 (reality F2, moneypath F7 sub-finding).
+///
+/// The old code asserted `may_be_resting: false` for EVERY non-2xx ("the
+/// exchange answered: it created nothing"), and streak reads that as licence to
+/// fire an IOC. That is FALSE for exactly the codes the restart/retry path
+/// produces:
+///
+///   - **409 `order_already_exists`** — the deterministic maker coid
+///     (`streak-{ticker}-m40`) means a prior attempt's order is ALREADY on the
+///     book (demo-proven, `verify-streak-retry.md`). Taking on top of it opens a
+///     second position on a ticker whose ledger holds one, and
+///     `on_fill_actual`'s duplicate guard then refuses the second — real,
+///     invisible exposure. It is also BENIGN for the sticky-halt breaker: five
+///     in-window restarts must not halt the bot.
+///   - **5xx / 408** — Kalshi's edge can time out AFTER the matching engine
+///     accepted the order. "It created nothing" is an assertion we cannot make.
+///     Not benign (a real fault), but the caller must still stand down.
+///
+/// Everything else (400/401/403/422 validation, insufficient balance, …) really
+/// does mean nothing was created, and taking stays safe.
+fn classify_resting_failure(status: u16, code: Option<&str>) -> (bool, bool) {
+    if status == 409 && code == Some("order_already_exists") {
+        return (true, true);
+    }
+    if status == 408 || (500..600).contains(&status) {
+        return (true, false);
+    }
+    (false, false)
+}
+
 /// Deterministic client_order_id for entry attempt `attempt` (1-based).
 /// Attempt 1 keeps the historical `{strategy}-{ticker}` form (restart-dedupe
 /// compatible with every order placed before retries existed); attempts ≥2
@@ -445,11 +476,26 @@ impl Engine {
         };
         if !(200..300).contains(&status) {
             self.release_reservation(reserve_key);
-            self.note_order_failure(Some(status)).await;
-            // The exchange answered: it created nothing. Safe to take instead.
+            let api = kalshi::parse_api_error(&text);
+            let (may_be_resting, benign) =
+                classify_resting_failure(status, api.code.as_deref());
+            // A benign duplicate means the order was ALREADY safely placed under
+            // our deterministic coid — never feed the sticky-halt breaker with
+            // it (mirrors the taker path, engine/strategy.rs recover_lost_ack).
+            if !benign {
+                self.note_order_failure(Some(status)).await;
+            }
+            if may_be_resting {
+                eprintln!(
+                    "[place_resting] {} HTTP {status} ({}) — an order MAY be resting; \
+                     the caller must NOT take instead",
+                    order.ticker,
+                    api.code.as_deref().unwrap_or("no code")
+                );
+            }
             return RestOutcome::RestError {
                 msg: format!("resting placement HTTP {status}: {text}"),
-                may_be_resting: false,
+                may_be_resting,
             };
         }
         let response: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
@@ -463,10 +509,17 @@ impl Engine {
         if filled > 0 {
             let price_estimated = placed.fill_price_cents.is_none();
             let avg_price = placed.fill_price_cents.unwrap_or(order.limit_cents);
+            // Crossed at post = a TAKER fill; use the exchange's fee when given
+            // (FIX 7b) rather than re-deriving it from the formula.
             self.risk
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .on_fill_actual(&order, filled, avg_price);
+                .on_fill_actual_fee(
+                    &order,
+                    filled,
+                    avg_price,
+                    placed.actual_fee_cents.map(|c| c / 100.0),
+                );
             self.release_reservation(reserve_key);
             let fill = FillReport {
                 requested: order.count,
@@ -539,6 +592,38 @@ impl Engine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .release(key);
+    }
+
+    /// Tell the risk layer this reservation's order is no longer RESTING — it
+    /// left the book by filling. The reservation is still held (the cap must not
+    /// be re-spent while the fill surfaces) but it stops widening the divergence
+    /// breaker's tolerance (see `RiskManager::resting_reserved`).
+    pub fn mark_reservation_off_book(&self, key: &str) {
+        self.risk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mark_reservation_off_book(key);
+    }
+
+    /// Book a signed HOUSE cash movement (cents, negative = spent) so the
+    /// divergence breaker can see a sleeve that deliberately sits outside the
+    /// position ledger (moneypath F2).
+    pub fn note_house_cash_cents(&self, ticker: &str, delta_cents: i64) {
+        self.risk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_house_cash_cents(ticker, delta_cents);
+    }
+
+    /// True when the GLOBAL kill-switch is engaged. Every sleeve must consult
+    /// this each pass — including ones that do not route orders through
+    /// `evaluate` (moneypath F2: a blind kill-switch is not a kill-switch).
+    pub fn risk_halted(&self) -> bool {
+        self.risk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .status()
+            .halted
     }
 
     /// Live path (V2 IOC create-order): place → read SYNCHRONOUS fill truth from
@@ -690,12 +775,21 @@ impl Engine {
             Err(e) => eprintln!("[execute] recon fills read failed for {}: {e}", order.ticker),
         }
 
-        // Feed risk ONLY the filled count at the ACTUAL average price.
+        // Feed risk ONLY the filled count at the ACTUAL average price, and the
+        // EXCHANGE'S OWN fee when the 201 carried one (FIX 7b, reality F7): the
+        // resting path already did this; the taker path parsed
+        // `average_fee_paid` into the FillReport and then debited the FORMULA
+        // anyway. Formula stays the fallback (conservative for a taker).
         if filled > 0 {
             self.risk
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .on_fill_actual(&order, filled, avg_price);
+                .on_fill_actual_fee(
+                    &order,
+                    filled,
+                    avg_price,
+                    placed.actual_fee_cents.map(|c| c / 100.0),
+                );
         }
         // A completed placement (fill or clean IOC no-cross) resets the
         // consecutive-signed-failure breaker (fix: OSS addendum #3).
@@ -857,6 +951,44 @@ mod tests {
         // pre-retry coid so a crash re-run still 409s against the original.
         assert_eq!(entry_coid(&order(), 1), "streak-KXBTC15M-26JUL251000-00");
         assert_eq!(entry_coid(&order(), 0), "streak-KXBTC15M-26JUL251000-00");
+    }
+
+    #[test]
+    fn resting_409_duplicate_coid_is_may_be_resting_and_benign() {
+        // FIX 4 (reality F2). The restart case: `seen` is in-memory, the ticker
+        // re-signals, the eventually-consistent resting list shows nothing, and
+        // place_maker re-posts under the SAME deterministic coid. Kalshi 409s.
+        // Reading that as "nothing was created" fires an IOC on top of a live
+        // 40c bid → two fills, one bookable position.
+        assert_eq!(
+            classify_resting_failure(409, Some("order_already_exists")),
+            (true, true)
+        );
+        // A 409 with a DIFFERENT code is not the duplicate-coid case.
+        assert_eq!(classify_resting_failure(409, Some("something_else")), (false, false));
+        assert_eq!(classify_resting_failure(409, None), (false, false));
+    }
+
+    #[test]
+    fn resting_5xx_and_timeout_are_ambiguous_but_not_benign() {
+        // Kalshi's edge can time out AFTER the matching engine accepted the
+        // order; "it created nothing" is not something a 502 tells us.
+        for s in [500u16, 502, 503, 504, 408] {
+            assert_eq!(classify_resting_failure(s, None), (true, false), "status {s}");
+        }
+    }
+
+    #[test]
+    fn resting_client_errors_really_did_create_nothing() {
+        // These are the codes where falling back to the taker leg IS safe — the
+        // signal is still live and nothing is on the book.
+        for s in [400u16, 401, 403, 404, 422] {
+            assert_eq!(classify_resting_failure(s, None), (false, false), "status {s}");
+        }
+        assert_eq!(
+            classify_resting_failure(400, Some("insufficient_balance")),
+            (false, false)
+        );
     }
 
     #[test]

@@ -1061,6 +1061,12 @@ pub fn parse_positions(body: &serde_json::Value) -> Vec<ExchangePosition> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RestingOrder {
     pub order_id: String,
+    /// The `client_order_id` we minted, when the payload echoes it. Every sleeve
+    /// namespaces its coids (`streak-…-m40`, `house-{ticker}-{side}-{ts}`), so
+    /// this is what lets a sweep cancel ONLY its own orders (moneypath F5).
+    /// `None` when absent — callers must fall back to a ticker/series filter
+    /// rather than assume ownership either way.
+    pub client_order_id: Option<String>,
     pub ticker: String,
     /// Our-side ("yes"/"no") folded from the YES-book bid/ask, when derivable.
     pub side: Option<String>,
@@ -1140,8 +1146,15 @@ pub fn parse_resting_orders(body: &serde_json::Value) -> Vec<RestingOrder> {
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .map(|dt| dt.timestamp())
             });
+        // The coid we minted, tolerant of both spellings the V2 payloads use.
+        let client_order_id = r
+            .get("client_order_id")
+            .or_else(|| r.get("client_order_id_str"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         out.push(RestingOrder {
             order_id,
+            client_order_id,
             ticker,
             side,
             remaining_count,

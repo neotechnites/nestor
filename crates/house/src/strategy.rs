@@ -78,6 +78,24 @@ fn books() -> Vec<Book> {
     ]
 }
 
+/// Prefix every house `client_order_id` carries (`place_leg`).
+const COID_PREFIX: &str = "house-";
+
+/// Does this resting order belong to the house sleeve? (FIX 2c, moneypath F5.)
+///
+/// PRIMARY evidence is the coid namespace — every house leg is posted as
+/// `house-{ticker}-{side}-{ts}`. Kalshi's resting-orders schema is only
+/// confirmed on the demo shakeout though, so when the payload does not echo the
+/// coid we fall back to house's own series, which are DISJOINT from streak's
+/// (KXBTC15M/KXETH15M) and volbook's (metal dailies). Either way the sweep can
+/// never reach another sleeve's order — the property the fix exists to restore.
+fn is_house_order(o: &kalshi::RestingOrder) -> bool {
+    match o.client_order_id.as_deref() {
+        Some(coid) => coid.starts_with(COID_PREFIX),
+        None => books().iter().any(|b| o.ticker.starts_with(b.series)),
+    }
+}
+
 /// Live per-market quote state.
 #[derive(Default)]
 struct BookQuote {
@@ -119,6 +137,10 @@ pub struct House {
     size: i64,
     state: Mutex<HouseState>,
     swept: AtomicBool,
+    /// True while the sleeve is standing down for the GLOBAL risk halt (FIX 2a).
+    /// Edge-triggered so the cancel-all fires once per halt episode, not every
+    /// 3s pass, and so an operator `resume` brings the sleeve back by itself.
+    stood_down: AtomicBool,
 }
 
 impl Default for House {
@@ -148,6 +170,7 @@ impl House {
             size,
             state: Mutex::new(HouseState::default()),
             swept: AtomicBool::new(false),
+            stood_down: AtomicBool::new(false),
         }
     }
 
@@ -155,9 +178,18 @@ impl House {
         eng.mode == Mode::Live && std::env::var(LIVE_ENABLE_ENV).ok().as_deref() == Some("1")
     }
 
-    /// Cancel EVERY resting order the account shows (startup orphan sweep AND the
-    /// shutdown handler). Best-effort: logs failures, never panics. Public so the
-    /// nestor_bin ctrl-c/SIGTERM handler can call it on shutdown.
+    /// Cancel every resting order **that belongs to THIS sleeve** (startup orphan
+    /// sweep AND the shutdown handler AND every halt). Best-effort: logs
+    /// failures, never panics. Public so the nestor_bin ctrl-c/SIGTERM handler
+    /// can call it on shutdown.
+    ///
+    /// FIX 2c (moneypath F5). This used to cancel EVERY resting order on the
+    /// account. `House::halt` can fire at any time from the −$20 ledger stop or
+    /// the −5¢ gap-through stop, and when it did it killed **streak's live 40¢
+    /// maker leg** — whose supervisor then reads the resulting cancel-404 as
+    /// "it filled", withholds the backstop forever, pins $4 of cap for ~5
+    /// minutes and fires a false CRITICAL page. Streak's own sweep was already
+    /// correctly series-filtered; the damage was one-directional, house → streak.
     pub async fn cancel_all_house_orders(eng: &Engine) {
         let body = match eng.kalshi.resting_orders(None).await {
             Ok(b) => b,
@@ -166,12 +198,23 @@ impl House {
                 return;
             }
         };
-        let orders = kalshi::parse_resting_orders(&body);
-        if orders.is_empty() {
+        let all = kalshi::parse_resting_orders(&body);
+        let total = all.len();
+        let ours: Vec<_> = all.into_iter().filter(is_house_order).collect();
+        if ours.is_empty() {
+            if total > 0 {
+                logging::info(format!(
+                    "house: sweep found {total} resting order(s), none of them house's — \
+                     leaving them alone"
+                ));
+            }
             return;
         }
-        logging::info(format!("house: sweeping {} resting order(s)", orders.len()));
-        for o in &orders {
+        logging::info(format!(
+            "house: sweeping {} of {total} resting order(s) (house-owned only)",
+            ours.len()
+        ));
+        for o in &ours {
             match eng.kalshi.cancel_order(&o.order_id).await {
                 Ok(_) => {}
                 Err(e) => eprintln!("[house] cancel {} failed during sweep: {e}", o.order_id),
@@ -208,6 +251,52 @@ impl Strategy for House {
         if !self.swept.swap(true, Ordering::SeqCst) && Self::live_enabled(eng) {
             Self::cancel_all_house_orders(eng).await;
         }
+
+        // FIX 2a (moneypath F2 / constants F1): THE GLOBAL KILL-SWITCH BINDS
+        // HERE TOO. House deliberately does not route orders through
+        // `risk.evaluate` (it is two-sided by design and would trip the
+        // one-position-per-ticker invariant), which meant it never saw
+        // `Rejection::Halted` — so a drawdown halt, a divergence halt or five
+        // consecutive placement failures stopped streak and volbook INSTANTLY
+        // while house kept quoting and filling real money at 3s cadence,
+        // indefinitely. That is the definition of a blind kill-switch.
+        //
+        // Stand down = cancel our own resting legs ONCE per halt episode and
+        // place nothing. NOT sticky in house's own flag: an operator `resume`
+        // must bring the sleeve back without a restart.
+        if eng.risk_halted() {
+            if !self.stood_down.swap(true, Ordering::SeqCst) {
+                {
+                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.quotes.clear();
+                }
+                if Self::live_enabled(eng) {
+                    Self::cancel_all_house_orders(eng).await;
+                }
+                logging::info(
+                    "house: GLOBAL RISK HALT — standing down (quotes cancelled, no new orders \
+                     until the risk layer resumes)",
+                );
+                logging::record_path(
+                    LOG,
+                    json!({"event": "house_stand_down", "reason": "global_risk_halt"}),
+                );
+                alert::notify(
+                    &eng.http,
+                    "house probe standing down — the GLOBAL risk halt is engaged",
+                )
+                .await;
+            }
+            return Ok(());
+        }
+        if self.stood_down.swap(false, Ordering::SeqCst) {
+            logging::info("house: global risk halt cleared — resuming quoting");
+            logging::record_path(
+                LOG,
+                json!({"event": "house_resume", "reason": "global_risk_halt_cleared"}),
+            );
+        }
+
         if self.state.lock().unwrap_or_else(|e| e.into_inner()).halted {
             return Ok(());
         }
@@ -536,14 +625,39 @@ impl House {
             // (H9's whole edge is +0.5¢/fill). Book the exchange's own figure;
             // the formula is only the fallback when the field is absent, and a
             // fallback use is flagged in the record so the report can weigh it.
-            let exchange_fee: Option<f64> = fills
-                .iter()
-                .map(|f| f.fee_cents)
-                .try_fold(0.0, |acc, f| f.map(|c| acc + c));
-            let fee = exchange_fee.unwrap_or_else(|| taker_fee(entry, delta) * 100.0);
-            let fee_estimated = exchange_fee.is_none();
+            //
+            // FIX 7c (reality F12): the fold is PER ROW, not all-or-nothing. It
+            // used to `try_fold`, so ONE row missing `fee_cost` silently
+            // converted the WHOLE batch — including genuine 0.000000 maker
+            // fills — to the taker formula, inventing ~1.7¢/contract of phantom
+            // cost on exactly the sleeve whose entire gross edge is +0.5¢/fill.
+            let mut fee = 0.0f64;
+            let mut fee_rows_estimated = 0usize;
+            for f in &fills {
+                match f.fee_cents {
+                    Some(c) => fee += c,
+                    None => {
+                        fee_rows_estimated += 1;
+                        fee += taker_fee(f.price_cents, f.count) * 100.0;
+                    }
+                }
+            }
+            let fee_estimated = fee_rows_estimated > 0;
             let all_maker = kalshi::fills_all_maker(&fills);
             let in_catalyst = signal::in_catalyst_window(now, &self.catalysts);
+
+            // FIX 2b (moneypath F2 / constants F1 / reality F1): tell the RISK
+            // layer that real cash just left the account. House is deliberately
+            // outside the position ledger, so without this the divergence
+            // breaker sees `delta × entry + fee` of unexplained spending and
+            // HALTS the whole bot — streak and volbook included — after roughly
+            // $2.25 of cumulative house inventory. The bridge is released the
+            // moment reconcile adopts the resulting position (or held forever
+            // for a matched YES+NO pair, which nets to zero position but really
+            // did cost ~98¢ of cash).
+            let cash_out_cents = delta * entry + fee.round() as i64;
+            eng.note_house_cash_cents(ticker, -cash_out_cents);
+
             {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.ledger
@@ -643,4 +757,97 @@ fn et_day(unix: i64) -> String {
     chrono::DateTime::from_timestamp(unix, 0)
         .map(|dt| dt.with_timezone(&New_York).format("%Y-%m-%d").to_string())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resting(coid: Option<&str>, ticker: &str) -> kalshi::RestingOrder {
+        kalshi::RestingOrder {
+            order_id: "oid".into(),
+            client_order_id: coid.map(|s| s.to_string()),
+            ticker: ticker.into(),
+            side: Some("yes".into()),
+            remaining_count: 1,
+            price_cents: Some(49),
+            expiration_ts: None,
+        }
+    }
+
+    #[test]
+    fn sweep_never_touches_another_sleeves_resting_order() {
+        // FIX 2c (moneypath F5). The concrete failure: HOUSE_PROBE=1, a POTUS
+        // fill marks out −5¢ at T0+20s → House::halt → the old blanket sweep
+        // cancelled streak's live 40¢ KXBTC15M bid; streak's own cancel then
+        // 404s and is read as "it filled" → backstop withheld forever, $4 of
+        // cap frozen ~5 minutes, false CRITICAL page.
+        assert!(is_house_order(&resting(
+            Some("house-KXAPRPOTUS-26APR-T50-yes-1784987100"),
+            "KXAPRPOTUS-26APR-T50"
+        )));
+        assert!(!is_house_order(&resting(
+            Some("streak-KXBTC15M-26JUL251000-00-m40"),
+            "KXBTC15M-26JUL251000-00"
+        )));
+        assert!(!is_house_order(&resting(
+            Some("volbook-KXGOLDD-3400"),
+            "KXGOLDD-26JUL27-3400"
+        )));
+    }
+
+    #[test]
+    fn sweep_falls_back_to_house_series_when_the_coid_is_absent() {
+        // Kalshi's resting-order schema is only demo-confirmed; if it does not
+        // echo the coid, ownership falls back to house's OWN series — disjoint
+        // from streak's crypto and volbook's metals, so the guarantee holds.
+        for b in books() {
+            assert!(is_house_order(&resting(None, &format!("{}-X", b.series))));
+        }
+        assert!(!is_house_order(&resting(None, "KXBTC15M-26JUL251000-00")));
+        assert!(!is_house_order(&resting(None, "KXGOLDD-26JUL27-3400")));
+        assert!(!is_house_order(&resting(None, "KXSILVERD-26JUL27-40")));
+    }
+
+    #[test]
+    fn one_missing_fee_row_does_not_convert_the_whole_batch_to_the_formula() {
+        // FIX 7c (reality F12). Per-row fold: a maker row billed 0.000000 keeps
+        // its zero even when a sibling row omits `fee_cost`. Under the old
+        // all-or-nothing `try_fold` the batch fell back to the taker formula and
+        // invented ~1.7¢/contract on a sleeve whose gross edge is +0.5¢/fill.
+        let rows = vec![
+            kalshi::ParsedFill {
+                count: 1,
+                price_cents: 49,
+                ts_ms: None,
+                fee_cents: Some(0.0), // demo-proven maker fill
+                is_taker: Some(false),
+            },
+            kalshi::ParsedFill {
+                count: 1,
+                price_cents: 49,
+                ts_ms: None,
+                fee_cents: None, // schema miss on ONE row
+                is_taker: None,
+            },
+        ];
+        let mut fee = 0.0f64;
+        let mut estimated = 0usize;
+        for f in &rows {
+            match f.fee_cents {
+                Some(c) => fee += c,
+                None => {
+                    estimated += 1;
+                    fee += taker_fee(f.price_cents, f.count) * 100.0;
+                }
+            }
+        }
+        assert_eq!(estimated, 1);
+        // Only the ONE unknown row is estimated: 0.07*1*0.49*0.51 = 0.017493
+        // → ceil($0.0001) = $0.0175 = 1.75¢. The maker row stays free.
+        assert!((fee - 1.75).abs() < 1e-9, "fee was {fee}");
+        // The old behaviour charged BOTH rows the formula — 2x the phantom cost.
+        let old_all_or_nothing = taker_fee(49, 2) * 100.0;
+        assert!(old_all_or_nothing > fee * 1.9);
+    }
 }

@@ -74,6 +74,43 @@ const SPOT_RETENTION_SECS: i64 = 2 * SAMPLE_WINDOW_SECS;
 /// alert loudly — the exchange sweep is the only remaining backstop.
 const CANCEL_RETRY_GRACE_SECS: i64 = 240;
 
+/// Clock slack applied to `expiration_ts` when deciding what a cancel-404 MEANS
+/// (FIX 6 — reality F3, sensors P2c). Before its `expiration_ts` a bid can only
+/// leave the book by FILLING, so a 404 proves a fill. AT OR AFTER it, the
+/// exchange's lazy expiry sweep is a second, equally likely producer of 404 —
+/// and the cancel-retry loop is GUARANTEED to reach that state (it retries every
+/// pass until `expiration_ts + CANCEL_RETRY_GRACE_SECS`, while the sweep lands
+/// somewhere in the first ~2-3min of that window). Reading those 404s as "it
+/// filled" withholds the backstop forever, pins the cap reservation for up to
+/// 300s, and fires a false CRITICAL page.
+///
+/// 5s: our clock is compared against the exchange's `Date` header every reconcile
+/// pass and alerts past 30s of skew, so normal NTP drift is far inside this;
+/// 5s of extra "404 ⇒ filled" exposure past expiry is the cost of not
+/// mis-classifying a fill that landed in the last instant before expiry.
+const EXPIRY_404_SLACK_SECS: i64 = 5;
+
+/// What a cancel-404 on a maker leg can mean at time `now` (FIX 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gone404 {
+    /// Before `expiration_ts` (+slack): the only way off the book is a FILL.
+    /// Demo-proven; withhold the backstop and keep polling fills.
+    Filled,
+    /// At/after expiry: the exchange's lazy sweep is an equally good explanation.
+    /// Close the episode as `expired_unfilled` — no CRITICAL alert, no permanent
+    /// backstop withhold, no cap held for 5 more minutes.
+    MaybeExpired,
+}
+
+/// Pure classifier for the cancel-404 branch — unit-tested.
+fn classify_cancel_404(now: i64, expiration_ts: i64) -> Gone404 {
+    if now > expiration_ts + EXPIRY_404_SLACK_SECS {
+        Gone404::MaybeExpired
+    } else {
+        Gone404::Filled
+    }
+}
+
 /// Marker file whose PRESENCE disables derivation — checked both at startup and
 /// live on every attempt. A USED-derivation disagreement with the official
 /// result creates it (item 4); the position it opened stays (risk-managed).
@@ -545,7 +582,30 @@ impl Streak {
         // Refetch settled results while the previous window is still settling
         // (flagged by a prior pass's PrevNotSettled), else serve from cache.
         let force = self.seen_contains(&Self::refetch_key(series, window_id));
-        let raw = self.settled_for(eng, series, window_id, force).await?;
+        // FIX 5c (moneypath F4): this fetch must NOT be able to skip a backstop
+        // deadline. It used to `?`-return ABOVE `supervise_makers`, which
+        // directly contradicts the invariant the code claims for itself below —
+        // the guard had been placed against the wrong fetch. `recent_closed` is
+        // not deadline-bounded, is uncached and re-run ~1/s during the
+        // settlement-lag phase, and a 429 storm or a 30s hang there leaves the
+        // 40¢ bid uncancelled past T0+45 with the exchange's expiry enforced
+        // lazily — a fill at T0+150 on a signal whose 60s edge is long gone.
+        //
+        // So: on error, still supervise (with NO settled windows — the flip
+        // check simply cannot fire, and it only ever CANCELS, so an absent flip
+        // is the safe direction), THEN propagate so the driving loop still backs
+        // off on a retryable status.
+        let raw = match self.settled_for(eng, series, window_id, force).await {
+            Ok(r) => r,
+            Err(e) => {
+                logging::info(format!(
+                    "streak {series}: settled-results fetch failed ({e}) — running maker \
+                     supervision anyway, then backing off"
+                ));
+                self.supervise_makers(eng, series, &[], now).await;
+                return Err(e);
+            }
+        };
         let settled = settled_windows(&raw);
 
         // VERIFY (item 4): any pending derivation whose official result has now
@@ -1258,17 +1318,34 @@ impl Streak {
         // (3b) An off-book leg (cancel 404) is waiting on a lagging fills API.
         //      It must never reach the cancel/backstop branch again.
         if leg.off_book {
-            self.mark_gone(eng, &leg, now).await;
+            self.mark_gone(eng, &leg, now, Gone404::Filled).await;
             return;
         }
 
         // (4) DEADLINE: cancel FIRST. A live bid plus an IOC on the same ticker
         //     could produce two fills, and the risk ledger books one position per
         //     ticker — the second would be real money it cannot see.
+        //
+        //     FIX 5a (constants F3): the cancel is DEADLINE-BOUNDED. Unwrapped it
+        //     inherits the shared client's 30s budget, and a stalled cancel puts
+        //     the backstop IOC outside the 60s window every one of its measured
+        //     numbers was fitted on. A timeout is treated exactly like any other
+        //     cancel failure: the bid may still be live, so no backstop, retry.
         let cancel = if leg.paper {
-            Ok(json!({"paper": true}))
+            Ok(Ok(json!({"paper": true})))
         } else {
-            eng.kalshi.cancel_order(&leg.order_id).await
+            in_window(eng.kalshi.cancel_order(&leg.order_id)).await
+        };
+        let cancel = match cancel {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                let msg = format!(
+                    "cancel exceeded the {}s in-window deadline",
+                    IN_WINDOW_TIMEOUT.as_secs()
+                );
+                self.mark_cancel_failed(eng, &leg, &msg, now).await;
+                return;
+            }
         };
         let cancel_resp = match cancel {
             Ok(v) => v,
@@ -1280,11 +1357,23 @@ impl Streak {
             // holds one. NEVER backstop on a 404: keep polling fills (they can
             // lag the matching engine by seconds) until the fill shows up.
             Err(e) if engine::net::http_status(&e) == Some(404) => {
+                // FIX 6: 404 ⇒ filled ONLY before expiry. Past it, the lazy
+                // expiry sweep produces the identical 404.
+                let meaning = classify_cancel_404(now, leg.expiration_ts);
                 logging::info(format!(
-                    "streak {series}: cancel 404 on {ticker} — the resting bid is already off \
-                     the book (filled); withholding the backstop and polling fills"
+                    "streak {series}: cancel 404 on {ticker} at T0+{}s (exp {}) — {}",
+                    now - leg.t0,
+                    leg.expiration_ts,
+                    match meaning {
+                        Gone404::Filled =>
+                            "before expiry, so the bid left the book by FILLING; withholding the \
+                             backstop and polling fills",
+                        Gone404::MaybeExpired =>
+                            "PAST expiry, so this is as likely the exchange's lazy sweep as a \
+                             fill; closing the episode as expired_unfilled",
+                    }
                 ));
-                self.mark_gone(eng, &leg, now).await;
+                self.mark_gone(eng, &leg, now, meaning).await;
                 return;
             }
             Err(e) => {
@@ -1309,7 +1398,9 @@ impl Streak {
                      first; backstop WITHHELD",
                     leg.order.count
                 ));
-                self.mark_gone(eng, &leg, now).await;
+                // A partial cancel proves a FILL, whatever the clock says — the
+                // exchange handed back a quantity, it did not 404.
+                self.mark_gone(eng, &leg, now, Gone404::Filled).await;
                 return;
             }
             // Field absent/unparseable — fall back to a fills poll.
@@ -1354,8 +1445,22 @@ impl Streak {
     /// a second position on this ticker could not be booked. If the fill never
     /// materialises by the end of the window, close the episode loudly and let
     /// reconcile's orphan adoption find any real position.
-    async fn mark_gone(&self, eng: &Engine, leg: &MakerLeg, now: i64) {
+    async fn mark_gone(&self, eng: &Engine, leg: &MakerLeg, now: i64, meaning: Gone404) {
+        // FIX 6 (reality F3 / sensors P2c): a 404 that arrives PAST the order's
+        // expiration is at least as likely the exchange's lazy sweep as a fill.
+        // Treating it as a fill costs the backstop forever, pins $4 of cap for
+        // 5 more minutes, and fires a CRITICAL page for a position that does not
+        // exist — the alert-fatigue machine. Release it as expired_unfilled.
+        if meaning == Gone404::MaybeExpired {
+            self.release_expired_unfilled(eng, leg, now);
+            return;
+        }
         if now <= leg.expiration_ts + CANCEL_RETRY_GRACE_SECS {
+            // FIX 1 (reality F1): the bid is OFF the book, so its collateral has
+            // certainly moved. The reservation stays (the cap must not be
+            // re-spent while the fill surfaces) but it must stop widening the
+            // divergence breaker, or a genuine miscount hides for 5 minutes.
+            eng.mark_reservation_off_book(&leg.reserve_key);
             let mut legs = self.maker.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(l) = legs.get_mut(&leg.ticker()) {
                 l.off_book = true; // worked every pass, but NEVER sends an IOC
@@ -1376,6 +1481,33 @@ impl Streak {
             ),
         )
         .await;
+    }
+
+    /// FIX 6 terminal: the bid left the book at or after its `expiration_ts`, so
+    /// the exchange's lazy expiry sweep explains it as well as a fill does. Close
+    /// the episode, free the cap immediately, and record it — NO alert (nothing
+    /// anomalous happened) and NO permanent backstop withhold (there is no
+    /// backstop to send: `expiration_ts` is the end of the entry window).
+    ///
+    /// If a fill DID land, reconcile's orphan adoption books it within 60s from
+    /// `/portfolio/positions` — exchange truth, not an inference from a 404.
+    fn release_expired_unfilled(&self, eng: &Engine, leg: &MakerLeg, now: i64) {
+        self.drop_leg(eng, &leg.ticker(), &leg.reserve_key);
+        let mut rec =
+            self.base_record(&leg.series, &leg.ticker(), &leg.meta, EntryPath::MakerRest);
+        rec["reject_reason"] = json!("expired_unfilled");
+        rec["maker_order_id"] = json!(leg.order_id);
+        rec["expiration_ts"] = json!(leg.expiration_ts);
+        rec["secs_past_expiry"] = json!(now - leg.expiration_ts);
+        rec["rest_secs"] = json!(now - leg.t0);
+        logging::record_path(WEEK1_LOG, rec);
+        logging::info(format!(
+            "streak {}: {} resting bid expired unfilled ({}s past expiry) — episode closed, \
+             cap released, no alert (reconcile adopts any real position)",
+            leg.series,
+            leg.ticker(),
+            now - leg.expiration_ts
+        ));
     }
 
     /// A cancel round-trip failed: the bid may still be live, so withhold the
@@ -1425,12 +1557,21 @@ impl Streak {
                 // used-derivation disagreement. Book it and stop cancelling, or
                 // the flip check would re-enter this every pass forever.
                 if engine::net::http_status(&e) == Some(404) {
+                    // FIX 6: same 404 ambiguity as the deadline cancel.
+                    let meaning = classify_cancel_404(now, leg.expiration_ts);
                     logging::info(format!(
-                        "streak: flip-cancel 404 on {} — the bid had already filled; booking the \
-                         position (it stays, risk-managed)",
-                        leg.ticker()
+                        "streak: flip-cancel 404 on {} — {}",
+                        leg.ticker(),
+                        match meaning {
+                            Gone404::Filled =>
+                                "before expiry, so the bid had already filled; booking the \
+                                 position (it stays, risk-managed)",
+                            Gone404::MaybeExpired =>
+                                "past expiry, so it may simply have been swept; closing as \
+                                 expired_unfilled",
+                        }
                     ));
-                    self.mark_gone(eng, leg, now).await;
+                    self.mark_gone(eng, leg, now, meaning).await;
                     return;
                 }
                 eprintln!("[streak] flip-cancel {} failed: {e}", leg.order_id);
@@ -1507,7 +1648,91 @@ impl Streak {
     /// backstop IOC for the remainder would fill real contracts the ledger and
     /// kill-switch could never see. The forgone EV is ~4.3¢ on a handful of
     /// contracts; the invariant is worth more.
+    ///
+    /// FIX 3 (moneypath F1): not topping up is NOT the same as leaving the
+    /// remainder alive. `drop_leg` forgets the order and releases its
+    /// reservation, but the exchange keeps the unfilled contracts on the book
+    /// until `expiration_ts` — and enforces THAT lazily (~2-3min). A second fill
+    /// on the same ticker is then refused by BOTH `on_fill_actual_fee` and
+    /// `adopt_orphan` (`has_open`), so those contracts are real money that
+    /// bankroll, `day_loss`, the drawdown kill-switch and settlement can never
+    /// see; and the un-reserved collateral pushes the divergence breaker into a
+    /// sticky halt no log explains. So: CANCEL THE REMAINDER FIRST, then drop.
     async fn settle_maker_fill(&self, eng: &Engine, leg: &MakerLeg, f: LegFill, now: i64) {
+        let remainder = leg.order.count - f.count;
+        let mut remainder_cancel = json!(null);
+        let mut remainder_canceled = false;
+        if remainder > 0 && !leg.paper {
+            match in_window(eng.kalshi.cancel_order(&leg.order_id)).await {
+                Ok(Ok(v)) => {
+                    remainder_canceled = true;
+                    logging::info(format!(
+                        "streak {}: partial maker fill on {} ({} of {}) — cancelled the {} \
+                         resting remainder (reduced_by {:?})",
+                        leg.series,
+                        leg.ticker(),
+                        f.count,
+                        leg.order.count,
+                        remainder,
+                        kalshi::parse_cancel_reduced_by(&v)
+                    ));
+                    remainder_cancel = v;
+                }
+                // 404 here is BENIGN: the rest of the order is already gone
+                // (filled through, or swept). Nothing left to cancel.
+                Ok(Err(e)) if engine::net::http_status(&e) == Some(404) => {
+                    remainder_canceled = true;
+                    remainder_cancel = json!({"status": 404, "note": "already gone"});
+                    logging::info(format!(
+                        "streak {}: partial maker fill on {} — remainder cancel 404 (already \
+                         fully off the book); benign",
+                        leg.series,
+                        leg.ticker()
+                    ));
+                }
+                Ok(Err(e)) => {
+                    remainder_cancel = json!({"error": e.to_string()});
+                    eprintln!(
+                        "[streak] CRITICAL: partial fill on {} left {remainder} contracts \
+                         resting and the cancel FAILED: {e}",
+                        leg.ticker()
+                    );
+                    alert::notify(
+                        &eng.http,
+                        &format!(
+                            "streak PARTIAL FILL on {}: {} of {} filled, the {remainder}-contract \
+                             remainder could NOT be cancelled ({e}) — it may still fill and the \
+                             ledger cannot book a second position on this ticker; check \
+                             /portfolio/orders",
+                            leg.ticker(),
+                            f.count,
+                            leg.order.count
+                        ),
+                    )
+                    .await;
+                }
+                Err(_elapsed) => {
+                    remainder_cancel = json!({"error": "in_window timeout"});
+                    eprintln!(
+                        "[streak] CRITICAL: partial fill on {} left {remainder} contracts \
+                         resting and the cancel TIMED OUT",
+                        leg.ticker()
+                    );
+                    alert::notify(
+                        &eng.http,
+                        &format!(
+                            "streak PARTIAL FILL on {}: {} of {} filled, the remainder cancel \
+                             timed out — check /portfolio/orders",
+                            leg.ticker(),
+                            f.count,
+                            leg.order.count
+                        ),
+                    )
+                    .await;
+                }
+            }
+        }
+
         eng.book_resting_fill(&leg.order, f.count, f.price_cents, f.actual_fee_cents);
         self.drop_leg(eng, &leg.ticker(), &leg.reserve_key);
 
@@ -1518,7 +1743,14 @@ impl Streak {
         rec["partial"] = json!(f.count < leg.order.count);
         rec["fill_price"] = json!(f.price_cents);
         rec["filled_count"] = json!(f.count);
-        rec["canceled_count"] = json!(leg.order.count - f.count);
+        rec["canceled_count"] = json!(remainder);
+        // FIX 3 forensics: did the unfilled remainder actually come off the book?
+        if remainder > 0 {
+            rec["remainder_canceled"] = json!(remainder_canceled);
+            rec["remainder_cancel"] = remainder_cancel;
+            rec["remainder_reduced_by"] =
+                json!(kalshi::parse_cancel_reduced_by(&rec["remainder_cancel"]));
+        }
         rec["limit_placed"] = json!(leg.order.limit_cents);
         rec["ts_submit"] = json!(leg.placed_ms);
         rec["ts_fill"] = json!(f.ts_ms);
@@ -1609,6 +1841,27 @@ impl Streak {
             }
         };
         rec["limit_placed"] = json!(limit);
+
+        // FIX 5b (constants F3): attempt 1 gets the SAME entry-window guard as
+        // attempts 2-4. The ladder's `ttc < MIN_TTC_SECS + 3` check only ran
+        // BETWEEN attempts, so a stalled deadline cancel (or any slow pass)
+        // could fire the first — and, once the guard broke the loop, the ONLY —
+        // IOC outside the 60s window every number in the policy was fitted on:
+        // the 52% win rate, the 24% dip probability, the 21% taker fill rate.
+        // Outside the window that order prices a regime we have never measured.
+        let ttc0 = close_unix - chrono::Utc::now().timestamp();
+        if ttc0 < signal::MIN_TTC_SECS + 3 {
+            rec["reject_reason"] = json!("out_of_entry_window");
+            rec["ttc_at_attempt"] = json!(ttc0);
+            logging::record_path(WEEK1_LOG, rec);
+            logging::info(format!(
+                "streak {series}: {ticker} {} SUPPRESSED — ttc {ttc0}s is outside the entry \
+                 window (needs ≥ {}s); the policy was never measured there",
+                path.as_str(),
+                signal::MIN_TTC_SECS + 3
+            ));
+            return Ok(());
+        }
 
         let sig = Signal {
             strategy: "streak".into(),
@@ -1950,5 +2203,71 @@ mod tests {
         let ms = vec![m];
         assert_eq!(strike_for_close(&ms, close), Some(118250.0));
         assert_eq!(strike_for_close(&ms, close + 1), None); // no market at that close
+    }
+
+    #[test]
+    fn cancel_404_means_filled_only_before_expiry() {
+        // FIX 6 (reality F3). T0 = window open; expiration_ts = T0+60.
+        let t0 = 1_784_987_100i64;
+        let exp = t0 + exec::MAKER_EXPIRY_SECS;
+
+        // The normal deadline cancel at T0+45: a 404 can only be a FILL.
+        assert_eq!(classify_cancel_404(t0 + 45, exp), Gone404::Filled);
+        // Right at expiry, and inside the clock slack: still a fill.
+        assert_eq!(classify_cancel_404(exp, exp), Gone404::Filled);
+        assert_eq!(
+            classify_cancel_404(exp + EXPIRY_404_SLACK_SECS, exp),
+            Gone404::Filled
+        );
+
+        // The guaranteed-to-happen case: mark_cancel_failed retries every pass
+        // until expiration_ts + CANCEL_RETRY_GRACE_SECS (T0+300), while the
+        // exchange's lazy sweep expires the order somewhere in T0+60..T0+240.
+        // Every retry past that point 404s, and the old code read all of them as
+        // "it filled" → backstop withheld forever + a false CRITICAL page.
+        assert_eq!(
+            classify_cancel_404(exp + EXPIRY_404_SLACK_SECS + 1, exp),
+            Gone404::MaybeExpired
+        );
+        assert_eq!(classify_cancel_404(t0 + 180, exp), Gone404::MaybeExpired);
+        assert_eq!(
+            classify_cancel_404(exp + CANCEL_RETRY_GRACE_SECS, exp),
+            Gone404::MaybeExpired
+        );
+    }
+
+    #[test]
+    fn expiry_slack_cannot_swallow_the_backstop_deadline() {
+        // The slack must stay far below the gap between the backstop cancel
+        // (T0+45) and expiry (T0+60), or a genuine pre-expiry fill would be
+        // mis-read as an expiry.
+        const _: () = assert!(EXPIRY_404_SLACK_SECS > 0);
+        // The slack must not reach back to the backstop deadline (T0+45), or a
+        // genuine pre-expiry fill would be mis-read as an expiry.
+        const _: () =
+            assert!(EXPIRY_404_SLACK_SECS < exec::MAKER_EXPIRY_SECS - exec::BACKSTOP_AT_SECS);
+        // And a leg cancelled at the deadline is unambiguously inside it.
+        let t0 = 0i64;
+        assert_eq!(
+            classify_cancel_404(t0 + exec::BACKSTOP_AT_SECS, t0 + exec::MAKER_EXPIRY_SECS),
+            Gone404::Filled
+        );
+    }
+
+    #[test]
+    fn attempt_one_window_guard_matches_the_ladder_guard() {
+        // FIX 5b (constants F3): the check applied to attempt 1 is byte-identical
+        // to the one the ladder applies between attempts 2-4 — `ttc <
+        // MIN_TTC_SECS + 3`. Expressed against the window: it bites at T0+57.
+        let t0 = 1_784_987_100i64;
+        let close = t0 + signal::WINDOW_SECS;
+        let bites_at = |now: i64| close - now < signal::MIN_TTC_SECS + 3;
+        assert!(!bites_at(t0)); // at the open
+        assert!(!bites_at(t0 + 45)); // the normal backstop moment
+        assert!(!bites_at(t0 + 56));
+        assert!(bites_at(t0 + 58)); // past the ladder's own cutoff
+        // The failure this closes: a 30s-stalled deadline cancel returning at
+        // T0+75 used to fire one un-modelled IOC 15s outside the window.
+        assert!(bites_at(t0 + 75));
     }
 }
