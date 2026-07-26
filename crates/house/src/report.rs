@@ -35,7 +35,7 @@ fn bool_of(v: &Value, k: &str) -> bool {
 pub fn summarize(records: &[Value]) -> Metrics {
     let mut quote_secs = 0.0f64;
     let mut fills = 0i64;
-    let mut half_spreads: Vec<f64> = Vec::new();
+    let mut net_markouts: Vec<f64> = Vec::new();
     let mut markouts = 0i64;
     let mut gap_throughs = 0i64;
     let mut adverse = 0i64;
@@ -44,6 +44,9 @@ pub fn summarize(records: &[Value]) -> Metrics {
     for r in records {
         match r.get("event").and_then(|e| e.as_str()) {
             Some(EV_QUOTE_LIVE) => {
+                // FIX 8 / I3: `quote_secs` is now a per-pass DELTA (it used to be
+                // the quote's cumulative age, and summing those overstated
+                // quote-hours ~9.5x → metric 1 understated ~10x → spurious KILL).
                 quote_secs += f64_of(r, "quote_secs").unwrap_or(0.0);
             }
             Some(EV_FILL) => {
@@ -54,13 +57,22 @@ pub fn summarize(records: &[Value]) -> Metrics {
                 if bool_of(r, "gap_through") {
                     gap_throughs += 1;
                 }
-                if let Some(hs) = f64_of(r, "half_spread_cents") {
-                    half_spreads.push(hs);
-                }
-                if f64_of(r, "markout_cents").unwrap_or(0.0) < 0.0 {
-                    adverse += 1;
-                    if bool_of(r, "in_catalyst") {
-                        adverse_catalyst += 1;
+                // FIX 8 / I5 (sensors F3): metric 2 averages EVERY markout, net
+                // of the fill's fee. It used to average only `half_spread_cents`,
+                // which the writer populated `if markout > 0` — so metric 2 was
+                // E[markout | markout > 0], structurally positive, and the
+                // "≥ +0.6¢ net of fees" promote gate COULD NOT FAIL. Fees were
+                // never subtracted at all despite the gate saying "net of fees".
+                if let Some(mk) = f64_of(r, "markout_cents") {
+                    let fee = f64_of(r, "fee_cents").unwrap_or(0.0);
+                    let count = i64_of(r, "count").unwrap_or(1).max(1) as f64;
+                    // markout is per contract; the fee row is the whole fill.
+                    net_markouts.push(mk - fee / count);
+                    if mk < 0.0 {
+                        adverse += 1;
+                        if bool_of(r, "in_catalyst") {
+                            adverse_catalyst += 1;
+                        }
                     }
                 }
             }
@@ -75,10 +87,10 @@ pub fn summarize(records: &[Value]) -> Metrics {
     } else {
         0.0
     };
-    let avg_half_spread_cents = if half_spreads.is_empty() {
+    let avg_half_spread_cents = if net_markouts.is_empty() {
         None
     } else {
-        Some(half_spreads.iter().sum::<f64>() / half_spreads.len() as f64)
+        Some(net_markouts.iter().sum::<f64>() / net_markouts.len() as f64)
     };
     let gap_through_frac = if markouts > 0 {
         gap_throughs as f64 / markouts as f64
@@ -127,9 +139,10 @@ pub fn run(path: &str) -> Result<()> {
     );
     match m.avg_half_spread_cents {
         Some(hs) => println!(
-            "  2. realized half-spread: {hs:+.2}¢  (promote if ≥ +0.6¢ net of fees)"
+            "  2. realized half-spread: {hs:+.2}¢/contract net of fees, over ALL markouts \
+             (promote if ≥ +0.6¢)"
         ),
-        None => println!("  2. realized half-spread: n/a (no completed round-trips)"),
+        None => println!("  2. realized half-spread: n/a (no markouts yet)"),
     }
     println!(
         "  3. gap-through freq   : {:.1}%  (kill number — if this eats the spread)",
@@ -157,19 +170,68 @@ mod tests {
             json!({"event": "house_quote_live", "quote_secs": 1800.0}), // +30 min = 1h
             json!({"event": "house_fill", "count": 3}),
             json!({"event": "house_fill", "count": 2}),
-            // 3 markouts: one gap-through & adverse-in-catalyst, one adverse-not, one favorable roundtrip.
-            json!({"event": "house_markout", "markout_cents": -4.0, "gap_through": true, "in_catalyst": true}),
-            json!({"event": "house_markout", "markout_cents": -1.0, "gap_through": false, "in_catalyst": false}),
-            json!({"event": "house_markout", "markout_cents": 1.0, "gap_through": false, "half_spread_cents": 0.8}),
+            // 3 markouts: one gap-through & adverse-in-catalyst, one adverse-not, one favorable.
+            json!({"event": "house_markout", "markout_cents": -4.0, "gap_through": true, "in_catalyst": true, "count": 1, "fee_cents": 0.0}),
+            json!({"event": "house_markout", "markout_cents": -1.0, "gap_through": false, "in_catalyst": false, "count": 1, "fee_cents": 0.0}),
+            json!({"event": "house_markout", "markout_cents": 1.0, "gap_through": false, "count": 1, "fee_cents": 0.0}),
         ];
         let m = summarize(&recs);
         assert_eq!(m.fills, 5);
         assert!((m.quote_minutes - 60.0).abs() < 1e-9);
         assert!((m.fill_rate_per_hour - 5.0).abs() < 1e-9); // 5 fills / 1h
-        assert_eq!(m.avg_half_spread_cents, Some(0.8));
+        // Metric 2 now averages ALL THREE: (−4 −1 +1)/3 = −1.333.
+        assert!((m.avg_half_spread_cents.unwrap() - (-4.0 / 3.0)).abs() < 1e-9);
         assert!((m.gap_through_frac - (1.0 / 3.0)).abs() < 1e-9);
         // adverse = 2 (the -4 and -1); in catalyst = 1 -> 0.5
         assert_eq!(m.adverse_in_catalyst_frac, Some(0.5));
+    }
+
+    #[test]
+    fn metric_two_can_actually_fail_and_nets_fees() {
+        // FIX 8 / I5 (sensors F3). The exact scenario the review named: 10 fills
+        // marked out +1,+1,+1,−4×7. TRUE mean = −2.5¢ → KILL. The old metric
+        // averaged only the favourable ones (`half_spread_cents` was populated
+        // `if markout > 0`) and reported +1.0¢ → PROMOTE, allocating real capital
+        // to a bleeding maker sleeve.
+        let mut recs: Vec<Value> = Vec::new();
+        for _ in 0..3 {
+            recs.push(json!({"event": "house_markout", "markout_cents": 1.0,
+                             "half_spread_cents": 1.0, "count": 1, "fee_cents": 0.0}));
+        }
+        for _ in 0..7 {
+            recs.push(json!({"event": "house_markout", "markout_cents": -4.0,
+                             "count": 1, "fee_cents": 0.0}));
+        }
+        let m = summarize(&recs);
+        let mean = m.avg_half_spread_cents.unwrap();
+        assert!((mean - (-2.5)).abs() < 1e-9, "metric 2 was {mean}");
+        assert!(mean < 0.6, "the promote gate must be able to FAIL");
+
+        // ...and it is net of fees: a +1.0¢ markout on a 2-contract fill billed
+        // 1.0¢ TOTAL nets to +0.5¢/contract, which does NOT clear +0.6¢.
+        let m = summarize(&[json!({"event": "house_markout", "markout_cents": 1.0,
+                                   "count": 2, "fee_cents": 1.0})]);
+        assert!((m.avg_half_spread_cents.unwrap() - 0.5).abs() < 1e-9);
+        assert!(m.avg_half_spread_cents.unwrap() < 0.6);
+    }
+
+    #[test]
+    fn quote_seconds_are_summed_as_deltas_not_cumulative_ages() {
+        // FIX 8 / I3 (sensors F2). 60 real seconds of quoting on the 3s loop:
+        // the writer now emits 3s per pass. The OLD writer emitted the quote's
+        // cumulative age (3,6,…,57), which this same sum turned into 570s —
+        // 9.5x the truth, so a probe genuinely filling 5/hr reported 0.53/hr.
+        let deltas: Vec<Value> = (1..=20)
+            .map(|_| json!({"event": "house_quote_live", "quote_secs": 3.0}))
+            .collect();
+        let m = summarize(&deltas);
+        assert!((m.quote_minutes - 1.0).abs() < 1e-9);
+
+        let cumulative: Vec<Value> = (1..=19)
+            .map(|i| json!({"event": "house_quote_live", "quote_secs": (i * 3) as f64}))
+            .collect();
+        let old = summarize(&cumulative);
+        assert!(old.quote_minutes > m.quote_minutes * 9.0);
     }
 
     #[test]

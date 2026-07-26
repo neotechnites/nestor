@@ -1701,6 +1701,119 @@ mod tests {
         assert_eq!(fills_all_maker(&f), None);
     }
 
+    /// EMPIRICAL probe for deep-review FIX 4 (reality F2) + FIX 3's cancel shape.
+    /// Answers, in ~8 calls and $0.01 of demo money:
+    ///   (a) does re-POSTing a RESTING order under a duplicate coid return
+    ///       **409 `order_already_exists`** — the exact classification
+    ///       `classify_resting_failure` now branches `may_be_resting: true` on?
+    ///   (b) does the coid dedupe SURVIVE the order's death (the restart case:
+    ///       re-POST after the original is cancelled)?
+    ///   (c) what does a successful cancel of a fully-resting order return
+    ///       (`reduced_by` shape, which FIX 3 logs on the partial path)?
+    ///   (d) bonus, free: does `/portfolio/balance` debit a RESTING order's
+    ///       collateral? (reality F1 — the whole reason FIX 1 widens the breaker
+    ///       rather than excluding reservations.)
+    ///
+    /// Ignored (needs demo keys + network). Prices 1¢ on a market whose ask is
+    /// far above, so it CANNOT fill; everything placed is cancelled before exit.
+    ///   KALSHI_API_BASE=https://demo-api.kalshi.co \
+    ///   KALSHI_API_KEY_ID=<id> KALSHI_PRIVATE_KEY_PATH=secrets/Demo.txt \
+    ///   NESTOR_TEST_TICKER=<open-demo-ticker> \
+    ///   cargo test -p engine demo_resting_409 -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn demo_resting_409_and_cancel_shape() {
+        let key_id = std::env::var("KALSHI_API_KEY_ID").expect("KALSHI_API_KEY_ID");
+        let key_path = std::env::var("KALSHI_PRIVATE_KEY_PATH").expect("KALSHI_PRIVATE_KEY_PATH");
+        let ticker = std::env::var("NESTOR_TEST_TICKER").expect("NESTOR_TEST_TICKER");
+        let k = Kalshi::authenticated(key_id, &key_path).unwrap();
+        let coid = format!("nestor-rest409-{}", chrono::Utc::now().timestamp());
+        let exp = chrono::Utc::now().timestamp() + 180;
+
+        let b0 = k.balance_cents().await.expect("balance b0");
+        println!("=== REST-409 PROBE === balance b0 = {b0}c");
+
+        let (s1, b1t, _) = k
+            .place_resting_limit_raw(&ticker, "yes", 1, 10, exp, &coid)
+            .await
+            .expect("first resting POST");
+        println!("--- (1) first resting POST  : HTTP {s1}\n{b1t}");
+        let v1: serde_json::Value = serde_json::from_str(&b1t).unwrap_or_default();
+        let placed = parse_place_response(&v1, "yes");
+        let order_id = placed.order_id.clone();
+
+        let b1 = k.balance_cents().await.expect("balance b1");
+        println!(
+            "--- (d) balance WHILE RESTING: {b1}c (b0 {b0}c, Δ {}c) → {}",
+            b1 - b0,
+            if b1 == b0 {
+                "does NOT lock collateral"
+            } else {
+                "LOCKS collateral"
+            }
+        );
+
+        let (s2, b2t, _) = k
+            .place_resting_limit_raw(&ticker, "yes", 1, 10, exp, &coid)
+            .await
+            .expect("duplicate resting POST");
+        let api2 = parse_api_error(&b2t);
+        println!(
+            "--- (a) duplicate coid WHILE RESTING: HTTP {s2} code={:?}\n{b2t}",
+            api2.code
+        );
+        println!(
+            "        classify_resting_failure({s2}, {:?}) = {:?}",
+            api2.code,
+            crate::strategy::classify_resting_failure_pub(s2, api2.code.as_deref())
+        );
+
+        if let Some(oid) = &order_id {
+            let cancel = k.cancel_order(oid).await;
+            match &cancel {
+                Ok(v) => println!(
+                    "--- (c) cancel of a FULLY-RESTING order: {v}\n        reduced_by = {:?}",
+                    parse_cancel_reduced_by(v)
+                ),
+                Err(e) => println!("--- (c) cancel FAILED: {e}"),
+            }
+        }
+
+        let (s3, b3t, _) = k
+            .place_resting_limit_raw(&ticker, "yes", 1, 10, exp, &coid)
+            .await
+            .expect("post-death duplicate POST");
+        let api3 = parse_api_error(&b3t);
+        println!(
+            "--- (b) duplicate coid AFTER the order died: HTTP {s3} code={:?}\n{b3t}",
+            api3.code
+        );
+        // If the third POST was ACCEPTED, a new order is now resting — kill it.
+        if (200..300).contains(&s3) {
+            let v3: serde_json::Value = serde_json::from_str(&b3t).unwrap_or_default();
+            if let Some(oid) = parse_place_response(&v3, "yes").order_id {
+                println!("        (3rd POST created {oid} — cancelling)");
+                let _ = k.cancel_order(&oid).await;
+            }
+        }
+
+        let b2 = k.balance_cents().await.expect("balance b2");
+        println!("--- balance after cancel: {b2}c (b0 {b0}c)");
+
+        // MUST exit with nothing of ours resting.
+        let resting = k.resting_orders(Some(&ticker)).await.expect("resting list");
+        let ours: Vec<_> = parse_resting_orders(&resting)
+            .into_iter()
+            .filter(|o| o.client_order_id.as_deref() == Some(coid.as_str()))
+            .collect();
+        println!("--- exit check: {} of our orders still resting", ours.len());
+        for o in &ours {
+            println!("    LEAKED {} — cancelling", o.order_id);
+            let _ = k.cancel_order(&o.order_id).await;
+        }
+        assert!(ours.is_empty(), "probe leaked a resting order");
+    }
+
     /// EMPIRICAL duplicate-`client_order_id` probe (fix 2b). Places the SAME 1ct
     /// 2¢ IOC order twice with a FIXED client_order_id against an empty demo book,
     /// printing BOTH raw (status, body) responses — settling whether Kalshi

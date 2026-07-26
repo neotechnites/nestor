@@ -195,12 +195,20 @@ impl OpenFill {
     }
 }
 
-/// Gap-through stop (protocol Hard stop): a single fill marked out worse than −5¢
-/// within the 60s horizon. `age_ms` is the fill's age; only fires once past a
-/// meaningful fraction of the horizon isn't required — a −5¢ markout at any point
-/// within 60s trips it.
+/// Gap-through stop (protocol Hard stop): a single fill marked out worse than
+/// −5¢ by the time it reaches the 60s horizon.
+///
+/// FIX 8 (sensors F6 — the protocol's own hard stop could barely fire). The old
+/// form was `age_secs <= MARKOUT_HORIZON_SECS && markout <= −5`, evaluated only
+/// on fills the caller had ALREADY skipped while `age_secs < 60`. The two
+/// conditions together admit exactly `age_secs == 60`, and on the 3s quote loop
+/// the first eligible evaluation lands at age 60, 61 or 62 with roughly equal
+/// probability — so the stop missed ~2/3 of the events it exists to catch, while
+/// the metric-3 classification recorded every one of them. The stop fires at the
+/// FIRST evaluation with `age_secs >= 60`; there is no upper bound, because a
+/// fill is evaluated once and then removed from `pending`.
 pub fn gap_through_stop(markout: f64, age_secs: i64) -> bool {
-    age_secs <= MARKOUT_HORIZON_SECS && markout <= GAP_THROUGH_STOP_CENTS
+    age_secs >= MARKOUT_HORIZON_SECS && markout <= GAP_THROUGH_STOP_CENTS
 }
 
 /// Metric-3 gap-through classification: mid moved ≥3¢ against within 60s.
@@ -326,11 +334,23 @@ mod tests {
     }
 
     #[test]
-    fn gap_through_stop_and_metric() {
-        assert!(gap_through_stop(-5.0, 30)); // -5c within 60s -> stop
-        assert!(!gap_through_stop(-5.0, 61)); // past horizon
-        assert!(!gap_through_stop(-4.0, 30)); // not deep enough
-        assert!(is_gap_through(-3.0)); // metric: 3c against
+    fn gap_through_stop_fires_at_the_first_evaluation_past_the_horizon() {
+        // FIX 8 (sensors F6). The caller skips any pending fill younger than the
+        // horizon, so the stop only ever sees ages >= 60 — and on a 3s loop the
+        // first such evaluation lands at 60, 61 or 62 with ~equal probability.
+        // The OLD form (`age <= 60`) fired on exactly one of those three.
+        assert!(gap_through_stop(-6.0, 60));
+        assert!(gap_through_stop(-6.0, 61)); // was FALSE — 2/3 of events missed
+        assert!(gap_through_stop(-6.0, 62)); // was FALSE
+        assert!(gap_through_stop(-6.0, 120)); // a delayed pass must still stop
+        // Threshold itself unchanged: exactly −5¢ trips, −4.9¢ does not.
+        assert!(gap_through_stop(GAP_THROUGH_STOP_CENTS, 60));
+        assert!(!gap_through_stop(-4.9, 61));
+        // Never before the horizon (the markout is not measured yet).
+        assert!(!gap_through_stop(-6.0, 59));
+        assert!(!gap_through_stop(-6.0, 0));
+        // Metric-3 classification is a separate, unchanged threshold.
+        assert!(is_gap_through(-3.0));
         assert!(!is_gap_through(-2.0));
     }
 }

@@ -23,9 +23,19 @@ pub struct City {
 
 /// Hard ceiling on the live-money bankroll seed. Refuse to start live with a
 /// bankroll above this — a lost/oversized nestor.toml must never set halts at a
-/// multiple of the real account or make it drainable (fix 4). Bump deliberately
-/// as the live program scales; $100 is the current pre-live cap.
-pub const MAX_LIVE_BANKROLL: f64 = 100.0;
+/// multiple of the real account or make it drainable (fix 4).
+///
+/// DERIVED (constants F5, 2026-07-26): **current live bankroll $106.03** (see
+/// `data/state.json`; real Kalshi balance $106.28, the Δ$0.25 being the standing
+/// genesis offset) **+ ~40% of headroom = $150**. At $100 the cap had already
+/// fallen BELOW the live account, so a lost state file could not be recovered:
+/// `--fresh-state` with the true balance bailed ("out of range"), and seeding
+/// the legal ≤$100 instead set `peak` $6 under the real cash — whereupon the
+/// FIRST reconcile pass computed Δ$6.28 > $2.00 and halted immediately. The
+/// number is still a SEED SANITY CAP, not a risk limit: it bounds a typo'd or
+/// stale config, and the drawdown / daily-loss / divergence switches do the real
+/// work. Bump it deliberately whenever the account grows past ~2/3 of it.
+pub const MAX_LIVE_BANKROLL: f64 = 150.0;
 
 /// Default bankroll used ONLY in paper mode when nothing is configured. Live mode
 /// has NO default — it must be set explicitly and within [`MAX_LIVE_BANKROLL`].
@@ -221,11 +231,24 @@ mod tests {
         assert!(resolve_bankroll(true, None, None).is_err());
         // Live: oversized config bankroll → REFUSE.
         assert!(resolve_bankroll(true, None, Some(1000.0)).is_err());
-        assert!(resolve_bankroll(true, None, Some(100.01)).is_err());
+        assert!(resolve_bankroll(true, None, Some(MAX_LIVE_BANKROLL + 0.01)).is_err());
         // Live: zero/negative → REFUSE.
         assert!(resolve_bankroll(true, Some(0.0), None).is_err());
         // Live: valid explicit seed → accepted; env overrides config.
         assert_eq!(resolve_bankroll(true, None, Some(100.0)).unwrap(), 100.0);
+        // FIX 12 (constants F5): the cap must clear the CURRENT live account, or
+        // a lost state file cannot be recovered — the recovery seed bails, and
+        // any legal-but-lower seed halts on the first divergence pass.
+        const LIVE_BANKROLL_TODAY: f64 = 106.03;
+        const LIVE_REAL_CASH_TODAY: f64 = 106.28;
+        assert_eq!(
+            resolve_bankroll(true, Some(LIVE_BANKROLL_TODAY), None).unwrap(),
+            LIVE_BANKROLL_TODAY
+        );
+        assert!(resolve_bankroll(true, Some(LIVE_REAL_CASH_TODAY), None).is_ok());
+        // ...while still being a real cap, not a rubber stamp.
+        assert!(resolve_bankroll(true, Some(1000.0), None).is_err());
+        const _: () = assert!(MAX_LIVE_BANKROLL >= 132.85); // 106.28 * 1.25
         assert_eq!(resolve_bankroll(true, Some(50.0), Some(1000.0)).unwrap(), 50.0);
     }
 

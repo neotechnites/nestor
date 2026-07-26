@@ -165,6 +165,13 @@ fn now_ms() -> i64 {
 ///
 /// Everything else (400/401/403/422 validation, insufficient balance, …) really
 /// does mean nothing was created, and taking stays safe.
+/// Test-only view of [`classify_resting_failure`] so the demo probe can print
+/// the classification alongside the raw response it was derived from.
+#[doc(hidden)]
+pub fn classify_resting_failure_pub(status: u16, code: Option<&str>) -> (bool, bool) {
+    classify_resting_failure(status, code)
+}
+
 fn classify_resting_failure(status: u16, code: Option<&str>) -> (bool, bool) {
     if status == 409 && code == Some("order_already_exists") {
         return (true, true);

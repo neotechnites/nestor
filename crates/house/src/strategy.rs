@@ -109,6 +109,10 @@ struct BookQuote {
     /// Contracts already booked from each leg (to book only the per-pass delta).
     booked_bid: i64,
     booked_ask: i64,
+    /// Unix second up to which quote-live time has already been emitted, so each
+    /// `house_quote_live` record carries a DELTA the report can sum (FIX 8/I3).
+    /// 0 = nothing emitted yet; the first delta runs from `quoted_ts`.
+    last_accrued_ts: i64,
 }
 
 /// A fill awaiting its +60s markout stamp.
@@ -119,6 +123,10 @@ struct Pending {
     entry_cents: i64,
     ts_ms: i64,
     in_catalyst: bool,
+    /// Shared id with the `house_fill` record, so metric 2 can net the fee (I5).
+    fill_id: String,
+    fee_cents: f64,
+    count: i64,
 }
 
 #[derive(Default)]
@@ -126,8 +134,14 @@ struct HouseState {
     ledger: ProbeLedger,
     quotes: HashMap<String, BookQuote>, // ticker -> live quote
     pending: Vec<Pending>,
+    /// (ticker, gate reason) pairs already logged once at human volume.
+    gates_logged: std::collections::HashSet<String>,
     /// ticker -> last known mid, for the cross-book −$20 ledger mark.
     last_mid: HashMap<String, i64>,
+    /// ticker -> unix second `last_mid` was refreshed, so a markout can say how
+    /// STALE the mid it used was (I6). A mid is only refreshed on a pass that
+    /// reaches that ticker with a two-sided book.
+    last_mid_ts: HashMap<String, i64>,
     halted: bool,
 }
 
@@ -337,6 +351,7 @@ impl House {
             if debug {
                 eprintln!("[house-dbg] {}: {} open, NO in-band pick", book.label, opens.len());
             }
+            self.log_pass(book, None, None, None, None, None, "no_pick", false);
             return Ok(()); // no in-band market right now
         };
         let ticker = m.ticker.clone();
@@ -354,15 +369,19 @@ impl House {
                 signal::spread_ok(best_bid, best_ask)
             );
         }
+        let spread = best_ask.zip(best_bid).map(|(a, b)| a - b);
         let Some(mid) = mid else {
             self.pull_quotes(eng, &ticker, "no_two_sided_book").await;
+            self.log_pass(book, Some(&ticker), best_bid, best_ask, spread, None,
+                          "no_two_sided_book", false);
+            self.log_gate_once(book, &ticker, "no_two_sided_book");
             return Ok(());
         };
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .last_mid
-            .insert(ticker.clone(), mid);
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.last_mid.insert(ticker.clone(), mid);
+            st.last_mid_ts.insert(ticker.clone(), now);
+        }
 
         // GATE: catalyst window (protocol §2) — pull all quotes T±15min.
         if signal::in_catalyst_window(now, &self.catalysts) {
@@ -372,13 +391,19 @@ impl House {
                 json!({"event": "house_gate", "book": book.label, "ticker": ticker,
                        "reason": "catalyst_window"}),
             );
+            self.log_pass(book, Some(&ticker), best_bid, best_ask, spread, Some(mid),
+                          "catalyst_window", false);
             return Ok(());
         }
         // GATE: spread ≥2¢ (protocol §1).
         if !signal::spread_ok(best_bid, best_ask) {
             self.pull_quotes(eng, &ticker, "spread_lt_2c").await;
+            self.log_pass(book, Some(&ticker), best_bid, best_ask, spread, Some(mid),
+                          "spread_lt_2c", false);
+            self.log_gate_once(book, &ticker, "spread_lt_2c");
             return Ok(());
         }
+        self.log_pass(book, Some(&ticker), best_bid, best_ask, spread, Some(mid), "ok", true);
 
         let live = Self::live_enabled(eng);
 
@@ -423,13 +448,91 @@ impl House {
             }
         } else {
             // Quote still good — accrue quote-live time for metric 1.
+            //
+            // FIX 8 / I3 (sensors F2): `quote_secs` is the DELTA since the
+            // previous record, not the quote's cumulative age. report.rs SUMS
+            // this field, so emitting the cumulative age turned 60 real seconds
+            // of quoting into Σ(3,6,…,57) = 570s — a ~9.5× overstatement of
+            // quote-hours, i.e. metric 1 (the PROMOTE gate) understated ~10×.
+            // A sleeve genuinely filling 5/hr reported 0.5/hr → spurious KILL.
+            // Worse, the bias was an uncontrolled function of mid volatility
+            // (a requote resets `quoted_ts`), so it was not even a fixable
+            // constant factor.
+            let delta = {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                match st.quotes.get_mut(&ticker) {
+                    Some(q) => {
+                        let last = if q.last_accrued_ts > 0 {
+                            q.last_accrued_ts
+                        } else {
+                            q.quoted_ts
+                        };
+                        q.last_accrued_ts = now;
+                        (now - last).max(0)
+                    }
+                    None => 0,
+                }
+            };
             logging::record_path(
                 LOG,
                 json!({"event": "house_quote_live", "book": book.label, "ticker": ticker,
-                       "quote_secs": age.max(0), "mid": mid}),
+                       "quote_secs": delta, "quote_age_secs": age.max(0), "mid": mid}),
             );
         }
         Ok(())
+    }
+
+    /// FIX 8 / I2 (sensors F4): one record EVERY pass, whatever happens. Before
+    /// this, the two gates that actually fire (`no_two_sided_book`,
+    /// `spread_lt_2c`) and the no-pick path wrote NOTHING, so
+    /// `data/house_probe.jsonl` did not exist after a full weekend live with
+    /// HOUSE_PROBE=1 — and "no quotes because the gate works" was an inference
+    /// from an ABSENT FILE, indistinguishable from a timed-out markets fetch, a
+    /// flag that never reached the process, or a panicked task. This record is
+    /// the probe's DENOMINATOR: quotable-spread fraction (H5) and quote uptime
+    /// (H6), neither of which was computable at all.
+    #[allow(clippy::too_many_arguments)]
+    fn log_pass(
+        &self,
+        book: &Book,
+        ticker: Option<&str>,
+        best_bid: Option<i64>,
+        best_ask: Option<i64>,
+        spread: Option<i64>,
+        mid: Option<i64>,
+        gate: &str,
+        quoting: bool,
+    ) {
+        logging::record_path(
+            LOG,
+            json!({"event": "house_pass", "book": book.label, "ticker": ticker,
+                   "best_bid": best_bid, "best_ask": best_ask, "spread": spread,
+                   "mid": mid, "gate": gate, "quoting": quoting, "size": self.size}),
+        );
+    }
+
+    /// Log a gate ONCE per (ticker, reason) at human volume — the per-pass
+    /// denominator lives in `house_pass`, but a first-occurrence line is what an
+    /// operator actually reads (sensors F4). Dedup is in-memory, so a restart
+    /// re-logs; that is the correct behaviour for a "this is why it is quiet" line.
+    fn log_gate_once(&self, book: &Book, ticker: &str, reason: &str) {
+        let key = format!("{ticker}|{reason}");
+        let first = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.gates_logged.insert(key)
+        };
+        if first {
+            logging::info(format!(
+                "house {}: {ticker} standing down — {reason} (first occurrence; per-pass \
+                 detail in house_pass records)",
+                book.label
+            ));
+            logging::record_path(
+                LOG,
+                json!({"event": "house_gate", "book": book.label, "ticker": ticker,
+                       "reason": reason, "first_occurrence": true}),
+            );
+        }
     }
 
     /// Select the in-band market: within [band_lo,band_hi] YES-mid, nearest to the
@@ -526,6 +629,7 @@ impl House {
                 since_ms: chrono::Utc::now().timestamp_millis(),
                 booked_bid: 0,
                 booked_ask: 0,
+                last_accrued_ts: 0,
             },
         );
         drop(st);
@@ -658,6 +762,10 @@ impl House {
             let cash_out_cents = delta * entry + fee.round() as i64;
             eng.note_house_cash_cents(ticker, -cash_out_cents);
 
+            // Shared id so `house_markout` can join back to this fill's fee —
+            // metric 2 is "net of fees" and the two records had no join key (I5).
+            let fill_id = format!("{oid}|{side:?}|{total}");
+
             {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.ledger
@@ -675,6 +783,9 @@ impl House {
                     entry_cents: entry,
                     ts_ms: ts.unwrap_or(now * 1000),
                     in_catalyst,
+                    fill_id: fill_id.clone(),
+                    fee_cents: fee,
+                    count: delta,
                 });
             }
             logging::info(format!(
@@ -686,8 +797,9 @@ impl House {
                 json!({"event": "house_fill", "book": book.label, "ticker": ticker,
                        "side": side.as_str(), "count": delta, "entry_cents": entry,
                        "mid_at_fill": mid, "fee_cents": fee, "fee_estimated": fee_estimated,
+                       "fee_rows_estimated": fee_rows_estimated, "fee_rows": fills.len(),
                        "all_maker": all_maker, "in_catalyst": in_catalyst,
-                       "order_id": oid}),
+                       "order_id": oid, "fill_id": fill_id}),
             );
             alert::notify(
                 &eng.http,
@@ -706,11 +818,13 @@ impl House {
     /// mid, log it with the gap-through flag, and fire the −5¢ gap-through stop.
     async fn settle_markouts(&self, eng: &Engine) {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let mut done: Vec<(String, String, Side, i64, f64, bool, bool)> = Vec::new();
+        let now = now_ms / 1000;
+        let mut done: Vec<MarkoutRow> = Vec::new();
         let mut trip_stop = false;
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let mids = st.last_mid.clone();
+            let mid_ts = st.last_mid_ts.clone();
             let mut keep = Vec::new();
             for p in std::mem::take(&mut st.pending) {
                 let age_secs = (now_ms - p.ts_ms) / 1000;
@@ -718,13 +832,38 @@ impl House {
                     keep.push(p);
                     continue;
                 }
-                let mid = mids.get(&p.ticker).copied().unwrap_or(p.entry_cents);
+                // FIX 8 / I6 (sensors F7): a markout computed against an ABSENT
+                // mid used to fall back to the entry price, producing exactly
+                // 0.0¢ — indistinguishable in the tape from a genuine flat
+                // markout, and diluting metric 3 (the KILL number) by precisely
+                // the cases where the book went one-sided, i.e. the gap-through
+                // cases. Now the record says which mid was used, how old it was,
+                // and whether it was real.
+                let live = mids.get(&p.ticker).copied();
+                let mid = live.unwrap_or(p.entry_cents);
+                let mid_source = if live.is_some() { "last_book_mid" } else { "entry_fallback" };
+                let mid_age_secs = mid_ts.get(&p.ticker).map(|t| now - t);
                 let mk = signal::markout_cents(p.side, p.entry_cents, mid);
                 let gap = signal::is_gap_through(mk);
                 if signal::gap_through_stop(mk, age_secs) {
                     trip_stop = true;
                 }
-                done.push((p.ticker, p.label, p.side, p.entry_cents, mk, gap, p.in_catalyst));
+                done.push(MarkoutRow {
+                    ticker: p.ticker,
+                    label: p.label,
+                    side: p.side,
+                    entry_cents: p.entry_cents,
+                    markout: mk,
+                    gap,
+                    in_catalyst: p.in_catalyst,
+                    fill_id: p.fill_id,
+                    fee_cents: p.fee_cents,
+                    count: p.count,
+                    mid_used: mid,
+                    mid_source,
+                    mid_age_secs,
+                    age_secs,
+                });
             }
             st.pending = keep;
         } // guard released here
@@ -732,23 +871,53 @@ impl House {
             Self::log_markout(d);
         }
         if trip_stop {
-            self.halt(eng, "−5¢ gap-through markout within 60s").await;
+            self.halt(eng, "−5¢ gap-through markout at the 60s horizon").await;
         }
     }
 
-    fn log_markout(d: &(String, String, Side, i64, f64, bool, bool)) {
-        let (ticker, label, side, entry, mk, gap, in_catalyst) = d;
-        // Realized half-spread proxy: a favorable markout on a maker fill IS the
-        // captured half-spread (entry sat inside the mid by the markout).
-        let half_spread = if *mk > 0.0 { Some(*mk) } else { None };
+    fn log_markout(d: &MarkoutRow) {
         logging::record_path(
             LOG,
-            json!({"event": "house_markout", "book": label, "ticker": ticker,
-                   "side": side.as_str(), "entry_cents": entry, "markout_cents": mk,
-                   "gap_through": gap, "in_catalyst": in_catalyst,
-                   "half_spread_cents": half_spread}),
+            json!({"event": "house_markout", "book": d.label, "ticker": d.ticker,
+                   "side": d.side.as_str(), "entry_cents": d.entry_cents,
+                   "markout_cents": d.markout, "gap_through": d.gap,
+                   "in_catalyst": d.in_catalyst,
+                   // FIX 8 / I5 (sensors F3): metric 2 is computed over ALL
+                   // markouts, net of fees, by report.rs. It used to be
+                   // `if markout > 0 { Some(markout) }` — E[markout | markout>0],
+                   // which is structurally positive, so the "+0.6¢ net of fees"
+                   // promote gate COULD NOT FAIL: 10 fills at +1,+1,+1 and 7×−4
+                   // (true mean −2.5¢, a kill) reported +1.0¢ and PROMOTED.
+                   // The field stays for backward compatibility with old tapes.
+                   "half_spread_cents": if d.markout > 0.0 { Some(d.markout) } else { None },
+                   // Metric-2 inputs (the fee lives on house_fill, which shared
+                   // no id with this record until now — I5).
+                   "fill_id": d.fill_id, "fee_cents": d.fee_cents, "count": d.count,
+                   // Mid provenance (I6) — separates a real 0¢ from a fabricated one.
+                   "mid_used": d.mid_used, "mid_source": d.mid_source,
+                   "mid_age_secs": d.mid_age_secs, "markout_age_secs": d.age_secs}),
         );
     }
+}
+
+/// One resolved markout, ready to log (FIX 8 — the tuple grew past readable).
+struct MarkoutRow {
+    ticker: String,
+    label: String,
+    side: Side,
+    entry_cents: i64,
+    markout: f64,
+    gap: bool,
+    in_catalyst: bool,
+    /// Joins this markout to its `house_fill` record (I5).
+    fill_id: String,
+    /// Exchange fee booked on that fill, in cents — metric 2 must net it.
+    fee_cents: f64,
+    count: i64,
+    mid_used: i64,
+    mid_source: &'static str,
+    mid_age_secs: Option<i64>,
+    age_secs: i64,
 }
 
 /// ET calendar day (YYYY-MM-DD) of a unix time — used by the CPI catalyst helper.
