@@ -277,10 +277,19 @@ enum WsEvent {
 }
 
 /// Decode a text frame into a [`WsEvent`]. Never panics; unknown shapes -> Other.
+/// Thin string wrapper over [`parse_value`] — the connection loop parses once and
+/// calls `parse_value` directly, so this is used only by the unit tests.
+#[cfg(test)]
 fn parse_event(text: &str) -> WsEvent {
-    let Ok(v) = serde_json::from_str::<Value>(text) else {
-        return WsEvent::Other;
-    };
+    match serde_json::from_str::<Value>(text) {
+        Ok(v) => parse_value(&v),
+        Err(_) => WsEvent::Other,
+    }
+}
+
+/// [`parse_event`] over an already-parsed value (the connection loop parses once
+/// for both the sequence check and the type dispatch).
+fn parse_value(v: &Value) -> WsEvent {
     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
     // seq lives at the top level alongside type/sid/msg.
     let seq = v.get("seq").and_then(|s| s.as_i64());
@@ -328,7 +337,7 @@ fn parse_event(text: &str) -> WsEvent {
             id: v.get("id").and_then(|i| i.as_i64()),
             sid: msg.get("sid").and_then(|s| s.as_i64()),
         },
-        "error" => WsEvent::Error(text.to_string()),
+        "error" => WsEvent::Error(v.to_string()),
         _ => WsEvent::Other,
     }
 }
@@ -389,6 +398,8 @@ async fn connect_and_serve(book: &Arc<WsBook>, url: &str, auth: Option<&WsAuth>)
     let mut subscribed: HashMap<String, i64> = HashMap::new();
     // outstanding subscribe cmd id -> ticker (awaiting ack).
     let mut pending: HashMap<i64, String> = HashMap::new();
+    // Per-sid sequence tracker (connection-scoped): a gap = a dropped frame.
+    let mut seq_by_sid: HashMap<i64, i64> = HashMap::new();
     let mut next_id: i64 = 1;
     let mut reconcile = tokio::time::interval(RECONCILE_TICK);
     reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -418,9 +429,28 @@ async fn connect_and_serve(book: &Arc<WsBook>, url: &str, auth: Option<&WsAuth>)
                     Message::Pong(_) | Message::Frame(_) => continue,
                     Message::Close(_) => return Ok(()),
                 };
+                // Parse once. FIRST enforce per-sid sequence continuity across
+                // EVERY seq-bearing frame (snapshots/`ok`/deltas share one counter
+                // per sid) — a gap means a dropped frame, so reconnect for fresh
+                // snapshots. THEN dispatch by type.
+                let v: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue, // non-JSON control frame
+                };
+                if let (Some(sid), Some(seq)) = (
+                    v.get("sid").and_then(|x| x.as_i64()),
+                    v.get("seq").and_then(|x| x.as_i64()),
+                ) {
+                    if !seq_in_order(&mut seq_by_sid, sid, seq) {
+                        let prev = seq_by_sid.get(&sid).copied().unwrap_or(-1);
+                        return Err(anyhow!(
+                            "seq gap sid={sid} {prev}->{seq} — resync via reconnect"
+                        ));
+                    }
+                }
                 // Route subscribe acks here (they touch pending/subscribed);
                 // book-mutating frames go to apply_event.
-                match parse_event(&text) {
+                match parse_value(&v) {
                     WsEvent::Subscribed { id: Some(id), sid: Some(sid) } => {
                         if let Some(ticker) = pending.remove(&id) {
                             subscribed.insert(ticker, sid);
@@ -429,12 +459,7 @@ async fn connect_and_serve(book: &Arc<WsBook>, url: &str, auth: Option<&WsAuth>)
                     WsEvent::Error(e) => {
                         crate::logging::info(format!("ws: server error frame: {e}"));
                     }
-                    ev => {
-                        if apply_event(book, ev) {
-                            // seq gap: reconnect for fresh snapshots on all tickers.
-                            return Err(anyhow!("seq gap — resync via reconnect"));
-                        }
-                    }
+                    ev => apply_event(book, ev),
                 }
             }
         }
@@ -500,14 +525,32 @@ where
     Ok(())
 }
 
-/// Apply one book-mutating event (Snapshot/Delta) to the store. Returns `true`
-/// iff a delta seq gap was detected (the caller reconnects for fresh snapshots).
-/// Acks/errors/control frames are handled by the caller and never reach here.
-fn apply_event(book: &Arc<WsBook>, ev: WsEvent) -> bool {
+/// Per-`sid` sequence continuity check. Kalshi numbers frames with ONE monotonic
+/// `seq` per subscription id — a single stream that spans every seq-bearing frame
+/// on that sid: snapshots for ALL multiplexed market_tickers, `ok` control acks,
+/// AND deltas (verified on prod 2026-07-26 — `1,2(ok),3(snapshot#2),4,5…` unbroken
+/// under one sid). So the gap check MUST be per-sid/connection, never per-ticker
+/// (per-ticker saw `1 -> 4` across the interleaved `ok`+2nd-snapshot and falsely
+/// "gapped" on every connect). Returns false on a real gap (caller reconnects for
+/// fresh snapshots); the first frame for a sid seeds the baseline.
+fn seq_in_order(seq_by_sid: &mut HashMap<i64, i64>, sid: i64, seq: i64) -> bool {
+    if let Some(&prev) = seq_by_sid.get(&sid) {
+        if seq != prev + 1 {
+            return false;
+        }
+    }
+    seq_by_sid.insert(sid, seq);
+    true
+}
+
+/// Apply one book-mutating event (Snapshot/Delta) to the store. Sequence
+/// continuity is enforced upstream per-sid ([`seq_in_order`]); here we only load
+/// snapshots and advance books. Acks/errors/control frames never reach here.
+fn apply_event(book: &Arc<WsBook>, ev: WsEvent) {
     match ev {
         WsEvent::Snapshot { ticker, seq, yes, no } => {
             if ticker.is_empty() {
-                return false;
+                return;
             }
             book.books
                 .lock()
@@ -515,28 +558,19 @@ fn apply_event(book: &Arc<WsBook>, ev: WsEvent) -> bool {
                 .entry(ticker)
                 .or_default()
                 .load_snapshot(yes, no, seq, Instant::now());
-            false
         }
         WsEvent::Delta { ticker, seq, side, price_cents, delta } => {
             let mut books = book.books.lock().unwrap_or_else(|e| e.into_inner());
             let b = books.entry(ticker).or_default();
-            // seq must advance by exactly 1; any gap invalidates every local book.
-            if let (Some(prev), Some(cur)) = (b.seq, seq) {
-                if cur != prev + 1 {
-                    b.synced = false;
-                    b.seq = None;
-                    b.yes.clear();
-                    b.no.clear();
-                    return true; // force a reconnect + resnapshot
-                }
-            }
+            // A delta before this ticker's snapshot (or after a disconnect cleared
+            // `synced`) is untrusted — the per-sid seq guard guarantees no frame
+            // was dropped, so `synced` flips true as soon as the snapshot lands.
             if !b.synced {
-                return false; // delta before snapshot / after gap: untrusted
+                return;
             }
             b.apply_delta(side, price_cents, delta, seq, Instant::now());
-            false
         }
-        _ => false,
+        _ => {}
     }
 }
 
@@ -674,30 +708,47 @@ mod tests {
     }
 
     #[test]
-    fn seq_gap_invalidates_book() {
+    fn per_sid_seq_is_global_not_per_ticker() {
+        // Reproduces the prod stream: ONE sid, seq spans snapshots for TWO
+        // tickers + an `ok` control frame + deltas, unbroken. Per-ticker tracking
+        // would have "gapped" BTC from seq 1 -> 4; per-sid tracking accepts it.
+        let mut m = HashMap::new();
+        assert!(seq_in_order(&mut m, 1, 1)); // BTC snapshot
+        assert!(seq_in_order(&mut m, 1, 2)); // ok
+        assert!(seq_in_order(&mut m, 1, 3)); // ETH snapshot
+        assert!(seq_in_order(&mut m, 1, 4)); // delta
+        assert!(seq_in_order(&mut m, 1, 5)); // delta
+        // A real dropped frame (5 -> 7) is a gap.
+        assert!(!seq_in_order(&mut m, 1, 7));
+        // A second sid keeps its OWN independent counter (first frame seeds it).
+        assert!(seq_in_order(&mut m, 2, 1));
+        assert!(seq_in_order(&mut m, 2, 2));
+        assert!(!seq_in_order(&mut m, 2, 9));
+    }
+
+    #[test]
+    fn apply_snapshot_then_delta_builds_book() {
         let book = Arc::new(WsBook::new());
-        // Snapshot seq 1.
-        let snap = r#"{"type":"orderbook_snapshot","seq":1,"msg":{"market_ticker":"T","no":[[55,80]]}}"#;
-        assert!(!apply_event(&book, parse_event(snap)));
+        // Snapshot: NO bid at 55 -> yes_ask 45.
+        let snap = r#"{"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{"market_ticker":"T","no":[[55,80]]}}"#;
+        apply_event(&book, parse_event(snap));
         assert!(book.quote("T").unwrap().synced);
-        // In-order delta seq 2 -> applied, yes_ask tightens to 100-57=43.
-        let d2 = r#"{"type":"orderbook_delta","seq":2,"msg":{"market_ticker":"T","price":57,"delta":10,"side":"no"}}"#;
-        assert!(!apply_event(&book, parse_event(d2)));
+        assert_eq!(book.quote("T").unwrap().yes_ask, Some(45));
+        // In-order delta: better NO bid at 57 -> yes_ask tightens to 43.
+        let d2 = r#"{"type":"orderbook_delta","sid":1,"seq":2,"msg":{"market_ticker":"T","price":57,"delta":10,"side":"no"}}"#;
+        apply_event(&book, parse_event(d2));
         assert_eq!(book.quote("T").unwrap().yes_ask, Some(43));
-        // Gap: seq jumps to 5 -> invalidated + reconnect signaled.
-        let d5 = r#"{"type":"orderbook_delta","seq":5,"msg":{"market_ticker":"T","price":50,"delta":1,"side":"no"}}"#;
-        assert!(apply_event(&book, parse_event(d5)));
-        assert!(!book.quote("T").unwrap().synced);
     }
 
     #[test]
     fn delta_before_snapshot_is_ignored() {
         let book = Arc::new(WsBook::new());
-        let d = r#"{"type":"orderbook_delta","seq":2,"msg":{"market_ticker":"T","price":57,"delta":10,"side":"no"}}"#;
-        assert!(!apply_event(&book, parse_event(d)));
-        // Book exists but is unsynced with no usable ask.
+        let d = r#"{"type":"orderbook_delta","sid":1,"seq":2,"msg":{"market_ticker":"T","price":57,"delta":10,"side":"no"}}"#;
+        apply_event(&book, parse_event(d));
+        // Book exists but is unsynced (no snapshot) with no usable ask.
         let q = book.quote("T").unwrap();
         assert!(!q.synced);
+        assert_eq!(q.yes_ask, None);
     }
 
     #[test]
@@ -739,38 +790,90 @@ mod demo_probe {
     async fn demo_ws_connect_and_book() {
         let key_id = std::env::var("KALSHI_API_KEY_ID").expect("KALSHI_API_KEY_ID (demo)");
         let key_path = std::env::var("KALSHI_PRIVATE_KEY_PATH").expect("KALSHI_PRIVATE_KEY_PATH");
-        let ticker = std::env::var("NESTOR_TEST_TICKER").expect("NESTOR_TEST_TICKER");
+        // Comma-separate NESTOR_TEST_TICKER to subscribe MULTIPLE tickers through
+        // the maintainer — the case that exposed the false per-ticker seq gap.
+        let tickers: Vec<String> = std::env::var("NESTOR_TEST_TICKER")
+            .expect("NESTOR_TEST_TICKER")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
         let k = Kalshi::authenticated(key_id, &key_path).unwrap();
         let auth = k.ws_auth();
         let url = ws_url();
-        println!("=== WS URL === {url} (auth={})", auth.is_some());
+        println!("=== WS URL === {url} (auth={}) tickers={tickers:?}", auth.is_some());
 
         let book = Arc::new(WsBook::new());
-        book.want(&ticker);
+        for t in &tickers {
+            book.want(t);
+        }
         let b2 = book.clone();
         let handle = tokio::spawn(async move { run(b2, url, auth).await });
 
         // Also dump raw frames on a second connection so the exact schema is
         // printed verbatim into the charter Decisions section.
-        let raw = tokio::spawn(dump_raw_frames(k.ws_auth(), ticker.clone()));
+        let raw = tokio::spawn(dump_raw_frames(k.ws_auth(), tickers[0].clone()));
 
         for i in 1..=15 {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Some(q) = book.quote(&ticker) {
-                println!(
-                    "  t+{i}s book: yes_ask={:?} no_ask={:?} age_ms={} synced={}",
-                    q.yes_ask,
-                    q.no_ask,
-                    q.age.as_millis(),
-                    q.synced
-                );
-            } else {
-                println!("  t+{i}s: no book yet");
+            for t in &tickers {
+                if let Some(q) = book.quote(t) {
+                    let tail = t.rsplit('-').next().unwrap_or(t);
+                    println!(
+                        "  t+{i}s …{tail}: yes_ask={:?} no_ask={:?} age_ms={} synced={}",
+                        q.yes_ask, q.no_ask, q.age.as_millis(), q.synced
+                    );
+                }
             }
         }
         handle.abort();
         raw.abort();
         println!("=== VERDICT === record endpoint/auth-ok/snapshot-schema/best-asks above into charter Decisions.");
+    }
+
+    /// DIAGNOSTIC: subscribe MULTIPLE tickers on one connection and print
+    /// `type/sid/seq/ticker` for ~20s — settles whether `seq` is per-connection
+    /// (global, interleaves across sids) or per-sid (per subscription). Comma-
+    /// separate NESTOR_TEST_TICKER. Run:
+    ///   KALSHI_API_KEY_ID=<id> KALSHI_PRIVATE_KEY_PATH=<abs>/secrets/prod.pem \
+    ///   NESTOR_TEST_TICKER=KXBTC15M-...,KXETH15M-... \
+    ///   cargo test -p engine ws::demo_probe::prod_seq_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn prod_seq_probe() {
+        let key_id = std::env::var("KALSHI_API_KEY_ID").expect("KALSHI_API_KEY_ID");
+        let key_path = std::env::var("KALSHI_PRIVATE_KEY_PATH").expect("KALSHI_PRIVATE_KEY_PATH");
+        let tickers = std::env::var("NESTOR_TEST_TICKER").expect("NESTOR_TEST_TICKER");
+        let k = Kalshi::authenticated(key_id, &key_path).unwrap();
+        let req = build_request(&ws_url(), k.ws_auth().as_ref()).unwrap();
+        let (stream, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        println!("handshake HTTP {}", resp.status());
+        let (mut write, mut read) = stream.split();
+        for (i, t) in tickers.split(',').enumerate() {
+            let sub = json!({"id": i as i64 + 1, "cmd": "subscribe",
+                "params": {"channels": ["orderbook_delta"], "market_tickers": [t.trim()]}});
+            write.send(Message::Text(sub.to_string())).await.unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut n = 0;
+        while tokio::time::Instant::now() < deadline && n < 60 {
+            let Ok(Some(Ok(msg))) =
+                tokio::time::timeout(Duration::from_secs(3), read.next()).await
+            else {
+                break;
+            };
+            if let Message::Text(t) = msg {
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                let typ = v.get("type").and_then(|x| x.as_str()).unwrap_or("?");
+                let sid = v.get("sid").and_then(|x| x.as_i64());
+                let seq = v.get("seq").and_then(|x| x.as_i64());
+                let tk = v.get("msg").and_then(|m| m.get("market_ticker"))
+                    .and_then(|x| x.as_str()).unwrap_or("");
+                let tail = tk.rsplit('-').next().unwrap_or(tk);
+                println!("  type={typ:<18} sid={sid:?} seq={seq:?} ticker=…{tail}");
+                n += 1;
+            }
+        }
+        println!("=== VERDICT === compare seq streams grouped by sid vs global ordering.");
     }
 
     /// Open a raw ws, subscribe, and print the first ~8 text frames verbatim.
