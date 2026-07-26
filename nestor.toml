@@ -14,7 +14,12 @@ cluster_cap_frac = 0.15     # max at-risk in one correlation cluster (streak: BT
 flat_usd = 4.0              # flat $ per flat-sized trade (streak week-1)
 daily_budget_usd = 60.0     # daily flat-budget cap (streak week-1)
 max_drawdown_frac = 0.30    # halt if drawdown from peak exceeds this
-daily_loss_limit_frac = 0.15 # halt if today's realized loss exceeds this * peak
+daily_loss_limit_frac = 0.35 # halt if today's realized loss exceeds this * peak
+# 0.35 DERIVED (Ryan-ordered 2026-07-26): the halt is DEFECT CONTAINMENT, not part of the
+# edge — stopping after losses truncates +EV bets, so it must sit where healthy variance
+# almost never reaches. Daily P&L sd at current sizing ~= $12: 0.15 was ~1.3 sigma (fired
+# on ordinary tail days — a single healthy ETH run burned 9.2% in 45min on 2026-07-26);
+# 0.35 ~= 2.5 sigma. The $2 divergence breaker + alerts remain the fast defect net.
 max_portfolio_frac = 0.50   # total at-risk across ALL open positions <= this * bankroll
 
 # Weather cities. series + station MUST be verified live (T005).
