@@ -1,8 +1,24 @@
 //! Live streak sleeve — scan pass over KXBTC15M + KXETH15M (redirect
-//! 2026-07-23). Detects a settled 4-streak, buys the reversal side in the new
-//! market's first 60s if its ask ≤ 44¢, taker-only, one order per market, hold
-//! to settlement. Orders route through `Engine::execute`, which verifies REAL
-//! fills (accepted ≠ filled) and cancels any unfilled remainder.
+//! 2026-07-23). Detects a settled 4-streak and buys the reversal side inside the
+//! new market's first 60s, one entry episode per market, hold to settlement.
+//!
+//! EXECUTION POLICY (2026-07-26, `work/verify-streak-execution.md` + note 39
+//! rulings; every constant and its derivation lives in [`crate::exec`]):
+//!   1. **Rest at 40¢.** As soon as the 4th result is known (official, or
+//!      derive-fourth at T0+0..1s) post a full-size RESTING limit BUY at 40¢ on
+//!      the reversal side, `good_till_canceled` + `expiration_ts = T0+60`.
+//!   2. **Cancel on flip.** If the official result contradicts the derivation
+//!      that opened the position, cancel at once. The CANCEL RESPONSE is truth;
+//!      the resting-orders list is eventually-consistent and is never polled for
+//!      truth (only for the startup orphan sweep).
+//!   3. **Backstop at T0+45s.** Unfilled → cancel, then IOC marketable-limit at
+//!      the 46¢ ceiling with the existing retry ladder. Ask > ceiling all window
+//!      is the correct no-trade.
+//!   4. **Late signal** (known after ~T0+40) → taker-only, no maker leg.
+//!
+//! The maker leg is a STATE MACHINE, not a blocking wait: `supervise_makers`
+//! runs at the top of every 1 Hz scan pass so the sleeve keeps polling, keeps
+//! logging, and keeps the other coin's window alive while a bid rests.
 //!
 //! Cadence: the binary polls at 1s inside each 60s entry window and lazily
 //! (~12s) outside it — see [`next_poll_delay`]. In-window passes fetch only the
@@ -19,14 +35,15 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use engine::kalshi::Market;
+use engine::kalshi::{self, Market};
 use engine::risk::taker_fee;
-use engine::strategy::{in_window, ExecOutcome, Mode, IN_WINDOW_TIMEOUT};
+use engine::strategy::{in_window, ExecOutcome, Mode, RestOutcome, IN_WINDOW_TIMEOUT};
 use engine::ws::WsBook;
-use engine::{alert, logging, Engine, Side, Signal, SizingHint, Strategy};
+use engine::{alert, logging, Engine, Order, Side, Signal, SizingHint, Strategy};
 use serde_json::json;
 
 use crate::derive::{self, Derivation, Verify};
+use crate::exec::{self, EntryPath};
 use crate::signal::{self, Candidate, SettledWindow, Skip};
 
 const WEEK1_LOG: &str = "data/streak_week1.jsonl";
@@ -50,15 +67,12 @@ const SAMPLE_WINDOW_SECS: i64 = 75;
 /// phase, where the derivation for the just-closed window consumes them.
 const SPOT_RETENTION_SECS: i64 = 2 * SAMPLE_WINDOW_SECS;
 
-/// Entry attempts per market episode: 1 initial IOC + 3 retries. The ≤44¢ ask
-/// flickers and RETURNS — P(still/again ≤44 at +5s | ≤44 at t) = 0.926 on the
-/// 100ms week-1 tape; measured fill-rate 70.5% (one shot at ask) → 88.5%
-/// (gate limit + 3 retries) for +0.66¢ avg price, retry fills non-toxic
-/// (verify-streak-retry 2026-07-25). One IOC per window forfeits the edge.
-const MAX_ENTRY_ATTEMPTS: u32 = 4;
-/// Spacing between entry retries (2s: past most sub-second flicker, 4 attempts
-/// still span only ~7s of the 60s window).
-const RETRY_SPACING_MS: u64 = 2000;
+/// How long past a maker leg's `expiration_ts` we keep RETRYING a failed cancel
+/// before giving up on it. Kalshi enforces expiry lazily (~2-3min sweep,
+/// demo-measured), so until then a bid we failed to cancel may still be live and
+/// we must not assume it is gone. Past this we release the cap reservation and
+/// alert loudly — the exchange sweep is the only remaining backstop.
+const CANCEL_RETRY_GRACE_SECS: i64 = 240;
 
 /// Marker file whose PRESENCE disables derivation — checked both at startup and
 /// live on every attempt. A USED-derivation disagreement with the official
@@ -123,8 +137,6 @@ fn skip_kind(skip: &Skip) -> Option<&'static str> {
         Skip::PrevNotSettled => Some("prev_not_settled"),
         Skip::WindowMismatch => Some("window_mismatch"),
         Skip::NotEntryWindow { .. } => Some("missed_entry_window"),
-        Skip::Unpriced => Some("unpriced"),
-        Skip::PriceAboveGate { .. } => Some("price_above_gate"),
     }
 }
 
@@ -155,6 +167,56 @@ struct PendingDerive {
     ticker: String,
 }
 
+/// Everything the participation record needs about WHY we entered, carried from
+/// the detection moment through whichever leg finally resolves.
+#[derive(Clone)]
+struct EntryMeta {
+    ts_signal: i64,
+    streak_dir: &'static str,
+    side: Side,
+    /// Reversal-side ask observed at the decision moment (diagnostic only).
+    ask_at_signal: Option<f64>,
+    /// Some((avg, margin_bp)) when a DERIVED 4th result opened this entry.
+    derived: Option<(f64, f64)>,
+    /// The derived prediction + the window it belongs to, for cancel-on-flip.
+    predicted: Option<String>,
+    jc_close: i64,
+    /// Order-book snapshot at the decision moment.
+    book: serde_json::Value,
+}
+
+/// A resting 40¢ maker leg under supervision. One per ticker at most; dropped
+/// the moment it fills, flips, or hands off to the taker backstop.
+struct MakerLeg {
+    series: String,
+    meta: EntryMeta,
+    /// The risk-sized order actually posted (count + the 40¢ limit).
+    order: Order,
+    /// Exchange order_id — what we cancel. In paper it is a `paper-` sentinel.
+    order_id: String,
+    t0: i64,
+    close_unix: i64,
+    backstop_at: i64,
+    expiration_ts: i64,
+    placed_ms: i64,
+    /// Key under which this leg's stake is reserved against the risk caps.
+    reserve_key: String,
+    /// Latest observed reversal ask, refreshed each pass — the PAPER fill model's
+    /// only input (live mode asks the exchange).
+    last_ask: Option<f64>,
+    /// Effective taker ceiling captured at placement, so the dial can't shift
+    /// under a live episode.
+    ceiling: i64,
+    paper: bool,
+    /// Set when a cancel attempt failed: the bid may still be live, so the
+    /// backstop is WITHHELD (a second fill on this ticker would be unbookable)
+    /// and the cancel is retried on later passes.
+    cancel_failed: bool,
+    /// Cancel returned 404: the bid is off the book (i.e. it filled) but the
+    /// fill has not surfaced in /portfolio/fills yet. NO backstop, ever.
+    off_book: bool,
+}
+
 pub struct Streak {
     /// Dedup for participation records and order attempts: "{ticker}" for an
     /// entry attempt (one order per market, ever), "{ticker}|{kind}" for skip
@@ -180,6 +242,10 @@ pub struct Streak {
     /// non-blocking and a dead ws NEVER halts an entry — REST is the floor.
     /// Present regardless of the STREAK_WS flag (divergence logging is always on).
     ws: Option<Arc<WsBook>>,
+    /// Resting maker legs under supervision, keyed by ticker.
+    maker: Mutex<HashMap<String, MakerLeg>>,
+    /// One-shot startup orphan sweep guard.
+    swept: Mutex<bool>,
 }
 
 impl Streak {
@@ -191,6 +257,8 @@ impl Streak {
             derive_pending: Mutex::new(HashMap::new()),
             skip_alarm: Mutex::new(HashMap::new()),
             ws: None,
+            maker: Mutex::new(HashMap::new()),
+            swept: Mutex::new(false),
         }
     }
 
@@ -415,7 +483,51 @@ impl Streak {
         }
     }
 
+    /// STARTUP ORPHAN SWEEP — once per process, live only. A restart mid-window
+    /// forgets its resting bid but the exchange does not; the forgotten order
+    /// would then fill into a `seen`-cleared strategy that re-posts under the
+    /// SAME deterministic coid (409) and supervises nothing. Cancel anything
+    /// resting on OUR series only — the account may legitimately hold house-sleeve
+    /// quotes, and a blanket sweep would kill them.
+    async fn sweep_orphan_rests(&self, eng: &Engine) {
+        {
+            let mut swept = self.swept.lock().unwrap_or_else(|e| e.into_inner());
+            if *swept {
+                return;
+            }
+            *swept = true;
+        }
+        if eng.mode != Mode::Live {
+            return;
+        }
+        let body = match eng.kalshi.resting_orders(None).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[streak] startup resting_orders read failed: {e}");
+                return;
+            }
+        };
+        let ours: Vec<_> = kalshi::parse_resting_orders(&body)
+            .into_iter()
+            .filter(|o| SERIES.iter().any(|s| o.ticker.starts_with(s)))
+            .collect();
+        if ours.is_empty() {
+            return;
+        }
+        logging::info(format!(
+            "streak: startup sweep — cancelling {} orphaned resting order(s)",
+            ours.len()
+        ));
+        for o in &ours {
+            match eng.kalshi.cancel_order(&o.order_id).await {
+                Ok(_) => logging::info(format!("streak: swept orphan {} on {}", o.order_id, o.ticker)),
+                Err(e) => eprintln!("[streak] orphan sweep cancel {} failed: {e}", o.order_id),
+            }
+        }
+    }
+
     async fn scan_series(&self, eng: &Engine, series: &str) -> Result<()> {
+        self.sweep_orphan_rests(eng).await;
         let now_dt = chrono::Utc::now();
         let now = now_dt.timestamp();
         let window_id = now.div_euclid(900);
@@ -440,6 +552,14 @@ impl Streak {
         // landed gets compared here; a used-derivation disagreement disables
         // derivation loudly.
         self.verify_pending(eng, series, &settled).await;
+
+        // MAKER SUPERVISION runs BEFORE the open-markets fetch on purpose: that
+        // fetch can time out, and a timed-out pass must never be able to skip a
+        // backstop deadline or a cancel-on-flip. Everything it needs is stored on
+        // the leg (the paper fill model's `last_ask` is therefore one ~1s pass
+        // stale — paper-only, and documented).
+        self.supervise_makers(eng, series, &settled, now).await;
+
         // Fail fast in-window (addendum #5): a 5s deadline beats the client's 30s
         // (half an entry window). A timeout skips THIS pass; the loop retries.
         let opens = match in_window(eng.kalshi.markets(series, "open")).await {
@@ -481,6 +601,10 @@ impl Streak {
         // let the ws ask drive the entry. A dead/stale ws silently falls back to
         // the REST asks already in `cand` (never blocks an entry).
         self.apply_ws(cur, &mut cand, now);
+
+        // Refresh the supervised leg's view of the reversal ask (paper fill model
+        // + the participation record's price context).
+        self.refresh_leg_ask(&cur.ticker, &cand);
 
         match signal::detect(&settled, &cand, now) {
             Ok(entry) => {
@@ -785,6 +909,44 @@ impl Streak {
         ));
     }
 
+    /// Refresh a supervised leg's view of the reversal ask. Live ignores it (the
+    /// exchange decides fills); paper's fill model is driven entirely by it.
+    fn refresh_leg_ask(&self, ticker: &str, cand: &Candidate) {
+        let mut legs = self.maker.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(leg) = legs.get_mut(ticker) {
+            leg.last_ask = match leg.meta.side {
+                Side::Yes => cand.yes_ask,
+                Side::No => cand.no_ask,
+            };
+        }
+    }
+
+    /// The participation-record skeleton every entry path shares.
+    fn base_record(&self, series: &str, ticker: &str, meta: &EntryMeta, path: EntryPath) -> serde_json::Value {
+        let mut rec = json!({
+            "event": "streak_signal",
+            "ts_signal": meta.ts_signal,
+            "series": series,
+            "ticker": ticker,
+            "streak_dir": meta.streak_dir,
+            "side_bought": meta.side.as_str(),
+            "ask_at_signal": meta.ask_at_signal,
+            "entry_path": path.as_str(),
+            "maker_price": exec::MAKER_PRICE_CENTS,
+            "filled": false,
+            "book": meta.book,
+        });
+        if let Some((avg, margin_bp)) = meta.derived {
+            rec["derived_fourth"] = json!(true);
+            rec["derived_avg"] = json!(avg);
+            rec["derived_margin_bp"] = json!(margin_bp);
+        }
+        rec
+    }
+
+    /// Entry dispatcher. One episode per market, ever (dedupes across restarts).
+    /// Rest at 40¢ whenever there is runway before the backstop; otherwise the
+    /// signal arrived too late to rest anything and we go taker-only.
     #[allow(clippy::too_many_arguments)]
     async fn enter(
         &self,
@@ -798,42 +960,662 @@ impl Streak {
         // tags the participation record derived_fourth:true (item 3).
         derived: Option<(f64, f64)>,
     ) -> Result<()> {
-        // One entry EPISODE per market (dedupes across restarts). Within the
-        // episode, a zero-fill IOC is RETRIED while the entry window lasts —
-        // the old "missed fills are DATA, never chased" doctrine measurably
-        // forfeited fills the book still offered (verify-streak-retry; live
-        // miss KXETH15M-26JUL251000-00: the 31¢ ask was back 300ms later).
         if !self.first_time(cur.ticker.clone()) {
             return Ok(());
         }
 
         // DATA CAPTURE 2 — decision snapshot at the entry moment (fetched before
-        // the order so the book reflects what we saw when deciding).
+        // any order so the book reflects what we saw when deciding).
         let book = match in_window(eng.kalshi.orderbook(&cur.ticker)).await {
             Ok(Ok(b)) => b,
             _ => json!(null), // timeout or error: book snapshot is best-effort
         };
 
         let side = if entry.buy_yes { Side::Yes } else { Side::No };
-        // LIVE: limit at the 44¢ gate, not the observed ask. IOC price
-        // improvement pays the resting ask, never our limit (verified live:
-        // 28¢ fill on a higher limit), so the gate limit only widens flicker
-        // tolerance — it can't worsen the price of liquidity already there.
-        // Sizing at 44 keeps the flat-$4 worst case exact (9 contracts).
-        // PAPER: keep the observed ask — simulated fills price at the limit,
-        // and paper must not pretend it paid 44 for a 31¢ ask.
-        let limit = if eng.mode == Mode::Live {
-            signal::ENTRY_LIMIT_CENTS
-        } else {
-            entry.ask.round() as i64
+        let t0 = cand.close_unix - signal::WINDOW_SECS;
+        // The JUST-CLOSED window is the one whose close == this market's open
+        // (T0) — the same key `derive_prev` files its pending derivation under.
+        // Get this wrong and cancel-on-flip silently never fires.
+        let jc_close = cur.open_unix().unwrap_or(t0);
+        let meta = EntryMeta {
+            ts_signal: now,
+            streak_dir: entry.streak_dir,
+            side,
+            ask_at_signal: entry.ask,
+            derived,
+            predicted: None, // set by place_maker when a derivation drove this
+            jc_close,
+            book,
         };
+        let ceiling = exec::taker_ceiling();
+
+        if exec::maker_eligible(now, t0) {
+            self.place_maker(eng, series, cur, cand, meta, t0, ceiling, now)
+                .await
+        } else {
+            // LATE SIGNAL: no runway to rest. Taker-only at the ceiling.
+            logging::info(format!(
+                "streak {series}: {} late signal (T0+{}s) — taker-only at {ceiling}c",
+                cur.ticker,
+                now - t0
+            ));
+            self.taker_leg(
+                eng,
+                series,
+                &cur.ticker,
+                &meta,
+                cand.close_unix,
+                ceiling,
+                entry.ask,
+                EntryPath::TakerLate,
+                json!(null),
+            )
+            .await
+        }
+    }
+
+    /// Post the resting 40¢ maker leg and hand it to the supervisor.
+    #[allow(clippy::too_many_arguments)]
+    async fn place_maker(
+        &self,
+        eng: &Engine,
+        series: &str,
+        cur: &Market,
+        cand: &Candidate,
+        mut meta: EntryMeta,
+        t0: i64,
+        ceiling: i64,
+        now: i64,
+    ) -> Result<()> {
+        let ticker = cur.ticker.clone();
+        // The derived 4th result (if any) is what a later official result may
+        // contradict — carry it so cancel-on-flip has something to compare.
+        if meta.derived.is_some() {
+            meta.predicted = self
+                .derive_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&format!("{series}|{}", meta.jc_close))
+                .map(|p| p.predicted.clone());
+        }
+
+        let expiration_ts = exec::maker_expiration(t0);
+        let reserve_key = format!("streak-maker|{ticker}");
+        // Distinct from the taker coid namespace (`streak-{ticker}[-r{n}]`) so a
+        // maker leg and a backstop IOC on the same market never collide into a
+        // duplicate-coid 409.
+        let coid = format!("streak-{ticker}-m{}", exec::MAKER_PRICE_CENTS);
         let sig = Signal {
             strategy: "streak".into(),
-            ticker: cur.ticker.clone(),
-            side,
-            limit_cents: limit,
+            ticker: ticker.clone(),
+            side: meta.side,
+            limit_cents: exec::MAKER_PRICE_CENTS,
             // Window close shared across coins: simultaneous BTC+ETH = ONE bet.
             cluster: format!("streak-{}", cand.close_unix),
+            sizing: SizingHint::Flat,
+        };
+
+        match eng
+            .place_resting(sig, &reserve_key, &coid, expiration_ts)
+            .await
+        {
+            RestOutcome::Resting {
+                order,
+                order_id,
+                response,
+            } => {
+                let leg = MakerLeg {
+                    series: series.to_string(),
+                    meta,
+                    order,
+                    order_id: order_id.clone(),
+                    t0,
+                    close_unix: cand.close_unix,
+                    backstop_at: exec::backstop_at(t0),
+                    expiration_ts,
+                    placed_ms: chrono::Utc::now().timestamp_millis(),
+                    reserve_key,
+                    last_ask: None,
+                    ceiling,
+                    paper: eng.mode != Mode::Live,
+                    cancel_failed: false,
+                    off_book: false,
+                };
+                logging::info(format!(
+                    "streak {series}: {}RESTING {}x {} {ticker} @ {}c (T0+{}s, backstop T0+{}s, exp {expiration_ts}) id={order_id}",
+                    if leg.paper { "[paper] " } else { "" },
+                    leg.order.count,
+                    leg.meta.side.as_str(),
+                    exec::MAKER_PRICE_CENTS,
+                    now - t0,
+                    exec::BACKSTOP_AT_SECS,
+                ));
+                logging::record_path(
+                    WEEK1_LOG,
+                    json!({
+                        "event": "streak_maker_rest",
+                        "series": series,
+                        "ticker": ticker,
+                        "side": leg.meta.side.as_str(),
+                        "price": exec::MAKER_PRICE_CENTS,
+                        "count": leg.order.count,
+                        "order_id": order_id,
+                        "expiration_ts": expiration_ts,
+                        "backstop_at": leg.backstop_at,
+                        "ceiling": ceiling,
+                        "paper": leg.paper,
+                        "order": response,
+                    }),
+                );
+                self.maker
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(ticker, leg);
+                Ok(())
+            }
+            // The 40¢ bid crossed a cheaper ask at post — a TAKER fill at a price
+            // better than we asked for. Nothing to supervise.
+            RestOutcome::ImmediateFill {
+                order,
+                fill,
+                response,
+            } => {
+                let mut rec = self.base_record(series, &ticker, &meta, EntryPath::MakerRest);
+                rec["crossed_at_post"] = json!(true);
+                rec["rest_secs"] = json!(0);
+                self.record_fill(eng, series, &ticker, rec, &order, &fill, Some(response))
+                    .await;
+                Ok(())
+            }
+            RestOutcome::Rejected(r) => {
+                let mut rec = self.base_record(series, &ticker, &meta, EntryPath::MakerRest);
+                rec["reject_reason"] = json!(format!("risk:{r:?}"));
+                logging::info(format!("streak {series}: rejected ({r:?}) {ticker}"));
+                logging::record_path(WEEK1_LOG, rec);
+                Ok(())
+            }
+            // The exchange told us it created nothing → taking is safe, and the
+            // signal is still live. Fall through to the taker leg.
+            RestOutcome::RestError {
+                msg,
+                may_be_resting: false,
+            } => {
+                logging::info(format!(
+                    "streak {series}: maker post FAILED for {ticker} ({msg}) — nothing resting, \
+                     falling back to taker at {ceiling}c"
+                ));
+                self.taker_leg(
+                    eng,
+                    series,
+                    &ticker,
+                    &meta,
+                    cand.close_unix,
+                    ceiling,
+                    meta.ask_at_signal,
+                    EntryPath::TakerLate,
+                    json!({"maker_error": msg}),
+                )
+                .await
+            }
+            // AMBIGUOUS: the POST may have landed and we have no order_id to
+            // cancel or supervise. Sending an IOC now risks a second fill on a
+            // ticker whose ledger can hold only one position, so we STAND DOWN
+            // and let `expiration_ts` (+ reconcile's orphan adoption) resolve it.
+            RestOutcome::RestError {
+                msg,
+                may_be_resting: true,
+            } => {
+                let mut rec = self.base_record(series, &ticker, &meta, EntryPath::MakerRest);
+                rec["reject_reason"] = json!("maker_place_ambiguous");
+                rec["maker_error"] = json!(msg.clone());
+                logging::record_path(WEEK1_LOG, rec);
+                logging::info(format!(
+                    "streak {series}: CRITICAL maker post ambiguous for {ticker} ({msg}) — an \
+                     order MAY be resting with no id; standing down (exp {expiration_ts})"
+                ));
+                alert::notify(
+                    &eng.http,
+                    &format!(
+                        "streak maker post AMBIGUOUS on {ticker} ({msg}) — possible unsupervised \
+                         resting bid, expires {expiration_ts}; no backstop sent"
+                    ),
+                )
+                .await;
+                Ok(())
+            }
+        }
+    }
+
+    /// Advance every supervised maker leg belonging to `series`.
+    async fn supervise_makers(
+        &self,
+        eng: &Engine,
+        series: &str,
+        settled: &[SettledWindow],
+        now: i64,
+    ) {
+        let tickers: Vec<String> = {
+            let legs = self.maker.lock().unwrap_or_else(|e| e.into_inner());
+            legs.values()
+                .filter(|l| l.series == series)
+                .map(|l| l.ticker())
+                .collect()
+        };
+        for t in tickers {
+            self.supervise_one(eng, series, &t, settled, now).await;
+        }
+    }
+
+    /// One supervision step: flip → fill → deadline. Everything it needs lives on
+    /// the leg, so a timed-out market fetch earlier in the pass cannot starve it.
+    async fn supervise_one(
+        &self,
+        eng: &Engine,
+        series: &str,
+        ticker: &str,
+        settled: &[SettledWindow],
+        now: i64,
+    ) {
+        let leg = {
+            let legs = self.maker.lock().unwrap_or_else(|e| e.into_inner());
+            match legs.get(ticker) {
+                Some(l) => l.snapshot(),
+                None => return,
+            }
+        };
+
+        // (1) CANCEL ON FLIP — the official result for the window our derivation
+        // synthesized has landed and contradicts it. The signal is void; the bid
+        // must come off the book before it can fill on a streak that never was.
+        if let Some(pred) = leg.meta.predicted.as_deref() {
+            if let Some(off) = settled.iter().find(|w| w.close_unix == leg.meta.jc_close) {
+                if off.result != pred {
+                    logging::info(format!(
+                        "streak {series}: FLIP on {ticker} — derived {pred} but official {} — \
+                         cancelling the resting bid",
+                        off.result
+                    ));
+                    self.abandon_leg(eng, &leg, "flipped", now).await;
+                    return;
+                }
+            }
+        }
+
+        // (2) FILL CHECK. /portfolio/fills by order_id is the truth; the resting
+        // list is eventually-consistent and is never consulted here.
+        if let Some(f) = self.poll_leg_fill(eng, &leg, now).await {
+            self.settle_maker_fill(eng, &leg, f, now).await;
+            return;
+        }
+
+        // (3) Still resting and the deadline has not arrived — leave it alone.
+        //     A leg with a failed cancel, or one already off the book, keeps
+        //     being worked every pass regardless of the clock.
+        if now < leg.backstop_at && !leg.cancel_failed && !leg.off_book {
+            return;
+        }
+
+        // (3b) An off-book leg (cancel 404) is waiting on a lagging fills API.
+        //      It must never reach the cancel/backstop branch again.
+        if leg.off_book {
+            self.mark_gone(eng, &leg, now).await;
+            return;
+        }
+
+        // (4) DEADLINE: cancel FIRST. A live bid plus an IOC on the same ticker
+        //     could produce two fills, and the risk ledger books one position per
+        //     ticker — the second would be real money it cannot see.
+        let cancel = if leg.paper {
+            Ok(json!({"paper": true}))
+        } else {
+            eng.kalshi.cancel_order(&leg.order_id).await
+        };
+        let cancel_resp = match cancel {
+            Ok(v) => v,
+            // DEMO-PROVEN 2026-07-26: cancelling an order that is no longer
+            // resting returns **HTTP 404 `not_found`**, not a 200 with counts.
+            // Before `expiration_ts` the only way a bid leaves the book is by
+            // FILLING, so a 404 here means "it filled" — and firing the backstop
+            // on top of it would open a second position on a ticker whose ledger
+            // holds one. NEVER backstop on a 404: keep polling fills (they can
+            // lag the matching engine by seconds) until the fill shows up.
+            Err(e) if engine::net::http_status(&e) == Some(404) => {
+                logging::info(format!(
+                    "streak {series}: cancel 404 on {ticker} — the resting bid is already off \
+                     the book (filled); withholding the backstop and polling fills"
+                ));
+                self.mark_gone(eng, &leg, now).await;
+                return;
+            }
+            Err(e) => {
+                self.mark_cancel_failed(eng, &leg, &e.to_string(), now).await;
+                return;
+            }
+        };
+
+        // (4b) THE CANCEL RESPONSE IS TRUTH. Demo-proven: it carries
+        //      `reduced_by` = the quantity still resting when we pulled it.
+        //      `/portfolio/fills` lags the matching engine by seconds, so this —
+        //      not a fills poll — is what decides whether a backstop is safe.
+        match kalshi::parse_cancel_reduced_by(&cancel_resp) {
+            // The whole order came off the book: nothing filled. Backstop is safe.
+            Some(r) if r >= leg.order.count => {}
+            // Something filled before the cancel landed. A backstop would try to
+            // open a SECOND position on this ticker, which the ledger cannot
+            // book. Withhold it and wait for the fill to surface.
+            Some(r) => {
+                logging::info(format!(
+                    "streak {series}: cancel on {ticker} reduced_by {r} of {} — a fill landed \
+                     first; backstop WITHHELD",
+                    leg.order.count
+                ));
+                self.mark_gone(eng, &leg, now).await;
+                return;
+            }
+            // Field absent/unparseable — fall back to a fills poll.
+            None => {
+                if let Some(f) = self.poll_leg_fill(eng, &leg, now).await {
+                    self.settle_maker_fill(eng, &leg, f, now).await;
+                    return;
+                }
+            }
+        }
+
+        // (5) Truly unfilled → the taker backstop at the ceiling.
+        self.drop_leg(eng, ticker, &leg.reserve_key);
+        logging::info(format!(
+            "streak {series}: {} maker unfilled at T0+{}s — cancelled, IOC backstop at {}c",
+            ticker,
+            now - leg.t0,
+            leg.ceiling
+        ));
+        let _ = self
+            .taker_leg(
+                eng,
+                series,
+                ticker,
+                &leg.meta,
+                leg.close_unix,
+                leg.ceiling,
+                leg.last_ask,
+                EntryPath::TakerBackstop,
+                json!({
+                    "maker_order_id": leg.order_id,
+                    "maker_rest_secs": now - leg.t0,
+                    "maker_cancel": cancel_resp,
+                }),
+            )
+            .await;
+    }
+
+    /// The exchange says the bid is off the book (cancel 404) but /portfolio/fills
+    /// has not shown the fill yet. Hold the leg — and its cap reservation — and
+    /// keep polling; the backstop stays withheld forever for this episode, since
+    /// a second position on this ticker could not be booked. If the fill never
+    /// materialises by the end of the window, close the episode loudly and let
+    /// reconcile's orphan adoption find any real position.
+    async fn mark_gone(&self, eng: &Engine, leg: &MakerLeg, now: i64) {
+        if now <= leg.expiration_ts + CANCEL_RETRY_GRACE_SECS {
+            let mut legs = self.maker.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(l) = legs.get_mut(&leg.ticker()) {
+                l.off_book = true; // worked every pass, but NEVER sends an IOC
+            }
+            return;
+        }
+        self.drop_leg(eng, &leg.ticker(), &leg.reserve_key);
+        let mut rec = self.base_record(&leg.series, &leg.ticker(), &leg.meta, EntryPath::MakerRest);
+        rec["reject_reason"] = json!("maker_off_book_no_fill_seen");
+        rec["maker_order_id"] = json!(leg.order_id);
+        logging::record_path(WEEK1_LOG, rec);
+        alert::notify(
+            &eng.http,
+            &format!(
+                "streak: resting bid {} on {} left the book (cancel 404) but no fill ever                  appeared in /portfolio/fills — check positions",
+                leg.order_id,
+                leg.ticker()
+            ),
+        )
+        .await;
+    }
+
+    /// A cancel round-trip failed: the bid may still be live, so withhold the
+    /// backstop and retry next pass. Past the lazy-expiry grace we give up, free
+    /// the cap reservation, and shout.
+    async fn mark_cancel_failed(&self, eng: &Engine, leg: &MakerLeg, err: &str, now: i64) {
+        if now > leg.expiration_ts + CANCEL_RETRY_GRACE_SECS {
+            self.drop_leg(eng, &leg.ticker(), &leg.reserve_key);
+            logging::info(format!(
+                "streak: GIVING UP cancelling {} ({}) after {}s past expiry — {err}",
+                leg.order_id,
+                leg.ticker(),
+                now - leg.expiration_ts
+            ));
+            alert::notify(
+                &eng.http,
+                &format!(
+                    "streak: could not cancel resting bid {} on {} ({err}) — relying on the \
+                     exchange expiry sweep; check /portfolio/orders",
+                    leg.order_id,
+                    leg.ticker()
+                ),
+            )
+            .await;
+            return;
+        }
+        {
+            let mut legs = self.maker.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(l) = legs.get_mut(&leg.ticker()) {
+                l.cancel_failed = true;
+            }
+        }
+        eprintln!(
+            "[streak] cancel {} ({}) failed: {err} — backstop WITHHELD, retrying next pass",
+            leg.order_id,
+            leg.ticker()
+        );
+    }
+
+    /// Cancel a leg and close its episode with no position (cancel-on-flip).
+    async fn abandon_leg(&self, eng: &Engine, leg: &MakerLeg, reason: &str, now: i64) {
+        if !leg.paper {
+            if let Err(e) = eng.kalshi.cancel_order(&leg.order_id).await {
+                // 404 = already off the book, i.e. it FILLED before the flip
+                // reached us. We now hold a position on a signal that turned out
+                // not to exist. It STAYS (risk-managed) — same doctrine as a
+                // used-derivation disagreement. Book it and stop cancelling, or
+                // the flip check would re-enter this every pass forever.
+                if engine::net::http_status(&e) == Some(404) {
+                    logging::info(format!(
+                        "streak: flip-cancel 404 on {} — the bid had already filled; booking the \
+                         position (it stays, risk-managed)",
+                        leg.ticker()
+                    ));
+                    self.mark_gone(eng, leg, now).await;
+                    return;
+                }
+                eprintln!("[streak] flip-cancel {} failed: {e}", leg.order_id);
+                // Transient failure: retry next pass, bounded by the same grace.
+                self.mark_cancel_failed(eng, leg, &e.to_string(), now).await;
+                return;
+            }
+        }
+        self.drop_leg(eng, &leg.ticker(), &leg.reserve_key);
+        let mut rec = self.base_record(&leg.series, &leg.ticker(), &leg.meta, EntryPath::MakerRest);
+        rec["reject_reason"] = json!(reason);
+        rec["maker_order_id"] = json!(leg.order_id);
+        logging::record_path(WEEK1_LOG, rec);
+    }
+
+    /// Forget a leg and release its cap reservation. Both must happen together.
+    fn drop_leg(&self, eng: &Engine, ticker: &str, reserve_key: &str) {
+        self.maker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(ticker);
+        eng.release_reservation(reserve_key);
+    }
+
+    /// Poll for a fill on a resting leg. LIVE: `/portfolio/fills` filtered by
+    /// order_id (the exchange's truth). PAPER: the ledger's own model — a bid at
+    /// L fills at L iff the reversal ask trades at or below L.
+    async fn poll_leg_fill(&self, eng: &Engine, leg: &MakerLeg, now: i64) -> Option<LegFill> {
+        if leg.paper {
+            if !exec::paper_maker_fills(leg.last_ask, leg.order.limit_cents) {
+                return None;
+            }
+            return Some(LegFill {
+                count: leg.order.count,
+                price_cents: leg.order.limit_cents,
+                ts_ms: Some(now * 1000),
+                // Paper models the MAKER fee the demo measured: zero.
+                actual_fee_cents: Some(0.0),
+                all_maker: Some(true),
+                raw: json!(null),
+                simulated: true,
+            });
+        }
+        let body = match in_window(eng.kalshi.fills(&leg.ticker())).await {
+            Ok(Ok(b)) => b,
+            _ => return None, // a missed poll is retried next pass
+        };
+        let fills = kalshi::parse_fills(
+            &body,
+            Some(&leg.order_id),
+            leg.meta.side.as_str(),
+            leg.placed_ms,
+        );
+        let (total, avg, ts) = kalshi::fills_summary(&fills);
+        let filled = total.min(leg.order.count);
+        if filled <= 0 {
+            return None;
+        }
+        Some(LegFill {
+            count: filled,
+            price_cents: avg.unwrap_or(leg.order.limit_cents),
+            ts_ms: ts,
+            actual_fee_cents: kalshi::fills_fee_cents(&fills),
+            all_maker: kalshi::fills_all_maker(&fills),
+            raw: body,
+            simulated: false,
+        })
+    }
+
+    /// Book a maker fill, close the episode, write the record.
+    ///
+    /// PARTIAL FILLS DO NOT GET TOPPED UP. `RiskManager::on_fill_actual` holds a
+    /// one-open-position-per-ticker invariant (its duplicate-fill guard), so a
+    /// backstop IOC for the remainder would fill real contracts the ledger and
+    /// kill-switch could never see. The forgone EV is ~4.3¢ on a handful of
+    /// contracts; the invariant is worth more.
+    async fn settle_maker_fill(&self, eng: &Engine, leg: &MakerLeg, f: LegFill, now: i64) {
+        eng.book_resting_fill(&leg.order, f.count, f.price_cents, f.actual_fee_cents);
+        self.drop_leg(eng, &leg.ticker(), &leg.reserve_key);
+
+        let fee_cents = taker_fee(f.price_cents, f.count) * 100.0;
+        let mut rec = self.base_record(&leg.series, &leg.ticker(), &leg.meta, EntryPath::MakerRest);
+        rec["filled"] = json!(true);
+        rec["simulated"] = json!(f.simulated);
+        rec["partial"] = json!(f.count < leg.order.count);
+        rec["fill_price"] = json!(f.price_cents);
+        rec["filled_count"] = json!(f.count);
+        rec["canceled_count"] = json!(leg.order.count - f.count);
+        rec["limit_placed"] = json!(leg.order.limit_cents);
+        rec["ts_submit"] = json!(leg.placed_ms);
+        rec["ts_fill"] = json!(f.ts_ms);
+        rec["rest_secs"] = json!(now - leg.t0);
+        rec["order_id"] = json!(leg.order_id);
+        // BOTH numbers, always: our taker-model estimate and the exchange's own
+        // `fee_cost` from the fills row. The bankroll is charged the exchange
+        // figure when present (a maker fill billed 0.000000 on demo) and the
+        // estimate only as a fallback.
+        rec["fee_cents"] = json!(fee_cents); // our estimate
+        rec["actual_fee_cents"] = json!(f.actual_fee_cents); // exchange truth
+        rec["is_maker_fill"] = json!(f.all_maker);
+        rec["fee_basis"] = json!(if f.actual_fee_cents.is_some() {
+            "exchange_fee_cost"
+        } else {
+            "taker_estimate_fallback"
+        });
+        if !f.simulated {
+            rec["fills_raw"] = f.raw.clone();
+        }
+        logging::record_path(WEEK1_LOG, rec);
+
+        logging::info(format!(
+            "streak {}: {}MAKER FILLED {}x {} {} @ {}c (rested {}s)",
+            leg.series,
+            if f.simulated { "[paper] " } else { "" },
+            f.count,
+            leg.meta.side.as_str(),
+            leg.ticker(),
+            f.price_cents,
+            now - leg.t0
+        ));
+        if !f.simulated {
+            alert::notify(
+                &eng.http,
+                &format!(
+                    "streak MAKER FILLED {}x {} {} @ {}c (fade {}, rested {}s)",
+                    f.count,
+                    leg.meta.side.as_str(),
+                    leg.ticker(),
+                    f.price_cents,
+                    leg.meta.streak_dir,
+                    now - leg.t0
+                ),
+            )
+            .await;
+        }
+    }
+
+    /// A TAKER leg: IOC marketable-limit at the ceiling with the retry ladder.
+    ///
+    /// LIVE sends the ceiling unconditionally — IOC price improvement pays the
+    /// real ask when it is lower, and an order that crosses nothing simply
+    /// returns fill_count 0, which IS the correct no-trade. That removes any
+    /// dependence on a REST quote that lags 0.5-3s.
+    #[allow(clippy::too_many_arguments)]
+    async fn taker_leg(
+        &self,
+        eng: &Engine,
+        series: &str,
+        ticker: &str,
+        meta: &EntryMeta,
+        close_unix: i64,
+        ceiling: i64,
+        observed_ask: Option<f64>,
+        path: EntryPath,
+        extra: serde_json::Value,
+    ) -> Result<()> {
+        let mut rec = self.base_record(series, ticker, meta, path);
+        rec["ceiling"] = json!(ceiling);
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                rec[k.as_str()] = v.clone();
+            }
+        }
+
+        let limit = match exec::taker_limit(eng.mode, observed_ask, ceiling) {
+            Some(l) => l,
+            None => {
+                // PAPER only: the observed ask is above the ceiling, so no cross.
+                rec["reject_reason"] = json!("above_ceiling");
+                rec["observed_ask"] = json!(observed_ask);
+                logging::record_path(WEEK1_LOG, rec);
+                logging::info(format!(
+                    "streak {series}: [paper] {ticker} no cross — ask {observed_ask:?} > {ceiling}c"
+                ));
+                return Ok(());
+            }
+        };
+        rec["limit_placed"] = json!(limit);
+
+        let sig = Signal {
+            strategy: "streak".into(),
+            ticker: ticker.to_string(),
+            side: meta.side,
+            limit_cents: limit,
+            cluster: format!("streak-{close_unix}"),
             sizing: SizingHint::Flat,
         };
 
@@ -841,127 +1623,47 @@ impl Streak {
         let mut retry_books: Vec<serde_json::Value> = Vec::new();
         let outcome = loop {
             let out = eng.execute_attempt(sig.clone(), attempts).await;
-            if !matches!(&out, ExecOutcome::Missed { .. }) || attempts >= MAX_ENTRY_ATTEMPTS {
+            if !matches!(&out, ExecOutcome::Missed { .. }) || attempts >= exec::MAX_ENTRY_ATTEMPTS {
                 break out;
             }
             // Next attempt must still land inside the entry window: 2s spacing
             // + ~1s of order round-trip margin.
-            let ttc = cand.close_unix - chrono::Utc::now().timestamp();
+            let ttc = close_unix - chrono::Utc::now().timestamp();
             if ttc < signal::MIN_TTC_SECS + 3 {
                 break out;
             }
             logging::info(format!(
-                "streak {series}: {} zero-fill IOC (attempt {attempts}/{MAX_ENTRY_ATTEMPTS}) — retrying in {RETRY_SPACING_MS}ms",
-                cur.ticker
+                "streak {series}: {ticker} zero-fill IOC (attempt {attempts}/{}) — retrying in {}ms",
+                exec::MAX_ENTRY_ATTEMPTS,
+                exec::RETRY_SPACING_MS
             ));
-            tokio::time::sleep(std::time::Duration::from_millis(RETRY_SPACING_MS)).await;
-            // DIAGNOSTIC (2026-07-26): three consecutive boundary-ask signals went
-            // 0-for-4 — snapshot the book at each retry so the record shows what
-            // was actually resting at ≤gate when each order arrived (phantom-quote
-            // vs real-but-taken vs repricing-away are distinguishable post-hoc).
-            let snap = match in_window(eng.kalshi.orderbook(&cur.ticker)).await {
+            tokio::time::sleep(std::time::Duration::from_millis(exec::RETRY_SPACING_MS)).await;
+            // DIAGNOSTIC (R154): snapshot the book at each retry so the record
+            // shows what was actually resting when each order arrived
+            // (phantom-quote vs real-but-taken vs repricing-away).
+            let snap = match in_window(eng.kalshi.orderbook(ticker)).await {
                 Ok(Ok(b)) => b,
                 _ => json!(null),
             };
             retry_books.push(json!({"attempt": attempts + 1, "ts_ms": chrono::Utc::now().timestamp_millis(), "book": snap}));
             attempts += 1;
         };
-        let mut rec = json!({
-            "event": "streak_signal",
-            "ts_signal": now,
-            "series": series,
-            "ticker": cur.ticker,
-            "streak_dir": entry.streak_dir,
-            "side_bought": side.as_str(),
-            "ask_at_signal": entry.ask,
-            "limit_placed": limit,
-            "filled": false,
-            "book": book,
-        });
-        if let Some((avg, margin_bp)) = derived {
-            rec["derived_fourth"] = json!(true);
-            rec["derived_avg"] = json!(avg);
-            rec["derived_margin_bp"] = json!(margin_bp);
-        }
         rec["attempts"] = json!(attempts);
         if !retry_books.is_empty() {
             rec["retry_books"] = json!(retry_books);
         }
 
         match &outcome {
-            ExecOutcome::Filled { fill, response, .. } => {
-                let fee_cents = taker_fee(fill.fill_price_cents, fill.filled) * 100.0;
-                rec["filled"] = json!(true);
-                rec["partial"] = json!(fill.partial);
-                rec["simulated"] = json!(fill.simulated);
-                rec["price_estimated"] = json!(fill.price_estimated);
-                rec["ts_submit"] = json!(fill.ts_submit_ms);
-                rec["ts_ack"] = json!(fill.ts_ack_ms);
-                rec["ts_fill"] = json!(fill.ts_fill_ms);
-                rec["fill_price"] = json!(fill.fill_price_cents);
-                rec["filled_count"] = json!(fill.filled);
-                rec["canceled_count"] = json!(fill.canceled);
-                rec["fee_cents"] = json!(fee_cents); // our pre-trade estimate
-                rec["actual_fee_cents"] = json!(fill.actual_fee_cents); // exchange truth
-                rec["order_id"] = json!(fill.order_id);
-                if !fill.simulated {
-                    rec["order"] = response.clone();
-                }
-                logging::info(format!(
-                    "streak {series}: {}FILLED {}x {} {} @ {}c (fade {}, ask {:.1}){}",
-                    if fill.simulated { "[paper] " } else { "" },
-                    fill.filled,
-                    side.as_str(),
-                    cur.ticker,
-                    fill.fill_price_cents,
-                    entry.streak_dir,
-                    entry.ask,
-                    if fill.partial { " (partial)" } else { "" }
-                ));
-                if !fill.simulated {
-                    alert::notify(
-                        &eng.http,
-                        &format!(
-                            "streak FILLED {}x {} {} @ {}c (fade {}){}",
-                            fill.filled,
-                            side.as_str(),
-                            cur.ticker,
-                            fill.fill_price_cents,
-                            entry.streak_dir,
-                            if fill.partial { " partial" } else { "" }
-                        ),
-                    )
+            ExecOutcome::Filled { fill, response, order } => {
+                self.record_fill(eng, series, ticker, rec, order, fill, Some(response.clone()))
                     .await;
-                }
             }
-            ExecOutcome::RecoveredFill { fill, .. } => {
-                // Lost-ack recovery (fix 1a): a fill that landed despite a placement
-                // error, recovered via the fills API. Recorded exactly like a normal
-                // fill, tagged `recovered` so week-1 accounting can see it happened.
-                let fee_cents = taker_fee(fill.fill_price_cents, fill.filled) * 100.0;
-                rec["filled"] = json!(true);
+            ExecOutcome::RecoveredFill { fill, order } => {
+                // Lost-ack recovery: a fill that landed despite a placement error.
+                // execute_live already fired its own alert; no second one here.
+                let mut rec = rec;
                 rec["recovered"] = json!(true);
-                rec["partial"] = json!(fill.partial);
-                rec["simulated"] = json!(false);
-                rec["price_estimated"] = json!(fill.price_estimated);
-                rec["ts_submit"] = json!(fill.ts_submit_ms);
-                rec["ts_ack"] = json!(fill.ts_ack_ms);
-                rec["ts_fill"] = json!(fill.ts_fill_ms);
-                rec["fill_price"] = json!(fill.fill_price_cents);
-                rec["filled_count"] = json!(fill.filled);
-                rec["canceled_count"] = json!(fill.canceled);
-                rec["fee_cents"] = json!(fee_cents);
-                rec["actual_fee_cents"] = json!(fill.actual_fee_cents);
-                rec["order_id"] = json!(fill.order_id);
-                logging::info(format!(
-                    "streak {series}: RECOVERED FILL {}x {} {} @ {}c (fade {}, lost-ack)",
-                    fill.filled,
-                    side.as_str(),
-                    cur.ticker,
-                    fill.fill_price_cents,
-                    entry.streak_dir,
-                ));
-                // execute_live already fired a recovery alert; no second alert here.
+                self.record_fill_quiet(series, ticker, rec, order, fill);
             }
             ExecOutcome::Missed { order, fill } => {
                 rec["partial"] = json!(false);
@@ -973,29 +1675,134 @@ impl Streak {
                 rec["order_id"] = json!(fill.order_id);
                 rec["reject_reason"] = json!("missed_fill");
                 logging::info(format!(
-                    "streak {series}: MISSED (no fill, canceled {}) {}",
-                    order.count, cur.ticker
+                    "streak {series}: MISSED (no fill, canceled {}) {ticker}",
+                    order.count
                 ));
+                logging::record_path(WEEK1_LOG, rec);
             }
             ExecOutcome::Rejected(r) => {
                 rec["reject_reason"] = json!(format!("risk:{r:?}"));
-                logging::info(format!("streak {series}: rejected ({r:?}) {}", cur.ticker));
+                logging::info(format!("streak {series}: rejected ({r:?}) {ticker}"));
+                logging::record_path(WEEK1_LOG, rec);
             }
             ExecOutcome::OrderError(e) => {
                 rec["reject_reason"] = json!(format!("order_error:{e}"));
-                logging::info(format!(
-                    "streak {series}: ORDER FAILED {} ({e})",
-                    cur.ticker
-                ));
-                alert::notify(
-                    &eng.http,
-                    &format!("streak ORDER FAILED {} ({e})", cur.ticker),
-                )
-                .await;
+                logging::info(format!("streak {series}: ORDER FAILED {ticker} ({e})"));
+                logging::record_path(WEEK1_LOG, rec);
+                alert::notify(&eng.http, &format!("streak ORDER FAILED {ticker} ({e})")).await;
             }
         }
-        logging::record_path(WEEK1_LOG, rec);
         Ok(())
+    }
+
+    /// Write a filled participation record and alert (live fills only).
+    #[allow(clippy::too_many_arguments)]
+    async fn record_fill(
+        &self,
+        eng: &Engine,
+        series: &str,
+        ticker: &str,
+        rec: serde_json::Value,
+        order: &Order,
+        fill: &engine::strategy::FillReport,
+        response: Option<serde_json::Value>,
+    ) {
+        let mut rec = rec;
+        if let Some(r) = response {
+            if !fill.simulated {
+                rec["order"] = r;
+            }
+        }
+        self.record_fill_quiet(series, ticker, rec, order, fill);
+        if !fill.simulated {
+            alert::notify(
+                &eng.http,
+                &format!(
+                    "streak FILLED {}x {} {} @ {}c{}",
+                    fill.filled,
+                    order.side.as_str(),
+                    ticker,
+                    fill.fill_price_cents,
+                    if fill.partial { " partial" } else { "" }
+                ),
+            )
+            .await;
+        }
+    }
+
+    /// The fill fields shared by every path (no alert, no network).
+    fn record_fill_quiet(
+        &self,
+        series: &str,
+        ticker: &str,
+        mut rec: serde_json::Value,
+        order: &Order,
+        fill: &engine::strategy::FillReport,
+    ) {
+        let fee_cents = taker_fee(fill.fill_price_cents, fill.filled) * 100.0;
+        rec["filled"] = json!(true);
+        rec["partial"] = json!(fill.partial);
+        rec["simulated"] = json!(fill.simulated);
+        rec["price_estimated"] = json!(fill.price_estimated);
+        rec["ts_submit"] = json!(fill.ts_submit_ms);
+        rec["ts_ack"] = json!(fill.ts_ack_ms);
+        rec["ts_fill"] = json!(fill.ts_fill_ms);
+        rec["fill_price"] = json!(fill.fill_price_cents);
+        rec["filled_count"] = json!(fill.filled);
+        rec["canceled_count"] = json!(fill.canceled);
+        rec["fee_cents"] = json!(fee_cents); // our pre-trade estimate
+        rec["actual_fee_cents"] = json!(fill.actual_fee_cents); // exchange truth
+        rec["order_id"] = json!(fill.order_id);
+        logging::info(format!(
+            "streak {series}: {}FILLED {}x {} {ticker} @ {}c{}",
+            if fill.simulated { "[paper] " } else { "" },
+            fill.filled,
+            order.side.as_str(),
+            fill.fill_price_cents,
+            if fill.partial { " (partial)" } else { "" }
+        ));
+        logging::record_path(WEEK1_LOG, rec);
+    }
+}
+
+/// A fill observed on a resting leg.
+struct LegFill {
+    count: i64,
+    price_cents: i64,
+    ts_ms: Option<i64>,
+    /// ACTUAL fee in cents from the fills row's `fee_cost` (demo-verified).
+    actual_fee_cents: Option<f64>,
+    /// `Some(true)` when every row said `is_taker: false` — a true maker fill.
+    all_maker: Option<bool>,
+    /// Raw `/portfolio/fills` body (fee forensics); null in paper.
+    raw: serde_json::Value,
+    simulated: bool,
+}
+
+impl MakerLeg {
+    fn ticker(&self) -> String {
+        self.order.ticker.clone()
+    }
+
+    /// A detached copy, so supervision never holds the state lock across an await.
+    fn snapshot(&self) -> MakerLeg {
+        MakerLeg {
+            series: self.series.clone(),
+            meta: self.meta.clone(),
+            order: self.order.clone(),
+            order_id: self.order_id.clone(),
+            t0: self.t0,
+            close_unix: self.close_unix,
+            backstop_at: self.backstop_at,
+            expiration_ts: self.expiration_ts,
+            placed_ms: self.placed_ms,
+            reserve_key: self.reserve_key.clone(),
+            last_ask: self.last_ask,
+            ceiling: self.ceiling,
+            paper: self.paper,
+            cancel_failed: self.cancel_failed,
+            off_book: self.off_book,
+        }
     }
 }
 
@@ -1124,8 +1931,8 @@ mod tests {
         assert_eq!(skip_kind(&Skip::NotConsecutive), None);
         assert_eq!(skip_kind(&Skip::PrevNotSettled), Some("prev_not_settled"));
         assert_eq!(
-            skip_kind(&Skip::PriceAboveGate { ask: 50.0 }),
-            Some("price_above_gate")
+            skip_kind(&Skip::NotEntryWindow { ttc: 800 }),
+            Some("missed_entry_window")
         );
     }
 

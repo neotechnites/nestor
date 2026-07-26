@@ -662,6 +662,16 @@ pub struct ParsedFill {
     pub price_cents: i64,
     /// Fill creation time in unix ms (None if unparseable).
     pub ts_ms: Option<i64>,
+    /// ACTUAL fee for THIS fill, in cents. DEMO-VERIFIED 2026-07-26: a fills row
+    /// carries `fee_cost` in DOLLARS and it is the TOTAL for the row, not a
+    /// per-contract figure (unlike create-order's `average_fee_paid`). This is
+    /// the only place a RESTING order's fee is ever visible — the create
+    /// response for a resting order reports no fee because nothing filled yet.
+    pub fee_cents: Option<f64>,
+    /// DEMO-VERIFIED 2026-07-26: `is_taker` is present on every fills row. A
+    /// maker fill (`false`) came off the book we posted to — and on demo it
+    /// billed `fee_cost: 0.000000`, i.e. maker fills were FREE.
+    pub is_taker: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -898,10 +908,20 @@ pub fn parse_fills(
                 })
             });
         let Some(price_cents) = price else { continue };
+        // Fee: `fee_cost` (demo-verified) in dollars, total for the row. Older /
+        // alternate spellings tolerated; anything unparseable stays None rather
+        // than guessing a number into the P&L.
+        let fee_cents = ["fee_cost", "fee_cost_dollars", "fee", "fee_dollars"]
+            .iter()
+            .find_map(|k| f.get(*k).and_then(dollars_f64))
+            .map(|d| d * 100.0);
+        let is_taker = f.get("is_taker").and_then(|v| v.as_bool());
         out.push(ParsedFill {
             count,
             price_cents,
             ts_ms: fill_ts_ms(f),
+            fee_cents,
+            is_taker,
         });
     }
     out
@@ -915,6 +935,45 @@ fn fill_ts_ms(f: &serde_json::Value) -> Option<i64> {
 }
 
 /// Summarize fills: (total filled count, weighted-avg price in cents, latest ts_ms).
+/// Contracts REMOVED from the book by a cancel, from the V2 cancel response.
+///
+/// DEMO-VERIFIED 2026-07-26: a successful cancel returns
+/// `{"order_id": "...", "reduced_by": "1.00", "ts_ms": ...}` — `reduced_by` is
+/// the quantity that was still resting, i.e. the UNFILLED remainder. This is the
+/// only synchronous, non-lagging answer to "did any of it fill before I pulled
+/// it?": `/portfolio/fills` trails the matching engine by seconds, so a caller
+/// that must decide immediately (send a backstop order or not?) reads this.
+/// `None` = the field was absent/unparseable — the caller must fall back to
+/// polling fills rather than assume either way.
+pub fn parse_cancel_reduced_by(resp: &serde_json::Value) -> Option<i64> {
+    resp.get("reduced_by")
+        .or_else(|| resp.get("order").and_then(|o| o.get("reduced_by")))
+        .and_then(count_to_i64)
+}
+
+/// Total ACTUAL fee across `fills` in cents, or None if no row reported one.
+/// Rows that omit the fee contribute nothing — a partial answer is still better
+/// than our own estimate, and the caller records both.
+pub fn fills_fee_cents(fills: &[ParsedFill]) -> Option<f64> {
+    let known: Vec<f64> = fills.iter().filter_map(|f| f.fee_cents).collect();
+    if known.is_empty() {
+        None
+    } else {
+        Some(known.iter().sum())
+    }
+}
+
+/// True when EVERY row that reported `is_taker` reported `false` — i.e. the
+/// whole quantity was a maker fill. None when no row said.
+pub fn fills_all_maker(fills: &[ParsedFill]) -> Option<bool> {
+    let known: Vec<bool> = fills.iter().filter_map(|f| f.is_taker).collect();
+    if known.is_empty() {
+        None
+    } else {
+        Some(known.iter().all(|t| !t))
+    }
+}
+
 pub fn fills_summary(fills: &[ParsedFill]) -> (i64, Option<i64>, Option<i64>) {
     let total: i64 = fills.iter().map(|f| f.count).sum();
     if total == 0 {
@@ -1565,6 +1624,70 @@ mod tests {
         assert!(markets.is_empty());
     }
 
+    /// VERBATIM capture from the demo cancel of a resting order, 2026-07-26
+    /// (`demo_streak_rest_cancel_ioc` step 3). `reduced_by` is the quantity that
+    /// was STILL RESTING — the streak backstop reads it to decide, synchronously,
+    /// whether any of the maker leg filled before the cancel landed.
+    #[test]
+    fn parse_cancel_reduced_by_reads_the_demo_response() {
+        let resp: serde_json::Value = serde_json::from_str(
+            r#"{"order_id":"e968ca51-efd7-4efa-9cec-e28ec3319774","reduced_by":"1.00","ts_ms":1785089698808}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_cancel_reduced_by(&resp), Some(1));
+        // Envelope tolerance + absence.
+        assert_eq!(
+            parse_cancel_reduced_by(&json!({"order": {"reduced_by": "10.00"}})),
+            Some(10)
+        );
+        assert_eq!(parse_cancel_reduced_by(&json!({"paper": true})), None);
+        assert_eq!(parse_cancel_reduced_by(&json!(null)), None);
+    }
+
+    /// VERBATIM capture of TWO demo fills rows, 2026-07-26 — one MAKER fill (our
+    /// resting NO bid at 15¢ got hit) and one TAKER fill (the IOC). Settles the
+    /// two fields the maker path depends on: `fee_cost` (dollars, TOTAL for the
+    /// row) and `is_taker`. The maker fill billed 0.000000 — maker fills are FREE
+    /// on demo, so charging them at taker rates would invent losses.
+    #[test]
+    fn parse_fills_reads_demo_fee_cost_and_is_taker() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"fills":[
+              {"count_fp":"1.00","fee_cost":"0.009900","is_taker":true,
+               "no_price_dollars":"0.1700","order_id":"TAKER","outcome_side":"no",
+               "side":"no","ts":1785089516,"yes_price_dollars":"0.8300"},
+              {"count_fp":"1.00","fee_cost":"0.000000","is_taker":false,
+               "no_price_dollars":"0.1500","order_id":"MAKER","outcome_side":"no",
+               "side":"no","ts":1785089511,"yes_price_dollars":"0.8500"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let maker = parse_fills(&body, Some("MAKER"), "no", 0);
+        assert_eq!(maker.len(), 1);
+        assert_eq!(maker[0].price_cents, 15);
+        assert_eq!(maker[0].is_taker, Some(false));
+        assert_eq!(maker[0].fee_cents, Some(0.0));
+        assert_eq!(fills_all_maker(&maker), Some(true));
+        assert_eq!(fills_fee_cents(&maker), Some(0.0));
+
+        let taker = parse_fills(&body, Some("TAKER"), "no", 0);
+        assert_eq!(taker[0].price_cents, 17);
+        assert_eq!(taker[0].is_taker, Some(true));
+        // 0.0099 dollars -> 0.99 cents, sub-cent resolution preserved.
+        assert!((taker[0].fee_cents.unwrap() - 0.99).abs() < 1e-9);
+        assert_eq!(fills_all_maker(&taker), Some(false));
+
+        // A row with neither field must not fabricate one.
+        let bare: serde_json::Value =
+            serde_json::from_str(r#"{"fills":[{"count_fp":"2.00","side":"yes","yes_price_dollars":"0.4000","order_id":"X"}]}"#)
+                .unwrap();
+        let f = parse_fills(&bare, Some("X"), "yes", 0);
+        assert_eq!(f[0].fee_cents, None);
+        assert_eq!(fills_fee_cents(&f), None);
+        assert_eq!(fills_all_maker(&f), None);
+    }
+
     /// EMPIRICAL duplicate-`client_order_id` probe (fix 2b). Places the SAME 1ct
     /// 2¢ IOC order twice with a FIXED client_order_id against an empty demo book,
     /// printing BOTH raw (status, body) responses — settling whether Kalshi
@@ -1732,6 +1855,132 @@ mod maker_demo_probes {
         let remaining = parse_resting_orders(&k.resting_orders(None).await.unwrap());
         println!("    remaining after sweep: {} (expect 0)", remaining.len());
         println!("=== VERDICT === record HTTP/fill_count/survived/remaining above into the charter Decisions section.");
+    }
+
+    /// EMPIRICAL probe for the STREAK execution policy: the exact production
+    /// sequence **rest → (deadline) cancel → IOC backstop**, end to end, on demo.
+    /// Proves the five things the policy depends on and that unit tests cannot:
+    ///   1. a `good_till_canceled` + future-`expiration_ts` BUY at the maker
+    ///      price RESTS (201, fill_count 0, remaining == count, an order_id) —
+    ///      it does NOT silently IOC;
+    ///   2. the resting order is visible by ticker (sanity only — the policy
+    ///      never treats this eventually-consistent list as truth);
+    ///   3. CANCEL BY ID succeeds and its RAW response is printed, settling
+    ///      whether the cancel response reports fill/remaining counts (the policy
+    ///      treats the cancel response as truth and then re-polls fills anyway);
+    ///   4. an IOC at a crossing limit, sent under a DISTINCT coid immediately
+    ///      after the cancel, fills — i.e. the two legs never collide on the
+    ///      duplicate-coid 409;
+    ///   5. the RAW `/portfolio/fills` row for that fill is printed, settling
+    ///      which fee field a fills row carries (the create-order response gives
+    ///      `average_fee_paid`; a resting fill is only ever seen through /fills).
+    /// Finally: nothing of ours remains resting on the ticker.
+    ///
+    /// Ignored (needs the DEMO account's key id + network). Run with:
+    ///   KALSHI_API_BASE=https://demo-api.kalshi.co \
+    ///   KALSHI_API_KEY_ID=<DEMO key id> KALSHI_PRIVATE_KEY_PATH=secrets/Demo.txt \
+    ///   NESTOR_TEST_TICKER=<open demo ticker with a live ask> \
+    ///   cargo test -p engine demo_streak_rest_cancel_ioc -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn demo_streak_rest_cancel_ioc() {
+        let key_id = std::env::var("KALSHI_API_KEY_ID").expect("KALSHI_API_KEY_ID (demo)");
+        let key_path = std::env::var("KALSHI_PRIVATE_KEY_PATH").expect("KALSHI_PRIVATE_KEY_PATH");
+        let ticker = std::env::var("NESTOR_TEST_TICKER").expect("NESTOR_TEST_TICKER");
+        // The maker price and the crossing IOC limit. Defaults mirror production
+        // (rest 40, take 46); override when the demo book sits elsewhere.
+        let rest_px: i64 = std::env::var("NESTOR_TEST_REST_PX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        let ioc_px: i64 = std::env::var("NESTOR_TEST_IOC_PX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(46);
+        let side = std::env::var("NESTOR_TEST_SIDE").unwrap_or_else(|_| "yes".into());
+        let k = Kalshi::authenticated(key_id, &key_path).unwrap();
+
+        let book = k.orderbook(&ticker).await.unwrap_or(serde_json::Value::Null);
+        println!("=== BOOK BEFORE ===\n{}", serde_json::to_string(&book).unwrap());
+
+        // (1) REST at the maker price, expiring at the end of a notional entry
+        //     window (T0+60 in production).
+        let t0 = chrono::Utc::now().timestamp();
+        let exp = t0 + 60;
+        let coid_m = format!("streak-{ticker}-m{rest_px}-probe{t0}");
+        let (s1, b1, _) = k
+            .place_resting_limit_raw(&ticker, &side, 1, rest_px, exp, &coid_m)
+            .await
+            .expect("resting POST");
+        println!("=== (1) REST @{rest_px}c === HTTP {s1}\n{b1}");
+        let placed = parse_place_response(
+            &serde_json::from_str(&b1).unwrap_or(serde_json::Value::Null),
+            &side,
+        );
+        println!(
+            "    fill_count={} remaining={} order_id={:?} (expect 0 / 1 / Some — RESTED, not IOC)",
+            placed.fill_count, placed.remaining_count, placed.order_id
+        );
+        let oid = placed.order_id.clone().expect("resting order_id");
+
+        // (2) visible in the (eventually-consistent) resting list.
+        let listed = parse_resting_orders(&k.resting_orders(Some(&ticker)).await.unwrap());
+        println!(
+            "=== (2) RESTING LIST === {} order(s); ours present: {}",
+            listed.len(),
+            listed.iter().any(|o| o.order_id == oid)
+        );
+
+        // (3) DEADLINE CANCEL — the raw response is the schema question.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let cancel = k.cancel_order(&oid).await;
+        match &cancel {
+            Ok(v) => println!(
+                "=== (3) CANCEL BY ID === RAW:\n{}",
+                serde_json::to_string_pretty(v).unwrap()
+            ),
+            Err(e) => println!("=== (3) CANCEL BY ID === ERROR {e}"),
+        }
+
+        // (4) IOC BACKSTOP immediately after, distinct coid namespace.
+        let coid_t = format!("streak-{ticker}-probe{t0}");
+        let (s4, b4, _) = k
+            .place_limit_buy_raw(&ticker, &side, 1, ioc_px, &coid_t)
+            .await
+            .expect("IOC POST");
+        println!("=== (4) IOC @{ioc_px}c === HTTP {s4}\n{b4}");
+        let took = parse_place_response(
+            &serde_json::from_str(&b4).unwrap_or(serde_json::Value::Null),
+            &side,
+        );
+        println!(
+            "    fill_count={} price={:?} actual_fee_cents={:?} order_id={:?}",
+            took.fill_count, took.fill_price_cents, took.actual_fee_cents, took.order_id
+        );
+
+        // (5) RAW fills row — which fee field does a FILL carry?
+        if let Ok(fills) = k.fills(&ticker).await {
+            let rows = fills
+                .get("fills")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
+            println!("=== (5) RAW FILLS (newest first, up to 2) ===");
+            for r in rows.iter().take(2) {
+                println!("{}", serde_json::to_string_pretty(r).unwrap());
+            }
+            let parsed = parse_fills(&fills, took.order_id.as_deref(), &side, 0);
+            println!("    parsed for our IOC order: {parsed:?}");
+        }
+
+        // (6) nothing of ours left resting.
+        let after = parse_resting_orders(&k.resting_orders(Some(&ticker)).await.unwrap());
+        println!(
+            "=== (6) AFTER === {} resting on {ticker}; ours still there: {} (expect false)",
+            after.len(),
+            after.iter().any(|o| o.order_id == oid)
+        );
+        println!("=== VERDICT === rest→cancel→IOC proven end-to-end; record the cancel + fills schemas above.");
     }
 }
 
