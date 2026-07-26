@@ -130,6 +130,27 @@ pub fn taker_fee(price_cents: i64, count: i64) -> f64 {
     (raw * 100.0).ceil() / 100.0
 }
 
+/// Capital committed to a RESTING (maker) order that has not filled yet. The
+/// taker path never needs this — an IOC resolves synchronously inside
+/// `exec_lock`, so the next `evaluate` already sees the fill. A maker leg rests
+/// for tens of seconds across many scan passes, so without a reservation the
+/// caps would be computed as if that money were free and a second leg could
+/// double-spend the same cluster/daily room.
+///
+/// NOT PERSISTED, deliberately: a reservation is only meaningful while THIS
+/// process owns the resting order. A crash loses both — and the order's
+/// `expiration_ts` (plus the startup orphan sweep) is what bounds the exchange
+/// side. Persisting a reservation would leak a phantom cap consumer across
+/// restarts.
+#[derive(Debug, Clone)]
+struct Reservation {
+    key: String,
+    cluster: String,
+    stake: f64,
+    /// Flat-sized: also consumes the daily budget while it rests.
+    flat: bool,
+}
+
 pub struct RiskManager {
     cfg: RiskConfig,
     state: State,
@@ -138,6 +159,8 @@ pub struct RiskManager {
     /// (a lost kill-switch flip is unacceptable with real money), and a missing
     /// state file is refused rather than silently re-armed.
     live: bool,
+    /// In-flight resting-order commitments (see [`Reservation`]).
+    reserved: Vec<Reservation>,
 }
 
 impl RiskManager {
@@ -172,6 +195,7 @@ impl RiskManager {
             state,
             store,
             live,
+            reserved: Vec::new(),
         })
     }
 
@@ -205,17 +229,57 @@ impl RiskManager {
     }
 
     fn cluster_at_risk(&self, cluster: &str) -> f64 {
-        self.state
+        let open: f64 = self
+            .state
             .open
             .iter()
             .filter(|p| p.cluster == cluster)
             .map(|p| p.stake())
-            .sum()
+            .sum();
+        let held: f64 = self
+            .reserved
+            .iter()
+            .filter(|r| r.cluster == cluster)
+            .map(|r| r.stake)
+            .sum();
+        open + held
     }
 
-    /// Total capital at risk across every open position (all clusters).
+    /// Total capital at risk across every open position (all clusters), plus
+    /// anything committed to an unfilled resting order.
     fn total_at_risk(&self) -> f64 {
-        self.state.open.iter().map(|p| p.stake()).sum()
+        let open: f64 = self.state.open.iter().map(|p| p.stake()).sum();
+        let held: f64 = self.reserved.iter().map(|r| r.stake).sum();
+        open + held
+    }
+
+    /// Daily flat-budget dollars committed to unfilled resting orders.
+    fn reserved_flat(&self) -> f64 {
+        self.reserved.iter().filter(|r| r.flat).map(|r| r.stake).sum()
+    }
+
+    /// Commit `o`'s stake against the caps while its resting order is alive.
+    /// Idempotent by `key` (a re-place under the same key replaces the entry).
+    /// The caller MUST [`release`](Self::release) on fill, cancel, or error —
+    /// `on_fill_actual` does not release for you (the key is the caller's).
+    pub fn reserve(&mut self, key: &str, o: &Order) {
+        self.reserved.retain(|r| r.key != key);
+        self.reserved.push(Reservation {
+            key: key.to_string(),
+            cluster: o.cluster.clone(),
+            stake: o.stake(),
+            flat: matches!(o.sizing, SizingHint::Flat),
+        });
+    }
+
+    /// Drop a reservation (fill booked, order cancelled, or placement failed).
+    pub fn release(&mut self, key: &str) {
+        self.reserved.retain(|r| r.key != key);
+    }
+
+    /// Dollars currently committed to unfilled resting orders (diagnostics).
+    pub fn reserved_total(&self) -> f64 {
+        self.reserved.iter().map(|r| r.stake).sum()
     }
 
     /// Decide size for a signal, or reject. Does not mutate open positions;
@@ -242,7 +306,8 @@ impl RiskManager {
 
         let stake = match s.sizing {
             SizingHint::Flat => {
-                let remaining = self.cfg.daily_budget_usd - self.state.day_spent;
+                let remaining =
+                    self.cfg.daily_budget_usd - self.state.day_spent - self.reserved_flat();
                 if remaining <= 0.0 {
                     return Err(Rejection::DailyCapHit);
                 }
@@ -291,6 +356,23 @@ impl RiskManager {
     /// and remembered on the Position so settle() reports net without
     /// re-charging. No-op if nothing filled.
     pub fn on_fill_actual(&mut self, o: &Order, filled_count: i64, fill_price_cents: i64) {
+        self.on_fill_actual_fee(o, filled_count, fill_price_cents, None)
+    }
+
+    /// [`on_fill_actual`](Self::on_fill_actual) with the EXCHANGE'S OWN fee when
+    /// we have it. MAKER fills are why this exists: our `taker_fee` formula is
+    /// the wrong model for them (demo 2026-07-26 billed a maker fill
+    /// `fee_cost: 0.000000`), and charging ~1.7¢/contract of phantom fee against
+    /// a $100 bankroll walks the drawdown kill-switch toward a halt that never
+    /// happened. `actual_fee_dollars: None` falls back to the taker estimate,
+    /// which stays the conservative default for the taker path.
+    pub fn on_fill_actual_fee(
+        &mut self,
+        o: &Order,
+        filled_count: i64,
+        fill_price_cents: i64,
+        actual_fee_dollars: Option<f64>,
+    ) {
         if filled_count <= 0 {
             return;
         }
@@ -309,7 +391,12 @@ impl RiskManager {
             );
             return;
         }
-        let fee = taker_fee(fill_price_cents, filled_count);
+        // Negative / non-finite "actual" fees are refused — a garbage field must
+        // never CREDIT the bankroll.
+        let fee = match actual_fee_dollars {
+            Some(f) if f.is_finite() && f >= 0.0 => f,
+            _ => taker_fee(fill_price_cents, filled_count),
+        };
         self.state.bankroll -= fee;
         if matches!(o.sizing, SizingHint::Flat) {
             self.state.day_spent += filled_count as f64 * fill_price_cents as f64 / 100.0;
@@ -519,6 +606,68 @@ mod tests {
             ticker: format!("TKR-{cluster}-{price}-{nonce}"),
             ..sig(sizing, price, cluster)
         }
+    }
+
+    #[test]
+    fn reservation_consumes_cluster_room_until_released() {
+        // A resting maker leg is capital at risk BEFORE it fills: without the
+        // reservation, a concurrent scan pass would size a second leg against
+        // money the first already committed. cluster cap = 0.15 * 100 = $15.
+        let mut r = rm(100.0);
+        let first = r.evaluate(&sig_uniq(SizingHint::Fraction, 50, "c", 1)).unwrap();
+        assert!((first.stake() - 5.0).abs() < 0.51); // 0.05 * 100 ≈ $5
+        r.reserve("leg-1", &first);
+        assert!((r.reserved_total() - first.stake()).abs() < 1e-9);
+
+        // Cluster room is now cap − reserved; keep reserving until it is gone.
+        for n in 2..10 {
+            match r.evaluate(&sig_uniq(SizingHint::Fraction, 50, "c", n)) {
+                Ok(o) => r.reserve(&format!("leg-{n}"), &o),
+                Err(rej) => {
+                    assert!(matches!(
+                        rej,
+                        Rejection::ClusterCapHit | Rejection::ZeroSize
+                    ));
+                    assert!(r.reserved_total() <= 15.0 + 1e-9);
+                    // Releasing everything restores full room.
+                    for k in 1..10 {
+                        r.release(&format!("leg-{k}"));
+                    }
+                    assert_eq!(r.reserved_total(), 0.0);
+                    assert!(r.evaluate(&sig_uniq(SizingHint::Fraction, 50, "c", 99)).is_ok());
+                    return;
+                }
+            }
+        }
+        panic!("reservations never bound the cluster cap");
+    }
+
+    #[test]
+    fn reservation_is_idempotent_by_key_and_bounds_the_daily_budget() {
+        let mut r = rm(100.0);
+        let o = r.evaluate(&sig(SizingHint::Flat, 40, "c")).unwrap();
+        r.reserve("k", &o);
+        r.reserve("k", &o); // same key must not double-count
+        assert!((r.reserved_total() - o.stake()).abs() < 1e-9);
+        r.release("k");
+        assert_eq!(r.reserved_total(), 0.0);
+    }
+
+    #[test]
+    fn reserved_flat_dollars_eat_the_daily_budget() {
+        // daily_budget_usd default = $80; flat_usd = $10. Reserve the whole
+        // budget across distinct clusters and the next flat signal is capped out.
+        let mut r = rm(1000.0);
+        for n in 0..8 {
+            let o = r
+                .evaluate(&sig_uniq(SizingHint::Flat, 50, &format!("c{n}"), n))
+                .unwrap();
+            r.reserve(&format!("k{n}"), &o);
+        }
+        assert!(matches!(
+            r.evaluate(&sig_uniq(SizingHint::Flat, 50, "c-next", 100)),
+            Err(Rejection::DailyCapHit)
+        ));
     }
 
     #[test]

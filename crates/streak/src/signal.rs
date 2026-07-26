@@ -1,10 +1,20 @@
-//! Streak ≤44¢ signal — pure, testable (redirect 2026-07-23).
+//! Streak signal — pure, testable (redirect 2026-07-23; execution policy
+//! 2026-07-26).
 //!
 //! After 4 consecutive settled 15-min windows printing the same direction, buy
-//! the OPPOSITE side of the new window — only in its first 60 seconds, only if
-//! that side's ask ≤ 44¢. Detection uses settled-market `result` fields ONLY
-//! (candles are banned: the 1-min-candle lookahead trap produced a fake 71%
-//! signal in research — vault note 18 gotchas).
+//! the OPPOSITE side of the new window, only in its first 60 seconds. Detection
+//! uses settled-market `result` fields ONLY (candles are banned: the 1-min-candle
+//! lookahead trap produced a fake 71% signal in research — vault note 18 gotchas).
+//!
+//! PRICE IS NO LONGER PART OF THE SIGNAL (work/verify-streak-execution.md). The
+//! old `observed ask ≤ 44¢` gate is SUPERSEDED by the fitted execution policy:
+//! willingness-to-pay is expressed by the 40¢ resting bid and the 46¢ taker
+//! ceiling in [`crate::exec`], not by a pre-filter on a quote that is stale by
+//! 0.5-3s and whose median value (53¢) would veto the maker leg outright. The
+//! reversal-side ask is still carried on [`Entry`] — for the paper fill model,
+//! the participation record, and diagnostics — but it never rejects a signal.
+//! Consequence: `Skip::PriceAboveGate` and `Skip::Unpriced` are GONE; an
+//! unpriced reversal side is a perfectly good place to rest a 40¢ bid.
 
 /// One settled market, newest-first ordering is the caller's job.
 #[derive(Debug, Clone)]
@@ -24,11 +34,13 @@ pub struct Candidate {
     pub no_ask: Option<f64>,
 }
 
-/// A qualifying entry: buy `buy_yes` side at `ask` (¢, deci-cent).
+/// A qualifying entry: buy the `buy_yes` side. `ask` is the reversal side's
+/// OBSERVED ask (¢, deci-cent) at the decision moment — diagnostic and the
+/// paper fill model's input, never a gate. `None` = that side is unpriced.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub buy_yes: bool,
-    pub ask: f64,
+    pub ask: Option<f64>,
     /// "up" or "down" — the direction of the 4-streak being faded.
     pub streak_dir: &'static str,
 }
@@ -53,19 +65,13 @@ pub enum Skip {
     WindowMismatch,
     /// Current market is past its first 60 seconds (ttc < 14 min). Terminal.
     NotEntryWindow { ttc: i64 },
-    /// Reversal side has no ask.
-    Unpriced,
-    /// Reversal side's ask is above the 44¢ gate. Retryable inside the window
-    /// (each later pass is a fresh taker decision; we never rest a bid below the
-    /// ask waiting — taker-only doctrine).
-    PriceAboveGate { ask: f64 },
 }
 
 impl Skip {
     /// Retryable skips may still convert to an entry on a later pass within the
     /// entry window; terminal ones cannot.
     pub fn retryable(&self) -> bool {
-        matches!(self, Skip::PrevNotSettled | Skip::PriceAboveGate { .. })
+        matches!(self, Skip::PrevNotSettled)
     }
 
     pub fn as_str(&self) -> String {
@@ -76,8 +82,6 @@ impl Skip {
             Skip::PrevNotSettled => "prev_not_settled".into(),
             Skip::WindowMismatch => "window_mismatch".into(),
             Skip::NotEntryWindow { ttc } => format!("not_entry_window(ttc={ttc}s)"),
-            Skip::Unpriced => "unpriced".into(),
-            Skip::PriceAboveGate { ask } => format!("price_above_gate(ask={ask:.1})"),
         }
     }
 }
@@ -86,21 +90,6 @@ impl Skip {
 pub const WINDOW_SECS: i64 = 900;
 /// Entry only while time-to-close ≥ 14 min (= within 60s of open).
 pub const MIN_TTC_SECS: i64 = 840;
-/// Price gate: reversal ask must be ≤ 44¢.
-pub const MAX_ASK_CENTS: f64 = 44.0;
-
-/// Willingness-to-pay CEILING for the entry order (¢) — deliberately ABOVE the
-/// signal gate (Ryan, 2026-07-26: "having a bid with a positive EV is better
-/// than having no bid... if we cant get 44, get what we can"). The tape proved
-/// the demand curve: at boundary signals, thousands of contracts of the SAME
-/// reversal side trade at 45-46 while a 44-limit order stands empty-handed
-/// (R155). EV at 46 = +7.0¢ at the measured 54.7% win rate, +4.3¢ at the
-/// conservative 52% origin estimate — still multiples of the fee — and 46 stays
-/// inside the origin research's validated cheap-side population (<~48¢).
-/// The 44 gate remains the SIGNAL (selectivity unchanged); this is only what
-/// we'll pay once the signal exists. IOC price improvement still fills at the
-/// real ask whenever it's lower.
-pub const ENTRY_LIMIT_CENTS: i64 = 46;
 
 /// Evaluate one candidate market against the newest settled windows.
 /// `settled_desc` must be sorted newest-first with non-empty results.
@@ -154,14 +143,10 @@ pub fn detect(settled_desc: &[SettledWindow], cur: &Candidate, now: i64) -> Resu
         return Err(Skip::NotEntryWindow { ttc });
     }
 
-    // Price gate on the reversal side's ask (redirect rule 5).
-    let ask = match if buy_yes { cur.yes_ask } else { cur.no_ask } {
-        Some(a) => a,
-        None => return Err(Skip::Unpriced),
-    };
-    if ask > MAX_ASK_CENTS {
-        return Err(Skip::PriceAboveGate { ask });
-    }
+    // The reversal side's observed ask rides along for the record and the paper
+    // fill model. It is NOT a gate (see the module header): the 40¢ rest and the
+    // 46¢ IOC ceiling are the willingness-to-pay.
+    let ask = if buy_yes { cur.yes_ask } else { cur.no_ask };
 
     Ok(Entry {
         buy_yes,
@@ -203,7 +188,7 @@ mod tests {
         let e = detect(&s, &c, T + 30).unwrap();
         assert!(!e.buy_yes); // fade the up-streak with NO
         assert_eq!(e.streak_dir, "up");
-        assert!((e.ask - 40.0).abs() < 1e-9);
+        assert_eq!(e.ask, Some(40.0));
     }
 
     #[test]
@@ -236,16 +221,28 @@ mod tests {
     }
 
     #[test]
-    fn price_gate_rejects_above_44() {
+    fn price_never_gates_the_signal() {
+        // SUPERSEDED 44¢ gate: an expensive reversal side is still a SIGNAL —
+        // the 40¢ rest / 46¢ ceiling decide what (if anything) we pay. A 53¢
+        // ask (the population median at open) must NOT be rejected here.
         let s = settled(&[T, T - 900, T - 1800, T - 2700], "yes");
-        let c = cand(T, 54.0, 44.1);
-        assert_eq!(
-            detect(&s, &c, T + 30),
-            Err(Skip::PriceAboveGate { ask: 44.1 })
-        );
-        // Exactly 44.0 is allowed (≤ gate).
-        let c = cand(T, 54.0, 44.0);
-        assert!(detect(&s, &c, T + 30).is_ok());
+        let e = detect(&s, &cand(T, 47.0, 53.0), T + 30).unwrap();
+        assert_eq!(e.ask, Some(53.0));
+        // Even a 95¢ reversal side signals; the execution layer simply won't fill.
+        assert_eq!(detect(&s, &cand(T, 5.0, 95.0), T + 30).unwrap().ask, Some(95.0));
+    }
+
+    #[test]
+    fn unpriced_reversal_side_still_signals() {
+        // An empty book is a fine place to rest a 40¢ bid — no ask, no veto.
+        let s = settled(&[T, T - 900, T - 1800, T - 2700], "yes");
+        let c = Candidate {
+            open_unix: Some(T),
+            close_unix: T + WINDOW_SECS,
+            yes_ask: Some(60.0),
+            no_ask: None,
+        };
+        assert_eq!(detect(&s, &c, T + 30).unwrap().ask, None);
     }
 
     #[test]

@@ -104,6 +104,42 @@ pub enum ExecOutcome {
     OrderError(String),
 }
 
+/// Result of posting a RESTING (maker) limit order — the maker analogue of
+/// [`ExecOutcome`]. A resting order does NOT resolve synchronously, so the
+/// caller owns a supervision loop (poll fills → book; cancel on flip/deadline)
+/// and MUST call [`Engine::release_reservation`] on every terminal branch.
+#[derive(Debug)]
+pub enum RestOutcome {
+    /// The order is alive on the book. `order` carries the risk-sized count and
+    /// the limit actually posted; nothing is booked in risk yet (accepted ≠
+    /// filled) but the stake IS reserved against the caps.
+    Resting {
+        order: Order,
+        order_id: String,
+        response: serde_json::Value,
+    },
+    /// The limit crossed the resting book at placement and filled immediately
+    /// (a maker order priced through the ask is a TAKER — the exchange fee and
+    /// `average_fee_paid` say so). Already booked in risk; reservation released.
+    ImmediateFill {
+        order: Order,
+        fill: FillReport,
+        response: serde_json::Value,
+    },
+    /// Risk layer refused.
+    Rejected(Rejection),
+    /// Placement failed. Reservation already released.
+    RestError {
+        msg: String,
+        /// TRUE when we cannot rule out that an order is alive on the exchange
+        /// (network error / timeout — the POST may have landed). The caller MUST
+        /// NOT then send a second order for the same ticker: two fills on one
+        /// ticker cannot both be booked. FALSE for a non-2xx, where the exchange
+        /// told us it created nothing and taking is safe.
+        may_be_resting: bool,
+    },
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -309,6 +345,200 @@ impl Engine {
                 response: serde_json::Value::Null,
             }
         }
+    }
+
+    /// MAKER path: size `signal` through risk, RESERVE its stake against the
+    /// caps, and post a RESTING limit at `signal.limit_cents` that auto-cancels
+    /// at `expiration_ts` (the load-bearing safety property — a dead process
+    /// leaves nothing meaningful alive; enforcement is lazy ~2-3min).
+    ///
+    /// Unlike [`execute_attempt`](Self::execute_attempt) this does NOT resolve:
+    /// on `Resting` the caller supervises the order (poll `fills` by order_id,
+    /// cancel on flip/deadline) and books any fill via
+    /// [`book_resting_fill`](Self::book_resting_fill). The reservation is the
+    /// caller's to release on EVERY terminal branch.
+    ///
+    /// Paper mode places no order: it returns `Resting` with a synthetic
+    /// `paper-` order_id so the caller's supervision (and its own fill model)
+    /// runs identically. Reserving in paper keeps paper caps honest too.
+    pub async fn place_resting(
+        &self,
+        signal: Signal,
+        reserve_key: &str,
+        coid: &str,
+        expiration_ts: i64,
+    ) -> RestOutcome {
+        let _exec = self.exec_lock.lock().await;
+        let order = {
+            let mut risk = self.risk.lock().unwrap_or_else(|e| e.into_inner());
+            match risk.evaluate(&signal) {
+                Ok(o) => {
+                    // Reserve BEFORE the network call: a concurrent scan pass
+                    // must not size a second leg against money this one is
+                    // about to commit.
+                    risk.reserve(reserve_key, &o);
+                    o
+                }
+                Err(r) => return RestOutcome::Rejected(r),
+            }
+        };
+
+        if self.mode != Mode::Live {
+            return RestOutcome::Resting {
+                order,
+                order_id: format!("paper-{coid}"),
+                response: serde_json::Value::Null,
+            };
+        }
+
+        // Same pre-order affordability guard as the taker path (fail-open on an
+        // unreadable balance — risk caps still bound the order).
+        let cost_cents = order.count * order.limit_cents;
+        if let Some(bal) = self.live_balance_cents().await {
+            if bal < cost_cents {
+                self.release_reservation(reserve_key);
+                let msg =
+                    format!("insufficient balance: need {cost_cents}c, have {bal}c");
+                eprintln!("[balance] refusing resting {} order: {msg}", order.ticker);
+                return RestOutcome::RestError {
+                    msg,
+                    may_be_resting: false,
+                };
+            }
+        }
+
+        let ts_submit_ms = now_ms();
+        let place = tokio::time::timeout(
+            IN_WINDOW_TIMEOUT,
+            self.kalshi.place_resting_limit_raw(
+                &order.ticker,
+                order.side.as_str(),
+                order.count,
+                order.limit_cents,
+                expiration_ts,
+                coid,
+            ),
+        )
+        .await;
+        let (status, text) = match place {
+            Ok(Ok((s, t, _rid))) => (s, t),
+            // AMBIGUOUS: the POST may have reached the matching engine.
+            Ok(Err(e)) => {
+                self.release_reservation(reserve_key);
+                self.note_order_failure(net::http_status(&e)).await;
+                return RestOutcome::RestError {
+                    msg: e.to_string(),
+                    may_be_resting: true,
+                };
+            }
+            Err(_elapsed) => {
+                self.release_reservation(reserve_key);
+                self.note_order_failure(None).await;
+                return RestOutcome::RestError {
+                    msg: format!(
+                        "resting placement timed out after {}s",
+                        IN_WINDOW_TIMEOUT.as_secs()
+                    ),
+                    may_be_resting: true,
+                };
+            }
+        };
+        if !(200..300).contains(&status) {
+            self.release_reservation(reserve_key);
+            self.note_order_failure(Some(status)).await;
+            // The exchange answered: it created nothing. Safe to take instead.
+            return RestOutcome::RestError {
+                msg: format!("resting placement HTTP {status}: {text}"),
+                may_be_resting: false,
+            };
+        }
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        let placed = kalshi::parse_place_response(&response, order.side.as_str());
+        self.note_signed_success();
+
+        // CROSSED AT POST: a bid priced through the ask fills immediately and is
+        // a TAKER fill (exchange fee proves it). Book it now — there is nothing
+        // left to supervise.
+        let filled = placed.fill_count.min(order.count);
+        if filled > 0 {
+            let price_estimated = placed.fill_price_cents.is_none();
+            let avg_price = placed.fill_price_cents.unwrap_or(order.limit_cents);
+            self.risk
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .on_fill_actual(&order, filled, avg_price);
+            self.release_reservation(reserve_key);
+            let fill = FillReport {
+                requested: order.count,
+                filled,
+                fill_price_cents: avg_price,
+                canceled: order.count - filled,
+                partial: filled < order.count,
+                actual_fee_cents: placed.actual_fee_cents,
+                simulated: false,
+                price_estimated,
+                ts_submit_ms,
+                ts_ack_ms: placed.ts_ms.or(Some(now_ms())),
+                ts_fill_ms: placed.ts_ms,
+                order_id: placed.order_id.clone(),
+            };
+            return RestOutcome::ImmediateFill {
+                order,
+                fill,
+                response,
+            };
+        }
+
+        match placed.order_id.clone() {
+            Some(order_id) => RestOutcome::Resting {
+                order,
+                order_id,
+                response,
+            },
+            // 2xx with no order_id: we cannot cancel what we cannot name. Treat
+            // as an error so the caller falls back to the taker path, and let
+            // expiration_ts bound whatever is actually out there.
+            None => {
+                self.release_reservation(reserve_key);
+                RestOutcome::RestError {
+                    msg: format!("resting placement 2xx with no order_id: {response}"),
+                    may_be_resting: true,
+                }
+            }
+        }
+    }
+
+    /// Book a fill that landed on a RESTING order into risk state at the ACTUAL
+    /// price, charging the EXCHANGE'S fee when the fills row reported one
+    /// (`fee_cost`) — a maker fill is not billed at taker rates. The reservation
+    /// is NOT released here; the caller owns the key.
+    pub fn book_resting_fill(
+        &self,
+        order: &Order,
+        filled: i64,
+        price_cents: i64,
+        actual_fee_cents: Option<f64>,
+    ) {
+        if filled <= 0 {
+            return;
+        }
+        self.risk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .on_fill_actual_fee(
+                order,
+                filled,
+                price_cents,
+                actual_fee_cents.map(|c| c / 100.0),
+            );
+    }
+
+    /// Release a resting-order cap reservation (fill booked / cancelled / dead).
+    pub fn release_reservation(&self, key: &str) {
+        self.risk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(key);
     }
 
     /// Live path (V2 IOC create-order): place → read SYNCHRONOUS fill truth from
