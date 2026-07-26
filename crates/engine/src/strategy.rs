@@ -128,6 +128,11 @@ pub enum RestOutcome {
     },
     /// Risk layer refused.
     Rejected(Rejection),
+    /// The runway that authorised resting was gone by the time `exec_lock` was
+    /// acquired (FIX 10 — constants F2). Nothing was evaluated, reserved, or
+    /// sent. The signal itself is still live: the caller should treat this
+    /// exactly like a signal that arrived too late to rest — go taker.
+    RunwayLost { waited_ms: u64 },
     /// Placement failed. Reservation already released.
     RestError {
         msg: String,
@@ -399,14 +404,37 @@ impl Engine {
     /// Paper mode places no order: it returns `Resting` with a synthetic
     /// `paper-` order_id so the caller's supervision (and its own fill model)
     /// runs identically. Reserving in paper keeps paper caps honest too.
+    /// `rest_by_unix`, when given, is the LAST unix second at which resting is
+    /// still worth doing — the caller's eligibility decision, RE-ASSERTED after
+    /// `exec_lock` is acquired (FIX 10, constants F2). The eligibility test runs
+    /// before the lock; the lock can then be held for the whole of another
+    /// strategy's evaluate→place→verify round-trip, so the decision that
+    /// authorised a 40¢ rest with 44s of runway could execute with 4s — silently
+    /// violating `MIN_REST_SECS` and paying two round-trips for a bid that never
+    /// sees a full 1 Hz poll. Worst tail: the bid posts with an `expiration_ts`
+    /// that has already passed.
     pub async fn place_resting(
         &self,
         signal: Signal,
         reserve_key: &str,
         coid: &str,
         expiration_ts: i64,
+        rest_by_unix: Option<i64>,
     ) -> RestOutcome {
+        let waiting_since = Instant::now();
         let _exec = self.exec_lock.lock().await;
+        if let Some(deadline) = rest_by_unix {
+            let now = chrono::Utc::now().timestamp();
+            if now > deadline {
+                let waited_ms = waiting_since.elapsed().as_millis() as u64;
+                eprintln!(
+                    "[place_resting] {} runway lost while waiting {waited_ms}ms for exec_lock \
+                     (now {now} > rest-by {deadline}) — NOT resting; nothing reserved or sent",
+                    signal.ticker
+                );
+                return RestOutcome::RunwayLost { waited_ms };
+            }
+        }
         let order = {
             let mut risk = self.risk.lock().unwrap_or_else(|e| e.into_inner());
             match risk.evaluate(&signal) {
@@ -763,8 +791,16 @@ impl Engine {
 
         // Reconciliation cross-check: one fills read (best-effort). The fills API
         // is still live in V2; a mismatch is logged but the 201 response wins.
-        match self.kalshi.fills(&order.ticker).await {
-            Ok(body) => {
+        //
+        // FIX 10 (constants F2): DEADLINE-BOUNDED. This GET runs INSIDE
+        // `exec_lock`, which serializes every strategy's evaluate→place→book
+        // sequence, and unwrapped it inherited the shared client's 30s timeout.
+        // Its result feeds nothing but a log line — yet a volbook IOC stalling
+        // here behind a Kalshi 5xx could hold the lock long enough to push
+        // streak's 40¢ maker post past the `MIN_REST_SECS` decision that
+        // authorised it, or past the entry window outright.
+        match in_window(self.kalshi.fills(&order.ticker)).await {
+            Ok(Ok(body)) => {
                 let fills = kalshi::parse_fills(
                     &body,
                     order_id.as_deref(),
@@ -779,7 +815,15 @@ impl Engine {
                     );
                 }
             }
-            Err(e) => eprintln!("[execute] recon fills read failed for {}: {e}", order.ticker),
+            Ok(Err(e)) => {
+                eprintln!("[execute] recon fills read failed for {}: {e}", order.ticker)
+            }
+            Err(_elapsed) => eprintln!(
+                "[execute] recon fills read for {} exceeded the {}s in-window deadline — \
+                 skipping the cross-check (the 201 response is the fill truth)",
+                order.ticker,
+                IN_WINDOW_TIMEOUT.as_secs()
+            ),
         }
 
         // Feed risk ONLY the filled count at the ACTUAL average price, and the

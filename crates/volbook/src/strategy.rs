@@ -42,6 +42,16 @@ const LIVE_ENABLE_ENV: &str = "VOLBOOK_LIVE";
 /// once; a single retry covers a transient partial without chasing.
 const MAX_ENTRY_ATTEMPTS: u32 = 2;
 const RETRY_SPACING_MS: u64 = 1000;
+/// How many LATER passes a rung that ended `Missed` may be retried on (FIX 11,
+/// constants F4). BOUNDED, not unlimited: the entry window is 3600s scanned every
+/// 60s, so an unbounded re-arm would fire 2 IOCs per pass × 60 passes × ~11
+/// qualifying rungs = ~1300 signed writes a day against a rate limit we have
+/// never measured (reality F5), and would bury the tape in `missed_fill` records.
+/// 5 is the horizon the sizing probe itself measures — verify-volbook-execution
+/// P3 asks for the fraction of rungs still at/below the ceiling on passes k+1..k+5
+/// — so it captures the persistence the fix exists to recover and stops exactly
+/// where the evidence stops. Raise it only with that measurement in hand.
+const MAX_REARMS: u32 = 5;
 
 pub struct Volbook {
     calib: Calib,
@@ -51,6 +61,9 @@ pub struct Volbook {
     /// Dedup: one entry episode per rung ticker (per process/day), and one skip
     /// record per (ticker, reason).
     seen: Mutex<HashSet<String>>,
+    /// ticker -> how many times a `Missed` episode has been re-armed (FIX 11),
+    /// bounded by [`MAX_REARMS`].
+    rearms: Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl Volbook {
@@ -70,6 +83,7 @@ impl Volbook {
             params,
             universe,
             seen: Mutex::new(HashSet::new()),
+            rearms: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -92,6 +106,28 @@ impl Volbook {
 
     fn first_time(&self, key: String) -> bool {
         self.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(key)
+    }
+
+    /// Release a rung's one-episode-per-ticker dedupe so a LATER pass in the same
+    /// entry window may try again (FIX 11). Only ever called for a zero-fill
+    /// `Missed` outcome — nothing was bought, nothing is resting (IOC), and the
+    /// next attempt re-runs `evaluate` against a fresh book and fresh caps.
+    /// Returns the re-arm number, or None once [`MAX_REARMS`] is spent.
+    fn rearm(&self, ticker: &str) -> Option<u32> {
+        let n = {
+            let mut r = self.rearms.lock().unwrap_or_else(|e| e.into_inner());
+            let c = r.entry(ticker.to_string()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        if n > MAX_REARMS {
+            return None;
+        }
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(ticker);
+        Some(n)
     }
 }
 
@@ -224,7 +260,7 @@ impl Volbook {
                     close_unix,
                     entry,
                 }),
-                Err(skip) => self.log_skip(series, &m.ticker, &skip),
+                Err(skip) => self.log_skip(series, &m.ticker, &skip, ttc, close_unix, no_ask),
             }
         }
         Ok(cands)
@@ -232,7 +268,15 @@ impl Volbook {
 
     /// Log a skip once per (ticker, reason) — only the informative ones (window/
     /// weekday no-signals are the resting state and stay silent to avoid spam).
-    fn log_skip(&self, series: &str, ticker: &str, skip: &Skip) {
+    fn log_skip(
+        &self,
+        series: &str,
+        ticker: &str,
+        skip: &Skip,
+        ttc: i64,
+        close_unix: i64,
+        no_ask: Option<f64>,
+    ) {
         // Silence the two "not even a candidate yet" reasons (the common case).
         if matches!(
             skip,
@@ -244,6 +288,20 @@ impl Volbook {
         if !self.first_time(format!("{ticker}|{reason}")) {
             return;
         }
+        // FIX 11 / I13 (sensors F13): NUMERIC fields, not just the formatted
+        // reason string. The Monday prediction is a BUCKET MIX (§5 of
+        // verify-volbook-execution: 4.90/2.48/1.45/0.93/1.10/0.31 across the six
+        // implied buckets), and the implied YES was reachable only by regex on
+        // `out_of_band(impl=23.4)`. There was also no way to confirm a skip was
+        // evaluated INSIDE the 17:30-18:30Z window rather than outside it.
+        let (implied_pct, ceiling_cents, no_ask_cents) = match skip {
+            Skip::OutOfBand { implied_pct } => (Some(*implied_pct), None, None),
+            Skip::NoEdge {
+                ceiling_cents,
+                no_ask_cents,
+            } => (None, Some(*ceiling_cents), Some(*no_ask_cents)),
+            _ => (None, None, None),
+        };
         logging::record_path(
             LOG,
             json!({
@@ -251,6 +309,12 @@ impl Volbook {
                 "series": series,
                 "ticker": ticker,
                 "reject_reason": reason,
+                "implied_pct": implied_pct,
+                "ceiling_cents": ceiling_cents,
+                "no_ask_cents": no_ask_cents,
+                "no_ask": no_ask,
+                "ttc": ttc,
+                "close_unix": close_unix,
             }),
         );
     }
@@ -406,9 +470,29 @@ impl Volbook {
             ExecOutcome::Missed { order, fill } => {
                 rec["reject_reason"] = json!("missed_fill");
                 rec["canceled_count"] = json!(fill.canceled);
+                // FIX 11 (constants F4): RE-ARM. A rung that ends Missed gets
+                // 2 IOCs spanning 2 SECONDS of a 3600-second entry window, and
+                // the permanent `seen` dedupe then blanked the remaining ~59
+                // passes. A market maker pulling the NO ask for five seconds
+                // killed the rung for the life of the process — and because the
+                // pool is ranked by `gap_pp` descending, the rung most likely to
+                // be lost that way is the day's HIGHEST-EDGE one, recorded as
+                // `missed_fill`, indistinguishable in the ledger from "no edge
+                // existed". Dedupe still holds for FILLED / REJECTED / errored
+                // episodes: those either hold a position or were refused by risk,
+                // and re-running them would double-book or spam.
+                let rearmed = self.rearm(&m.ticker);
+                rec["rearm"] = json!(rearmed);
                 logging::info(format!(
-                    "volbook {series}: MISSED (no fill, canceled {}) {}",
-                    order.count, m.ticker
+                    "volbook {series}: MISSED (no fill, canceled {}) {} — {}",
+                    order.count,
+                    m.ticker,
+                    match rearmed {
+                        Some(n) => format!("RE-ARMED ({n}/{MAX_REARMS}) for a later pass"),
+                        None => format!(
+                            "re-arm budget spent ({MAX_REARMS}) — rung closed for the window"
+                        ),
+                    }
                 ));
             }
             ExecOutcome::Rejected(r) => {
@@ -454,5 +538,62 @@ mod tests {
             .unwrap()
             .timestamp();
         assert_eq!(close_date_et(t), "2026-07-27");
+    }
+
+    #[test]
+    fn a_missed_rung_re_arms_but_a_filled_one_does_not() {
+        // FIX 11 (constants F4). MAX_ENTRY_ATTEMPTS=2 x RETRY_SPACING_MS=1000
+        // gives a rung 2 IOCs spanning 2 SECONDS of a 3600s entry window scanned
+        // every 60s — 60 passes available, 1 usable, because `seen` was never
+        // cleared. A maker pulling the NO ask for five seconds killed the rung
+        // for the life of the process, and since the pool is ranked by `gap_pp`
+        // descending it was the day's HIGHEST-EDGE rung that died that way.
+        let v = Volbook::from_path(DEFAULT_CALIB);
+        let Ok(v) = v else { return }; // no calib artifact in this checkout
+        let t = "KXGOLDD-26JUL27-3400";
+        assert!(v.first_time(t.to_string()), "first episode must be allowed");
+        assert!(!v.first_time(t.to_string()), "dedupe holds within an episode");
+
+        // Zero-fill Missed: nothing bought, nothing resting (IOC) -> re-arm.
+        assert_eq!(v.rearm(t), Some(1));
+        assert!(v.first_time(t.to_string()), "a missed rung must retry later");
+
+        // A FILLED / REJECTED episode never calls rearm, so the dedupe stands
+        // and a later pass cannot double-book or re-spam a refused signal.
+        assert!(!v.first_time(t.to_string()));
+
+        // The budget is BOUNDED: unlimited re-arms would fire 2 IOCs per pass
+        // for 60 passes on every missed rung, against an unmeasured rate limit.
+        for n in 2..=MAX_REARMS {
+            assert_eq!(v.rearm(t), Some(n));
+            assert!(v.first_time(t.to_string()));
+            assert!(!v.first_time(t.to_string()));
+        }
+        assert_eq!(v.rearm(t), None, "budget must be spent after MAX_REARMS");
+        assert!(!v.first_time(t.to_string()), "a spent rung stays closed");
+
+        // Re-arming one rung must not disturb another, or a skip record's
+        // (ticker|reason) dedupe.
+        assert!(v.first_time("KXSILVERD-26JUL27-40".to_string()));
+        assert!(v.first_time(format!("{t}|out_of_band(impl=23.4)")));
+        let _ = v.rearm(t);
+        assert!(
+            !v.first_time(format!("{t}|out_of_band(impl=23.4)")),
+            "re-arming an entry must not clear that ticker's skip dedupe"
+        );
+    }
+
+    #[test]
+    fn arithmetic_of_the_entry_window_the_rearm_unlocks() {
+        // 3600s window (entry_ttc 9000..12600) scanned every 60s = 60 passes.
+        const ENTRY_WINDOW_SECS: i64 = 12600 - 9000;
+        const SCAN_SECS: i64 = 60;
+        assert_eq!(ENTRY_WINDOW_SECS / SCAN_SECS, 60);
+        // The ladder itself spans 1 retry x 1000ms = ~1s of that.
+        assert_eq!(MAX_ENTRY_ATTEMPTS, 2);
+        assert!((MAX_ENTRY_ATTEMPTS as u64 - 1) * RETRY_SPACING_MS < 2000);
+        // Bounded re-arm: worst case MAX_REARMS+1 episodes x 2 IOCs = 12 order
+        // POSTs per rung per day, not 120.
+        assert_eq!((MAX_REARMS + 1) * MAX_ENTRY_ATTEMPTS, 12);
     }
 }

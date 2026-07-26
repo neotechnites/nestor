@@ -629,13 +629,52 @@ impl Streak {
                     "streak {series}: open-markets fetch exceeded {}s — skip pass",
                     IN_WINDOW_TIMEOUT.as_secs()
                 ));
+                // FIX 9 / I1: a timed-out fetch must be DISTINGUISHABLE from a
+                // market that is not listed yet (sensors F1 — the two produced
+                // identical silence).
+                logging::record_path(
+                    &obs_path(now_dt),
+                    json!({
+                        "event": "streak_pass",
+                        "ts_ms": now_dt.timestamp_millis(),
+                        "series": series,
+                        "into_window": now.rem_euclid(signal::WINDOW_SECS),
+                        "ticker": serde_json::Value::Null,
+                        "reason": "fetch_timeout",
+                    }),
+                );
                 return Ok(());
             }
         };
 
+        // FIX 9 / I1 (sensors F1 — the most expensive sensor gap in the tree).
+        // `current_market() == None` used to `return Ok(())` with NO log line and
+        // NO record. Measured over n=518 windows on 3 days of `data/obs/`, the
+        // FIRST observation of a new market lands at a MEDIAN T0+25s — and the
+        // 40¢ rest is fitted on a dip that bottoms at a median T0+4.8s. 13.3% of
+        // windows first observe after T0+40 (forced `taker_late`, no maker leg at
+        // all) and 4.2% after T0+60 (window missed outright). None of that is
+        // reconstructible today: "market not listed yet", "listed but unpriced",
+        // "fetch timed out" and "process wedged" all produce identical silence.
+        // One line per pass makes the blind spot MEASURE ITSELF.
+        let into_window = now.rem_euclid(signal::WINDOW_SECS);
         let cur = match current_market(&opens, now) {
             Some(m) => m,
-            None => return Ok(()),
+            None => {
+                logging::record_path(
+                    &obs_path(now_dt),
+                    json!({
+                        "event": "streak_pass",
+                        "ts_ms": now_dt.timestamp_millis(),
+                        "series": series,
+                        "into_window": into_window,
+                        "ticker": serde_json::Value::Null,
+                        "reason": if opens.is_empty() { "no_open_markets" } else { "no_current_market" },
+                        "open_count": opens.len(),
+                    }),
+                );
+                return Ok(());
+            }
         };
         let mut cand = Candidate {
             open_unix: cur.open_unix(),
@@ -994,6 +1033,14 @@ impl Streak {
             "entry_path": path.as_str(),
             "maker_price": exec::MAKER_PRICE_CENTS,
             "filled": false,
+            // Overwritten with "pending" by the at-placement emission (I4); every
+            // other writer of this skeleton is a terminal branch.
+            "outcome": "terminal",
+            // FIX 9 / I7 (sensors F8): the snapshot is the T0 DECISION book, and
+            // it is reused verbatim on a `taker_backstop` record generated at
+            // T0+45 — 45s stale and, as plain `book`, unlabelled as such. Named
+            // now; `book` is kept as an alias so existing joins do not break.
+            "book_at_signal": meta.book,
             "book": meta.book,
         });
         if let Some((avg, margin_bp)) = meta.derived {
@@ -1115,10 +1162,39 @@ impl Streak {
             sizing: SizingHint::Flat,
         };
 
+        // FIX 10 (constants F2): re-assert the maker runway AFTER `exec_lock` is
+        // acquired. `maker_eligible(now, t0)` was evaluated by `enter`; the lock
+        // wait between then and the POST is unbounded from this call site's
+        // point of view. `maker_eligible` is `backstop_at(t0) − now >=
+        // MIN_REST_SECS`, so the last second at which resting is still worth it
+        // is exactly this.
+        let rest_by = exec::backstop_at(t0) - exec::MIN_REST_SECS;
+
         match eng
-            .place_resting(sig, &reserve_key, &coid, expiration_ts)
+            .place_resting(sig, &reserve_key, &coid, expiration_ts, Some(rest_by))
             .await
         {
+            // The lock wait consumed the runway. The signal is still live — this
+            // is precisely the "arrived too late to rest" case, so take instead.
+            RestOutcome::RunwayLost { waited_ms } => {
+                logging::info(format!(
+                    "streak {series}: {ticker} lost the maker runway waiting {waited_ms}ms for \
+                     exec_lock (rest-by {rest_by}) — taker-only at {ceiling}c"
+                ));
+                self.taker_leg(
+                    eng,
+                    series,
+                    &ticker,
+                    &meta,
+                    cand.close_unix,
+                    ceiling,
+                    meta.ask_at_signal,
+                    EntryPath::TakerLate,
+                    json!({"maker_skipped": "runway_lost_on_exec_lock",
+                           "exec_lock_wait_ms": waited_ms}),
+                )
+                .await
+            }
             RestOutcome::Resting {
                 order,
                 order_id,
@@ -1150,6 +1226,31 @@ impl Streak {
                     now - t0,
                     exec::BACKSTOP_AT_SECS,
                 ));
+                // FIX 9 / I4 (sensors F5): write the FULL participation record at
+                // PLACEMENT with `outcome: pending`, not only on a terminal
+                // branch. `base_record` carries ts_signal, streak_dir,
+                // ask_at_signal, entry_path, the derive-fourth fields and the T0
+                // book — and `streak_maker_rest` carried NONE of them. A restart
+                // between placement and resolution (VPS migration is tonight;
+                // note 39 documents the kill as flaky) left a tape with no signal
+                // context, no book, and NO terminal record at all: the episode
+                // could not be classified and vanished from every entry_path
+                // denominator. The terminal record is re-emitted as usual; a
+                // reader keeps the last record per (ticker, event).
+                let mut pending =
+                    self.base_record(series, &ticker, &leg.meta, EntryPath::MakerRest);
+                pending["outcome"] = json!("pending");
+                pending["order_id"] = json!(order_id);
+                pending["expiration_ts"] = json!(expiration_ts);
+                pending["backstop_at"] = json!(leg.backstop_at);
+                pending["ceiling"] = json!(ceiling);
+                pending["limit_placed"] = json!(exec::MAKER_PRICE_CENTS);
+                pending["filled_count"] = json!(0);
+                pending["count"] = json!(leg.order.count);
+                pending["ts_submit"] = json!(leg.placed_ms);
+                pending["paper"] = json!(leg.paper);
+                logging::record_path(WEEK1_LOG, pending);
+
                 logging::record_path(
                     WEEK1_LOG,
                     json!({
@@ -1420,6 +1521,17 @@ impl Streak {
             now - leg.t0,
             leg.ceiling
         ));
+        // FIX 9 / I7 (sensors F8): snapshot the book AT THE BACKSTOP MOMENT.
+        // Without it a `filled_count: 0` backstop is unreadable: was the ask 60¢
+        // (correct no-trade, the policy working) or 45¢ that we missed on a
+        // 300ms RTT (an execution defect)? The record carried only the T0 book,
+        // 45s stale, and `retry_books` snapshots attempts 2-4 only — attempt 1
+        // had none. Best-effort; a timeout leaves null rather than delaying the
+        // IOC that is already at its deadline.
+        let book_at_backstop = match in_window(eng.kalshi.orderbook(ticker)).await {
+            Ok(Ok(b)) => b,
+            _ => json!(null),
+        };
         let _ = self
             .taker_leg(
                 eng,
@@ -1434,6 +1546,12 @@ impl Streak {
                     "maker_order_id": leg.order_id,
                     "maker_rest_secs": now - leg.t0,
                     "maker_cancel": cancel_resp,
+                    "book_at_backstop": book_at_backstop,
+                    "book_at_backstop_ts_ms": chrono::Utc::now().timestamp_millis(),
+                    // The reversal ask the supervisor last saw, which LIVE
+                    // `taker_limit` discards (it always sends the ceiling), so it
+                    // was dropped on the floor for every live backstop record.
+                    "observed_ask_at_backstop": leg.last_ask,
                 }),
             )
             .await;
@@ -1516,6 +1634,16 @@ impl Streak {
     async fn mark_cancel_failed(&self, eng: &Engine, leg: &MakerLeg, err: &str, now: i64) {
         if now > leg.expiration_ts + CANCEL_RETRY_GRACE_SECS {
             self.drop_leg(eng, &leg.ticker(), &leg.reserve_key);
+            // FIX 9 / I4 (sensors F5): the give-up path wrote an alert and a
+            // run.log line but NO week1 record, so the episode silently
+            // disappeared from every entry_path denominator.
+            let mut rec =
+                self.base_record(&leg.series, &leg.ticker(), &leg.meta, EntryPath::MakerRest);
+            rec["reject_reason"] = json!("cancel_gave_up");
+            rec["maker_order_id"] = json!(leg.order_id);
+            rec["maker_error"] = json!(err);
+            rec["secs_past_expiry"] = json!(now - leg.expiration_ts);
+            logging::record_path(WEEK1_LOG, rec);
             logging::info(format!(
                 "streak: GIVING UP cancelling {} ({}) after {}s past expiry — {err}",
                 leg.order_id,
@@ -1821,6 +1949,10 @@ impl Streak {
     ) -> Result<()> {
         let mut rec = self.base_record(series, ticker, meta, path);
         rec["ceiling"] = json!(ceiling);
+        // FIX 9 / I7: recorded on EVERY taker path, not just paper's no-cross
+        // branch. In live, `exec::taker_limit` returns the ceiling
+        // unconditionally, so the branch that set this never ran.
+        rec["observed_ask"] = json!(observed_ask);
         if let Some(obj) = extra.as_object() {
             for (k, v) in obj {
                 rec[k.as_str()] = v.clone();
@@ -2252,6 +2384,30 @@ mod tests {
             classify_cancel_404(t0 + exec::BACKSTOP_AT_SECS, t0 + exec::MAKER_EXPIRY_SECS),
             Gone404::Filled
         );
+    }
+
+    #[test]
+    fn maker_runway_recheck_deadline_matches_maker_eligible() {
+        // FIX 10 (constants F2). The value passed as `rest_by_unix` must be the
+        // exact boundary `exec::maker_eligible` draws, or the re-check after
+        // exec_lock either fires early (forgoing good maker legs) or late
+        // (posting a bid with less than MIN_REST_SECS of runway).
+        let t0 = 1_784_987_100i64;
+        let rest_by = exec::backstop_at(t0) - exec::MIN_REST_SECS;
+        for offset in 0..60i64 {
+            let now = t0 + offset;
+            assert_eq!(
+                exec::maker_eligible(now, t0),
+                now <= rest_by,
+                "disagreement at T0+{offset}s"
+            );
+        }
+        // The concrete failure it closes: a decision made at T0+1 with 44s of
+        // runway executing at T0+29 after a 28s lock wait — 11s of runway left,
+        // still eligible; but at T0+41 (the derive-fourth-at-T0+12 tail) it is
+        // NOT, and the old code posted anyway.
+        assert!(exec::maker_eligible(t0 + 29, t0));
+        assert!(!exec::maker_eligible(t0 + 41, t0));
     }
 
     #[test]
