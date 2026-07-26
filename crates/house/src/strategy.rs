@@ -529,7 +529,20 @@ impl House {
             }
             any = true;
             let entry = avg.unwrap_or(px);
-            let fee = taker_fee(entry, delta) * 100.0; // cents
+            // FEE TRUTH (demo-verified 2026-07-26, work/verify-house-truth.md):
+            // fills rows carry `fee_cost` (total dollars for the row) and maker
+            // fills billed 0.000000 — the taker formula would invent ~1.7¢/fill
+            // of phantom cost, enough to flip the probe's promote/kill verdict
+            // (H9's whole edge is +0.5¢/fill). Book the exchange's own figure;
+            // the formula is only the fallback when the field is absent, and a
+            // fallback use is flagged in the record so the report can weigh it.
+            let exchange_fee: Option<f64> = fills
+                .iter()
+                .map(|f| f.fee_cents)
+                .try_fold(0.0, |acc, f| f.map(|c| acc + c));
+            let fee = exchange_fee.unwrap_or_else(|| taker_fee(entry, delta) * 100.0);
+            let fee_estimated = exchange_fee.is_none();
+            let all_maker = kalshi::fills_all_maker(&fills);
             let in_catalyst = signal::in_catalyst_window(now, &self.catalysts);
             {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -558,7 +571,8 @@ impl House {
                 LOG,
                 json!({"event": "house_fill", "book": book.label, "ticker": ticker,
                        "side": side.as_str(), "count": delta, "entry_cents": entry,
-                       "mid_at_fill": mid, "fee_cents": fee, "in_catalyst": in_catalyst,
+                       "mid_at_fill": mid, "fee_cents": fee, "fee_estimated": fee_estimated,
+                       "all_maker": all_maker, "in_catalyst": in_catalyst,
                        "order_id": oid}),
             );
             alert::notify(
