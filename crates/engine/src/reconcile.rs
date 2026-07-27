@@ -308,6 +308,16 @@ async fn reconcile_exchange_truth(eng: &Engine) -> Result<()> {
         .await
         .context("balance read (divergence check)")?;
     let real_cash = bal_cents as f64 / 100.0;
+    // EXTERNAL-CASH LEDGER (2026-07-27, fired live: the LIP probe's fills moved
+    // $11.07 of real cash in the SHARED account and the breaker correctly saw
+    // "missing money" and halted — the money wasn't missing, it was in probe
+    // positions nestor's ledger can't see. Until side operations live in their
+    // own subaccount (R153), the operator records their cash effects in
+    // data/external_cash.jsonl: {"delta_dollars": -11.07, "note": "..."} shifts
+    // expected cash; {"pending_payout_dollars": 26.0, ...} widens ONLY the
+    // positive side (expected future credits, e.g. probe settlements/rewards).
+    // Missing-money protection stays tight around the shifted expectation.
+    let (ext_cash, ext_pending) = read_external_cash();
     let (expected_cash, resting_reserved, house_cash, pending_payout) = {
         let r = eng.risk.lock().unwrap_or_else(|e| e.into_inner());
         (
@@ -317,9 +327,11 @@ async fn reconcile_exchange_truth(eng: &Engine) -> Result<()> {
             r.pending_payout(),
         )
     };
+    let expected_cash = expected_cash + ext_cash;
     let delta_signed = real_cash - expected_cash;
     let divergence = delta_signed.abs();
-    let threshold = breaker_threshold(delta_signed, resting_reserved, pending_payout);
+    let threshold =
+        breaker_threshold(delta_signed, resting_reserved, pending_payout + ext_pending);
 
     // FREE EVIDENCE (reality F1): the first live pass that lands while an order
     // rests answers the resting-collateral question outright. Record it.
@@ -493,4 +505,31 @@ mod f8_tests {
         // No open positions: the old tight symmetric behavior exactly.
         assert_eq!(breaker_threshold(5.0, 0.0, 0.0), breaker_threshold(-5.0, 0.0, 0.0));
     }
+}
+
+/// Sum the operator's external-cash ledger (`data/external_cash.jsonl`).
+/// Returns (Σ delta_dollars, Σ pending_payout_dollars). Absent file = (0, 0).
+/// Malformed lines are skipped loudly rather than trusted.
+fn read_external_cash() -> (f64, f64) {
+    let mut cash = 0.0;
+    let mut pending = 0.0;
+    if let Ok(text) = std::fs::read_to_string("data/external_cash.jsonl") {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(v) => {
+                    cash += v.get("delta_dollars").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    pending += v
+                        .get("pending_payout_dollars")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(0.0);
+                }
+                Err(e) => eprintln!("[reconcile] external_cash.jsonl bad line skipped: {e}"),
+            }
+        }
+    }
+    (cash, pending)
 }
