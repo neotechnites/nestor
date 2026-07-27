@@ -63,15 +63,26 @@ pub enum Skip {
     PrevNotSettled,
     /// The settled chain doesn't abut the current market at all.
     WindowMismatch,
-    /// Current market is past its first 60 seconds (ttc < 14 min). Terminal.
+    /// Current market is past its first 60 seconds (ttc < 14 min). TERMINAL —
+    /// the entry window for this market is over and cannot come back.
     NotEntryWindow { ttc: i64 },
+    /// The market has not opened yet and is further out than the pre-T0 rest
+    /// lead allows (ttc > 900 + [`PRE_T0_LEAD_SECS`]). RETRYABLE: "too early" is
+    /// a state the clock cures, unlike "too late".
+    ///
+    /// SPLIT 2026-07-27 (charter item 3). Both cases used to return
+    /// `NotEntryWindow`, and `retryable()` was true only for `PrevNotSettled`,
+    /// so ANY market first evaluated before its open was rejected terminally and
+    /// never re-examined — which made a pre-T0 maker leg unreachable by
+    /// construction (lane-VENUE-MECHANICS-jul27 §"Second blocker").
+    TooEarly { ttc: i64 },
 }
 
 impl Skip {
     /// Retryable skips may still convert to an entry on a later pass within the
     /// entry window; terminal ones cannot.
     pub fn retryable(&self) -> bool {
-        matches!(self, Skip::PrevNotSettled)
+        matches!(self, Skip::PrevNotSettled | Skip::TooEarly { .. })
     }
 
     pub fn as_str(&self) -> String {
@@ -82,6 +93,7 @@ impl Skip {
             Skip::PrevNotSettled => "prev_not_settled".into(),
             Skip::WindowMismatch => "window_mismatch".into(),
             Skip::NotEntryWindow { ttc } => format!("not_entry_window(ttc={ttc}s)"),
+            Skip::TooEarly { ttc } => format!("too_early(ttc={ttc}s)"),
         }
     }
 }
@@ -90,6 +102,24 @@ impl Skip {
 pub const WINDOW_SECS: i64 = 900;
 /// Entry only while time-to-close ≥ 14 min (= within 60s of open).
 pub const MIN_TTC_SECS: i64 = 840;
+
+/// How far BEFORE a window's T0 an entry may be decided (and a maker leg
+/// rested). ttc for a not-yet-open window is `WINDOW_SECS + (T0 − now)`, so this
+/// widens `detect`'s upper bound to `WINDOW_SECS + PRE_T0_LEAD_SECS`.
+///
+/// DERIVED, NOT CHOSEN. The pre-T0 entry is only as good as the derive-fourth
+/// call that authorises it, and `crate::derive` refuses any call whose in-window
+/// samples span less than `derive::MIN_SPAN_SECS` (50s) of the
+/// `derive::AVG_WINDOW_SECS` (60s) settlement average. At 1 Hz sampling the
+/// earliest instant at which that EXISTING, UNCHANGED gate can be satisfied is
+/// therefore `AVG_WINDOW_SECS − MIN_SPAN_SECS = 10s` before the close. Resting
+/// earlier is impossible, not merely unwise — so the bound is the derivation's,
+/// and this constant just states it where `detect` can see it.
+///
+/// Venue side (demo-proven 2026-07-27): a POST at T0−34.9s returns 201 and the
+/// order rests across the boundary; T0−399s returns 503. 10s is inside the
+/// proven-good region with 25s of margin.
+pub const PRE_T0_LEAD_SECS: i64 = crate::derive::AVG_WINDOW_SECS - crate::derive::MIN_SPAN_SECS;
 
 /// Evaluate one candidate market against the newest settled windows.
 /// `settled_desc` must be sorted newest-first with non-empty results.
@@ -137,9 +167,17 @@ pub fn detect(settled_desc: &[SettledWindow], cur: &Candidate, now: i64) -> Resu
         });
     }
 
-    // First 60 seconds only (redirect rule 4: ttc ≥ 14 min).
+    // First 60 seconds only (redirect rule 4: ttc ≥ 14 min) — plus the pre-T0
+    // lead, during which the market exists but has not opened (ttc > 900).
+    //
+    // The two out-of-band directions are DISTINCT skips (charter item 3): above
+    // the band the clock is still walking toward the window (retryable); below
+    // it the window is gone (terminal).
     let ttc = cur.close_unix - now;
-    if !(MIN_TTC_SECS..=WINDOW_SECS).contains(&ttc) {
+    if ttc > WINDOW_SECS + PRE_T0_LEAD_SECS {
+        return Err(Skip::TooEarly { ttc });
+    }
+    if ttc < MIN_TTC_SECS {
         return Err(Skip::NotEntryWindow { ttc });
     }
 
@@ -254,6 +292,49 @@ mod tests {
             detect(&s, &c, T + 61),
             Err(Skip::NotEntryWindow { ttc: 839 })
         );
+    }
+
+    #[test]
+    fn pre_t0_lead_is_the_derivations_own_floor() {
+        // Not a chosen number: the earliest instant the UNCHANGED derive gate
+        // (MIN_SPAN_SECS of AVG_WINDOW_SECS) can be met at 1 Hz.
+        assert_eq!(PRE_T0_LEAD_SECS, 10);
+        assert_eq!(
+            PRE_T0_LEAD_SECS,
+            crate::derive::AVG_WINDOW_SECS - crate::derive::MIN_SPAN_SECS
+        );
+    }
+
+    #[test]
+    fn next_window_is_enterable_inside_the_pre_t0_lead() {
+        // The NEXT market opens at T (=T0) and closes at T+900. Evaluated 10s
+        // before its open, ttc = 910 — which the old `..=WINDOW_SECS` bound
+        // rejected terminally.
+        let s = settled(&[T, T - 900, T - 1800, T - 2700], "yes");
+        let c = Candidate {
+            open_unix: Some(T),
+            close_unix: T + WINDOW_SECS,
+            yes_ask: None,
+            no_ask: None,
+        };
+        let e = detect(&s, &c, T - PRE_T0_LEAD_SECS).unwrap();
+        assert!(!e.buy_yes);
+        assert_eq!(e.ask, None); // unpriced pre-T0: the book does not exist yet
+    }
+
+    #[test]
+    fn too_early_and_too_late_are_distinct_and_only_too_early_retries() {
+        let s = settled(&[T, T - 900, T - 1800, T - 2700], "yes");
+        let c = cand(T, 60.0, 40.0);
+        // 11s before open → ttc 911 > 900+10 → TOO EARLY, retryable.
+        let early = detect(&s, &c, T - PRE_T0_LEAD_SECS - 1).unwrap_err();
+        assert_eq!(early, Skip::TooEarly { ttc: 911 });
+        assert!(early.retryable());
+        // 61s after open → ttc 839 → TOO LATE, terminal.
+        let late = detect(&s, &c, T + 61).unwrap_err();
+        assert_eq!(late, Skip::NotEntryWindow { ttc: 839 });
+        assert!(!late.retryable());
+        assert_ne!(early.as_str(), late.as_str());
     }
 
     #[test]
