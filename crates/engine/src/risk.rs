@@ -515,12 +515,62 @@ impl RiskManager {
         self.state.open.iter().any(|p| p.ticker == ticker)
     }
 
+    /// THE SETTLED SET (R171 / incident #5): has this ticker's P&L already been
+    /// booked? A market on Kalshi settles EXACTLY ONCE, so a ticker in here can
+    /// never legitimately be opened, adopted, or settled again — whatever local
+    /// state or the exchange's lagging indexes say.
+    ///
+    /// Derived from the persisted `state.settled` vector rather than a new field:
+    /// that vector already IS the record of what we booked and it already
+    /// survives restarts. A second, parallel record of the same fact could
+    /// disagree with it — and two views of one fact diverging is exactly the
+    /// failure class this guard exists to stop.
+    ///
+    /// Linear scan, deliberately un-indexed: the list is bounded at
+    /// `MAX_SETTLED` (1000) and this runs at most once per exchange position per
+    /// reconcile pass — a thousand string compares next to a network round-trip.
+    /// A HashSet index would be a second copy of the same truth needing sync on
+    /// every push and drain (the divergence risk above) bought with nothing.
+    ///
+    /// WINDOW SUFFICIENCY of the MAX_SETTLED=1000 drain bound: a re-book needs
+    /// the ticker to STILL be visible on the exchange (that is adoption's whole
+    /// precondition), i.e. inside the settlement/payout lag — minutes to hours
+    /// (F8 family; the metals still showed `position_fp != 0` 41 minutes after
+    /// nestor booked them on 2026-07-27). Nestor's settlement ceiling is ~200/day
+    /// (two 15-minute crypto series = 192 windows, plus a handful of daily
+    /// metals/CPI markets), so 1000 settlements ≈ 5 days of history versus an
+    /// hours-long exposure window — two orders of magnitude of margin. The guard
+    /// would only degrade if the settlement RATE ever exceeded ~1000 inside one
+    /// exchange lag window; raise MAX_SETTLED if a new sleeve ever approaches it.
+    pub fn is_settled(&self, ticker: &str) -> bool {
+        self.settled_record(ticker).is_some()
+    }
+
+    /// The settlement we booked for `ticker`, if any — the settled set's ONE
+    /// implementation ([`is_settled`](Self::is_settled) is defined in terms of
+    /// it, so a caller can never disagree with the guard about membership).
+    ///
+    /// Callers need the RECORD, not just the bit, for two reasons: `won` decides
+    /// whether the exchange still owes us a payout (the divergence breaker's
+    /// evidence, review F1), and naming the blocking entry in a log is what tells
+    /// an operator who has legitimately repaired `state.json` which stale
+    /// `Settled` row is refusing their ticker (review F3).
+    pub fn settled_record(&self, ticker: &str) -> Option<Settled> {
+        self.state
+            .settled
+            .iter()
+            .find(|s| s.ticker == ticker)
+            .cloned()
+    }
+
     /// Adopt an ORPHAN position discovered on the exchange but missing from local
     /// state (fix 1b) — e.g. a fill that landed after a lost ack. Conservative:
     /// no fee is charged (already paid on the exchange), `entry_cents` is the
     /// exchange cost basis when known else a worst-case, and it counts toward the
     /// daily budget so caps see the real exposure. Idempotent: a no-op if a
-    /// position on `ticker` is already tracked. Returns true if newly adopted.
+    /// position on `ticker` is already tracked, and a REFUSAL for a ticker we
+    /// have already settled (see the settled-set guard below). Returns true if
+    /// newly adopted.
     pub fn adopt_orphan(
         &mut self,
         ticker: &str,
@@ -530,6 +580,30 @@ impl RiskManager {
         cluster: &str,
     ) -> bool {
         if count <= 0 || self.has_open(ticker) {
+            return false;
+        }
+        // SETTLED-SET GUARD (R171 / incident #5, 2026-07-27 — the leg that DRIVES
+        // the re-book loop). "The exchange shows a position we do not have open"
+        // is NOT sufficient evidence of an orphan once we have settled that
+        // ticker: Kalshi's settlement/payout indexes lag the booking by minutes
+        // to hours (same lagging-index family as F8 and the 36s settled filter),
+        // so the exchange keeps reporting a non-zero position on a market that is
+        // over. Adopting it re-creates the position we just closed — which
+        // inflates `day_spent` by its stake and hands the next reconcile pass
+        // something to settle again (+$2.17/pass, 8 passes, bankroll $122.64 vs a
+        // real ~$106 on 2026-07-27).
+        //
+        // This is an EXPECTED condition during the lag, not an incident, so it
+        // logs at ordinary volume and raises no operator alert and no halt — the
+        // ORPHAN ADOPTED alert in reconcile deliberately does not fire here.
+        // (Reconcile refuses these one step earlier, with the payout evidence the
+        // divergence breaker needs; this is the backstop for any other caller.)
+        if let Some(rec) = self.settled_record(ticker) {
+            crate::logging::info(format!(
+                "orphan adoption REFUSED {ticker} — already in the settled set \
+                 (won={} pnl=${:.2}); exchange payout lag, not an orphan",
+                rec.won, rec.pnl
+            ));
             return false;
         }
         // Worst-case entry: assume we paid the top of the band, so the position's
@@ -600,6 +674,65 @@ impl RiskManager {
     /// (e.g. a same-day-settling crypto sleeve). Cross-day weather settlements
     /// never touch today's counter.
     pub fn settle(&mut self, ticker: &str, won: bool) -> Option<SettleOutcome> {
+        // SETTLED-SET GUARD (R171 / incident #5, backstop leg). A ticker in the
+        // settled set has had its P&L booked; a Kalshi market settles exactly
+        // once, so a position on that ticker being open AGAIN is a phantom, never
+        // a genuine re-entry — no strategy can buy a market that is over. Booking
+        // it a second time invents money (that is precisely how bankroll read
+        // $122.64 against a real ~$106).
+        //
+        // The phantom is DROPPED here rather than left in `open`. Deriving that
+        // choice: incident #5's actual mechanism was a hand-edit of state.json
+        // under the running writer, so the in-memory `open` never lost the
+        // settled positions — refusing without repairing would leave the phantom
+        // stake eating cluster/portfolio/daily room forever, and the only
+        // recovery would be hand-editing state.json under the live writer, i.e.
+        // repeating the incident. In-process repair is the one recovery path that
+        // does not require the operation that caused this. No money moves: the
+        // P&L was already realized on the first settle, so removing the duplicate
+        // only stops it from being counted as exposure twice.
+        //
+        // `day_spent` is deliberately NOT rewound: we cannot know this phantom
+        // ever added to it (fraction-sized positions never do, and the trading
+        // day may have rolled since), and an over-stated budget counter only
+        // trades LESS. Under-stating it would let the day over-spend.
+        //
+        // The drop also HALTS (review F2). Unlike the adoption refusal — which is
+        // an ordinary payout lag — there is no benign way to reach this branch:
+        // either local state regressed (incident #5's clobbered state.json), or
+        // `on_fill` booked a position on a market that is over. Both mean the
+        // ledger just proved itself wrong, and dropping the phantom FREES cap room
+        // — continuing to trade on that ledger with more room than before is
+        // fail-open, the one direction a money bot may never take. Halting is
+        // recoverable by an operator (`nestor resume`); a wrong ledger spending
+        // freed room is not.
+        //
+        // The log NAMES the blocking `Settled` row (review F3): an operator who
+        // has legitimately repaired `state.json` needs to know that this stale
+        // entry, not their repair, is what refuses the ticker.
+        if let Some(rec) = self.settled_record(ticker) {
+            if let Some(idx) = self.state.open.iter().position(|p| p.ticker == ticker) {
+                let pos = self.state.open.remove(idx);
+                let msg = format!(
+                    "RE-SETTLE REFUSED {ticker} — blocked by settled record \
+                     (ticker={} won={} pnl=${:.2}); dropped a phantom open position of {}x @ \
+                     {}c (${:.2} stake) without booking P&L, and HALTED. STATE REGRESSED: stop \
+                     the service before editing state.json; if the ledger was repaired, THAT \
+                     settled row is what blocks this ticker.",
+                    rec.ticker,
+                    rec.won,
+                    rec.pnl,
+                    pos.count,
+                    pos.entry_cents,
+                    pos.stake(),
+                );
+                crate::logging::info(format!("ALERT: {msg}"));
+                eprintln!("risk: {msg}");
+                // halt() persists, so the drop is durable with the kill-switch.
+                self.halt();
+            }
+            return None;
+        }
         let idx = self.state.open.iter().position(|p| p.ticker == ticker)?;
         let pos = self.state.open.remove(idx);
         let entry = pos.entry_cents as f64 / 100.0;
@@ -627,6 +760,9 @@ impl RiskManager {
             ticker: pos.ticker.clone(),
             won,
             pnl,
+            // What OUR ledger closed (review N1) — the bound on how much payout
+            // the breaker may ever believe the exchange owes us on this ticker.
+            count: pos.count,
         });
         // Keep only the most recent settlements in live state — the full history
         // lives in the JSONL trade log. Bounds state.json growth over time.
@@ -1336,6 +1472,287 @@ mod tests {
             "adoption must hand off, not double-count: {}",
             r.expected_cash()
         );
+    }
+
+    // ---- SETTLED-SET GUARD (R171 / incident #5, 2026-07-27) -----------------
+    // Today's live shape: 5 settled volbook metal positions re-booked 8+ times at
+    // ~$2.17 a pass, bankroll reading $122.64 against a real ~$106, `settled`
+    // holding ~50 entries for 5 real settlements and `day_spent` inflated by a
+    // re-adopted stake every pass. Both legs of that loop are covered below.
+
+    /// A store two managers can share, so a test can prove something survives a
+    /// RESTART (`MemoryStore` is not cloneable, so the older reload test above
+    /// could only ever drive one manager).
+    #[derive(Clone, Default)]
+    struct SharedStore(std::sync::Arc<std::sync::Mutex<Option<State>>>);
+
+    impl StateStore for SharedStore {
+        fn load(&self) -> Result<Option<State>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn save(&self, s: &State) -> Result<()> {
+            *self.0.lock().unwrap() = Some(s.clone());
+            Ok(())
+        }
+    }
+
+    /// A flat-sized metals order (the sleeve that produced the incident).
+    fn flat_order(ticker: &str, count: i64, price: i64) -> Order {
+        Order {
+            strategy: "volbook".into(),
+            ticker: ticker.into(),
+            side: Side::Yes,
+            count,
+            limit_cents: price,
+            cluster: "metals".into(),
+            sizing: SizingHint::Flat,
+        }
+    }
+
+    #[test]
+    fn a_settled_ticker_is_never_readopted_as_an_orphan() {
+        // (a) The DRIVING leg. After settlement the exchange still reports the
+        // position for minutes-to-hours (metals: still non-zero 41 min after
+        // booking). That is a payout lag, not an orphan — refuse it.
+        let mut r = rm(106.03);
+        r.begin_day("2026-07-27");
+        r.on_fill(&flat_order("KXGOLDD-26JUL27-T4110", 2, 40));
+        assert!(r.settle("KXGOLDD-26JUL27-T4110", true).is_some());
+        let bankroll = r.status().bankroll;
+        let day_spent = r.state.day_spent;
+
+        assert!(
+            !r.adopt_orphan("KXGOLDD-26JUL27-T4110", Side::Yes, 2, Some(40), "orphan"),
+            "a settled ticker must never be adopted back as an orphan"
+        );
+        assert!(r.open_positions().is_empty());
+        assert_eq!(
+            r.state.day_spent, day_spent,
+            "refusal must not spend budget"
+        );
+        assert_eq!(r.status().bankroll, bankroll);
+        assert!(
+            !r.status().halted,
+            "an adoption refusal is an ordinary payout lag — it must never halt"
+        );
+    }
+
+    #[test]
+    fn re_settling_a_settled_ticker_books_no_money() {
+        // (b) The BACKSTOP leg: refuse, return None, move nothing.
+        let mut r = rm(106.03);
+        r.begin_day("2026-07-27");
+        r.on_fill(&flat_order("KXSILVERD-26JUL27-T38", 3, 40));
+        let first = r.settle("KXSILVERD-26JUL27-T38", true).unwrap();
+        let bankroll = r.status().bankroll;
+        let day_spent = r.state.day_spent;
+
+        assert!(r.settle("KXSILVERD-26JUL27-T38", true).is_none());
+        assert!(r.settle("KXSILVERD-26JUL27-T38", false).is_none());
+        assert_eq!(
+            r.status().bankroll,
+            bankroll,
+            "no P&L on a refused re-settle"
+        );
+        assert_eq!(r.state.day_spent, day_spent);
+        assert_eq!(
+            r.state.settled.len(),
+            1,
+            "one real settlement must leave exactly one settled record"
+        );
+        assert!(first.pnl > 0.0);
+        // Nothing was open, so nothing regressed: a no-op re-settle is not a halt.
+        assert!(!r.status().halted);
+    }
+
+    #[test]
+    fn the_eight_pass_rebook_loop_is_dead() {
+        // The incident reproduced end to end: settle → adopt → settle, eight
+        // times. Every number that moved on 2026-07-27 must now stand still.
+        let mut r = rm(106.03);
+        r.begin_day("2026-07-27");
+        r.on_fill(&flat_order("KXCOPPERD-26JUL27-T512", 5, 40));
+        let out = r.settle("KXCOPPERD-26JUL27-T512", true).unwrap();
+        let bankroll = r.status().bankroll;
+        let day_spent = r.state.day_spent;
+        let peak = r.status().peak;
+
+        for pass in 0..8 {
+            assert!(
+                !r.adopt_orphan("KXCOPPERD-26JUL27-T512", Side::Yes, 5, Some(40), "orphan"),
+                "pass {pass}: re-adopted a settled ticker"
+            );
+            assert!(
+                r.settle("KXCOPPERD-26JUL27-T512", true).is_none(),
+                "pass {pass}: re-booked a settled ticker"
+            );
+        }
+        assert_eq!(
+            r.status().bankroll,
+            bankroll,
+            "bankroll drifted (was +$2.17/pass)"
+        );
+        assert_eq!(
+            r.state.day_spent, day_spent,
+            "day_spent inflated (was +stake/pass)"
+        );
+        assert_eq!(r.status().peak, peak);
+        assert_eq!(
+            r.state.settled.len(),
+            1,
+            "settled list grew (was ~10x the real count)"
+        );
+        assert!(r.open_positions().is_empty());
+        assert!(out.won);
+        // The whole loop is the payout-lag path: loud, but never a halt.
+        assert!(!r.status().halted, "the payout-lag path must keep trading");
+    }
+
+    #[test]
+    fn a_phantom_open_position_on_a_settled_ticker_is_dropped_not_rebooked() {
+        // Incident #5's ACTUAL mechanism (note 41 §0): state.json was hand-edited
+        // under the running writer, so the in-memory `open` never lost the
+        // positions we had already settled — no adoption needed to re-book them.
+        // The guard must refuse the money AND clear the phantom, because the only
+        // other way out is hand-editing state under a live writer, i.e. the very
+        // operation that caused this.
+        let mut r = rm(106.03);
+        r.begin_day("2026-07-27");
+        r.on_fill(&flat_order("KXGOLDD-26JUL27-T4085", 2, 40));
+        r.settle("KXGOLDD-26JUL27-T4085", true).unwrap();
+        let bankroll = r.status().bankroll;
+
+        r.state.open.push(Position {
+            strategy: "phantom".into(),
+            ticker: "KXGOLDD-26JUL27-T4085".into(),
+            side: Side::Yes,
+            count: 2,
+            entry_cents: 40,
+            cluster: "metals".into(),
+            fee: 0.0,
+            day: "2026-07-27".into(),
+        });
+        assert!(r.settle("KXGOLDD-26JUL27-T4085", true).is_none());
+        assert!(
+            r.open_positions().is_empty(),
+            "the phantom must be dropped, not left eating cluster/portfolio room"
+        );
+        assert_eq!(
+            r.status().bankroll,
+            bankroll,
+            "dropping a phantom moves no money"
+        );
+        assert_eq!(r.state.settled.len(), 1);
+        // REVIEW F2: the drop frees cap room on a ledger that just proved itself
+        // wrong. Trading on with MORE room than before is fail-open — halt.
+        assert!(
+            r.status().halted,
+            "a settle-guard drop must halt: state regressed and the drop freed room"
+        );
+        // The blocking record is still there and still names the ticker, which is
+        // what the operator-facing log quotes (review F3).
+        let rec = r.settled_record("KXGOLDD-26JUL27-T4085").unwrap();
+        assert_eq!(rec.ticker, "KXGOLDD-26JUL27-T4085");
+        assert!(rec.won);
+        // Review N1: the record carries what OUR ledger closed, which is what
+        // bounds the breaker's missing-money grace.
+        assert_eq!(rec.count, 2);
+    }
+
+    #[test]
+    fn unsettled_orphans_and_first_settlements_are_unaffected() {
+        // (c) The guard must not break the paths it sits on: a genuine orphan is
+        // still adopted, a first settlement still books, and a DIFFERENT ticker
+        // is never caught by another ticker's settlement.
+        let mut r = rm(100.0);
+        r.begin_day("2026-07-27");
+        assert!(r.adopt_orphan("KXETH15M-ORPH", Side::No, 5, Some(40), "orphan"));
+        assert_eq!(r.open_positions().len(), 1);
+        assert!((r.state.day_spent - 2.0).abs() < 1e-9);
+
+        // Win pays 5 x (1.00 − 0.40) = $3.00, and an adopted orphan carries no fee.
+        let out = r.settle("KXETH15M-ORPH", true).unwrap();
+        assert!((out.pnl - 3.0).abs() < 1e-9);
+        // A neighbouring market is untouched by that settlement.
+        assert!(!r.is_settled("KXETH15M-OTHER"));
+        assert!(r.adopt_orphan("KXETH15M-OTHER", Side::Yes, 3, Some(30), "orphan"));
+        assert!(r.settle("KXETH15M-OTHER", false).is_some());
+    }
+
+    #[test]
+    fn the_settled_set_survives_persist_and_reload() {
+        // (d) The set must be a RESTART-proof fact, not process memory —
+        // `state.settled` is persisted, which is exactly why it is the record.
+        let store = SharedStore::default();
+        let mut r = RiskManager::load_or_init(
+            RiskConfig::default(),
+            Box::new(store.clone()),
+            106.03,
+            false,
+            true,
+        )
+        .unwrap();
+        r.begin_day("2026-07-27");
+        r.on_fill(&flat_order("KXSILVERD-26JUL27-T39", 2, 40));
+        assert!(r.settle("KXSILVERD-26JUL27-T39", true).is_some());
+        let bankroll = r.status().bankroll;
+        drop(r);
+
+        // Restart over the same persisted state.
+        let mut r2 = RiskManager::load_or_init(
+            RiskConfig::default(),
+            Box::new(store.clone()),
+            106.03,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(r2.is_settled("KXSILVERD-26JUL27-T39"));
+        // The N1 ledger bound must survive the JSON round-trip too, or the
+        // breaker silently falls back to trusting the shared account's net.
+        assert_eq!(
+            r2.settled_record("KXSILVERD-26JUL27-T39").unwrap().count,
+            2
+        );
+        assert!(!r2.adopt_orphan("KXSILVERD-26JUL27-T39", Side::Yes, 2, Some(40), "orphan"));
+        assert!(r2.settle("KXSILVERD-26JUL27-T39", true).is_none());
+        assert!(r2.open_positions().is_empty());
+        assert_eq!(r2.status().bankroll, bankroll);
+    }
+
+    #[test]
+    fn settling_a_winner_runs_expected_cash_ahead_by_exactly_the_payout() {
+        // The arithmetic under the divergence breaker's new missing-money grace
+        // (review F1). It is what justifies counting $1.00 x count and nothing
+        // else: booking a winner moves `expected_cash` by the FULL payout (the
+        // win lands in bankroll AND the stake leaves total_at_risk), while real
+        // cash does not move until the exchange pays.
+        let cfg = RiskConfig {
+            flat_usd: 4.0,
+            daily_budget_usd: 60.0,
+            ..RiskConfig::default()
+        };
+        let mut r =
+            RiskManager::load_or_init(cfg, Box::new(MemoryStore::default()), 100.0, false, true)
+                .unwrap();
+        r.begin_day("2026-07-27");
+        r.on_fill(&flat_order("KXBTC15M-26JUL27-W", 10, 40));
+        // Real exchange cash after the fill: $100 − $4.00 stake − fee.
+        let real_cash = 100.0 - 4.0 - taker_fee(40, 10);
+        assert!(
+            (r.expected_cash() - real_cash).abs() < 1e-9,
+            "ledger and exchange must agree before the settlement"
+        );
+
+        assert!(r.settle("KXBTC15M-26JUL27-W", true).is_some());
+        // Real cash is UNCHANGED (payout not paid yet); expected has run ahead.
+        let delta = real_cash - r.expected_cash();
+        assert!(
+            (delta + 10.0).abs() < 1e-9,
+            "gap must equal $1.00 x 10 contracts exactly, got {delta}"
+        );
+        // Which is a $10 miss against a $2 threshold — the false halt F1 removes.
+        assert!(delta.abs() > 2.0);
     }
 
     #[test]
