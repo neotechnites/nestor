@@ -204,6 +204,30 @@ enum Discovery {
     Timeout,
 }
 
+/// A quoted ask is REAL only if it is strictly inside (0, 100)¢.
+///
+/// MEASURED ON PROD 2026-07-27, and load-bearing precisely because of this
+/// change. A 15m market with no book does not omit its ask fields — it reports
+/// `yes_ask_dollars: "0.0000"` and `no_ask_dollars: "1.0000"`, which
+/// `Market::yes_ask_cents_f64` faithfully parses to `Some(0.0)` and
+/// `Some(100.0)`. Both are impossible quotes: the tapered deci-cent grid tops
+/// out at 99.9¢ and nobody sells a contract for nothing. They are the venue's
+/// encoding of "unpriced".
+///
+/// Why it was harmless before and is not now: list discovery first saw a window
+/// at a median T0+21-32s, by which time the book existed. Direct-ticker
+/// discovery sees it from T0+0 — and prod shows KXBTC15M still reporting
+/// `0.0000 / 1.0000` at T0+0, +3 and +6, only pricing at T0+12 (KXETH15M was
+/// two-sided 0.65/0.50 at T0+0.0s). Left alone, a `Some(0.0)` yes-ask would
+/// make `exec::paper_maker_fills(Some(0.0), 40)` TRUE — a phantom 40¢ paper
+/// fill on a market with no book — and would write `ask_at_signal: 0.0` into
+/// the participation tape. Live is unaffected (the exchange decides fills and
+/// `taker_limit` sends the ceiling regardless), so this is a paper-fidelity and
+/// tape-integrity fix, not a policy change.
+fn real_ask(a: Option<f64>) -> Option<f64> {
+    a.filter(|&a| a > 0.0 && a < 100.0)
+}
+
 /// Coinbase product id for a Kalshi crypto series, or None if unmapped.
 fn coin_product(series: &str) -> Option<&'static str> {
     match series {
@@ -942,8 +966,13 @@ impl Streak {
                         "ticker": cur.ticker,
                         "discovery_rel_t0": now - mkt_t0,
                         "discovery_path": disc_path.as_str(),
-                        "priced": cur.yes_ask_cents_f64().is_some()
-                            || cur.no_ask_cents_f64().is_some(),
+                        // `real_ask`, not `is_some()`: an unpriced market reports
+                        // 0.0000/1.0000, so `is_some()` would call every window
+                        // priced at T0+0 and the recovery would be unmeasurable.
+                        "priced": real_ask(cur.yes_ask_cents_f64()).is_some()
+                            || real_ask(cur.no_ask_cents_f64()).is_some(),
+                        "raw_yes_ask": cur.yes_ask_cents_f64(),
+                        "raw_no_ask": cur.no_ask_cents_f64(),
                         "status": cur.status,
                     }),
                 );
@@ -963,8 +992,10 @@ impl Streak {
         let mut cand = Candidate {
             open_unix: cur.open_unix(),
             close_unix: cur.close_unix().unwrap_or(now + signal::WINDOW_SECS),
-            yes_ask: cur.yes_ask_cents_f64(),
-            no_ask: cur.no_ask_cents_f64(),
+            // `real_ask` — direct discovery reaches the no-book window, where the
+            // venue encodes "unpriced" as 0.0000 / 1.0000 rather than omitting.
+            yes_ask: real_ask(cur.yes_ask_cents_f64()),
+            no_ask: real_ask(cur.no_ask_cents_f64()),
         };
 
         // DATA CAPTURE 1 — observation log: one compact line per poll, always.
@@ -3504,6 +3535,46 @@ mod tests {
              the cancel responses above are the truth): {left:?}",
             left.len()
         );
+    }
+
+    #[test]
+    fn unpriced_is_encoded_as_zero_and_one_not_as_absent() {
+        // Verbatim from prod 2026-07-27, KXBTC15M-26JUL271330-30 at T0+0/+3/+6:
+        // `yes_ask_dollars "0.0000"`, `no_ask_dollars "1.0000"`, floor_strike
+        // null, status active — a live market with no book. The parser turns
+        // those into Some(0.0)/Some(100.0), which are not quotes.
+        let m: Market = serde_json::from_value(json!({
+            "ticker": "KXBTC15M-26JUL271330-30",
+            "close_time": "2026-07-27T17:30:00Z",
+            "yes_ask_dollars": "0.0000",
+            "no_ask_dollars": "1.0000",
+        }))
+        .unwrap();
+        assert_eq!(m.yes_ask_cents_f64(), Some(0.0)); // the raw parse
+        assert_eq!(m.no_ask_cents_f64(), Some(100.0));
+        assert_eq!(real_ask(m.yes_ask_cents_f64()), None); // what streak must see
+        assert_eq!(real_ask(m.no_ask_cents_f64()), None);
+
+        // THE BUG IT CLOSES: a 0¢ "ask" satisfies the paper maker fill model, so
+        // a fade-a-down-streak YES leg would book a phantom 40¢ paper fill on a
+        // market with no book — reachable only because direct discovery now
+        // arrives before the book exists.
+        assert!(exec::paper_maker_fills(m.yes_ask_cents_f64(), 40));
+        assert!(!exec::paper_maker_fills(real_ask(m.yes_ask_cents_f64()), 40));
+
+        // Real two-sided quotes are untouched (prod KXETH15M at T0+0.0s).
+        let e: Market = serde_json::from_value(json!({
+            "ticker": "KXETH15M-26JUL271330-30",
+            "close_time": "2026-07-27T17:30:00Z",
+            "yes_ask_dollars": "0.6500",
+            "no_ask_dollars": "0.5000",
+        }))
+        .unwrap();
+        assert_eq!(real_ask(e.yes_ask_cents_f64()), Some(65.0));
+        assert_eq!(real_ask(e.no_ask_cents_f64()), Some(50.0));
+        // And the deci-cent extremes that ARE real stay real.
+        assert_eq!(real_ask(Some(0.1)), Some(0.1));
+        assert_eq!(real_ask(Some(99.9)), Some(99.9));
     }
 
     #[test]
