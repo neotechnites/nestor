@@ -193,10 +193,17 @@ fn classify_resting_failure(status: u16, code: Option<&str>) -> (bool, bool) {
 /// append `-r{n}` so Kalshi's duplicate-coid 409 doesn't block a deliberate
 /// retry after a clean zero-fill IOC cancel.
 fn entry_coid(order: &Order, attempt: u32) -> String {
+    // Kalshi rejects coids containing '.' with 400 invalid_parameters (LIVE-
+    // PROVEN 2026-07-27: every volbook copper/silver order on a dotted ticker
+    // like KXCOPPERD-26JUL2717-T6.40 400'd; dot-free gold/silver tickers on the
+    // same pass succeeded — and the LIP probe hit the identical wall the same
+    // hour). Crypto tickers are dot-free, which is why streak never saw it.
+    // '.' -> '_' preserves determinism and restart-dedupe within each ticker.
+    let ticker = order.ticker.replace('.', "_");
     if attempt <= 1 {
-        format!("{}-{}", order.strategy, order.ticker)
+        format!("{}-{}", order.strategy, ticker)
     } else {
-        format!("{}-{}-r{attempt}", order.strategy, order.ticker)
+        format!("{}-{}-r{attempt}", order.strategy, ticker)
     }
 }
 
@@ -1049,5 +1056,28 @@ mod tests {
         assert_eq!(entry_coid(&order(), 2), "streak-KXBTC15M-26JUL251000-00-r2");
         assert_eq!(entry_coid(&order(), 3), "streak-KXBTC15M-26JUL251000-00-r3");
         assert_ne!(entry_coid(&order(), 2), entry_coid(&order(), 3));
+    }
+}
+
+#[cfg(test)]
+mod coid_charset_tests {
+    use super::*;
+    use crate::risk::Side;
+
+    #[test]
+    fn dotted_tickers_produce_dot_free_coids() {
+        let o = Order {
+            strategy: "volbook".into(),
+            ticker: "KXCOPPERD-26JUL2717-T6.40".into(),
+            side: Side::No,
+            count: 4,
+            limit_cents: 85,
+            cluster: "volbook-metal-2026-07-27".into(),
+            sizing: crate::risk::SizingHint::Flat,
+        };
+        let c = entry_coid(&o, 1);
+        assert!(!c.contains('.'), "coid must be dot-free: {c}");
+        assert_eq!(c, "volbook-KXCOPPERD-26JUL2717-T6_40");
+        assert_eq!(entry_coid(&o, 3), "volbook-KXCOPPERD-26JUL2717-T6_40-r3");
     }
 }
