@@ -2254,7 +2254,25 @@ impl Streak {
             }
         }
 
-        // (5) Truly unfilled → the taker backstop at the ceiling.
+        // (5) Truly unfilled → historically the taker backstop at the ceiling.
+        // BACKSTOP OFF BY DEFAULT (verify-bezos-claims 2026-07-27): every honest
+        // specification of every ceiling 44-48 measures NEGATIVE EV per fill
+        // (−2.38¢ at 46; the "wait for significance" gate needs ~3,350 fills and
+        // can never fire) — turning it off costs ~0.115¢/signal of modeled EV and
+        // stops taking chronically negative fills. STREAK_BACKSTOP=1 re-enables
+        // if live evidence ever argues the other way.
+        if std::env::var("STREAK_BACKSTOP").ok().as_deref() != Some("1") {
+            self.drop_leg(eng, ticker, &leg.reserve_key);
+            let mut rec = self.base_record(&leg.series, ticker, &leg.meta, EntryPath::MakerRest);
+            rec["reject_reason"] = json!("maker_unfilled_no_backstop");
+            rec["maker_cancel"] = cancel_resp.clone();
+            logging::record_path(WEEK1_LOG, rec);
+            logging::info(format!(
+                "streak {series}: {ticker} maker unfilled at T0+{}s — cancelled, backstop DISABLED (correct no-trade)",
+                now - leg.t0
+            ));
+            return;
+        }
         self.drop_leg(eng, ticker, &leg.reserve_key);
         logging::info(format!(
             "streak {series}: {} maker unfilled at T0+{}s — cancelled, IOC backstop at {}c",
