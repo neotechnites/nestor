@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono_tz::America::New_York;
 use engine::kalshi::{self, Market};
 use engine::risk::taker_fee;
 use engine::strategy::{in_window, ExecOutcome, Mode, RestOutcome, IN_WINDOW_TIMEOUT};
@@ -136,6 +137,73 @@ pub fn next_poll_delay(now_unix: i64) -> std::time::Duration {
     std::time::Duration::from_secs(secs as u64)
 }
 
+/// Construct the 15-minute market ticker for the window CLOSING at `close_unix`.
+///
+/// FORMAT (probe-proven 6/6, lane-VENUE-MECHANICS-jul27; re-verified against the
+/// live prod list 2026-07-27 on 12 tickers across both series and both the
+/// `open` and `unopened` populations):
+///   `{SERIES}-{%y%b%d uppercased}{%H%M}-{%M}`, every field taken from the CLOSE
+///   time expressed in **America/New_York** (so it follows EDT/EST, which is why
+///   this uses chrono-tz and not a fixed offset).
+///   e.g. close 2026-07-27T16:45:00Z → 12:45 ET → `KXBTC15M-26JUL271245-45`.
+///        close 2026-07-28T04:00:00Z → 00:00 ET → `KXBTC15M-26JUL280000-00`.
+///
+/// WHY IT MATTERS: this is the ONLY path to a 15m market before it appears in
+/// `GET /markets?status=open`, which is a 15.00s per-series phase-locked cache
+/// grid (BTC +6.17s, ETH +2.68s) and therefore lags T0 by a median 21.2s/31.9s —
+/// structurally incapable of reaching the T0+4.8s dip the 40¢ rest is fitted on.
+/// The single-market GET (`Kalshi::market`) is uncached.
+///
+/// Pure — unit-tested against the live-observed strings, including a DST case.
+fn window_ticker(series: &str, close_unix: i64) -> Option<String> {
+    let et = chrono::DateTime::from_timestamp(close_unix, 0)?.with_timezone(&New_York);
+    Some(format!(
+        "{series}-{}{}-{}",
+        et.format("%y%b%d").to_string().to_uppercase(),
+        et.format("%H%M"),
+        et.format("%M")
+    ))
+}
+
+/// The unix close time of the 15-minute window currently in progress at `now`
+/// (i.e. the next boundary). At an exact boundary the window that OPENS there is
+/// the one in progress, so the result is always strictly greater than `now`.
+fn current_close(now: i64) -> i64 {
+    (now.div_euclid(signal::WINDOW_SECS) + 1) * signal::WINDOW_SECS
+}
+
+/// How a market was resolved on this pass — carried onto the observation line so
+/// tomorrow's tape can measure the discovery recovery directly (charter item 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryPath {
+    /// Constructed-ticker direct GET (uncached) — the new primary.
+    Direct,
+    /// `GET /markets?status=open` — the 15s cache grid, now a fallback only.
+    List,
+}
+
+impl DiscoveryPath {
+    fn as_str(self) -> &'static str {
+        match self {
+            DiscoveryPath::Direct => "direct_ticker",
+            DiscoveryPath::List => "open_list",
+        }
+    }
+}
+
+/// Outcome of one discovery attempt for the in-progress window.
+enum Discovery {
+    Found(Market, DiscoveryPath),
+    /// Resolved nothing; `reason`/`open_count` feed the observation line.
+    Missing {
+        reason: &'static str,
+        open_count: usize,
+        path: DiscoveryPath,
+    },
+    /// The fetch blew the in-window deadline — skip the pass (as before).
+    Timeout,
+}
+
 /// Coinbase product id for a Kalshi crypto series, or None if unmapped.
 fn coin_product(series: &str) -> Option<&'static str> {
     match series {
@@ -171,6 +239,11 @@ const ANY_REASON_ALARM: u32 = 5;
 fn skip_kind(skip: &Skip) -> Option<&'static str> {
     match skip {
         Skip::NoStreak | Skip::InsufficientHistory | Skip::NotConsecutive => None,
+        // TOO EARLY is the normal resting state of the pre-T0 evaluation (the
+        // next window is simply not close enough yet), not a malfunction — it
+        // must not feed the repeat-skip alarm or the week1 tape, exactly like
+        // NoStreak. Contrast NotEntryWindow, which means the window was MISSED.
+        Skip::TooEarly { .. } => None,
         Skip::PrevNotSettled => Some("prev_not_settled"),
         Skip::WindowMismatch => Some("window_mismatch"),
         Skip::NotEntryWindow { .. } => Some("missed_entry_window"),
@@ -202,6 +275,42 @@ struct PendingDerive {
     avg: f64,
     margin_bp: f64,
     ticker: String,
+    /// Filed by the PRE-T0 path from a PARTIAL (50s of 60s) settlement window.
+    /// Marks the record so `derive_prev`'s later full-window call does not
+    /// overwrite the provenance of the call that actually drove the order.
+    pre_t0: bool,
+}
+
+/// The safety attached to a maker leg rested BEFORE its window's T0.
+///
+/// WHY IT EXISTS (the load-bearing new risk of this charter). A pre-T0 rest is
+/// authorised by a derivation over a PARTIAL settlement window: at T0−10s the
+/// spot buffer covers `[T0−60, T0−10]`, i.e. 50 of the 60 seconds Kalshi averages.
+/// The final 10 seconds can move the mean across the strike, so the provisional
+/// call can be WRONG in a way the post-T0 call never is.
+///
+/// THE BOUND, derived rather than tuned: the very first supervision pass at or
+/// after T0 re-runs the SAME `derive::derive` with the now-COMPLETE 60s buffer
+/// and cancels the bid unless the complete window still says the same thing.
+/// That lands at T0+0..1s. The reversal side opens at a median 53¢ and its dip
+/// bottoms at a median T0+4.8s (P(min ≤ 40¢) = 24%), and pre-T0 the book does
+/// not exist at all (0 of 77,263 `initialized` markets are priced; their
+/// orderbooks return empty arrays), so the exposure of a wrong provisional call
+/// is one second at the top of the window, where a 40¢ bid is ~13¢ away from the
+/// market. No new gate, no new margin, no new dial: the existing 5bp
+/// decisiveness test simply gets applied twice.
+#[derive(Clone)]
+struct PreT0Guard {
+    /// The provisional (partial-window) result that authorised the rest.
+    predicted: String,
+    /// `floor_strike` of the window closing at T0 — needed to re-derive.
+    strike: f64,
+    /// Coinbase product whose buffer feeds the re-derivation.
+    product: &'static str,
+    /// Seconds before T0 at which the bid was posted (negative rel-T0).
+    lead_secs: i64,
+    /// Set once the complete-window re-derivation has confirmed the call.
+    confirmed: bool,
 }
 
 /// Everything the participation record needs about WHY we entered, carried from
@@ -220,6 +329,9 @@ struct EntryMeta {
     jc_close: i64,
     /// Order-book snapshot at the decision moment.
     book: serde_json::Value,
+    /// Present iff this entry was decided BEFORE its window opened. See
+    /// [`PreT0Guard`].
+    pre_t0: Option<PreT0Guard>,
 }
 
 /// A resting 40¢ maker leg under supervision. One per ticker at most; dropped
@@ -349,6 +461,17 @@ impl Streak {
             .unwrap_or_else(|e| e.into_inner())
             .contains(key)
     }
+
+    /// Un-consume a dedup key. Used ONLY by the pre-T0 path when the exchange
+    /// declined the early rest: the market's one-episode-ever budget must not be
+    /// spent by an attempt that placed nothing, or a benign 503 at T0−10s would
+    /// silently cost us the whole window. Never called once anything is resting.
+    fn forget(&self, key: &str) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
 }
 
 impl Default for Streak {
@@ -473,6 +596,108 @@ impl Streak {
 
     fn refetch_key(series: &str, window_id: i64) -> String {
         format!("refetch|{series}|{window_id}")
+    }
+
+    /// Latch key: the constructed ticker did not resolve for this window, so the
+    /// remaining passes of the window go straight to the list (see
+    /// [`Self::discover_current`] for why the latch is a BUDGET device).
+    fn direct_off_key(series: &str, window_id: i64) -> String {
+        format!("directoff|{series}|{window_id}")
+    }
+
+    /// Latch key: the pre-T0 rest for the window opening at `t0` was declined
+    /// (venue, risk, or runway). One attempt per window per series — see the
+    /// `stand_down` closure in [`Self::place_maker`].
+    fn pre_t0_off_key(series: &str, t0: i64) -> String {
+        format!("pret0off|{series}|{t0}")
+    }
+
+    /// Resolve the market for the 15-minute window in progress at `now`.
+    ///
+    /// PRIMARY — constructed-ticker direct GET. `Kalshi::market()` is the
+    /// uncached single-market endpoint; the ticker is fully determined by the
+    /// close time, so no index has to have caught up for us to see the market.
+    /// This is the whole fix: `GET /markets?status=open` is a 15.00s per-series
+    /// phase-locked cache grid (BTC +6.17s ± 0.16, ETH +2.68s ± 0.52, 16/16
+    /// on-grid), so its first sighting of a new window lands at a median T0+21.2s
+    /// (BTC) / T0+31.9s (ETH); reconstructed on nestor's own `data/obs/` over
+    /// n=536 windows, only 1.5% of windows were first observed by the T0+4.8s
+    /// dip bottom the 40¢ rest is fitted on. The direct GET returns the market at
+    /// T0−10s and first PRICED at a median T0+5.4s / T0+9.6s.
+    ///
+    /// FALLBACK — the old list, used only when the constructed ticker fails to
+    /// resolve, and then LATCHED for the rest of the window.
+    ///
+    /// REQUEST BUDGET (the 429s at 05:58Z are live evidence of pressure). The
+    /// prod `status=open` list for a 15m series returns exactly 1 market with an
+    /// empty cursor, i.e. 1 request — the same as one direct GET. So the happy
+    /// path is request-NEUTRAL, one-for-one. A failed direct GET costs one extra
+    /// request on the pass that discovers the failure and ZERO thereafter (the
+    /// latch), bounding the worst case at +1 request per window per series
+    /// instead of +1 per pass. A retryable status (429/5xx) on the direct GET is
+    /// propagated WITHOUT trying the list: doubling our rate under a 429 is the
+    /// one thing we must never do.
+    async fn discover_current(
+        &self,
+        eng: &Engine,
+        series: &str,
+        now: i64,
+        window_id: i64,
+    ) -> Result<Discovery> {
+        let close_unix = current_close(now);
+
+        if !self.seen_contains(&Self::direct_off_key(series, window_id)) {
+            if let Some(ticker) = window_ticker(series, close_unix) {
+                match in_window(eng.kalshi.market(&ticker)).await {
+                    Ok(Ok(m)) if m.close_unix() == Some(close_unix) => {
+                        return Ok(Discovery::Found(m, DiscoveryPath::Direct));
+                    }
+                    // Resolved, but not the window we asked for: the format
+                    // assumption is wrong. Latch off and fall back THIS pass.
+                    Ok(Ok(m)) => {
+                        logging::info(format!(
+                            "streak {series}: constructed ticker {ticker} resolved to close {:?}, \
+                             expected {close_unix} — falling back to the open list for this window",
+                            m.close_unix()
+                        ));
+                        self.first_time(Self::direct_off_key(series, window_id));
+                    }
+                    // 404 = the ticker does not exist. 15m markets are created
+                    // hours ahead (the unopened population has a median 16.1h
+                    // lead), so this is a format/schedule fault, not a race.
+                    Ok(Err(e)) if engine::net::http_status(&e) == Some(404) => {
+                        logging::info(format!(
+                            "streak {series}: constructed ticker {ticker} 404 — falling back to \
+                             the open list for this window ({e})"
+                        ));
+                        self.first_time(Self::direct_off_key(series, window_id));
+                    }
+                    // Anything else (429/5xx/transport) is TRANSIENT. Do not
+                    // latch (the format is probably fine) and do NOT also hit
+                    // the list — propagate so the driving loop backs off.
+                    Ok(Err(e)) => return Err(e),
+                    Err(_elapsed) => return Ok(Discovery::Timeout),
+                }
+            }
+        }
+
+        // FALLBACK: the cached index, exactly as before.
+        let opens = match in_window(eng.kalshi.markets(series, "open")).await {
+            Ok(r) => r?,
+            Err(_) => return Ok(Discovery::Timeout),
+        };
+        match current_market(&opens, now) {
+            Some(m) => Ok(Discovery::Found(m.clone(), DiscoveryPath::List)),
+            None => Ok(Discovery::Missing {
+                reason: if opens.is_empty() {
+                    "no_open_markets"
+                } else {
+                    "no_current_market"
+                },
+                open_count: opens.len(),
+                path: DiscoveryPath::List,
+            }),
+        }
     }
 
     /// WS integration for one candidate market. No-op when no ws book is attached.
@@ -620,32 +845,33 @@ impl Streak {
         // stale — paper-only, and documented).
         self.supervise_makers(eng, series, &settled, now).await;
 
+        // WS PRE-REGISTRATION (charter item 4). strategy.rs used to mark a
+        // ticker wanted only AFTER REST discovery had produced it, which put the
+        // websocket strictly DOWNSTREAM of the 15s cache grid — it could not
+        // rescue the discovery lag because it never learned the ticker before
+        // REST did. The ticker is deterministic, so interest is registered from
+        // the constructed name the moment the pre-boundary sampling zone opens
+        // (T0−75s), costing ZERO http requests.
+        if now.rem_euclid(signal::WINDOW_SECS) >= signal::WINDOW_SECS - SAMPLE_WINDOW_SECS {
+            if let (Some(ws), Some(next)) = (
+                self.ws.as_ref(),
+                window_ticker(series, current_close(now) + signal::WINDOW_SECS),
+            ) {
+                if self.first_time(format!("wspre|{series}|{window_id}")) {
+                    logging::info(format!(
+                        "streak {series}: pre-registering ws interest in {next} \
+                         (T0-{}s, no http)",
+                        current_close(now) - now
+                    ));
+                }
+                ws.want(&next);
+            }
+        }
+
         // Fail fast in-window (addendum #5): a 5s deadline beats the client's 30s
         // (half an entry window). A timeout skips THIS pass; the loop retries.
-        let opens = match in_window(eng.kalshi.markets(series, "open")).await {
-            Ok(r) => r?,
-            Err(_) => {
-                logging::info(format!(
-                    "streak {series}: open-markets fetch exceeded {}s — skip pass",
-                    IN_WINDOW_TIMEOUT.as_secs()
-                ));
-                // FIX 9 / I1: a timed-out fetch must be DISTINGUISHABLE from a
-                // market that is not listed yet (sensors F1 — the two produced
-                // identical silence).
-                logging::record_path(
-                    &obs_path(now_dt),
-                    json!({
-                        "event": "streak_pass",
-                        "ts_ms": now_dt.timestamp_millis(),
-                        "series": series,
-                        "into_window": now.rem_euclid(signal::WINDOW_SECS),
-                        "ticker": serde_json::Value::Null,
-                        "reason": "fetch_timeout",
-                    }),
-                );
-                return Ok(());
-            }
-        };
+        let into_window = now.rem_euclid(signal::WINDOW_SECS);
+        let discovered = self.discover_current(eng, series, now, window_id).await?;
 
         // FIX 9 / I1 (sensors F1 — the most expensive sensor gap in the tree).
         // `current_market() == None` used to `return Ok(())` with NO log line and
@@ -657,10 +883,13 @@ impl Streak {
         // reconstructible today: "market not listed yet", "listed but unpriced",
         // "fetch timed out" and "process wedged" all produce identical silence.
         // One line per pass makes the blind spot MEASURE ITSELF.
-        let into_window = now.rem_euclid(signal::WINDOW_SECS);
-        let cur = match current_market(&opens, now) {
-            Some(m) => m,
-            None => {
+        let (cur, disc_path) = match discovered {
+            Discovery::Found(m, p) => (m, p),
+            Discovery::Timeout => {
+                logging::info(format!(
+                    "streak {series}: market discovery exceeded {}s — skip pass",
+                    IN_WINDOW_TIMEOUT.as_secs()
+                ));
                 logging::record_path(
                     &obs_path(now_dt),
                     json!({
@@ -669,13 +898,68 @@ impl Streak {
                         "series": series,
                         "into_window": into_window,
                         "ticker": serde_json::Value::Null,
-                        "reason": if opens.is_empty() { "no_open_markets" } else { "no_current_market" },
-                        "open_count": opens.len(),
+                        "reason": "fetch_timeout",
+                    }),
+                );
+                return Ok(());
+            }
+            Discovery::Missing {
+                reason,
+                open_count,
+                path,
+            } => {
+                logging::record_path(
+                    &obs_path(now_dt),
+                    json!({
+                        "event": "streak_pass",
+                        "ts_ms": now_dt.timestamp_millis(),
+                        "series": series,
+                        "into_window": into_window,
+                        "ticker": serde_json::Value::Null,
+                        "reason": reason,
+                        "open_count": open_count,
+                        "discovery_path": path.as_str(),
                     }),
                 );
                 return Ok(());
             }
         };
+        let cur = &cur;
+
+        // INSTRUMENTATION (charter item 5): the FIRST sighting of each window,
+        // stamped relative to that window's T0. This is the number the whole
+        // change exists to move — median T0+25.6s on the list, and it must land
+        // at or before the T0+4.8s dip on the direct path. One line per ticker.
+        if let Some(close_unix) = cur.close_unix() {
+            let mkt_t0 = close_unix - signal::WINDOW_SECS;
+            if self.first_time(format!("firstseen|{}", cur.ticker)) {
+                logging::record_path(
+                    &obs_path(now_dt),
+                    json!({
+                        "event": "streak_discovery",
+                        "ts_ms": now_dt.timestamp_millis(),
+                        "series": series,
+                        "ticker": cur.ticker,
+                        "discovery_rel_t0": now - mkt_t0,
+                        "discovery_path": disc_path.as_str(),
+                        "priced": cur.yes_ask_cents_f64().is_some()
+                            || cur.no_ask_cents_f64().is_some(),
+                        "status": cur.status,
+                    }),
+                );
+            }
+        }
+
+        // PRE-T0 MAKER REST (charter item 2). Inside the last PRE_T0_LEAD_SECS
+        // before the boundary, `cur` is the window that is CLOSING — which is
+        // exactly the window derive-fourth needs (its `floor_strike` is set, and
+        // our 1 Hz spot buffer already covers 50 of its 60 settlement seconds).
+        // If that provisional call completes a 4-streak, rest on the NEXT
+        // window's market NOW instead of at T0+21-32s.
+        if self.try_pre_t0(eng, series, cur, &settled, now).await? {
+            return Ok(());
+        }
+
         let mut cand = Candidate {
             open_unix: cur.open_unix(),
             close_unix: cur.close_unix().unwrap_or(now + signal::WINDOW_SECS),
@@ -692,6 +976,11 @@ impl Streak {
                 "ticker": cur.ticker,
                 "yes_ask": cand.yes_ask,
                 "no_ask": cand.no_ask,
+                // charter item 5: every heartbeat carries where in the window it
+                // sits and which path resolved the market, so the recovery is
+                // measurable from the same file the defect was measured in.
+                "discovery_rel_t0": now - (cand.close_unix - signal::WINDOW_SECS),
+                "discovery_path": disc_path.as_str(),
             }),
         );
 
@@ -705,10 +994,33 @@ impl Streak {
         // + the participation record's price context).
         self.refresh_leg_ask(&cur.ticker, &cand);
 
+        // NOT-YET-TRADEABLE GUARD. Direct-ticker discovery can now see a market
+        // BEFORE the venue flips it out of `initialized` — that is the win, but
+        // it also creates a state the old list path could never reach: a
+        // resolvable market that is not open for business. Whether the matching
+        // engine accepts an order there is the one thing nobody has verified on
+        // prod (demo cannot answer it: demo lists 15m markets `active` ~16h
+        // early and returns ZERO `unopened` for KXBTC15M), and finding out HERE
+        // would be expensive — a 400 on the maker post falls through to the
+        // taker leg, which fires a 46¢ IOC into a book that does not exist,
+        // returns fill_count 0, and burns the market's one-episode-ever key.
+        // That is strictly worse than the defect we are fixing.
+        //
+        // So the experiment lives ONLY in the pre-T0 branch above, where every
+        // rejection is benign and hands the market back. Here we simply wait a
+        // pass: `initialized` is a "too early" state, and too-early is
+        // waitable (charter item 3). 15m crypto books are two-sided at a median
+        // T0+2.45s, so this costs at most a couple of passes against the 21-32s
+        // the list cost.
+        if cur.status.as_deref() == Some("initialized") {
+            return Ok(());
+        }
+
         match signal::detect(&settled, &cand, now) {
             Ok(entry) => {
                 self.note_skip_alarm(eng, series, None).await; // evaluated → reset
-                self.enter(eng, series, cur, &cand, entry, now, None).await
+                self.enter(eng, series, cur, &cand, entry, now, None, None)
+                    .await
             }
             Err(Skip::PrevNotSettled) => {
                 // Ask subsequent passes in this window to refetch settled (the
@@ -788,6 +1100,11 @@ impl Streak {
                     "agree": outcome == Verify::Agree,
                     "derived_avg": p.avg,
                     "derived_margin_bp": p.margin_bp,
+                    // Provenance of the call being scored: a `pre_t0` record was
+                    // made from 50 of the 60 settlement seconds, so its agreement
+                    // rate is a DIFFERENT statistic from the full-window one and
+                    // must be poolable separately when the tape is read.
+                    "pre_t0": p.pre_t0,
                 }),
             );
             match outcome {
@@ -839,6 +1156,191 @@ impl Streak {
         }
     }
 
+    /// PRE-T0 MAKER REST (charter item 2). Returns `true` when it opened an
+    /// episode on the NEXT window, in which case the caller must not also
+    /// evaluate the closing market this pass.
+    ///
+    /// The sequence, all inside the last [`signal::PRE_T0_LEAD_SECS`]:
+    ///   1. `cur` is the market closing at T0. Its `floor_strike` is set (only
+    ///      the NEXT window's strike is "TBD" pre-open), and our spot buffer
+    ///      already spans `[T0−60, now]`.
+    ///   2. Run the UNCHANGED `derive::derive` against it. At T0−10s that is 51
+    ///      samples over a 50s span — exactly the existing MIN_SAMPLES/MIN_SPAN
+    ///      floor, which is why `PRE_T0_LEAD_SECS` is 10 and not a preference.
+    ///      Anything earlier returns `Insufficient` on its own.
+    ///   3. Prepend that provisional result to the settled chain and re-run
+    ///      `detect` against the NEXT window (open T0, close T0+900). ttc = 910,
+    ///      which only the item-3 bound split makes reachable.
+    ///   4. Confirm the constructed next ticker resolves, then rest the SAME 40¢
+    ///      bid with the SAME `expiration_ts` (T0+60) and the SAME T0+45
+    ///      backstop. No parameter moves; only the clock does.
+    ///
+    /// REJECTION IS BENIGN. Demo proves a 201 at T0−34.9s and a 503 at T0−399s,
+    /// so acceptance begins somewhere in between and PROD IS UNVERIFIED. Every
+    /// non-resting outcome therefore un-consumes the ticker so the ordinary
+    /// at-T0 flow re-enters 10 seconds later, and NOTHING pre-T0 is allowed to
+    /// reach the taker leg (an IOC into a book that does not exist yet is
+    /// meaningless, and `taker_leg`'s own ttc guard would not catch it because
+    /// ttc = 910 passes a `>= 843` test).
+    async fn try_pre_t0(
+        &self,
+        eng: &Engine,
+        series: &str,
+        cur: &Market,
+        settled: &[SettledWindow],
+        now: i64,
+    ) -> Result<bool> {
+        let Some(t0) = cur.close_unix() else {
+            return Ok(false);
+        };
+        let lead = t0 - now;
+        if !(1..=signal::PRE_T0_LEAD_SECS).contains(&lead) {
+            return Ok(false);
+        }
+        // One attempt per window: a declined pre-T0 rest is not retried at −9,
+        // −8, … −1s. The at-T0 flow owns the market from here.
+        if self.seen_contains(&Self::pre_t0_off_key(series, t0)) {
+            return Ok(false);
+        }
+        if !derive_enabled() {
+            return Ok(false);
+        }
+        let Some(product) = coin_product(series) else {
+            return Ok(false);
+        };
+        let strike = match cur.floor_strike {
+            Some(s) if s > 0.0 => s,
+            _ => return Ok(false),
+        };
+        let samples = self
+            .spot_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(product)
+            .cloned()
+            .unwrap_or_default();
+
+        // The provisional call. Marginal/Insufficient are the NORMAL states here
+        // and stay silent — the ordinary post-T0 path handles them 10s later.
+        let derive::Derivation::Derived {
+            result,
+            avg,
+            margin_bp,
+        } = derive::derive(&samples, strike, t0)
+        else {
+            return Ok(false);
+        };
+
+        let mut settled2 = Vec::with_capacity(settled.len() + 1);
+        settled2.push(SettledWindow {
+            close_unix: t0,
+            result: result.to_string(),
+        });
+        settled2.extend_from_slice(settled);
+
+        let next_close = t0 + signal::WINDOW_SECS;
+        let cand = Candidate {
+            open_unix: Some(t0),
+            close_unix: next_close,
+            // Pre-T0 the book does not exist (0 of 77,263 `initialized` markets
+            // are priced). Unpriced has never gated this signal.
+            yes_ask: None,
+            no_ask: None,
+        };
+        let Ok(entry) = signal::detect(&settled2, &cand, now) else {
+            return Ok(false);
+        };
+
+        let Some(next_ticker) = window_ticker(series, next_close) else {
+            return Ok(false);
+        };
+        if self.seen_contains(&next_ticker) {
+            return Ok(false); // an episode already exists for that market
+        }
+
+        // Confirm the market before POSTing to it. One request, and only on a
+        // pass that has already qualified a 4-streak with a decisive derivation
+        // (~12.5% of windows), so it is not a polling cost.
+        let next_mkt = match in_window(eng.kalshi.market(&next_ticker)).await {
+            Ok(Ok(m)) if m.close_unix() == Some(next_close) => m,
+            Ok(Ok(m)) => {
+                logging::info(format!(
+                    "streak {series}: pre-T0 ticker {next_ticker} resolved to close {:?} \
+                     (expected {next_close}) — standing down, normal T0 flow will handle it",
+                    m.close_unix()
+                ));
+                return Ok(false);
+            }
+            Ok(Err(e)) => {
+                logging::info(format!(
+                    "streak {series}: pre-T0 fetch of {next_ticker} failed ({e}) — standing \
+                     down, normal T0 flow will handle it"
+                ));
+                return Ok(false);
+            }
+            Err(_elapsed) => return Ok(false),
+        };
+
+        self.derive_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                format!("{series}|{t0}"),
+                PendingDerive {
+                    close_unix: t0,
+                    predicted: result.to_string(),
+                    used: true,
+                    avg,
+                    margin_bp,
+                    ticker: next_ticker.clone(),
+                    pre_t0: true,
+                },
+            );
+        logging::record_path(
+            WEEK1_LOG,
+            json!({
+                "event": "streak_derive",
+                "series": series,
+                "ticker": next_ticker,
+                "close_unix": t0,
+                "predicted": result,
+                "derived_avg": avg,
+                "derived_margin_bp": margin_bp,
+                "strike": strike,
+                "buf_samples": samples.len(),
+                "used": true,
+                "pre_t0": true,
+                "lead_secs": lead,
+            }),
+        );
+        logging::info(format!(
+            "streak {series}: PRE-T0 DERIVED {result} at T0-{lead}s (avg {avg:.2} vs strike \
+             {strike:.2}, {margin_bp:.1}bp, {} buf) — resting on {next_ticker} before the open",
+            samples.len()
+        ));
+
+        self.note_skip_alarm(eng, series, None).await;
+        let guard = PreT0Guard {
+            predicted: result.to_string(),
+            strike,
+            product,
+            lead_secs: lead,
+            confirmed: false,
+        };
+        self.enter(
+            eng,
+            series,
+            &next_mkt,
+            &cand,
+            entry,
+            now,
+            Some((avg, margin_bp)),
+            Some(guard),
+        )
+        .await?;
+        Ok(true)
+    }
+
     /// PrevNotSettled handler: try to derive the just-closed window's result from
     /// the spot buffer. Decisive → re-run detection with the synthesized 4th
     /// result and enter (tagged derived) if it qualifies. Marginal/Insufficient
@@ -857,6 +1359,17 @@ impl Streak {
         let jc_close = cur
             .open_unix()
             .unwrap_or(cand.close_unix - signal::WINDOW_SECS);
+
+        // An episode already exists for this market (the pre-T0 path opened one,
+        // or an earlier pass in this window did). There is nothing left to
+        // decide, and re-deriving here would overwrite the pending record that
+        // documents WHICH call actually drove the order.
+        if self.seen_contains(&cur.ticker) {
+            // An open episode IS a successful evaluation — reset the run so a
+            // pre-existing prev_not_settled streak cannot fire a stale alarm.
+            self.note_skip_alarm(eng, series, None).await;
+            return Ok(());
+        }
 
         // Gate: feature on, coin mapped, strike known. Any miss → normal skip
         // (still a prev_not_settled-class skip for the repeat-skip alarm).
@@ -914,6 +1427,7 @@ impl Streak {
                         avg,
                         margin_bp,
                         ticker: cur.ticker.clone(),
+                        pre_t0: false,
                     },
                 );
                 logging::record_path(
@@ -943,8 +1457,17 @@ impl Streak {
                     Ok(entry) => {
                         // Derived result completed the streak → a real evaluation.
                         self.note_skip_alarm(eng, series, None).await;
-                        self.enter(eng, series, cur, cand, entry, now, Some((avg, margin_bp)))
-                            .await
+                        self.enter(
+                            eng,
+                            series,
+                            cur,
+                            cand,
+                            entry,
+                            now,
+                            Some((avg, margin_bp)),
+                            None,
+                        )
+                        .await
                     }
                     Err(skip) => {
                         self.note_skip_alarm(eng, series, Some("prev_not_settled")).await;
@@ -1048,6 +1571,12 @@ impl Streak {
             rec["derived_avg"] = json!(avg);
             rec["derived_margin_bp"] = json!(margin_bp);
         }
+        if let Some(g) = &meta.pre_t0 {
+            rec["pre_t0"] = json!(true);
+            rec["pre_t0_lead_secs"] = json!(g.lead_secs);
+            rec["pre_t0_predicted"] = json!(g.predicted);
+            rec["pre_t0_confirmed"] = json!(g.confirmed);
+        }
         rec
     }
 
@@ -1066,16 +1595,26 @@ impl Streak {
         // Some((avg, margin_bp)) when this entry rests on a DERIVED 4th result —
         // tags the participation record derived_fourth:true (item 3).
         derived: Option<(f64, f64)>,
+        // Some(..) when the decision was taken BEFORE the window opened.
+        pre_t0: Option<PreT0Guard>,
     ) -> Result<()> {
         if !self.first_time(cur.ticker.clone()) {
             return Ok(());
         }
 
         // DATA CAPTURE 2 — decision snapshot at the entry moment (fetched before
-        // any order so the book reflects what we saw when deciding).
-        let book = match in_window(eng.kalshi.orderbook(&cur.ticker)).await {
-            Ok(Ok(b)) => b,
-            _ => json!(null), // timeout or error: book snapshot is best-effort
+        // any order so the book reflects what we saw when deciding). Skipped
+        // pre-T0: the orderbook of an `initialized` market is documented empty
+        // (`{"yes_dollars":[],"no_dollars":[]}` on 77,263 of them), so the call
+        // would spend a request to learn nothing on the one path where latency
+        // is the entire point.
+        let book = if pre_t0.is_some() {
+            json!({"pre_t0": true, "note": "initialized market — book not yet created"})
+        } else {
+            match in_window(eng.kalshi.orderbook(&cur.ticker)).await {
+                Ok(Ok(b)) => b,
+                _ => json!(null), // timeout or error: book snapshot is best-effort
+            }
         };
 
         let side = if entry.buy_yes { Side::Yes } else { Side::No };
@@ -1093,12 +1632,26 @@ impl Streak {
             predicted: None, // set by place_maker when a derivation drove this
             jc_close,
             book,
+            pre_t0,
         };
         let ceiling = exec::taker_ceiling();
 
+        // Pre-T0 there is nothing to take, so the late-signal branch is
+        // unreachable by construction (`maker_eligible` at T0−10 has 55s of
+        // runway against a 5s floor); the assert-by-branch is kept anyway so a
+        // future clock change cannot silently route an IOC into an empty book.
         if exec::maker_eligible(now, t0) {
             self.place_maker(eng, series, cur, cand, meta, t0, ceiling, now)
                 .await
+        } else if meta.pre_t0.is_some() {
+            self.forget(&cur.ticker);
+            logging::info(format!(
+                "streak {series}: {} pre-T0 signal had no maker runway (T0{:+}s) — standing \
+                 down; the at-T0 flow will re-evaluate",
+                cur.ticker,
+                now - t0
+            ));
+            Ok(())
         } else {
             // LATE SIGNAL: no runway to rest. Taker-only at the ceiling.
             logging::info(format!(
@@ -1169,6 +1722,51 @@ impl Streak {
         // MIN_REST_SECS`, so the last second at which resting is still worth it
         // is exactly this.
         let rest_by = exec::backstop_at(t0) - exec::MIN_REST_SECS;
+        let pre_t0 = meta.pre_t0.is_some();
+
+        // PRE-T0 STAND-DOWN (charter: "handle rejection (503/400) as benign →
+        // retry at T0"). Demo proved a 201 at T0−34.9s but PROD IS UNVERIFIED,
+        // so every non-resting outcome here must (a) never fire a taker IOC into
+        // a book that does not exist and (b) hand the market back to the
+        // ordinary at-T0 flow by releasing the one-episode-ever key. The single
+        // exception is the ambiguous placement error, where an order MAY be
+        // resting: that keeps the existing stand-down-and-do-nothing doctrine,
+        // key included, because a retry could double the position.
+        let stand_down = |what: &str, detail: String| {
+            self.forget(&ticker);
+            // ONE pre-T0 attempt per window per series. Without this latch a 503
+            // at T0−10s would be retried at −9, −8, … −1: ten POSTs into a venue
+            // that just said no, on a system already seeing 429s.
+            self.first_time(Self::pre_t0_off_key(series, t0));
+            // The provisional derivation was filed `used: true` in anticipation
+            // of the order. Nothing was placed, so it drove nothing — and a USED
+            // disagreement is what disables derivation entirely and pages
+            // CRITICAL. Downgrade it before `verify_pending` can score it.
+            if let Some(p) = self
+                .derive_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&format!("{series}|{t0}"))
+            {
+                p.used = false;
+            }
+            logging::info(format!(
+                "streak {series}: pre-T0 rest on {ticker} {what} at T0-{}s ({detail}) — BENIGN, \
+                 nothing placed; the at-T0 flow re-evaluates this market normally",
+                t0 - now
+            ));
+            logging::record_path(
+                WEEK1_LOG,
+                json!({
+                    "event": "streak_pre_t0_declined",
+                    "series": series,
+                    "ticker": ticker,
+                    "lead_secs": t0 - now,
+                    "outcome": what,
+                    "detail": detail,
+                }),
+            );
+        };
 
         match eng
             .place_resting(sig, &reserve_key, &coid, expiration_ts, Some(rest_by))
@@ -1176,6 +1774,10 @@ impl Streak {
         {
             // The lock wait consumed the runway. The signal is still live — this
             // is precisely the "arrived too late to rest" case, so take instead.
+            RestOutcome::RunwayLost { waited_ms } if pre_t0 => {
+                stand_down("runway_lost", format!("exec_lock wait {waited_ms}ms"));
+                Ok(())
+            }
             RestOutcome::RunwayLost { waited_ms } => {
                 logging::info(format!(
                     "streak {series}: {ticker} lost the maker runway waiting {waited_ms}ms for \
@@ -1218,7 +1820,7 @@ impl Streak {
                     off_book: false,
                 };
                 logging::info(format!(
-                    "streak {series}: {}RESTING {}x {} {ticker} @ {}c (T0+{}s, backstop T0+{}s, exp {expiration_ts}) id={order_id}",
+                    "streak {series}: {}RESTING {}x {} {ticker} @ {}c (T0{:+}s, backstop T0+{}s, exp {expiration_ts}) id={order_id}",
                     if leg.paper { "[paper] " } else { "" },
                     leg.order.count,
                     leg.meta.side.as_str(),
@@ -1249,6 +1851,11 @@ impl Streak {
                 pending["count"] = json!(leg.order.count);
                 pending["ts_submit"] = json!(leg.placed_ms);
                 pending["paper"] = json!(leg.paper);
+                // INSTRUMENTATION (charter item 5). The one number that says
+                // whether the rest actually beat the boundary: NEGATIVE means we
+                // were on the book before the window opened. Present on every
+                // maker record, pre-T0 or not, so the tape has a single column.
+                pending["rest_placed_rel_t0"] = json!(now - t0);
                 logging::record_path(WEEK1_LOG, pending);
 
                 logging::record_path(
@@ -1265,6 +1872,8 @@ impl Streak {
                         "backstop_at": leg.backstop_at,
                         "ceiling": ceiling,
                         "paper": leg.paper,
+                        "rest_placed_rel_t0": now - t0,
+                        "pre_t0": pre_t0,
                         "order": response,
                     }),
                 );
@@ -1288,11 +1897,26 @@ impl Streak {
                     .await;
                 Ok(())
             }
+            RestOutcome::Rejected(r) if pre_t0 => {
+                stand_down("risk_rejected", format!("{r:?}"));
+                Ok(())
+            }
             RestOutcome::Rejected(r) => {
                 let mut rec = self.base_record(series, &ticker, &meta, EntryPath::MakerRest);
                 rec["reject_reason"] = json!(format!("risk:{r:?}"));
                 logging::info(format!("streak {series}: rejected ({r:?}) {ticker}"));
                 logging::record_path(WEEK1_LOG, rec);
+                Ok(())
+            }
+            // THE PRE-T0 REJECTION PATH the charter names: a 503 (seen on demo at
+            // T0−399s) or a 400 "market not open" lands here with
+            // may_be_resting=false. Nothing was created, so nothing needs
+            // cancelling and nothing may be taken.
+            RestOutcome::RestError {
+                msg,
+                may_be_resting: false,
+            } if pre_t0 => {
+                stand_down("rest_error", msg);
                 Ok(())
             }
             // The exchange told us it created nothing → taking is safe, and the
@@ -1330,15 +1954,32 @@ impl Streak {
                 rec["reject_reason"] = json!("maker_place_ambiguous");
                 rec["maker_error"] = json!(msg.clone());
                 logging::record_path(WEEK1_LOG, rec);
+                // NOTE (charter divergence, surfaced deliberately). The charter
+                // asks for a pre-T0 503 to be treated as BENIGN and retried at
+                // T0. It cannot be, here: `classify_resting_failure` (engine FIX
+                // 4) already ruled that a 5xx/408 on a resting POST is AMBIGUOUS
+                // — Kalshi's edge can time out AFTER the matching engine accepted
+                // the order — and forgetting the ticker would let the at-T0 flow
+                // send a SECOND resting order for a market whose ledger books one
+                // position. The pre-T0 case does not weaken that argument, so the
+                // existing stand-down doctrine is kept verbatim. If prod evidence
+                // shows the pre-open 503 carries a distinguishing error code
+                // (i.e. it is a REJECTION, not an edge timeout), the correct fix
+                // is one line in `classify_resting_failure`, not a special case
+                // here. Both branches leave `pre_t0` on the record.
                 logging::info(format!(
                     "streak {series}: CRITICAL maker post ambiguous for {ticker} ({msg}) — an \
-                     order MAY be resting with no id; standing down (exp {expiration_ts})"
+                     order MAY be resting with no id; standing down (exp {expiration_ts}, \
+                     rel_t0 {:+}s)",
+                    now - t0
                 ));
                 alert::notify(
                     &eng.http,
                     &format!(
-                        "streak maker post AMBIGUOUS on {ticker} ({msg}) — possible unsupervised \
-                         resting bid, expires {expiration_ts}; no backstop sent"
+                        "streak maker post AMBIGUOUS on {ticker} ({msg}) at T0{:+}s{} — possible \
+                         unsupervised resting bid, expires {expiration_ts}; no backstop sent",
+                        now - t0,
+                        if pre_t0 { " (PRE-T0 attempt)" } else { "" }
                     ),
                 )
                 .await;
@@ -1384,6 +2025,75 @@ impl Streak {
                 None => return,
             }
         };
+
+        // (0) PRE-T0 CONFIRMATION — see [`PreT0Guard`]. The bid was authorised by
+        // a derivation over 50 of the 60 settlement seconds; the moment the
+        // buffer holds all 60, re-run the SAME gate and require the SAME answer.
+        // This is the bound on the one genuinely new failure mode this charter
+        // introduces, and it lands at T0+0..1s — before the T0+4.8s median dip
+        // bottom, and against a book that opens at a median 53¢.
+        if let Some(g) = leg.meta.pre_t0.clone() {
+            if !g.confirmed && now >= leg.t0 {
+                let samples = self
+                    .spot_buf
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(g.product)
+                    .cloned()
+                    .unwrap_or_default();
+                let full = derive::derive(&samples, g.strike, leg.t0);
+                let verdict = match &full {
+                    derive::Derivation::Derived { result, .. } if *result == g.predicted => None,
+                    derive::Derivation::Derived { result, .. } => Some(format!(
+                        "complete-window derivation says {result}, provisional said {}",
+                        g.predicted
+                    )),
+                    // The complete minute no longer clears the 5bp gate, so we
+                    // are holding a bet the signal does not support. Withdraw:
+                    // the whole point of the gate is that a coin-flip is not a
+                    // call, and that verdict does not become weaker because we
+                    // acted on an earlier, thinner slice of the same data.
+                    other => Some(format!("complete-window derivation is {other:?}, not decisive")),
+                };
+                match verdict {
+                    None => {
+                        logging::info(format!(
+                            "streak {series}: pre-T0 rest on {ticker} CONFIRMED at T0+{}s — the \
+                             complete 60s window agrees with the T0-{}s call ({})",
+                            now - leg.t0,
+                            g.lead_secs,
+                            g.predicted
+                        ));
+                        let mut legs = self.maker.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(l) = legs.get_mut(ticker) {
+                            if let Some(gg) = l.meta.pre_t0.as_mut() {
+                                gg.confirmed = true;
+                            }
+                        }
+                    }
+                    Some(why) => {
+                        logging::info(format!(
+                            "streak {series}: pre-T0 rest on {ticker} WITHDRAWN at T0+{}s — {why}; \
+                             cancelling the resting bid",
+                            now - leg.t0
+                        ));
+                        // The derivation did NOT end up driving a position we
+                        // stand behind, so it must not count as USED against the
+                        // auto-disable: we caught it ourselves, which is the
+                        // machinery working, not derivation being unreliable.
+                        {
+                            let mut pend =
+                                self.derive_pending.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(p) = pend.get_mut(&format!("{series}|{}", leg.t0)) {
+                                p.used = false;
+                            }
+                        }
+                        self.abandon_leg(eng, &leg, "pre_t0_derive_withdrawn", now).await;
+                        return;
+                    }
+                }
+            }
+        }
 
         // (1) CANCEL ON FLIP — the official result for the window our derivation
         // synthesized has landed and contradicts it. The signal is void; the bid
@@ -1728,6 +2438,15 @@ impl Streak {
     /// order_id (the exchange's truth). PAPER: the ledger's own model — a bid at
     /// L fills at L iff the reversal ask trades at or below L.
     async fn poll_leg_fill(&self, eng: &Engine, leg: &MakerLeg, now: i64) -> Option<LegFill> {
+        // BEFORE T0 a fill is impossible: the market is `initialized`, its
+        // orderbook returns empty arrays, and 0 of the 77,263 markets in that
+        // state are priced — there is no counterparty to trade against. Polling
+        // `/portfolio/fills` once a second for the ~10s of pre-T0 rest would
+        // spend 10 requests per episode per series to learn nothing, on a system
+        // whose rate limit already produced 429s at 05:58Z.
+        if now < leg.t0 {
+            return None;
+        }
         if leg.paper {
             if !exec::paper_maker_fills(leg.last_ask, leg.order.limit_cents) {
                 return None;
@@ -2425,5 +3144,378 @@ mod tests {
         // The failure this closes: a 30s-stalled deadline cancel returning at
         // T0+75 used to fire one un-modelled IOC 15s outside the window.
         assert!(bites_at(t0 + 75));
+    }
+
+    /// Unix seconds for an RFC3339 string (test helper).
+    fn ts(s: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp()
+    }
+
+    #[test]
+    fn window_ticker_matches_the_live_venue_strings() {
+        // Captured from prod 2026-07-27 (`status=open` + `status=unopened`).
+        // EDT (UTC-4) cases:
+        assert_eq!(
+            window_ticker("KXBTC15M", ts("2026-07-27T16:45:00Z")).unwrap(),
+            "KXBTC15M-26JUL271245-45"
+        );
+        assert_eq!(
+            window_ticker("KXBTC15M", ts("2026-07-28T03:45:00Z")).unwrap(),
+            "KXBTC15M-26JUL272345-45"
+        );
+        // Midnight ET rolls BOTH the date and the HHMM — the case a naive UTC
+        // formatter gets wrong every single day.
+        assert_eq!(
+            window_ticker("KXBTC15M", ts("2026-07-28T04:00:00Z")).unwrap(),
+            "KXBTC15M-26JUL280000-00"
+        );
+        assert_eq!(
+            window_ticker("KXETH15M", ts("2026-07-28T03:15:00Z")).unwrap(),
+            "KXETH15M-26JUL272315-15"
+        );
+    }
+
+    #[test]
+    fn window_ticker_follows_est_not_a_fixed_offset() {
+        // January: America/New_York is UTC-5, so 05:00Z is 00:00 ET. A hardcoded
+        // -4 would emit `26JAN150100-00`-shaped garbage and 404 every winter.
+        assert_eq!(
+            window_ticker("KXBTC15M", ts("2026-01-15T05:00:00Z")).unwrap(),
+            "KXBTC15M-26JAN150000-00"
+        );
+        // The month is uppercased (`Jul` → `JUL`), matching the venue.
+        let t = window_ticker("KXBTC15M", ts("2026-11-02T14:30:00Z")).unwrap();
+        assert_eq!(t, "KXBTC15M-26NOV020930-30");
+    }
+
+    #[test]
+    fn current_close_is_the_next_boundary_and_never_now() {
+        let t0 = 1_784_987_100i64; // a 900-aligned instant
+        assert_eq!(t0 % 900, 0);
+        // AT the boundary the window that OPENS there is the one in progress.
+        assert_eq!(current_close(t0), t0 + 900);
+        assert_eq!(current_close(t0 + 1), t0 + 900);
+        assert_eq!(current_close(t0 + 899), t0 + 900);
+        assert_eq!(current_close(t0 + 900), t0 + 1800);
+        // One second before the boundary we still want the CLOSING window — that
+        // is the market whose floor_strike derive-fourth needs pre-T0.
+        assert_eq!(current_close(t0 + 900 - signal::PRE_T0_LEAD_SECS), t0 + 900);
+        for k in 0..2000i64 {
+            assert!(current_close(t0 + k) > t0 + k);
+        }
+    }
+
+    #[test]
+    fn pre_t0_rest_window_is_reachable_by_every_downstream_clock_gate() {
+        // The pre-T0 leg reuses EVERY execution constant unchanged (charter:
+        // execution timing only). Assert they all still admit a rest placed at
+        // T0−PRE_T0_LEAD_SECS, so a future move of any of them fails HERE rather
+        // than silently disabling the early rest in production.
+        let t0 = 1_784_987_100i64;
+        let now = t0 - signal::PRE_T0_LEAD_SECS;
+        assert!(exec::maker_eligible(now, t0));
+        assert_eq!(exec::initial_path(now, t0), EntryPath::MakerRest);
+        // rest-by re-check after exec_lock, and the unchanged T0+45 / T0+60.
+        assert!(now <= exec::backstop_at(t0) - exec::MIN_REST_SECS);
+        assert_eq!(exec::backstop_at(t0), t0 + 45);
+        assert_eq!(exec::maker_expiration(t0), t0 + 60);
+        // The whole pre-T0 leg lives inside the order's lifetime.
+        assert!(now < exec::maker_expiration(t0));
+    }
+
+    #[test]
+    fn pre_t0_derivation_uses_exactly_the_existing_gate() {
+        // At T0−10s a 1 Hz buffer holds [T0−60, T0−10]: 51 samples, span 50 —
+        // the existing MIN_SAMPLES/MIN_SPAN floor, met with nothing to spare.
+        // One second earlier it is Insufficient, which is WHY the lead is 10s.
+        let t0 = 1_000_000i64;
+        let buf: Vec<(i64, f64)> = (t0 - 74..=t0).map(|t| (t, 100.20)).collect();
+        let at = |now: i64| {
+            let seen: Vec<(i64, f64)> = buf.iter().copied().filter(|&(t, _)| t <= now).collect();
+            derive::derive(&seen, 100.00, t0)
+        };
+        assert!(matches!(
+            at(t0 - signal::PRE_T0_LEAD_SECS),
+            derive::Derivation::Derived { result: "yes", .. }
+        ));
+        assert!(matches!(
+            at(t0 - signal::PRE_T0_LEAD_SECS - 1),
+            derive::Derivation::Insufficient { .. }
+        ));
+    }
+
+    #[test]
+    fn a_partial_window_call_can_flip_which_is_what_the_guard_is_for() {
+        // The new failure mode, made concrete. First 50s at 100.20 (decisive
+        // yes vs a 100.00 strike); the last 10s crash to 98.00. The complete
+        // 60s mean is 99.83 → decisive NO. The provisional call was wrong, and
+        // ONLY the complete-window re-derivation at T0 catches it — the official
+        // result does not land until ~T0+10-25s, past the T0+4.8s dip.
+        let t0 = 1_000_000i64;
+        let mut buf: Vec<(i64, f64)> = (t0 - 60..=t0 - 10).map(|t| (t, 100.20)).collect();
+        let provisional = derive::derive(&buf, 100.00, t0);
+        assert!(matches!(
+            provisional,
+            derive::Derivation::Derived { result: "yes", .. }
+        ));
+        buf.extend((t0 - 9..=t0).map(|t| (t, 98.00)));
+        match derive::derive(&buf, 100.00, t0) {
+            derive::Derivation::Derived { result, .. } => assert_eq!(result, "no"),
+            other => panic!("expected a decisive flip, got {other:?}"),
+        }
+    }
+
+    /// END-TO-END DEMO PROBE of the pre-T0 path (charter "Demo verification").
+    /// Walks the exact production sequence with the exact production helpers:
+    ///   construct ticker (`window_ticker`) → uncached GET (`Kalshi::market`) →
+    ///   decisive derivation + `signal::detect` on the NEXT window at ttc=910 →
+    ///   resting POST at T0−PRE_T0_LEAD_SECS with `exec::maker_expiration(t0)` →
+    ///   201 + resting pre-T0 → survives the boundary → cancel → gone.
+    ///
+    /// Size is 1 contract at 1¢, not the production 10 × 40¢: acceptance is what
+    /// is under test and price/size do not bear on it, while 1¢ makes a fill
+    /// impossible at any point. EVERYTHING PLACED IS CANCELLED.
+    ///
+    /// Ignored (needs the DEMO key + network + up to ~15 min of waiting):
+    ///   KALSHI_API_BASE=https://demo-api.kalshi.co \
+    ///   KALSHI_API_KEY_ID=<demo key id> KALSHI_PRIVATE_KEY_PATH=secrets/Demo.txt \
+    ///   cargo test -p streak pre_t0_demo_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn pre_t0_demo_probe() {
+        use engine::kalshi::{
+            parse_cancel_reduced_by, parse_place_response, parse_resting_orders, Kalshi,
+        };
+        let key_id = std::env::var("KALSHI_API_KEY_ID").expect("KALSHI_API_KEY_ID (demo)");
+        let key_path = std::env::var("KALSHI_PRIVATE_KEY_PATH").expect("KALSHI_PRIVATE_KEY_PATH");
+        let series = std::env::var("NESTOR_TEST_SERIES").unwrap_or("KXBTC15M".into());
+        let k = Kalshi::authenticated(key_id, &key_path).unwrap();
+
+        // Aim at a boundary far enough out that we can still reach T0−10s.
+        let mut t0 = current_close(chrono::Utc::now().timestamp());
+        if t0 - chrono::Utc::now().timestamp() < signal::PRE_T0_LEAD_SECS + 15 {
+            t0 += signal::WINDOW_SECS;
+        }
+        let next_close = t0 + signal::WINDOW_SECS;
+        let ticker = window_ticker(&series, next_close).expect("constructed ticker");
+        println!("=== (0) CONSTRUCTED TICKER === {ticker}  (T0={t0}, close={next_close})");
+
+        // (1) UNCACHED DIRECT GET, well before T0 — the whole point: the market is
+        //     readable by name long before any `status=open` index carries it.
+        let m = k.market(&ticker).await.expect("direct market GET");
+        println!(
+            "=== (1) DIRECT GET === status={:?} open={:?} close={:?} floor_strike={:?}",
+            m.status, m.open_time, m.close_time, m.floor_strike
+        );
+        assert_eq!(m.close_unix(), Some(next_close), "ticker/close mismatch");
+        if m.status.as_deref() != Some("initialized") {
+            // MEASURED 2026-07-27: the DEMO venue does not reproduce prod's
+            // lifecycle for 15m crypto. Demo lists every 15m market `active`
+            // from ~16h before its close (`status=unopened` returns ZERO for
+            // KXBTC15M on demo), whereas prod opens each one exactly 900s before
+            // close and holds it `initialized` until then. So demo can prove the
+            // ticker construction, the uncached GET, and a resting order placed
+            // before the window's own trading period that survives the boundary
+            // — but it CANNOT prove acceptance on a genuinely `initialized`
+            // market. That question stays open on prod.
+            println!(
+                "!!! CAVEAT: market status is {:?}, not `initialized` — demo does not \
+                 reproduce prod's pre-open lifecycle; acceptance-during-initialized is NOT \
+                 under test here",
+                m.status
+            );
+        }
+        let ob = k.orderbook(&ticker).await.expect("orderbook GET");
+        println!("=== (1b) PRE-T0 ORDERBOOK === {ob}");
+
+        // (1c) CONTROL: on PROD the constructed ticker is ABSENT from the cached
+        //      `status=open` index until T0 — that absence is the whole defect.
+        //      (Prod, 2026-07-27: `status=open` for KXBTC15M returns exactly ONE
+        //      market with an empty cursor. Demo returns several, so this is
+        //      reported, not asserted.)
+        let opens = k.markets(&series, "open").await.expect("open list");
+        println!(
+            "=== (1c) OPEN-LIST CONTROL === {} open market(s); contains {ticker}: {}",
+            opens.len(),
+            opens.iter().any(|x| x.ticker == ticker)
+        );
+
+        // (2) The decision the charter mocks: a decisive derivation for the window
+        //     closing at T0 completes a 4-streak, and `detect` admits the NEXT
+        //     window at ttc = 900 + PRE_T0_LEAD_SECS.
+        let now_dec = t0 - signal::PRE_T0_LEAD_SECS;
+        let buf: Vec<(i64, f64)> = (t0 - 60..=now_dec).map(|t| (t, 100.20)).collect();
+        let d = derive::derive(&buf, 100.00, t0);
+        println!("=== (2) PROVISIONAL DERIVATION === {d:?}");
+        let derive::Derivation::Derived { result, .. } = d else {
+            panic!("mock derivation must be decisive at T0-{}s", signal::PRE_T0_LEAD_SECS)
+        };
+        let settled: Vec<SettledWindow> = [t0, t0 - 900, t0 - 1800, t0 - 2700]
+            .iter()
+            .map(|&c| SettledWindow {
+                close_unix: c,
+                result: result.into(),
+            })
+            .collect();
+        let cand = Candidate {
+            open_unix: Some(t0),
+            close_unix: next_close,
+            yes_ask: None,
+            no_ask: None,
+        };
+        let entry = signal::detect(&settled, &cand, now_dec).expect("pre-T0 entry");
+        println!("=== (2b) DETECT AT ttc={} === {entry:?}", next_close - now_dec);
+
+        // (3) Sleep to exactly T0 − PRE_T0_LEAD_SECS and POST the resting bid
+        //     with the PRODUCTION expiration (T0+60) and coid namespace.
+        let wait = now_dec - chrono::Utc::now().timestamp();
+        println!("=== (3) waiting {wait}s for T0-{}s ===", signal::PRE_T0_LEAD_SECS);
+        if wait > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
+        }
+        let exp = exec::maker_expiration(t0);
+        let coid = format!("streak-{ticker}-pret0probe-{}", chrono::Utc::now().timestamp());
+        let side = if entry.buy_yes { "yes" } else { "no" };
+        let t_post = chrono::Utc::now().timestamp();
+        let (status, body, reqid) = k
+            .place_resting_limit_raw(&ticker, side, 1, 1, exp, &coid)
+            .await
+            .expect("pre-T0 resting POST");
+        println!(
+            "=== (4) PRE-T0 POST at T0{:+}s === HTTP {status} req-id={reqid:?}\n{body}",
+            t_post - t0
+        );
+        let placed = parse_place_response(
+            &serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+            side,
+        );
+        println!(
+            "    fill_count={} remaining={} order_id={:?}  (expect 0 / 1 / Some)",
+            placed.fill_count, placed.remaining_count, placed.order_id
+        );
+        if !(200..300).contains(&status) {
+            // The charter's benign branch: record it verbatim and stop. Nothing
+            // was placed, so there is nothing to cancel.
+            println!("!!! PRE-T0 POST REJECTED — this is the BENIGN path; nothing resting");
+            return;
+        }
+        let oid = placed.order_id.clone().expect("order_id on a 201");
+
+        // (5) It is on the book BEFORE the window opens. REPORTED, NOT ASSERTED:
+        //     `/portfolio/orders?status=resting` is eventually-consistent —
+        //     measured 2026-07-27 it showed `[]` 1s after a 201 and still showed
+        //     the order after a 200 cancel reported `reduced_by 1.00`. The 201's
+        //     own `remaining_count` (step 4) is the synchronous truth that the
+        //     order rests; step (7)'s `reduced_by` is the truth that it did not
+        //     fill. This crate's supervisor already encodes exactly that rule.
+        let pre = parse_resting_orders(&k.resting_orders(Some(&ticker)).await.unwrap());
+        println!(
+            "=== (5) RESTING LIST PRE-T0 (T0{:+}s) === listed={} {pre:?}",
+            chrono::Utc::now().timestamp() - t0,
+            pre.iter().any(|o| o.order_id == oid)
+        );
+
+        // (6) It survives the boundary — the property the whole change depends on.
+        let to_t0 = t0 + 2 - chrono::Utc::now().timestamp();
+        if to_t0 > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(to_t0 as u64)).await;
+        }
+        let post = parse_resting_orders(&k.resting_orders(Some(&ticker)).await.unwrap());
+        let survived = post.iter().any(|o| o.order_id == oid);
+        println!(
+            "=== (6) STILL RESTING AT T0{:+}s === {survived}\n    {post:?}",
+            chrono::Utc::now().timestamp() - t0
+        );
+        let m2 = k.market(&ticker).await.expect("post-T0 market GET");
+        println!(
+            "=== (6b) MARKET AT T0{:+}s === status={:?} yes_ask={:?} no_ask={:?}",
+            chrono::Utc::now().timestamp() - t0,
+            m2.status,
+            m2.yes_ask_cents_f64(),
+            m2.no_ask_cents_f64()
+        );
+
+        // (7) CANCEL EVERYTHING. The cancel response IS truth: `reduced_by` is
+        //     the quantity still resting when we pulled it, so `reduced_by == 1`
+        //     proves both that the order was alive and that nothing filled.
+        let c = k.cancel_order(&oid).await;
+        let reduced = c.as_ref().ok().and_then(parse_cancel_reduced_by);
+        println!("=== (7) CANCEL === reduced_by={reduced:?} (expect Some(1)) -> {c:?}");
+        assert_eq!(reduced, Some(1), "the pre-T0 order must come off whole");
+        let after = parse_resting_orders(&k.resting_orders(Some(&ticker)).await.unwrap());
+        println!(
+            "=== (8) LIST AFTER CANCEL === {} listed (eventually-consistent; the \
+             reduced_by above is the truth)",
+            after.len()
+        );
+    }
+
+    /// Operator/probe hygiene: cancel every resting order the DEMO account holds
+    /// on the streak series — the same set `sweep_orphan_rests` targets, run by
+    /// hand. Used to guarantee "cancel everything you place" after
+    /// [`pre_t0_demo_probe`], whose own cancel step can be skipped by an earlier
+    /// assertion failure.
+    ///
+    ///   KALSHI_API_BASE=https://demo-api.kalshi.co \
+    ///   KALSHI_API_KEY_ID=<demo key id> KALSHI_PRIVATE_KEY_PATH=secrets/Demo.txt \
+    ///   cargo test -p streak demo_sweep_streak_resting -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn demo_sweep_streak_resting() {
+        use engine::kalshi::{parse_resting_orders, Kalshi};
+        let key_id = std::env::var("KALSHI_API_KEY_ID").expect("KALSHI_API_KEY_ID (demo)");
+        let key_path = std::env::var("KALSHI_PRIVATE_KEY_PATH").expect("KALSHI_PRIVATE_KEY_PATH");
+        let k = Kalshi::authenticated(key_id, &key_path).unwrap();
+        let body = k.resting_orders(None).await.expect("resting_orders");
+        println!("RAW RESTING: {body}");
+        let ours: Vec<_> = parse_resting_orders(&body)
+            .into_iter()
+            .filter(|o| SERIES.iter().any(|s| o.ticker.starts_with(s)))
+            .collect();
+        println!("{} resting order(s) on {SERIES:?}: {ours:?}", ours.len());
+        // THE CANCEL RESPONSE IS TRUTH (`reduced_by` == the quantity still
+        // resting when we pulled it). The resting-orders LIST is not: measured
+        // 2026-07-27, it still listed an order that a 200 cancel had just
+        // reported `reduced_by 1.00` for. Asserting on the list is the mistake
+        // this crate's own supervisor doctrine already forbids.
+        for o in &ours {
+            let resp = k.cancel_order(&o.order_id).await;
+            let reduced = resp
+                .as_ref()
+                .ok()
+                .and_then(engine::kalshi::parse_cancel_reduced_by);
+            println!(
+                "CANCEL {} ({}): reduced_by={reduced:?} of {} -> {resp:?}",
+                o.order_id, o.ticker, o.remaining_count
+            );
+            assert_eq!(
+                reduced,
+                Some(o.remaining_count),
+                "cancel must remove the whole order"
+            );
+        }
+        let after = parse_resting_orders(&k.resting_orders(None).await.unwrap());
+        let left: Vec<_> = after
+            .iter()
+            .filter(|o| SERIES.iter().any(|s| o.ticker.starts_with(s)))
+            .collect();
+        println!(
+            "LIST AFTER: {} still listed on our series (eventually-consistent; \
+             the cancel responses above are the truth): {left:?}",
+            left.len()
+        );
+    }
+
+    #[test]
+    fn too_early_is_silent_and_missed_window_is_not() {
+        // skip_kind decides both the repeat-skip alarm and the week1 tape.
+        // "Too early" is the normal pre-T0 resting state and must be as silent
+        // as NoStreak; "missed the window" must stay loud.
+        assert_eq!(skip_kind(&Skip::TooEarly { ttc: 911 }), None);
+        assert_eq!(
+            skip_kind(&Skip::NotEntryWindow { ttc: 839 }),
+            Some("missed_entry_window")
+        );
+        assert_eq!(skip_kind(&Skip::NoStreak), None);
     }
 }
