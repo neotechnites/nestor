@@ -199,7 +199,10 @@ fn entry_coid(order: &Order, attempt: u32) -> String {
     // same pass succeeded — and the LIP probe hit the identical wall the same
     // hour). Crypto tickers are dot-free, which is why streak never saw it.
     // '.' -> '_' preserves determinism and restart-dedupe within each ticker.
-    let ticker = order.ticker.replace('.', "_");
+    // Delegated to [`kalshi::sanitize_coid`] — the SAME mapping the wire applies
+    // to every coid, so a pre-sanitized coid and a raw one can never split a
+    // dedupe namespace (sanitize is idempotent on its own output).
+    let ticker = kalshi::sanitize_coid(&order.ticker);
     if attempt <= 1 {
         format!("{}-{}", order.strategy, ticker)
     } else {

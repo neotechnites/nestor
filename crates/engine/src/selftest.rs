@@ -51,7 +51,9 @@ pub async fn run(
         "price": crate::kalshi::order_price_dollars(side, price_cents),
         "time_in_force": "immediate_or_cancel",
         "self_trade_prevention_type": "taker_at_cross",
-        "client_order_id": coid,
+        // Print the coid EXACTLY as the wire will carry it (sanitize_coid runs
+        // inside place_limit_buy_raw), so the preview never lies about the body.
+        "client_order_id": crate::kalshi::sanitize_coid(&coid),
     });
     println!(
         "POST /trade-api/v2/portfolio/events/orders\nrequest body:\n{}",

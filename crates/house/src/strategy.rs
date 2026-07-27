@@ -965,6 +965,29 @@ mod tests {
         )));
     }
 
+    /// MISMATCH GUARD for the coid choke point. `place_leg` builds the coid RAW;
+    /// the wire rewrites '.' -> '_' (`kalshi::sanitize_coid`), so what the
+    /// exchange echoes back to the sweep is the SANITIZED string — never the
+    /// one this crate formatted. Ownership must survive that rewrite, or the
+    /// halt-sweep stops recognising its own quotes on exactly the dotted
+    /// (fractional-strike) markets the sleeve is there to quote, and leaves them
+    /// resting past a halt.
+    #[test]
+    fn house_ownership_survives_wire_coid_sanitization() {
+        let ticker = "KXAPRPOTUS-26JUL31-40.9";
+        // Byte-for-byte the format place_leg uses.
+        let minted = format!("house-{ticker}-yes-1769900000");
+        let echoed = kalshi::sanitize_coid(&minted);
+        assert_ne!(echoed, minted, "this ticker must actually be rewritten");
+        assert!(!echoed.contains('.'));
+        assert!(is_house_order(&resting(Some(&echoed), ticker)));
+        // And the rewrite cannot flip a foreign order into ours.
+        assert!(!is_house_order(&resting(
+            Some(&kalshi::sanitize_coid("volbook-KXCOPPERD-26JUL2717-T6.40")),
+            "KXCOPPERD-26JUL2717-T6.40"
+        )));
+    }
+
     #[test]
     fn sweep_falls_back_to_house_series_when_the_coid_is_absent() {
         // Kalshi's resting-order schema is only demo-confirmed; if it does not

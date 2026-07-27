@@ -460,18 +460,9 @@ impl Kalshi {
     ) -> Result<(u16, String, Option<String>)> {
         let path = format!("{PREFIX}/portfolio/events/orders");
         let headers = self.sign_headers("POST", &path)?;
-        let mut map = serde_json::Map::new();
-        map.insert("ticker".into(), json!(ticker));
-        map.insert("side".into(), json!(book_side(side)));
-        map.insert("count".into(), json!(count_fp(count)));
-        map.insert("price".into(), json!(order_price_dollars(side, price_cents)));
-        map.insert("time_in_force".into(), json!("immediate_or_cancel"));
-        map.insert(
-            "self_trade_prevention_type".into(),
-            json!("taker_at_cross"),
-        );
-        map.insert("client_order_id".into(), json!(client_order_id));
-        let body = serde_json::Value::Object(map);
+        // The coid is sanitized INSIDE the body builder — the wire is the only
+        // place the no-'.' invariant can be enforced once for every caller.
+        let body = taker_order_body(ticker, side, count, price_cents, client_order_id);
         let mut req = self.http.post(format!("{}{path}", api_base())).json(&body);
         for (k, v) in headers {
             req = req.header(k, v);
@@ -580,26 +571,17 @@ impl Kalshi {
     ) -> Result<(u16, String, Option<String>)> {
         let path = format!("{PREFIX}/portfolio/events/orders");
         let headers = self.sign_headers("POST", &path)?;
-        let mut map = serde_json::Map::new();
-        map.insert("ticker".into(), json!(ticker));
-        map.insert("side".into(), json!(book_side(side)));
-        map.insert("count".into(), json!(count_fp(count)));
-        map.insert("price".into(), json!(order_price_dollars(side, price_cents)));
-        // GTD resting: time_in_force is REQUIRED by the API (demo-proven 2026-07-25:
-        // omitting it -> 400 "failed on the 'required' tag"); a resting order uses
-        // good_till_cancelled + a FUTURE expiration_ts, which bounds its life (the
-        // safety property — never omit expiration_ts, that would rest forever).
-        map.insert("time_in_force".into(), json!("good_till_canceled"));
-        map.insert("expiration_ts".into(), json!(expiration_ts));
-        // Demo-proven: "cancel_both" fails the API's oneof validation; use the same
-        // taker_at_cross the IOC path uses (our two legs sit 2c apart and never
-        // cross each other, so STP should never fire at all).
-        map.insert(
-            "self_trade_prevention_type".into(),
-            json!("taker_at_cross"),
+        // The coid is sanitized INSIDE the body builder (see [`sanitize_coid`]):
+        // the house sleeve builds `house-{ticker}-{side}-{ts}` raw, and on a
+        // dotted ticker every quote 400'd until this invariant moved to the wire.
+        let body = resting_order_body(
+            ticker,
+            side,
+            count,
+            price_cents,
+            expiration_ts,
+            client_order_id,
         );
-        map.insert("client_order_id".into(), json!(client_order_id));
-        let body = serde_json::Value::Object(map);
         let mut req = self.http.post(format!("{}{path}", api_base())).json(&body);
         for (k, v) in headers {
             req = req.header(k, v);
@@ -704,6 +686,98 @@ pub fn order_price_dollars(side: &str, price_cents: i64) -> String {
         price_cents
     };
     format!("{:.4}", yes_cents as f64 / 100.0)
+}
+
+/// THE COID CHOKE POINT. Kalshi rejects any `client_order_id` containing '.'
+/// with **400 `invalid_parameters`** (LIVE-PROVEN 2026-07-27: every volbook
+/// order on a dotted ticker like `KXCOPPERD-26JUL2717-T6.40` 400'd while
+/// dot-free gold tickers on the same pass went through; the LIP probe and the
+/// house sleeve hit the identical wall within the same 24h). Dotted tickers are
+/// how Kalshi encodes fractional strikes, so any sleeve quoting metals/politics
+/// mints one by default — the trap fires per call site, forever, until the
+/// invariant lives at the WIRE, which is here.
+///
+/// Contract: '.' -> '_', nothing else. Properties the callers depend on:
+///   - **deterministic + idempotent** — the same raw coid always maps to the
+///     same wire coid, so re-POSTing after a lost ack still collides with the
+///     original and earns the benign 409 `order_already_exists` that
+///     `recover_lost_ack` / `classify_resting_failure` rely on. `sanitize_coid`
+///     is also a fixed point on its own output (no '.' left to map).
+///   - **prefix-preserving** — never touches the leading `{sleeve}-` namespace,
+///     so `is_house_order`'s `starts_with("house-")` and every series filter
+///     keep working on the exchange-echoed form.
+///   - **same mapping as the entry path** (commit 482afd2, `entry_coid`), so a
+///     coid built raw and one pre-sanitized by a caller land on the SAME string
+///     and never split a dedupe namespace.
+///
+/// Applied inside [`Kalshi::place_limit_buy_raw`] and
+/// [`Kalshi::place_resting_limit_raw`] — the only two functions in the codebase
+/// that POST an order — so no coid with a '.' can leave the client regardless of
+/// what a caller builds. Any code comparing a locally-built coid against an
+/// exchange-echoed one MUST compare the sanitized form.
+pub fn sanitize_coid(raw: &str) -> String {
+    raw.replace('.', "_")
+}
+
+/// The exact JSON body of a TAKER (IOC) create-order POST. Pure, so the wire
+/// shape — including the sanitized coid — is unit-testable without a network.
+fn taker_order_body(
+    ticker: &str,
+    side: &str,
+    count: i64,
+    price_cents: i64,
+    client_order_id: &str,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("ticker".into(), json!(ticker));
+    map.insert("side".into(), json!(book_side(side)));
+    map.insert("count".into(), json!(count_fp(count)));
+    map.insert("price".into(), json!(order_price_dollars(side, price_cents)));
+    map.insert("time_in_force".into(), json!("immediate_or_cancel"));
+    map.insert(
+        "self_trade_prevention_type".into(),
+        json!("taker_at_cross"),
+    );
+    map.insert(
+        "client_order_id".into(),
+        json!(sanitize_coid(client_order_id)),
+    );
+    serde_json::Value::Object(map)
+}
+
+/// The exact JSON body of a RESTING (GTD) create-order POST. Pure; see
+/// [`Kalshi::place_resting_limit_raw`] for why `expiration_ts` is load-bearing.
+fn resting_order_body(
+    ticker: &str,
+    side: &str,
+    count: i64,
+    price_cents: i64,
+    expiration_ts: i64,
+    client_order_id: &str,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("ticker".into(), json!(ticker));
+    map.insert("side".into(), json!(book_side(side)));
+    map.insert("count".into(), json!(count_fp(count)));
+    map.insert("price".into(), json!(order_price_dollars(side, price_cents)));
+    // GTD resting: time_in_force is REQUIRED by the API (demo-proven 2026-07-25:
+    // omitting it -> 400 "failed on the 'required' tag"); a resting order uses
+    // good_till_cancelled + a FUTURE expiration_ts, which bounds its life (the
+    // safety property — never omit expiration_ts, that would rest forever).
+    map.insert("time_in_force".into(), json!("good_till_canceled"));
+    map.insert("expiration_ts".into(), json!(expiration_ts));
+    // Demo-proven: "cancel_both" fails the API's oneof validation; use the same
+    // taker_at_cross the IOC path uses (our two legs sit 2c apart and never
+    // cross each other, so STP should never fire at all).
+    map.insert(
+        "self_trade_prevention_type".into(),
+        json!("taker_at_cross"),
+    );
+    map.insert(
+        "client_order_id".into(),
+        json!(sanitize_coid(client_order_id)),
+    );
+    serde_json::Value::Object(map)
 }
 
 /// Translate a YES-book fill price (dollars) back into OUR side's whole cents.
@@ -1231,6 +1305,52 @@ mod tests {
         assert_eq!(book_side("NO"), "ask");
         // anything not "no" is a YES bid (defensive default)
         assert_eq!(book_side("weird"), "bid");
+    }
+
+    /// THE CLASS REGRESSION. A dotted ticker (Kalshi's fractional-strike form,
+    /// e.g. KXAPRPOTUS-26JUL31-40.9) must produce a dot-free coid on BOTH
+    /// order-placement paths — the taker POST and the resting POST are the only
+    /// two functions in the codebase that send a client_order_id, and each has
+    /// now been the site of an independent live 400 (engine entry 482afd2, the
+    /// LIP probe, the house sleeve). The caller is deliberately the NAIVE one:
+    /// the house sleeve's raw `house-{ticker}-{side}-{ts}` format, unmodified.
+    #[test]
+    fn dotted_tickers_never_reach_the_wire_on_any_placement_path() {
+        let ticker = "KXAPRPOTUS-26JUL31-40.9";
+        let naive_coid = format!("house-{ticker}-yes-1769900000");
+        assert!(naive_coid.contains('.'), "the caller really is naive");
+
+        let taker = taker_order_body(ticker, "yes", 1, 40, &naive_coid);
+        let resting = resting_order_body(ticker, "no", 2, 40, 1769900075, &naive_coid);
+        for (path, body) in [("taker", &taker), ("resting", &resting)] {
+            let sent = body["client_order_id"].as_str().expect("coid on the wire");
+            assert!(!sent.contains('.'), "{path} coid reached the wire dotted: {sent}");
+            assert_eq!(sent, "house-KXAPRPOTUS-26JUL31-40_9-yes-1769900000");
+            // The TICKER field keeps its dot — only the coid is rewritten, or we
+            // would be ordering on a market that does not exist.
+            assert_eq!(body["ticker"].as_str(), Some(ticker));
+        }
+    }
+
+    /// Idempotency + namespace stability — the properties the dedupe path rests
+    /// on. Recovery re-POSTs the SAME logical coid expecting Kalshi's 409
+    /// `order_already_exists`; that only works if sanitize is deterministic and
+    /// a fixed point on its own output (a pre-sanitized coid must not be
+    /// rewritten a second time into a different string).
+    #[test]
+    fn sanitize_coid_is_deterministic_idempotent_and_prefix_preserving() {
+        let raw = "volbook-KXCOPPERD-26JUL2717-T6.40";
+        let once = sanitize_coid(raw);
+        assert_eq!(once, "volbook-KXCOPPERD-26JUL2717-T6_40");
+        assert_eq!(sanitize_coid(raw), once, "not deterministic");
+        assert_eq!(sanitize_coid(&once), once, "not idempotent");
+        // Multiple dots (a hypothetical multi-decimal strike) all map.
+        assert_eq!(sanitize_coid("a.b.c"), "a_b_c");
+        // Untouched when clean — every historical crypto/gold coid is byte-identical,
+        // so restart-dedupe against pre-fix orders still collides.
+        assert_eq!(sanitize_coid("streak-KXBTC15M-26JUL251000-00"), "streak-KXBTC15M-26JUL251000-00");
+        // Sleeve prefix (what every ownership matcher keys on) is never altered.
+        assert!(sanitize_coid("house-KXAPRPOTUS-26JUL31-40.9-yes-1").starts_with("house-"));
     }
 
     #[test]
@@ -1804,7 +1924,11 @@ mod tests {
         let resting = k.resting_orders(Some(&ticker)).await.expect("resting list");
         let ours: Vec<_> = parse_resting_orders(&resting)
             .into_iter()
-            .filter(|o| o.client_order_id.as_deref() == Some(coid.as_str()))
+            // Compare against the SANITIZED form: the exchange echoes what the
+            // wire carried, which is `sanitize_coid(coid)` — matching the raw
+            // string would silently miss on any dotted input and report "no
+            // leak" while an order of ours is still resting.
+            .filter(|o| o.client_order_id.as_deref() == Some(sanitize_coid(&coid).as_str()))
             .collect();
         println!("--- exit check: {} of our orders still resting", ours.len());
         for o in &ours {
