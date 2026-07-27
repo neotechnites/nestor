@@ -41,6 +41,15 @@ pub struct Settled {
     pub ticker: String,
     pub won: bool,
     pub pnl: f64,
+    /// Contracts OUR ledger settled on this ticker (review N1). The account is
+    /// shared, and the house sleeve trades tickers inside NESTOR_SERIES while
+    /// deliberately staying outside the position ledger — so the exchange's NET
+    /// position on a ticker can exceed what we settled. The divergence breaker's
+    /// missing-money grace is bounded by THIS number, never by the exchange's.
+    /// Defaulted to 0 for rows written before the field existed; see
+    /// `reconcile::unpaid_payout` for how those are handled.
+    #[serde(default)]
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

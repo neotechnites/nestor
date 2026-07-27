@@ -760,6 +760,9 @@ impl RiskManager {
             ticker: pos.ticker.clone(),
             won,
             pnl,
+            // What OUR ledger closed (review N1) — the bound on how much payout
+            // the breaker may ever believe the exchange owes us on this ticker.
+            count: pos.count,
         });
         // Keep only the most recent settlements in live state — the full history
         // lives in the JSONL trade log. Bounds state.json growth over time.
@@ -1651,6 +1654,9 @@ mod tests {
         let rec = r.settled_record("KXGOLDD-26JUL27-T4085").unwrap();
         assert_eq!(rec.ticker, "KXGOLDD-26JUL27-T4085");
         assert!(rec.won);
+        // Review N1: the record carries what OUR ledger closed, which is what
+        // bounds the breaker's missing-money grace.
+        assert_eq!(rec.count, 2);
     }
 
     #[test]
@@ -1702,6 +1708,12 @@ mod tests {
         )
         .unwrap();
         assert!(r2.is_settled("KXSILVERD-26JUL27-T39"));
+        // The N1 ledger bound must survive the JSON round-trip too, or the
+        // breaker silently falls back to trusting the shared account's net.
+        assert_eq!(
+            r2.settled_record("KXSILVERD-26JUL27-T39").unwrap().count,
+            2
+        );
         assert!(!r2.adopt_orphan("KXSILVERD-26JUL27-T39", Side::Yes, 2, Some(40), "orphan"));
         assert!(r2.settle("KXSILVERD-26JUL27-T39", true).is_none());
         assert!(r2.open_positions().is_empty());
