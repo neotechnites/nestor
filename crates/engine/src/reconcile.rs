@@ -57,6 +57,20 @@ fn divergence_threshold(resting_reserved: f64) -> f64 {
     DIVERGENCE_THRESHOLD_USD + resting_reserved.max(0.0)
 }
 
+/// FIX F8 (moneypath review; fired live 2026-07-27 12:45Z, 52min idle over the
+/// bot's own $10 win): asymmetric breaker tolerance. EXTRA money bounded by the
+/// maximum payout of our own unbooked open positions is a settlement credit
+/// outrunning the lagging settle index (36s-settled-filter family) — a check
+/// clearing, not a disagreement. MISSING money gets no grace: it halts at the
+/// tight threshold regardless of what we're owed.
+fn breaker_threshold(delta_signed: f64, resting_reserved: f64, pending_payout: f64) -> f64 {
+    if delta_signed > 0.0 {
+        divergence_threshold(resting_reserved) + pending_payout.max(0.0)
+    } else {
+        divergence_threshold(resting_reserved)
+    }
+}
+
 /// Which branch of the unproven resting-collateral question this observation is
 /// consistent with. Only meaningful when `resting_reserved > 0`.
 fn collateral_branch(real_cash: f64, expected_cash: f64, resting_reserved: f64) -> &'static str {
@@ -294,12 +308,18 @@ async fn reconcile_exchange_truth(eng: &Engine) -> Result<()> {
         .await
         .context("balance read (divergence check)")?;
     let real_cash = bal_cents as f64 / 100.0;
-    let (expected_cash, resting_reserved, house_cash) = {
+    let (expected_cash, resting_reserved, house_cash, pending_payout) = {
         let r = eng.risk.lock().unwrap_or_else(|e| e.into_inner());
-        (r.expected_cash(), r.resting_reserved(), r.house_cash())
+        (
+            r.expected_cash(),
+            r.resting_reserved(),
+            r.house_cash(),
+            r.pending_payout(),
+        )
     };
-    let divergence = (real_cash - expected_cash).abs();
-    let threshold = divergence_threshold(resting_reserved);
+    let delta_signed = real_cash - expected_cash;
+    let divergence = delta_signed.abs();
+    let threshold = breaker_threshold(delta_signed, resting_reserved, pending_payout);
 
     // FREE EVIDENCE (reality F1): the first live pass that lands while an order
     // rests answers the resting-collateral question outright. Record it.
@@ -454,5 +474,23 @@ mod tests {
         assert_eq!(settlement_won(Side::Yes, "YES"), Some(true));
         // Unexpected/void outcome → skip rather than book a phantom loss.
         assert_eq!(settlement_won(Side::Yes, "void"), None);
+    }
+}
+
+#[cfg(test)]
+mod f8_tests {
+    use super::*;
+
+    #[test]
+    fn credit_within_pending_payout_is_tolerated_but_missing_money_is_not() {
+        // The live incident: +$10.26 delta with a 10-contract winner unbooked.
+        let pending = 10.0;
+        assert!(10.26 < breaker_threshold(10.26, 0.0, pending)); // no halt
+        // Same magnitude MISSING money: no grace from what we're owed.
+        assert!(10.26 > breaker_threshold(-10.26, 0.0, pending)); // halts
+        // Extra money BEYOND anything we're owed still halts.
+        assert!(13.0 > breaker_threshold(13.0, 0.0, pending));
+        // No open positions: the old tight symmetric behavior exactly.
+        assert_eq!(breaker_threshold(5.0, 0.0, 0.0), breaker_threshold(-5.0, 0.0, 0.0));
     }
 }

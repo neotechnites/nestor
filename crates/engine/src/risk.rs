@@ -564,6 +564,19 @@ impl RiskManager {
         self.state.bankroll - self.total_at_risk() + self.house_cash()
     }
 
+    /// Maximum settlement credit the exchange could pay us for positions we
+    /// hold but have not yet booked as settled: $1.00 × count per open
+    /// position. FIX F8 (moneypath review; fired live 2026-07-27 12:45Z): a
+    /// winner's cash credit can land a minute or more before the settle
+    /// detection books it (the same lagging-index family as the 36s settled
+    /// filter), and in that window real cash legitimately exceeds
+    /// expected_cash by up to this amount. The divergence breaker widens its
+    /// POSITIVE-side tolerance by this; money going MISSING still halts at
+    /// the tight threshold.
+    pub fn pending_payout(&self) -> f64 {
+        self.state.open.iter().map(|p| p.count as f64).sum()
+    }
+
     /// Force the kill-switch on (divergence breaker / operator). Persisted.
     pub fn halt(&mut self) {
         self.state.halted = true;
