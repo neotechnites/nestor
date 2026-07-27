@@ -31,6 +31,13 @@ const DIVERGENCE_THRESHOLD_USD: f64 = 2.0;
 /// first live maker leg answers it for free.
 const RESTING_COLLATERAL_LOG: &str = "data/resting_collateral.jsonl";
 
+/// Series prefixes nestor's own strategies trade — the ADOPTION BOUNDARY.
+/// Positions outside these series belong to operator side-operations and are
+/// accounted via data/external_cash.jsonl, never adopted (verify-ops-map F1).
+const NESTOR_SERIES: [&str; 7] = [
+    "KXBTC15M", "KXETH15M", "KXGOLDD", "KXSILVERD", "KXCOPPERD", "KXAPRPOTUS", "KXCPIYOY",
+];
+
 /// The divergence breaker's tolerance for this pass, in dollars (FIX 1 —
 /// reality F1, constants F1, moneypath F3).
 ///
@@ -274,6 +281,16 @@ async fn reconcile_exchange_truth(eng: &Engine) -> Result<()> {
         .context("positions read (orphan check)")?;
     let exchange = kalshi::parse_positions(&raw);
     for p in &exchange {
+        // ADOPTION BOUNDARY (verify-ops-map F1, 2026-07-27): only adopt positions
+        // on series NESTOR'S OWN STRATEGIES trade. The account is shared with
+        // operator side-operations (LIP probe, manual event trades — external_cash
+        // ledger territory); adopting those double-books their cash effects,
+        // eats the daily budget/portfolio caps, and would have booked a 1,000-lot
+        // penny order at WORST_CASE 99c = a phantom $990 stake. Six of the ops-map
+        // attack's ten findings die on this filter.
+        if !NESTOR_SERIES.iter().any(|s| p.ticker.starts_with(s)) {
+            continue;
+        }
         // adopt_orphan is idempotent: it no-ops (returns false) for a ticker we
         // already track, so this only fires for genuine orphans.
         let cluster = format!("orphan-{}", p.ticker);
