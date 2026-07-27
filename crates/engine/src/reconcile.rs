@@ -70,11 +70,35 @@ fn divergence_threshold(resting_reserved: f64) -> f64 {
 /// outrunning the lagging settle index (36s-settled-filter family) — a check
 /// clearing, not a disagreement. MISSING money gets no grace: it halts at the
 /// tight threshold regardless of what we're owed.
-fn breaker_threshold(delta_signed: f64, resting_reserved: f64, pending_payout: f64) -> f64 {
+///
+/// FIX F1 of the settled-guard review (R171 / incident #5): `unpaid_settled` is
+/// the MIRROR of `pending_payout` and the only new grace on the missing-money
+/// side. When we book a winner, `expected_cash` rises by the full $1.00 × count
+/// payout the instant we settle (bankroll gains the win, the stake leaves
+/// `total_at_risk`), but the exchange pays minutes-to-hours later — so real cash
+/// is legitimately SHORT by exactly that payout until it lands. Before the
+/// settled-set guard, the re-adoption bug accidentally masked most of this by
+/// putting the stake back; with the guard, the gap is fully exposed and a
+/// 10-contract winner would false-halt a $2 threshold on its own settlement.
+///
+/// It is evidence-bounded exactly like `resting_reserved`, and that matters more
+/// here than anywhere else because this widens the side F8 deliberately kept
+/// tight: the caller may only count a ticker whose position the EXCHANGE STILL
+/// SHOWS in this same pass AND whose local `Settled` record says `won` — i.e.
+/// money we can prove we are owed. A settled LOSER contributes nothing (its
+/// payout is $0.00 and its delta is exactly zero). The grace self-extinguishes:
+/// once the payout lands the position leaves the exchange's list and the
+/// widening disappears on the next pass.
+fn breaker_threshold(
+    delta_signed: f64,
+    resting_reserved: f64,
+    pending_payout: f64,
+    unpaid_settled: f64,
+) -> f64 {
     if delta_signed > 0.0 {
         divergence_threshold(resting_reserved) + pending_payout.max(0.0)
     } else {
-        divergence_threshold(resting_reserved)
+        divergence_threshold(resting_reserved) + unpaid_settled.max(0.0)
     }
 }
 
@@ -107,6 +131,32 @@ fn settlement_won(side: Side, result: &str) -> Option<bool> {
         // "" (still open) or "void"/anything unexpected: don't settle.
         _ => None,
     }
+}
+
+/// Is this market OVER — trading finished and the outcome known or imminent?
+///
+/// Deliberately NOT [`is_settleable`], and deliberately an OR where that is an
+/// AND. The two functions answer opposite-facing questions and so round in
+/// opposite directions: `is_settleable` asks "may we BOOK MONEY on this?", where
+/// the conservative answer is NO unless the outcome is unambiguous; this asks
+/// "could this exchange position still be a live orphan worth adopting?", where
+/// the conservative answer is NO on ANY evidence the market is finished. A
+/// non-empty `result` alone is enough, and so is a terminal status with no result
+/// yet (the transient determined-with-empty-result state books nothing but is
+/// still not something to open a position on).
+///
+/// `closed` is NOT terminal: trading has stopped but the outcome is still
+/// pending, and a position on a closed-undetermined market is a genuine orphan
+/// that must remain adoptable — refusing it would leave real exposure invisible
+/// to the caps.
+fn is_over(status: &str, result: &str) -> bool {
+    if !result.trim().is_empty() {
+        return true;
+    }
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "determined" | "finalized" | "settled"
+    )
 }
 
 /// Whether a market is settleable NOW (item 6). Kalshi status progresses
@@ -238,8 +288,17 @@ pub async fn run(eng: &Engine) -> Result<()> {
                 ));
             }
             None => {
+                // Two outcomes share this None (review F7): nothing open under
+                // that ticker, or the settled-set guard refused and dropped a
+                // phantom. Deliberately NOT split into an enum return: the risk
+                // layer already emits the authoritative record for the second
+                // case — named settled row, dropped stake, HALT — so an enum
+                // would buy a second, weaker copy of that message at the cost of
+                // changing every caller's signature. This line just stops
+                // asserting the first case as if it were the only one.
                 logging::info(format!(
-                    "{ticker}: no open position (already settled?) — skip"
+                    "{ticker}: nothing booked — no open position, or the settled-set guard \
+                     refused it (see the risk-layer log) — skip"
                 ));
             }
         }
@@ -280,6 +339,10 @@ async fn reconcile_exchange_truth(eng: &Engine) -> Result<()> {
         .await
         .context("positions read (orphan check)")?;
     let exchange = kalshi::parse_positions(&raw);
+    // Settlement payouts the exchange still owes us, in dollars, evidenced by
+    // this very pass: a ticker we booked as a WIN whose position the exchange is
+    // still showing. Feeds the divergence breaker's missing-money side (F1).
+    let mut unpaid_settled = 0.0f64;
     for p in &exchange {
         // ADOPTION BOUNDARY (verify-ops-map F1, 2026-07-27): only adopt positions
         // on series NESTOR'S OWN STRATEGIES trade. The account is shared with
@@ -291,12 +354,76 @@ async fn reconcile_exchange_truth(eng: &Engine) -> Result<()> {
         if !NESTOR_SERIES.iter().any(|s| p.ticker.starts_with(s)) {
             continue;
         }
+        // Cheap, local, network-free questions first: an empty row or a ticker we
+        // already track needs no work — and, critically, no market fetch.
+        let (tracked, settled) = {
+            let r = eng.risk.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                p.count <= 0 || r.has_open(&p.ticker),
+                r.settled_record(&p.ticker),
+            )
+        };
+        if tracked {
+            continue;
+        }
+
+        // SETTLED-SET REFUSAL (R171 / incident #5). The exchange keeps showing a
+        // position for minutes-to-hours after we book its settlement; adopting
+        // that re-opens what we just closed (+$2.17/pass, 8 passes, on
+        // 2026-07-27). Refused here rather than inside `adopt_orphan` — which
+        // still enforces it for every other caller — because THIS is where the
+        // payout the exchange still owes us can be measured for the divergence
+        // breaker (F1): the position in hand is the evidence.
+        if let Some(rec) = settled {
+            let owed = if rec.won { p.count as f64 } else { 0.0 };
+            unpaid_settled += owed;
+            logging::info(format!(
+                "{}: adoption refused — already settled (won={} pnl=${:.2}); exchange still \
+                 shows {}x, payout owed ${owed:.2} — payout lag, not an orphan",
+                p.ticker, rec.won, rec.pnl, p.count
+            ));
+            continue;
+        }
+
+        // MARKET-TRUTH GUARD (review F4) — the PRIMARY, stateless test: a market
+        // that is OVER can never be an orphan worth adopting, whatever local
+        // state says. It needs no memory, so it holds even if `state.settled` is
+        // lost, truncated, or hand-edited away; the settled set is the backstop
+        // that holds when the network is down. Placement is the cheapest correct
+        // one: the fetch runs ONLY for would-be adoptees, which are rare (every
+        // tracked, empty, or settled row has already `continue`d above), so the
+        // normal pass adds zero calls.
+        //
+        // A failed fetch REFUSES (fail-closed): unverified means unknown, an
+        // un-adopted genuine orphan is retried next pass and meanwhile shows up
+        // as unexplained cash the breaker will halt on — loud and safe — whereas
+        // adopting a finished market is the incident this fix exists to end.
+        match eng.kalshi.market(&p.ticker).await {
+            Ok(m) => {
+                let result = m.result.unwrap_or_default();
+                let status = m.status.unwrap_or_default();
+                if is_over(&status, &result) {
+                    logging::info(format!(
+                        "{}: adoption refused — market is over (status={status:?} \
+                         result={result:?}); a finished market cannot be an orphan",
+                        p.ticker
+                    ));
+                    continue;
+                }
+            }
+            Err(e) => {
+                logging::info(format!(
+                    "{}: adoption deferred — market fetch failed ({e}); refusing to adopt an \
+                     unverified market, will retry next pass",
+                    p.ticker
+                ));
+                continue;
+            }
+        }
+
         // adopt_orphan is idempotent: it no-ops (returns false) for a ticker we
-        // already track, AND refuses one already in the settled set (R171 /
-        // incident #5 — the exchange keeps showing a position for minutes-to-hours
-        // after we book its settlement, and adopting that re-opens what we just
-        // closed). So this only fires for genuine orphans, and the alert below
-        // stays a real signal instead of firing once per pass through a payout lag.
+        // already track. So this only fires for genuine orphans, and the alert
+        // below stays a real signal.
         let cluster = format!("orphan-{}", p.ticker);
         let adopted = {
             let mut r = eng.risk.lock().unwrap_or_else(|e| e.into_inner());
@@ -351,8 +478,12 @@ async fn reconcile_exchange_truth(eng: &Engine) -> Result<()> {
     let expected_cash = expected_cash + ext_cash;
     let delta_signed = real_cash - expected_cash;
     let divergence = delta_signed.abs();
-    let threshold =
-        breaker_threshold(delta_signed, resting_reserved, pending_payout + ext_pending);
+    let threshold = breaker_threshold(
+        delta_signed,
+        resting_reserved,
+        pending_payout + ext_pending,
+        unpaid_settled,
+    );
 
     // FREE EVIDENCE (reality F1): the first live pass that lands while an order
     // rests answers the resting-collateral question outright. Record it.
@@ -381,9 +512,10 @@ async fn reconcile_exchange_truth(eng: &Engine) -> Result<()> {
     if divergence > threshold {
         let msg = format!(
             "BANKROLL DIVERGENCE ${divergence:.2} > ${threshold:.2} (base \
-             ${DIVERGENCE_THRESHOLD_USD:.2} + ${resting_reserved:.2} resting) — real cash \
-             ${real_cash:.2} vs expected ${expected_cash:.2} (house bridge ${house_cash:.2}). \
-             HALTING (state/exchange disagree).",
+             ${DIVERGENCE_THRESHOLD_USD:.2} + ${resting_reserved:.2} resting + \
+             ${unpaid_settled:.2} settled-unpaid) — real cash ${real_cash:.2} vs expected \
+             ${expected_cash:.2} (house bridge ${house_cash:.2}). HALTING (state/exchange \
+             disagree).",
         );
         logging::info(format!("ALERT: {msg}"));
         eprintln!("[reconcile] ALERT: {msg}");
@@ -518,13 +650,79 @@ mod f8_tests {
     fn credit_within_pending_payout_is_tolerated_but_missing_money_is_not() {
         // The live incident: +$10.26 delta with a 10-contract winner unbooked.
         let pending = 10.0;
-        assert!(10.26 < breaker_threshold(10.26, 0.0, pending)); // no halt
+        assert!(10.26 < breaker_threshold(10.26, 0.0, pending, 0.0)); // no halt
         // Same magnitude MISSING money: no grace from what we're owed.
-        assert!(10.26 > breaker_threshold(-10.26, 0.0, pending)); // halts
+        assert!(10.26 > breaker_threshold(-10.26, 0.0, pending, 0.0)); // halts
         // Extra money BEYOND anything we're owed still halts.
-        assert!(13.0 > breaker_threshold(13.0, 0.0, pending));
+        assert!(13.0 > breaker_threshold(13.0, 0.0, pending, 0.0));
         // No open positions: the old tight symmetric behavior exactly.
-        assert_eq!(breaker_threshold(5.0, 0.0, 0.0), breaker_threshold(-5.0, 0.0, 0.0));
+        assert_eq!(
+            breaker_threshold(5.0, 0.0, 0.0, 0.0),
+            breaker_threshold(-5.0, 0.0, 0.0, 0.0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod settled_guard_tests {
+    use super::*;
+
+    /// Would the breaker HALT on a signed delta with this evidence?
+    fn halts(delta: f64, resting: f64, pending: f64, unpaid: f64) -> bool {
+        delta.abs() > breaker_threshold(delta, resting, pending, unpaid)
+    }
+
+    #[test]
+    fn a_settled_winner_awaiting_payout_does_not_false_halt() {
+        // REVIEW F1. We book a 10-contract winner; expected_cash immediately
+        // rises by the whole $10.00 payout, the exchange pays minutes-to-hours
+        // later, and this pass still sees the position on the exchange (which is
+        // exactly why adoption was refused). Real cash is short by $10.00 for
+        // reasons we can prove — that must not halt.
+        let unpaid = 10.0;
+        assert!(!halts(-10.0, 0.0, 0.0, unpaid), "false-halted on our own winnings");
+        // Without that evidence the SAME missing $10 halts at the tight
+        // threshold: the grace is bounded by what the exchange still shows, not
+        // granted to missing money in general.
+        assert!(halts(-10.0, 0.0, 0.0, 0.0));
+        // Missing MORE than we are owed still halts — widened, not disabled.
+        assert!(halts(-12.01, 0.0, 0.0, unpaid));
+        // A settled LOSER owes us nothing, so it contributes nothing: its real
+        // delta is exactly zero, and $10 going missing next to it still halts.
+        assert!(halts(-10.0, 0.0, 0.0, 0.0));
+        // The POSITIVE side is untouched by this term (F8 owns that side).
+        assert_eq!(
+            breaker_threshold(5.0, 0.0, 0.0, 10.0),
+            breaker_threshold(5.0, 0.0, 0.0, 0.0)
+        );
+        // Garbage never shrinks the tolerance below the base.
+        assert_eq!(
+            breaker_threshold(-1.0, 0.0, 0.0, -50.0),
+            DIVERGENCE_THRESHOLD_USD
+        );
+    }
+
+    #[test]
+    fn a_finished_market_is_never_an_orphan_worth_adopting() {
+        // REVIEW F4, the stateless primary guard. Any evidence the market is
+        // over disqualifies adoption...
+        assert!(is_over("determined", "yes"));
+        assert!(is_over("finalized", "no"));
+        assert!(is_over("SETTLED", "")); // terminal status, result not in yet
+        assert!(is_over("", "yes")); // result is authoritative without status
+        assert!(is_over("active", "yes")); // stale status, outcome known
+        // ...while a market that is merely not trading is still adoptable: a
+        // position on it is a real orphan whose outcome has not happened.
+        assert!(!is_over("closed", ""));
+        assert!(!is_over("active", ""));
+        assert!(!is_over("", ""));
+        assert!(!is_over("paused", "  "));
+
+        // The two questions round in OPPOSITE directions, on purpose. These are
+        // exactly the states where "may we book money?" and "could this be a
+        // live orphan?" disagree — both answers conservative for their own side.
+        assert!(!is_settleable("determined", "") && is_over("determined", ""));
+        assert!(!is_settleable("active", "yes") && is_over("active", "yes"));
     }
 }
 
