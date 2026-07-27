@@ -292,7 +292,11 @@ async fn reconcile_exchange_truth(eng: &Engine) -> Result<()> {
             continue;
         }
         // adopt_orphan is idempotent: it no-ops (returns false) for a ticker we
-        // already track, so this only fires for genuine orphans.
+        // already track, AND refuses one already in the settled set (R171 /
+        // incident #5 — the exchange keeps showing a position for minutes-to-hours
+        // after we book its settlement, and adopting that re-opens what we just
+        // closed). So this only fires for genuine orphans, and the alert below
+        // stays a real signal instead of firing once per pass through a payout lag.
         let cluster = format!("orphan-{}", p.ticker);
         let adopted = {
             let mut r = eng.risk.lock().unwrap_or_else(|e| e.into_inner());
