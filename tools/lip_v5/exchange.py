@@ -203,11 +203,17 @@ class FakeExchange(object):
         self._oid += 1
         oid = "fake-%d" % self._oid
         self.resting[oid] = dict(body)
-        return self.place_status, {"order": {"order_id": oid,
-                                             "client_order_id": body.get("client_order_id"),
-                                             "status": "resting",
-                                             "remaining_count": float(body.get("count", 0)),
-                                             "fill_count": 0}}
+        # THE REAL WIRE SHAPE, captured from prod 2026-07-28: order fields are FLAT at the top
+        # level and the counts are DOLLAR-STRINGS, not floats.  The old fixture nested them
+        # under "order" with float counts, so `place()` read every real success as a rejection
+        # and re-placed the same order every second — 130 duplicates on one rung.  The fake is
+        # the engine's contract with the wire; when it speaks a dialect the wire does not, a
+        # green suite certifies nothing.
+        return self.place_status, {"order_id": oid,
+                                   "client_order_id": body.get("client_order_id"),
+                                   "remaining_count": "%.2f" % float(body.get("count", 0)),
+                                   "fill_count": "0.00",
+                                   "ts_ms": int((now_ms := 0) or 1785268562482)}
 
     def cancel(self, order_id):
         self.cancelled.append(order_id)

@@ -294,7 +294,18 @@ class Maker(object):
 
         status, resp = self.ex.place(body)
         self.note_http(status, now)                           # SF-2
-        if status not in (200, 201) or not (resp.get("order") or {}).get("order_id"):
+        # THE ORDER OBJECT MAY BE FLAT OR NESTED.  Measured live 2026-07-28: the prod wire
+        # returns the order's fields AT THE TOP LEVEL
+        #     {client_order_id, order_id, remaining_count: "61.00", fill_count: "0.00", ts_ms}
+        # while the fixture returned {"order": {...}}.  Reading only the nested form made a
+        # SUCCESSFUL placement look like a rejection: the order went live on the exchange, v5
+        # recorded nothing, released collateral it was actually holding, and one second later
+        # placed the same order again — 130 duplicates on one rung before a human noticed.  A
+        # response shape is the wire's to declare, never ours to assume: accept BOTH, and key
+        # the decision on the only field that means "the exchange took it" — order_id.
+        _nested = resp.get("order") if isinstance(resp, dict) else None
+        o_resp = _nested if isinstance(_nested, dict) else (resp if isinstance(resp, dict) else {})
+        if status not in (200, 201) or not o_resp.get("order_id"):
             if status == 0:
                 # TRANSPORT failure: the POST may have LANDED (v4's B2 class).  The order
                 # would be live with no order_id in our books — freeze the market so nothing
@@ -314,7 +325,7 @@ class Maker(object):
                               err=str(resp)[:200])
             return False, "reject", resp
 
-        o = resp["order"]
+        o = o_resp
         oid = str(o["order_id"])
         self.cash.confirm_order(coid, 0.0 if fully_closing else collateral)
         self.orders[oid] = {"order_id": oid, "coid": coid, "ticker": ticker, "side": side,

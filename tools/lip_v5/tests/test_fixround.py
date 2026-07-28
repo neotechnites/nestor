@@ -64,7 +64,7 @@ class TestFakeFidelity(LipTestCase):
         ex = X.FakeExchange(balance_cents=100_000)
         _, resp = ex.place({"ticker": "T", "side": "bid", "count": "10.00",
                             "price": "0.0200", "client_order_id": "v5-x-1"})
-        oid = resp["order"]["order_id"]
+        oid = resp["order_id"]          # FLAT: the real wire shape
         row = ex.take(oid, 10, now=NOW)
         self.assertEqual(row["side"], "yes")
         self.assertEqual(row["action"], "buy")
@@ -655,3 +655,50 @@ class TestTheEmptyBookIsEnterable(FixRoundCase if 'FixRoundCase' in dir() else _
                                   "p": None, "legal": False}}}}
 
         self.assertEqual(scan.build_slots([prog], C0(), now, p6=lambda t: True), [])
+
+
+class TestNoDuplicateOrderLoop(__import__('unittest').TestCase):
+    """THE 130-ORDER LOOP, 2026-07-28 live.  The prod wire returns the placed order's fields
+    FLAT (`{order_id, remaining_count: "61.00", ...}`); the engine read only the nested
+    `{"order": {...}}` form, so every SUCCESS was booked as a rejection: the order went live,
+    v5 recorded nothing, released collateral it was really holding, and re-placed the same
+    order on the next 1 Hz cycle — 130 duplicates on one rung before a human saw it.
+
+    The invariant this pins is not "parse that field": it is **one intent, one order.**"""
+
+    def _maker(self):
+        from lip_v5 import engine, exchange as X
+        ex = X.FakeExchange(balance_cents=1_000_000)
+        m = engine.Maker(ex, 1785268000.0, live=False)
+        m.nestor_orders, m.nestor_positions = set(), set()
+        return m, ex
+
+    def test_a_flat_response_is_recorded_as_a_live_order(self):
+        m, ex = self._maker()
+        ok, why, resp = m.place("KXTRUEV-26JUL28-T1208.87", "bid", 0.01, 61,
+                                1785271600.0, 1785268000.0, available_cash_usd=1000.0)
+        self.assertTrue(ok, "a flat-shaped SUCCESS must not read as a rejection (got %r)" % why)
+        self.assertEqual(len(m.orders), 1, "the order the exchange took must be in our books")
+        o = list(m.orders.values())[0]
+        self.assertEqual(o["remaining"], 61.0)
+        self.assertEqual(len(ex.placed), 1)
+
+    def test_the_same_intent_never_places_twice(self):
+        """Place, then ask for the identical size again: the second call must NOT create a
+        second order on the wire, because the first one is already resting."""
+        m, ex = self._maker()
+        m.place("KXTRUEV-26JUL28-T1208.87", "bid", 0.01, 61, 1785271600.0, 1785268000.0,
+                available_cash_usd=1000.0)
+        live = [o for o in m.orders.values() if o.get("remaining", 0) > 0]
+        self.assertEqual(len(live), 1)
+        self.assertEqual(len(ex.resting), 1, "one intent, one resting order")
+
+    def test_a_genuine_rejection_is_still_a_rejection(self):
+        """The mirror: accepting the flat shape must not make us book failures as successes."""
+        m, ex = self._maker()
+        ex.place_error = "insufficient balance"
+        ex.place_status = 400
+        ok, why, _ = m.place("KXTRUEV-26JUL28-T1208.87", "bid", 0.01, 61,
+                             1785271600.0, 1785268000.0, available_cash_usd=1000.0)
+        self.assertFalse(ok)
+        self.assertEqual(m.orders, {}, "a refused order must never enter our books")
