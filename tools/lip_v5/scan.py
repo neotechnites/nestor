@@ -163,9 +163,34 @@ class Classifier:
         return t is None or (float(now) - t) >= self.refresh_s
 
     def candidates(self, programs, now):
-        """Top-N markets by ρ, denied series removed BEFORE we spend a request on them."""
+        """Top-N markets by ρ, with EVERY request-free exclusion applied first.
+
+        Denied series were already excluded here.  The window ones were not, and that was the
+        whole classify budget: measured live at G2, 4,517 of 7,000 programs had ALREADY ENDED,
+        and because a dead program keeps its ρ (pool ÷ its own window) the ranking is dominated
+        by windows that closed — 200 markets classified, ZERO slots, because `build_slots` then
+        drops every one of them on `hours_left <= 0`.  We paid ~200 requests per sweep to learn
+        the shape of books we can never be paid for.
+
+        The exclusions here must be exactly those `build_slots` applies for free, or the budget
+        is spent on markets the next stage discards: ended, not-yet-open (the pre-position
+        guard), and unreachable-floor (the runway guard).
+        """
         rows = []
         for prog in programs:
+            hours_left = (float(prog["end_ts"]) - float(now)) / 3600.0
+            if hours_left <= 0:
+                continue                       # the window is over: nothing here can be earned
+            hours_to_start = max(0.0, (float(prog["start_ts"]) - float(now)) / 3600.0)
+            if not preposition_ok(hours_to_start):
+                continue                       # not open yet — a pre-start quote earns zero
+            # NO RUNWAY CHECK HERE, deliberately.  Accrual is per (market, side) and unknown
+            # until `build_slots`; a program sitting at $0.87 needs only $0.23 more to clear the
+            # cliff, so ANY from-scratch floor applied here would starve the rescue of exactly
+            # the programs it exists to save (BLOCKER-2's mirror, one stage earlier — the test
+            # `test_venue_floor_uses_the_rescue_target_not_the_entry_floor` catches it).  The
+            # two exclusions above are accrual-INDEPENDENT and unambiguous, and they are the
+            # ones that were costing the whole budget.
             for tk in prog["tickers"]:
                 if C.series_denied(tk):
                     continue
