@@ -268,6 +268,22 @@ class Runner(object):
         # heartbeat keeps publishing — a halted-but-alive v5 still holds inventory, and a
         # stale feed would page nestor's operator about a process that is fine.
         if self.m.halt.halted:
+            # NEW-2 — **A HALTED BOOK MUST STILL SEE ITS OWN FILLS.**  `poll_fills_due` lived
+            # only in `cycle()`, which a halted iteration never reaches, so the shed this very
+            # branch posts could FILL on the wire and stay in our books as a position AND as a
+            # live order for the whole halt — and `halted_closing_pass` would then decline to
+            # repost, because it still saw its own dead order as presence.  The halt's whole
+            # purpose is to LEAVE; leaving requires knowing we left.  Its own try/except (not
+            # the block below) so a failing fills read never costs the closing pass its turn —
+            # they are independent duties and coupling them would make the read that reports
+            # the exit able to prevent it.  The cadence is `poll_fills_due`'s own FILLS_POLL_S
+            # gate and the `verify` rate lane, unchanged: at HALTED_IDLE_S = 30 s this is at
+            # most one fills read per halted pass.
+            try:
+                self.m.poll_fills_due(now)
+            except Exception as exc:                          # noqa: BLE001 - no crash
+                R.log("halted_idle_error", where="poll_fills",
+                      err="%s: %s" % (type(exc).__name__, exc))
             try:
                 if not self.m.halt_flatten_done:
                     self.m.flatten(now)
