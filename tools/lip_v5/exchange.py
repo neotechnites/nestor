@@ -34,7 +34,7 @@ class Exchange(object):
         params = {"limit": C.SCAN_PAGE_LIMIT} if hasattr(C, "SCAN_PAGE_LIMIT") else {}
         if cursor:
             params["cursor"] = cursor
-        return R.public_get("/liquidity_incentive_programs", params=params)
+        return R.public_get("/incentive_programs", params=params)
 
     def trades(self, ticker, min_ts=None, limit=1):          # pragma: no cover - network
         """Public trade tape — P6's evidence source ("does ANYONE ever trade here?").
@@ -169,7 +169,7 @@ class FakeExchange(object):
         return 200, {"market_positions": list(self._positions)}
 
     def programs(self, cursor=None):
-        return 200, {"liquidity_incentive_programs": []}
+        return 200, {"incentive_programs": [], "next_cursor": None}
 
     def balance(self):
         return 200, {"balance": self.balance_cents}

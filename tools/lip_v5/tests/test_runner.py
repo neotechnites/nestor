@@ -24,7 +24,7 @@ def program_body(series="KXAAAGASD", tickers=("KXAAAGASD-26JUL29-T4.12",),
                  reward=1_000_000, start=NOW - 3600, end=NOW + 16 * 3600):
     from datetime import datetime, timezone
     iso = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"liquidity_incentive_programs": [{
+    return {"incentive_programs": [{
         "id": "prog-1", "series_ticker": series, "market_tickers": list(tickers),
         "period_reward": reward, "start_date": iso(start), "end_date": iso(end),
         "target_size_fp": 1000}]}
@@ -56,7 +56,7 @@ class TestScanStage(LipTestCase):
         self.assertAlmostEqual(p["rho"], 100.0 / 17.0, places=6)
 
     def test_an_unparseable_program_is_DROPPED_loudly(self):
-        body = {"liquidity_incentive_programs": [{"id": "x", "start_date": "nonsense"}]}
+        body = {"incentive_programs": [{"id": "x", "start_date": "nonsense"}]}
         self.assertEqual(scan.parse_programs(body), [])
         self.assertTrue(self.logs_of("program_unparseable"))
 

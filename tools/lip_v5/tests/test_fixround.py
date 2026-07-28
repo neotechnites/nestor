@@ -28,7 +28,7 @@ def iso(t):
 
 def program_body(series="KXAAAGASD", tickers=(TK,), reward=1_000_000,
                  start=NOW - 3600, end=NOW + 16 * 3600, pid="prog-1"):
-    return {"liquidity_incentive_programs": [{
+    return {"incentive_programs": [{
         "id": pid, "series_ticker": series, "market_tickers": list(tickers),
         "period_reward": reward, "start_date": iso(start), "end_date": iso(end),
         "target_size_fp": 1000}]}

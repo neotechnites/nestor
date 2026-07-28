@@ -62,7 +62,9 @@ def parse_programs(body):
     """The LIP programs feed → normalized program dicts.  Unparseable rows are DROPPED, loudly:
     a program we cannot read is a program we must not size against."""
     out = []
-    rows = (body or {}).get("liquidity_incentive_programs") or []
+    rows = ((body or {}).get("incentive_programs")
+            or (body or {}).get("liquidity_incentive_programs")
+            or (body or {}).get("programs") or [])
     for row in rows:
         try:
             start = parse_iso(row.get("start_date"))
@@ -121,7 +123,7 @@ class Scanner(object):
                 R.log("scan_failed", status=status)
                 break
             collected.extend(parse_programs(body))
-            cursor = (body or {}).get("cursor")
+            cursor = (body or {}).get("next_cursor") or (body or {}).get("cursor")
             pages += 1
             if not cursor:
                 break
