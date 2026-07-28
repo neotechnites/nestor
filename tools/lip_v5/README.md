@@ -324,6 +324,14 @@ Full derivations are in the build report and in the code beside each item.
 4. **UNPROBEABLE venues (RD-2)** — if the per-slot or per-market cap falls below `floor_q`, the
    venue is refused rather than funded at a size whose silence we would misread as evidence.
 
+5. **Per-rung cap, DERIVED (charter amendment, this round).** The flat `INV_CAP_USD = $10`
+   was inherited, not derived. Per-rung size now comes from (★)'s own share saturation (the
+   reward side needs no constant) bounded by `slot_cap = max($10, 0.5 × day_stop)` — the same
+   "no single bet may trip the day stop alone" factor as the cluster and series caps, re-derived
+   every cycle. $50/rung is reachable exactly when the funded day stop is ≥ $100; the $10
+   floor is itself derived (0.5 × the day-stop floor). B9's turnover bound scales with it, so
+   the informed-taker blast radius stays proportional.
+
 `grep UNDERIVED config.py` lists everything spec §9 flags as unmeasured.
 
 ---

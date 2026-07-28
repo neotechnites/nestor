@@ -368,6 +368,15 @@ class TestCycle(EngineCase):
         m.cycle(NOW, server_epoch=NOW - 5.0, yes_mids={})
         self.assertTrue(m.skew_ok)
 
+    def test_the_cycle_derives_the_slot_cap_from_the_day_stop(self):
+        """Charter amendment: the per-rung cap is re-derived every cycle from the funded day
+        stop (0.5×), so a $300/day book quotes $52.50 rungs and a floor-day book $10 ones."""
+        m = self.maker()
+        m.projected_day_reward = 300.0        # day stop = min(150, 0.35×300) = 105 ⇒ 52.50
+        out = m.cycle(NOW, slots=[slot()], yes_mids={})
+        self.assertAlmostEqual(out["allocate"]["slot_cap_usd"], 52.5, places=9)
+        self.assertAlmostEqual(m.slot_cap_usd, 52.5, places=9)
+
     def test_the_cash_feed_heartbeat_fires(self):
         m = self.maker()
         m.cycle(NOW, yes_mids={})

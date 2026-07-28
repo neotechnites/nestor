@@ -380,17 +380,47 @@ MAX_SHADE_TICKS = 1                          # spec §4.3 "NEVER consider k ≥ 
 # =============================================================================================
 # RISK CAPS  (spec §4.4 table)
 # =============================================================================================
-INV_CAP_USD = 10.00                          # v1 §8.1 per-SLOT net inventory cap
-# MIRROR (per-slot inventory cap ↔ per-VENUE): NEW in v5 — no single venue may trip the
-# global day stop alone, else one venue halts the whole book, contradicting charter §5.
+DAY_STOP_FRAC = 0.35                         # v1 §8.4.  UNDERIVED §9.5.
+DAY_STOP_FLOOR_USD = 20.0
+DAY_STOP_CAP_USD = 150.0
+
+# --- the PER-RUNG size bound, DERIVED (charter amendment, Ryan, finish round) ---
+# The flat $10 `INV_CAP_USD` was INHERITED, NOT DERIVED — it predates knowing pools run
+# ~$100/rung, and it refused $50 on rungs whose reward supported it.  Per-rung size now
+# derives from its two real bounds:
+#   (a) REWARD: (★)'s own share saturation — marginal gross ∝ S/(q+S)², so the water level
+#       stops adding to a rung as we come to own its book.  No constant needed; a rung where
+#       $10 saturates share stays small BY ARITHMETIC (test: amendment T2).
+#   (b) RISK: no single rung's worst case may trip the global day stop alone — the SAME 0.5×
+#       factor, for the same charter-§5 reason, as the cluster and per-series caps (one rung
+#       halting the whole book stands a venue down the hard way).
+#           slot_cap = max( 0.5 × DAY_STOP_FLOOR , 0.5 × day_stop ) ∈ [$10, $75]
+#       $50/rung becomes reachable exactly when the funded day stop is ≥ $100 — "statistically
+#       safe" is priced by the same instrument that bounds the loss.  The blast radius scales
+#       WITH the cap: the B9 turnover bound is 4 × n_cap (proportional) and the §2.5 kill
+#       cadence is size-independent, so a $50 rung is bounded the same way a $10 one was —
+#       Ryan's complaint (1), informed takers, is answered by d/PSDH/turnover, never by
+#       starving the rung.
+# MIRROR (cap too LOOSE ↔ too TIGHT): loose is bounded by the day stop it derives from and by
+# the cluster cap at place(); tight is the old defect — refusing reward-supported size — and
+# is what this derivation removes.
+# INV_CAP_USD survives ONLY as the FLOOR, and the floor itself is now derived:
+# 0.5 × DAY_STOP_FLOOR_USD = $10, i.e. the slot cap at the smallest fundable day.
+INV_CAP_USD = 0.5 * DAY_STOP_FLOOR_USD       # = $10 — the slot cap's FLOOR, not the cap
+
+
+def slot_cap_usd(day_stop_threshold_usd, floor_usd=None):
+    """The derived per-rung collateral cap: `max(floor, 0.5 × day_stop)`.  Same shape as
+    `cap_series_usd`/`cluster_cap_usd` at the same factor, one level finer."""
+    f = INV_CAP_USD if floor_usd is None else float(floor_usd)
+    return max(f, 0.5 * float(day_stop_threshold_usd))
+
+
 PER_MARKET_POOL_MULT = 4.0                   # v1 §8.2 never risk 4× a market's own max prize
 PER_MARKET_BUDGET_FRAC = 0.25                # v1 §8.2 no single-market concentration
 MAX_TOTAL_COLLATERAL_USD = 300.0             # R168 ladder rung.  G5 owns changes to this: one
                                              # constant, one commit, funded by the PREVIOUS
                                              # window's OBSERVED print, never the model.
-DAY_STOP_FRAC = 0.35                         # v1 §8.4.  UNDERIVED §9.5.
-DAY_STOP_FLOOR_USD = 20.0
-DAY_STOP_CAP_USD = 150.0
 # MIRROR (day stop for LOSS ↔ day stop for WIN): none needed, and the consideration is the
 # record — a large POSITIVE divergence is the settlement/credit path, covered by §5.2's
 # pending widening.  MIRROR (day stop ↔ IDLE capital): losing nothing and earning nothing is

@@ -91,6 +91,9 @@ class Maker(object):
         self.shed_completed_h = {}           # (ticker, held_leg) -> [hours open->flat]
         # --- SF-3 ---
         self.halt_flatten_done = False       # every halt path flattens ONCE
+        # Charter amendment: per-rung cap, derived per cycle from the day stop; the FLOOR
+        # before the first cycle (conservative — no reward projection exists yet).
+        self.slot_cap_usd = C.INV_CAP_USD
 
     # =========================================================================================
     # STARTUP
@@ -196,12 +199,16 @@ class Maker(object):
                 resting.append({"ticker": o["ticker"],
                                 "side": "yes" if o["side"] == "bid" else "no",
                                 "n": o["remaining"], "basis": o["price"]})
+        # B9's turnover bound scales WITH the derived slot cap (charter amendment): a $50
+        # rung gets 4 turnovers of $50, a $10 rung 4 of $10 — proportional blast radius.
+        caps = alloc.Caps(inv_cap_usd=self.slot_cap_usd)
         return G.PlaceContext(
             halt_state=self.halt, positions=open_pos, resting_basis=resting,
             nestor_orders=self.nestor_orders, nestor_positions=self.nestor_positions,
             available_cash_usd=available_cash_usd,
             cluster_cap_usd=CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward)),
-            frozen=self.frozen, refill=self.refill, n_cap_fn=alloc.n_cap,
+            frozen=self.frozen, refill=self.refill,
+            n_cap_fn=lambda p: alloc.n_cap(p, caps),
             day_stopped=self.day_stopped, skew_ok=self.skew_ok)
 
     def place(self, ticker, side, price, count, expiration_ts, now,
@@ -448,11 +455,19 @@ class Maker(object):
 
         # --- allocate → REQUOTE (charter A: the stage that was never written) ---
         if slots:
+            # Charter amendment: the per-rung cap DERIVES from the day stop each cycle
+            # (0.5×, floored at $10); the reward side of sizing is (★)'s own saturation.
+            self.slot_cap_usd = C.slot_cap_usd(
+                G.day_stop_usd(self.projected_day_reward))
+            caps = alloc.Caps(inv_cap_usd=self.slot_cap_usd)
             venue_caps = self.admit_venues(now, slots)
-            budget = alloc.reserve_budget(self.ceiling_usd, C.INV_CAP_USD)
-            a, spent, res = alloc.allocate_with_rstar(slots, budget, venue_caps=venue_caps)
+            # MBB's reserve is one copy of the LARGEST slot, which is now the derived cap.
+            budget = alloc.reserve_budget(self.ceiling_usd, self.slot_cap_usd)
+            a, spent, res = alloc.allocate_with_rstar(slots, budget, caps=caps,
+                                                      venue_caps=venue_caps)
             out["allocate"] = {"spent": spent, "r_star": res.r_star,
                                "converged": res.converged, "slots": len(slots),
+                               "slot_cap_usd": self.slot_cap_usd,
                                "venues_admitted": len(self.venues),
                                "dropped_programs": sorted(str(d) for d in
                                                           (res.dropped or ()))}
@@ -598,7 +613,7 @@ class Maker(object):
                 net0 = max(s.net_at(0, C.FLOOR_RATE_PER_H) for s in ss)
                 candidates.append((venue, floor_usd, net0))
             elif st.rung == 0 and not st.verified and not st.stood_down:
-                cap, status = RT.rung0_cap(floor_usd, C.INV_CAP_USD, per_market)
+                cap, status = RT.rung0_cap(floor_usd, self.slot_cap_usd, per_market)
                 st.rung0_cap_usd = cap        # tracks floor_q up; 0.0 when UNPROBEABLE
                 if status == RT.UNPROBEABLE:
                     self.venue_status[venue] = RT.UNPROBEABLE
@@ -613,7 +628,7 @@ class Maker(object):
         n_oversized = sum(1 for st in unverified if st.oversized)
         for venue, floor_usd, _net0 in sorted(candidates, key=lambda kv: (-kv[2], kv[0])):
             vs = RT.VenueState(venue)
-            status, cap, detail = RT.admit(vs, floor_usd, C.INV_CAP_USD, per_market,
+            status, cap, detail = RT.admit(vs, floor_usd, self.slot_cap_usd, per_market,
                                            self.ceiling_usd, expo, n_unver, n_oversized)
             prev = self.venue_status.get(venue)
             if status != prev:

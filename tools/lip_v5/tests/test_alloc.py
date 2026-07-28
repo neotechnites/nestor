@@ -169,6 +169,48 @@ class TestVenueCaps(LipTestCase):
         self.assertGreaterEqual(C.cap_series_usd(1.0), C.INV_CAP_USD)
 
 
+class TestDerivedSlotCap(LipTestCase):
+    """CHARTER AMENDMENT (Ryan, finish round): the flat $10 per-rung cap was inherited, not
+    derived.  Per-rung size now derives from (a) (★)'s own share saturation and (b) the day
+    stop — no single rung's worst case may trip it alone (0.5×, the cluster/series factor)."""
+
+    def test_the_cap_derives_from_the_day_stop(self):
+        self.assertAlmostEqual(C.slot_cap_usd(20.0), 10.0, places=9)    # floor day
+        self.assertAlmostEqual(C.slot_cap_usd(100.0), 50.0, places=9)   # Ryan's $50
+        self.assertAlmostEqual(C.slot_cap_usd(150.0), 75.0, places=9)   # at the day-stop cap
+        # the surviving constant is the FLOOR, and the floor itself is derived
+        self.assertAlmostEqual(C.INV_CAP_USD, 0.5 * C.DAY_STOP_FLOOR_USD, places=9)
+
+    def test_a_contested_rung_whose_reward_supports_50_gets_50(self):
+        """Amendment T1: marginal rate supports it, cluster bounds allow it ⇒ ~$50 lands."""
+        from .. import clusters as CL
+        s = slot("KXBIG-1", p=0.50, S=50, phi=0.01)      # contested share, thin fill risk
+        caps = alloc.Caps(inv_cap_usd=C.slot_cap_usd(100.0))   # day stop $100 ⇒ cap $50
+        a, spent, _ = alloc.allocate([s], 300.0, RSTAR, caps=caps)
+        self.assertAlmostEqual(spent, 50.0, places=6)
+        # ...and the SAME day stop's cluster cap admits the order it sized
+        ok, reason, _ = CL.cluster_admits(
+            [], {"ticker": "KXBIG-1", "side": "yes", "n": a[s.key], "basis": 0.50},
+            CL.cluster_cap_usd(100.0))
+        self.assertTrue(ok, reason)
+
+    def test_a_rung_where_share_saturates_stays_small_despite_the_cap(self):
+        """Amendment T2: sizing is bought by MARGINAL reward — owning the book pays nothing
+        more (note 43 §7 saturation), so a thin-S rung stops by arithmetic, not by cap."""
+        s = slot("KXSAT-1", p=0.50, S=2, phi=0.08)
+        caps = alloc.Caps(inv_cap_usd=C.slot_cap_usd(100.0))   # cap $50: NOT the binder
+        a, spent, _ = alloc.allocate([s], 300.0, RSTAR, caps=caps)
+        self.assertGreater(spent, 0.0)
+        self.assertLess(spent, 15.0)
+
+    def test_the_old_flat_cap_would_have_refused_the_50(self):
+        """The defect, pinned: the same rung under the inherited flat floor stops at ~$10."""
+        s = slot("KXBIG-1", p=0.50, S=50, phi=0.01)
+        a, spent, _ = alloc.allocate([s], 300.0, RSTAR,
+                                     caps=alloc.Caps(inv_cap_usd=C.INV_CAP_USD))
+        self.assertLessEqual(spent, C.INV_CAP_USD + 1e-9)
+
+
 class TestForfeitGate(LipTestCase):
     def test_a_program_that_cannot_clear_the_floor_is_dropped(self):
         """v1 §3.1 — enter iff the PERIOD projection clears $2.00."""
