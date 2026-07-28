@@ -1,0 +1,195 @@
+GATE G0 — NESTOR CASH-FEED READER
+=================================================================================================
+STATUS: **NOT APPLIED.** This is a proposal diff against `crates/engine/src/reconcile.rs`.
+It takes its OWN review gate (spec §7 G0, SF-4) and is deliberately shipped as a file rather
+than as a commit on the v5 branch, so that reviewing v5 and reviewing this are two separate
+acts by two separate reviewers.
+
+WHAT IT DOES
+  Adds `data/lip_cash_feed.json` to the breaker's `(ext_cash, ext_pending)` pair, behind the
+  environment flag `LIP_CASH_FEED_ENABLED`, **default FALSE (IGNORE)**.
+
+WHY A SECOND FILE AT ALL (spec §5.1)
+  nestor's breaker SUMS every line of `data/external_cash.jsonl` (`read_external_cash`, this
+  file). A cumulative computed value appended THERE would double-count against the operator's
+  hand rows, and two writers on one file is a collision. So v5 owns a separate single-object
+  file, rewritten atomically, and `external_cash.jsonl` survives untouched for non-LIP flows
+  (deposits, the FOMC strangle).
+
+WHY IT IS INERT UNTIL THE FLAG FLIPS
+  With the flag false this is dead code: `read_lip_cash_feed()` returns `(0.0, 0.0)` before it
+  touches the filesystem, so `divergence` is byte-identical to today. That is the G0 read-out.
+
+THE THREE SAFETY PROPERTIES, EACH LOAD-BEARING
+  1. **Staleness pages, never halts** (spec §5.4). If `now − ts > 120 s` we KEEP the last value
+     and alert. Halting on a stale feed would convert *v5 dying* into *nestor dying* — the
+     precise failure this whole interface exists to prevent.
+  2. **A malformed or foreign-schema file contributes (0, 0)**, loudly. It never contributes a
+     partial parse: a half-understood cash number is worse than none.
+  3. **An ABSENT file is (0, 0)**, which is correct only if v5 is truly flat — and v5's SIGTERM
+     path guarantees that by writing a final ZEROED feed after cancel-all + shed, and only then
+     may the file be removed (spec §5.4's mirror).
+
+REVIEW CHECKLIST FOR THE G0 REVIEWER
+  [ ] With `LIP_CASH_FEED_ENABLED` unset, `divergence` is byte-identical across ≥1 reconcile
+      pass (the flag's whole purpose).
+  [ ] With it true and a hand-built feed file, `expected_cash` moves by exactly the feed's
+      `delta_dollars`, and `pending_payout` by exactly `pending_payout_dollars`.
+  [ ] The staleness branch does NOT halt.
+  [ ] `external_cash.jsonl` behaviour is unchanged in every branch.
+  [ ] Rollback is `unset LIP_CASH_FEED_ENABLED` — a one-line revert, no redeploy.
+
+ROLLBACK: flag false. The reader is inert code until then.
+=================================================================================================
+
+--- a/crates/engine/src/reconcile.rs
++++ b/crates/engine/src/reconcile.rs
+@@
+ /// Sum the operator's external-cash ledger (`data/external_cash.jsonl`).
+ /// Returns (Σ delta_dollars, Σ pending_payout_dollars). Absent file = (0, 0).
+ /// Malformed lines are skipped loudly rather than trusted.
+ fn read_external_cash() -> (f64, f64) {
+     let mut cash = 0.0;
+     let mut pending = 0.0;
+     if let Ok(text) = std::fs::read_to_string("data/external_cash.jsonl") {
+         for line in text.lines() {
+             let line = line.trim();
+             if line.is_empty() {
+                 continue;
+             }
+             match serde_json::from_str::<serde_json::Value>(line) {
+                 Ok(v) => {
+                     cash += v.get("delta_dollars").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                     pending += v
+                         .get("pending_payout_dollars")
+                         .and_then(|x| x.as_f64())
+                         .unwrap_or(0.0);
+                 }
+                 Err(e) => eprintln!("[reconcile] external_cash.jsonl bad line skipped: {e}"),
+             }
+         }
+     }
+     (cash, pending)
+ }
++
++/// GATE G0 — the lip_v5 computed cash feed (`data/lip_cash_feed.json`).
++///
++/// Returns (delta_dollars, pending_payout_dollars) to ADD to the operator's
++/// external-cash totals. A SEPARATE file from `external_cash.jsonl` on purpose:
++/// that one is a cumulative append-log summed line by line, and a computed
++/// value appended there would double-count against the operator's hand rows
++/// while making two processes write one file.
++///
++/// **Default OFF.** Until `LIP_CASH_FEED_ENABLED` is set truthy this returns
++/// (0.0, 0.0) before touching the filesystem, so `divergence` is byte-identical
++/// to today. That inertness is what G0 reviews; flipping the flag is a separate,
++/// human-gated decision with its own read-out.
++///
++/// v5 publishes this file BEFORE every cash-consuming POST and corrects it after
++/// the response, so its `delta_dollars` is never ABOVE the truth, only below.
++/// The breaker's dangerous direction (missing money) therefore stays tight, and
++/// v5 cannot cause a false halt.
++const LIP_CASH_FEED_PATH: &str = "data/lip_cash_feed.json";
++const LIP_CASH_FEED_SCHEMA: &str = "lip_cash_feed/1";
++/// 4 x v5's 30 s heartbeat: survives one miss plus jitter.
++const LIP_CASH_FEED_STALE_S: f64 = 120.0;
++
++fn lip_cash_feed_enabled() -> bool {
++    matches!(
++        std::env::var("LIP_CASH_FEED_ENABLED")
++            .unwrap_or_default()
++            .trim()
++            .to_ascii_lowercase()
++            .as_str(),
++        "1" | "true" | "yes"
++    )
++}
++
++fn read_lip_cash_feed(now_s: f64) -> (f64, f64) {
++    if !lip_cash_feed_enabled() {
++        return (0.0, 0.0); // G0: inert until the flag flips.
++    }
++    // An ABSENT file is (0, 0). That is correct only if v5 is truly flat, which
++    // v5's SIGTERM path guarantees: it writes a final zeroed feed after
++    // cancel-all + shed, and only then may the file be removed.
++    let text = match std::fs::read_to_string(LIP_CASH_FEED_PATH) {
++        Ok(t) => t,
++        Err(_) => return (0.0, 0.0),
++    };
++    let v: serde_json::Value = match serde_json::from_str(&text) {
++        Ok(v) => v,
++        // A partially-written file cannot occur (v5 writes temp + rename), so a
++        // parse failure means something else is wrong. Contribute NOTHING rather
++        // than a partial reading: a half-understood cash number is worse than none.
++        Err(e) => {
++            eprintln!("[reconcile] lip_cash_feed.json unparseable, ignored: {e}");
++            return (0.0, 0.0);
++        }
++    };
++    if v.get("schema").and_then(|x| x.as_str()) != Some(LIP_CASH_FEED_SCHEMA) {
++        eprintln!("[reconcile] lip_cash_feed.json schema mismatch, ignored");
++        return (0.0, 0.0);
++    }
++    let delta = v.get("delta_dollars").and_then(|x| x.as_f64()).unwrap_or(0.0);
++    let pending = v
++        .get("pending_payout_dollars")
++        .and_then(|x| x.as_f64())
++        .unwrap_or(0.0);
++    let ts = v.get("ts").and_then(|x| x.as_f64()).unwrap_or(0.0);
++    if now_s - ts > LIP_CASH_FEED_STALE_S {
++        // PAGE, DO NOT HALT. The last value is conservative by construction (v5
++        // over-reports its own consumption), so continuing to use it is safe,
++        // whereas halting here would convert v5 dying into nestor dying.
++        eprintln!(
++            "[reconcile] ALERT lip_cash_feed_stale: {:.0}s old (> {LIP_CASH_FEED_STALE_S:.0}s) \
++             — using last value, NOT halting",
++            now_s - ts
++        );
++    }
++    (delta, pending)
++}
+@@
+     let (ext_cash, ext_pending) = read_external_cash();
++    // GATE G0: lip_v5's computed cash feed, behind LIP_CASH_FEED_ENABLED (default
++    // FALSE). With the flag unset this adds exactly (0.0, 0.0).
++    let now_s = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_secs_f64())
++        .unwrap_or(0.0);
++    let (lip_cash, lip_pending) = read_lip_cash_feed(now_s);
++    let (ext_cash, ext_pending) = (ext_cash + lip_cash, ext_pending + lip_pending);
+     let (expected_cash, resting_reserved, house_cash, pending_payout) = {
+         let r = eng.risk.lock().unwrap_or_else(|e| e.into_inner());
+         (
+             r.expected_cash(),
+             r.resting_reserved(),
+             r.house_cash(),
+             r.pending_payout(),
+         )
+     };
+
+=================================================================================================
+SUGGESTED TESTS TO ADD ALONGSIDE (in reconcile.rs's own `mod tests`)
+=================================================================================================
+
++    #[test]
++    fn lip_cash_feed_is_inert_until_the_flag_flips() {
++        // The G0 read-out, as a test: with the flag unset the reader contributes
++        // nothing at all, whatever is on disk.
++        std::env::remove_var("LIP_CASH_FEED_ENABLED");
++        assert_eq!(read_lip_cash_feed(0.0), (0.0, 0.0));
++    }
++
++    #[test]
++    fn a_foreign_schema_contributes_nothing() {
++        // Belt: even with the flag on, only the schema we own may move money.
++        // (Run with the feed file pointed at a fixture; see the harness note below.)
++    }
+
+NOTE ON TESTING THE ENABLED PATH: `read_lip_cash_feed` reads a fixed relative path, matching
+`read_external_cash`'s existing shape. To test the enabled branch without a global-CWD test,
+the reviewer may prefer to split the parse into
+`fn parse_lip_cash_feed(text: &str, now_s: f64) -> (f64, f64)` and test that pure function
+directly — the same refactor `read_external_cash` would benefit from. That is a REVIEWER'S
+CALL, deliberately not pre-empted here, because it changes an existing function's shape and
+this patch's whole claim is that it changes nothing that already runs.
