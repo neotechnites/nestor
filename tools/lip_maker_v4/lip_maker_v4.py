@@ -1515,6 +1515,127 @@ def standdown_nodata_breach(reconcilable_rows_by_day):
     return len(tail) >= STANDDOWN_DAYS and all(int(x) == 0 for x in tail)
 
 
+def read_jsonl(path):
+    """Tolerant append-only reader: a malformed line is skipped, never fatal.  The operator
+    leg is hand-appended (§7.2), so it WILL contain a typo one day, and a reconciliation
+    file that refuses to load is a reconciliation loop that has silently stopped (§12.3b)."""
+    out = []
+    if not path or not os.path.exists(path):
+        return out
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except Exception:
+        return out
+    return out
+
+
+OPERATOR_KINDS = ("competition", "popover_estimate", "credit", "deny", "allow_override")
+
+
+def credits_by_program(operator_records):
+    """§7.2 — {program_id: paid_usd} from the operator leg.  Unknown kinds are IGNORED WITH
+    A WARN by spec, never fatal; the trading path must not block on this file."""
+    out, unknown = {}, []
+    for r in operator_records or []:
+        kind = str(r.get("kind") or "")
+        if kind not in OPERATOR_KINDS:
+            unknown.append(kind)
+            continue
+        if kind != "credit":
+            continue
+        pid = r.get("program_id")
+        if pid is None:
+            continue
+        out[pid] = num(r.get("paid_usd"), 0.0)
+    return out, sorted(set(unknown))
+
+
+def recon_program_row(program, model_usd, collateral_avg, collateral_peak, coverage_pct,
+                      fills_ct, paid_usd=None, popover_est=None, now=None):
+    """§12.1 program row — one per PROGRAM, with daily accrual sub-rows written separately."""
+    now = _now() if now is None else now
+    start, end = program.get("start_ts"), program.get("end_ts")
+    return {
+        "row": "program", "ts": now,
+        "program_id": program.get("program_id"),
+        "market_ticker": program.get("market_ticker"),
+        "series": program.get("series"),
+        "pool_usd": pool_usd(program.get("period_reward")),
+        "period_start": start, "period_end": end,
+        "period_hours": window_hours(start, end),
+        "model_usd": round(float(model_usd), 6),
+        "popover_est_usd": popover_est,
+        "paid_usd": paid_usd,
+        "paid_out_flag": bool(program.get("paid_out")),
+        "collateral_avg_usd": round(float(collateral_avg), 6),
+        "collateral_peak_usd": round(float(collateral_peak), 6),
+        "coverage_pct": round(float(coverage_pct), 6),
+        "fills_ct": fills_ct,
+        "settle_date": datetime.fromtimestamp(end or now, timezone.utc).strftime("%Y-%m-%d"),
+    }
+
+
+def daily_reconcile(recon_rows, credits):
+    """§12.2 — roll program rows into a per-settlement-day view.
+    Returns {date: {"paid","model","ratio","n_reconciled","n_rows"}}.
+
+    A row is RECONCILABLE only when a credit exists for it: a model number with no credit
+    is not a data point, it is a missing one, and §12.3(b) exists precisely because those
+    two look identical from the inside."""
+    days = {}
+    for r in recon_rows or []:
+        if r.get("row") != "program":
+            continue
+        d = days.setdefault(r.get("settle_date"),
+                            {"paid": 0.0, "model": 0.0, "n_reconciled": 0, "n_rows": 0})
+        d["n_rows"] += 1
+        paid = credits.get(r.get("program_id"), r.get("paid_usd"))
+        if paid is None:
+            continue
+        d["paid"] += float(paid)
+        d["model"] += float(r.get("model_usd") or 0.0)
+        d["n_reconciled"] += 1
+    for d in days.values():
+        d["ratio"] = (d["paid"] / d["model"]) if d["model"] > 0 else None
+    return days
+
+
+def standdown_check(days):
+    """§12.3 — the two INDEPENDENT triggers, evaluated on settlement days in order.
+    Returns (breached, reason) — reason is None when clear."""
+    dates = sorted(days.keys())
+    ratios = [days[d]["ratio"] for d in dates if days[d]["n_reconciled"] > 0]
+    if standdown_ratio_breach(ratios):
+        return True, ("ratio |log2(paid/model)|>1 for %d consecutive settlement days: %s"
+                      % (STANDDOWN_DAYS, [round(r, 3) for r in ratios[-STANDDOWN_DAYS:]]))
+    counts = [days[d]["n_reconciled"] for d in dates]
+    if standdown_nodata_breach(counts):
+        return True, ("zero reconcilable rows for %d consecutive days: %s"
+                      % (STANDDOWN_DAYS, dates[-STANDDOWN_DAYS:]))
+    return False, None
+
+
+def credit_overdue(program_row, credits, now=None, max_age_s=CREDIT_MISSING_ALERT_S):
+    """§7.3a — paid_out true and still no credit row after 24h.  That is the reconciliation
+    loop silently breaking, which is indistinguishable from a good day until capital has
+    scaled."""
+    now = _now() if now is None else now
+    if not program_row.get("paid_out_flag"):
+        return False
+    if program_row.get("program_id") in credits:
+        return False
+    flipped = program_row.get("paid_out_ts") or program_row.get("ts") or now
+    return (now - float(flipped)) >= max_age_s
+
+
 def disclosure_state(deployed_usd, our_daily_usd,
                      exchange_runrate=EXCHANGE_RUNRATE_USD_DAY):
     """§10.4 — do not disclose below $2k deployed; disclose before any deployment above $10k,
@@ -2192,10 +2313,12 @@ def parse_iso(s):
         return None
 
 
-def scan_programs(now=None, cache=True):
-    """Full cursor pull of /incentive_programs (no auth), filtered to LIVE liquidity
-    programs with period_reward > 0.  Cached to ~/nestor/data/lip/programs-YYYYMMDD.json."""
-    now = _now() if now is None else now
+def scan_programs_raw():
+    """Full cursor pull of /incentive_programs (no auth), UNFILTERED.
+
+    §7.3's paid_out poller needs programs whose window has ENDED — precisely the ones
+    scan_programs() filters out — so the pull and the live filter have to be separable.
+    """
     out = []
     cursor = None
     for _ in range(SCAN_MAX_PAGES):
@@ -2211,6 +2334,13 @@ def scan_programs(now=None, cache=True):
         cursor = (body or {}).get("cursor")
         if not cursor or not page:
             break
+    return out
+
+
+def scan_programs(now=None, cache=True):
+    """Live liquidity programs with period_reward > 0, per §7.1."""
+    now = _now() if now is None else now
+    out = scan_programs_raw()
     live = []
     for p in out:
         if str(p.get("incentive_type", p.get("type", "liquidity"))).lower() == "volume":
@@ -2399,6 +2529,13 @@ class Maker(object):
         self.unknown_retry_ts = {}      # D7: order_id -> last cancel-retry ts
         self.unknown_retries = {}       # D7: order_id -> attempts
         self.last_orphan_poll = 0.0     # C6: orphan-shed poll throttle
+        self.recon_written = set()      # §12.1 program rows already written
+        self.recon_alerted = set()      # §7.3a alerts already sent (once each)
+        self.collateral_avg = {}        # program_id -> running mean collateral
+        self.collateral_peak = {}       # program_id -> peak collateral
+        self.fills_ct = {}              # program_id -> fills observed
+        self.slot_program = {}          # (ticker, side) -> program_id
+        self._accrual_ticks = {}        # program_id -> samples, for the running mean
         self.refilled = {}              # (ticker, side) -> contracts re-posted this window
         self.mbb_degraded = set()       # slots automatically on cancel-first (§4.2)
         # S3: seeded FROM THE LEDGER, so a restart preserves A and does not refire
@@ -3219,6 +3356,100 @@ class Maker(object):
             log("orphan_shed_requote", ticker=ticker, side=side, size=size, price_c=px)
             self.taker_exit(ticker, now)                   # §5.4(iii), if enabled
 
+    def write_recon(self, row):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(RECON_PATH, "a") as fh:
+                fh.write(json.dumps(row, default=str) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except Exception as exc:
+            log("recon_write_failed", err="%s: %s" % (type(exc).__name__, exc))
+
+    def poll_paid_out(self, now):
+        """§7.3 — `paid_out` is the MACHINE trigger for the reconciliation ritual, not a
+        clock.  It is public on every program object and flips within ~2h of period close
+        (verified across 330 completed KXAAAGASD programs).  Poll every 30 min; on each flip
+        write the §12.1 program row and enqueue a credit_pending item.
+
+        Then run BOTH §12.3 stand-down triggers, because a reconciliation loop that has
+        silently stopped looks exactly like a good day from the inside.
+        """
+        if now - self.last_paidout_poll < PAID_OUT_POLL_S:
+            return
+        self.last_paidout_poll = now
+        watch = {pid for pid, v in self.accrued.items() if v > 0
+                 and pid not in self.recon_written}
+        if watch:
+            by_id = {}
+            for p in scan_programs_raw():
+                pid = p.get("id") or p.get("program_id")
+                if pid in watch:
+                    by_id[pid] = p
+            for pid in sorted(watch, key=str):
+                raw = by_id.get(pid)
+                if not raw or not bool(raw.get("paid_out")):
+                    continue
+                tk = raw.get("market_ticker") or raw.get("ticker")
+                prog = {"program_id": pid, "market_ticker": tk,
+                        "series": str(tk).split("-")[0] if tk else None,
+                        "period_reward": num(raw.get("period_reward"), 0.0),
+                        "start_ts": parse_iso(raw.get("start_date")),
+                        "end_ts": parse_iso(raw.get("end_date")),
+                        "paid_out": True}
+                cov = self.coverage_pct(pid)
+                row = recon_program_row(
+                    prog, self.accrued.get(pid, 0.0),
+                    self.collateral_avg.get(pid, 0.0), self.collateral_peak.get(pid, 0.0),
+                    cov, self.fills_ct.get(pid, 0), now=now)
+                row["paid_out_ts"] = now
+                self.write_recon(row)
+                self.recon_written.add(pid)
+                log("credit_pending", program_id=pid, ticker=tk,
+                    model_usd=round(self.accrued.get(pid, 0.0), 4),
+                    why="paid_out flipped; operator credit row now due (§7.3a)")
+
+        # ---- reconcile against the operator leg, and check both stand-down triggers ----
+        rows = read_jsonl(RECON_PATH)
+        credits, unknown_kinds = credits_by_program(read_jsonl(OPERATOR_PATH))
+        if unknown_kinds:
+            log("operator_ledger_unknown_kinds", kinds=unknown_kinds,
+                why="ignored with a warn per §7.2; the trading path never blocks on this")
+        for r in rows:
+            if r.get("row") == "program" and credit_overdue(r, credits, now):
+                key = ("credit_overdue", r.get("program_id"))
+                if key not in self.recon_alerted:
+                    self.recon_alerted.add(key)
+                    log("credit_overdue", program_id=r.get("program_id"),
+                        ticker=r.get("market_ticker"),
+                        hours=round((now - float(r.get("paid_out_ts") or r.get("ts")))
+                                    / 3600.0, 2))
+                    ntfy("LIP v4 credit missing 24h after paid_out",
+                         "%s: paid_out is true but no credit row - the reconciliation loop "
+                         "may have stopped" % r.get("market_ticker"))
+        days = daily_reconcile(rows, credits)
+        breached, why = standdown_check(days)
+        log("recon_summary", days={d: {k: (round(v, 4) if isinstance(v, float) else v)
+                                       for k, v in days[d].items()}
+                                  for d in sorted(days)[-4:]},
+            n_credits=len(credits), standdown=breached)
+        if breached and not self.halted:
+            # §12.3: HALT DEPLOYMENT.  Not a warning — capital stops scaling until a human
+            # re-derives against the captured book tape.
+            log("standdown", why=why)
+            ntfy("LIP v4 STAND-DOWN (§12.3)", why)
+            self.cancel_all("standdown")
+            self.flatten(now, "standdown")
+            self.halted = True
+            self.stopping = True
+
+    def coverage_pct(self, program_id):
+        at_best = sum(v for k, v in self.at_best_s.items()
+                      if self.slot_program.get(k) == program_id)
+        rest = sum(v for k, v in self.rest_s.items()
+                   if self.slot_program.get(k) == program_id)
+        return (at_best / rest) if rest > 0 else 0.0
+
     def sweep_unknown_orders(self, now):
         """D7 — an order stuck ST_UNKNOWN holds collateral and blocks its market forever.
         Retry the cancel on a cadence; after UNKNOWN_MAX_RETRIES give up and book the
@@ -3313,6 +3544,9 @@ class Maker(object):
         # §4.6 CLASSIFY-THEN-CLAMP (B1).  The 1 Hz REST budget covers 6 markets; WHICH 6 is
         # decided by the classification sweep, not by rho (degenerate inside one event —
         # see the CLASSIFY_* block).  Pinned markets are excluded outright.
+        self.poll_paid_out(now)                       # §7.3 / §12.3 (Phase 2)
+        if self.stopping:
+            return
         self.sweep_unknown_orders(now)                # D7
         self.st.prune_terminal_orders()               # C10
         self.requote_orphan_sheds(now)                # C6
@@ -3463,6 +3697,15 @@ class Maker(object):
                 funded.add(s.program_id)
                 self.accrued[s.program_id] = self.accrued.get(s.program_id, 0.0) + \
                     reward_rate(s.rho, alloc[s.key], s.S + s.W) * dt_h
+                # §12.1 telemetry, sampled on the same tick as the accrual
+                self.slot_program[s.key] = s.program_id
+                c = alloc[s.key] * s.p
+                n = self._accrual_ticks.get(s.program_id, 0) + 1
+                self._accrual_ticks[s.program_id] = n
+                prev = self.collateral_avg.get(s.program_id, 0.0)
+                self.collateral_avg[s.program_id] = prev + (c - prev) / n
+                self.collateral_peak[s.program_id] = max(
+                    self.collateral_peak.get(s.program_id, 0.0), c)
         if dt_h > 0 and now - self.last_snapshot >= BOOK_SNAPSHOT_S:
             for pid in funded:
                 self.persist_accrual(pid)               # S3, at the 60s snapshot cadence

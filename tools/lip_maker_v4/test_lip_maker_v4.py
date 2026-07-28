@@ -1622,13 +1622,23 @@ class FIXB_CeilingBlockedRequotesDegradeInsteadOfFreezing(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self.old = (M.DATA_DIR, M.LEDGER_PATH, M.DRY)
+        # EVERY writable path is redirected, not just the ledger.  RECON_PATH and
+        # OPERATOR_PATH are module constants frozen at import from DATA_DIR, so patching
+        # DATA_DIR alone leaves them pointing at the OPERATOR'S REAL FILES -- the same class
+        # of leak as the ntfy incident, and one that would have appended test rows to a live
+        # reconciliation ledger on the VPS.
+        self.old = (M.DATA_DIR, M.LEDGER_PATH, M.RECON_PATH, M.OPERATOR_PATH, M.SEQ_PATH,
+                    M.DRY)
         M.DATA_DIR = os.path.join(self.tmp, "lip")
         M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+        M.RECON_PATH = os.path.join(M.DATA_DIR, "recon.jsonl")
+        M.OPERATOR_PATH = os.path.join(M.DATA_DIR, "pools_operator.jsonl")
+        M.SEQ_PATH = os.path.join(M.DATA_DIR, "v4_coid_seq")
         M.DRY = False
 
     def tearDown(self):
-        M.DATA_DIR, M.LEDGER_PATH, M.DRY = self.old
+        (M.DATA_DIR, M.LEDGER_PATH, M.RECON_PATH, M.OPERATOR_PATH, M.SEQ_PATH,
+         M.DRY) = self.old
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _saturated_maker(self, cost=None, headroom=4.30):
@@ -2240,17 +2250,30 @@ class C2_SettlementRelease(unittest.TestCase):
 
 
 class _RunnerCase(unittest.TestCase):
-    """Shared harness: a Maker with no network and a real ledger file."""
+    """Shared harness: a Maker with no network and a real ledger file.
+
+    EVERY writable path is redirected, not just the ledger.  RECON_PATH and OPERATOR_PATH
+    are module constants frozen at import from DATA_DIR, so patching DATA_DIR alone leaves
+    them pointing at the OPERATOR'S REAL FILES — the same class of leak as the ntfy
+    incident, and one that would have appended test rows to a live reconciliation ledger on
+    the VPS.
+    """
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self.old = (M.DATA_DIR, M.LEDGER_PATH, M.DRY)
+        self.old = (M.DATA_DIR, M.LEDGER_PATH, M.RECON_PATH, M.OPERATOR_PATH, M.SEQ_PATH,
+                    M.DRY)
         M.DATA_DIR = os.path.join(self.tmp, "lip")
         M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+        M.RECON_PATH = os.path.join(M.DATA_DIR, "recon.jsonl")
+        M.OPERATOR_PATH = os.path.join(M.DATA_DIR, "pools_operator.jsonl")
+        M.SEQ_PATH = os.path.join(M.DATA_DIR, "v4_coid_seq")
         M.DRY = False
+        os.makedirs(M.DATA_DIR, exist_ok=True)
 
     def tearDown(self):
-        M.DATA_DIR, M.LEDGER_PATH, M.DRY = self.old
+        (M.DATA_DIR, M.LEDGER_PATH, M.RECON_PATH, M.OPERATOR_PATH, M.SEQ_PATH,
+         M.DRY) = self.old
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def events(self):
@@ -3223,6 +3246,201 @@ class InventorySlotGuarantee(_RunnerCase):
         m.poll_set({"M0": self._prog("M0"), "M1": self._prog("M1")}, 1000.0)
         self.assertIn("GONE", m.flatten_only)
         self.assertIn("GONE", m.inventory_markets())
+
+
+class Phase2_ReconPoller(_RunnerCase):
+    """U7 -- the §12 pure functions existed and were tested, but NOTHING CALLED THEM: no
+    paid_out poll, no recon rows, no stand-down.  Reconciliation had to be run by hand, and
+    §12.3's whole point is that a loop which has silently stopped looks identical to a good
+    day from the inside."""
+
+    def _prog(self, pid="P1", tk="KXA-26JUL28-1", reward=1_000_000.0):
+        return {"program_id": pid, "market_ticker": tk, "series": "KXA",
+                "period_reward": reward, "start_ts": 0.0, "end_ts": 16 * 3600.0,
+                "paid_out": True}
+
+    # ---- pure layer -----------------------------------------------------------------
+    def test_credits_by_program_ignores_unknown_kinds_with_a_warn(self):
+        """§7.2 -- the operator leg is hand-appended, so it WILL contain a typo one day, and
+        the trading path must never block on it."""
+        recs = [{"kind": "credit", "program_id": "P1", "paid_usd": 5.40},
+                {"kind": "competition", "event_ticker": "X", "tag": "Low"},
+                {"kind": "wat", "program_id": "P2", "paid_usd": 99.0},
+                {"kind": "credit", "paid_usd": 1.0}]                 # no program_id
+        credits, unknown = M.credits_by_program(recs)
+        self.assertEqual(credits, {"P1": 5.40})
+        self.assertEqual(unknown, ["wat"])
+
+    def test_read_jsonl_survives_a_malformed_line(self):
+        path = os.path.join(self.tmp, "op.jsonl")
+        with open(path, "w") as fh:
+            fh.write('{"kind":"credit","program_id":"P1","paid_usd":5.4}\n')
+            fh.write('this is not json\n')
+            fh.write('{"kind":"credit","program_id":"P2","paid_usd":1.0}\n')
+        self.assertEqual(len(M.read_jsonl(path)), 2)
+        self.assertEqual(M.read_jsonl(os.path.join(self.tmp, "nope")), [])
+
+    def test_only_credited_rows_count_as_reconciled(self):
+        """A model number with no credit is not a data point, it is a MISSING one."""
+        rows = [M.recon_program_row(self._prog("P1"), 5.0, 10.0, 12.0, 0.95, 3),
+                M.recon_program_row(self._prog("P2", "KXA-26JUL28-2"), 4.0, 8.0, 9.0,
+                                    0.9, 1)]
+        days = M.daily_reconcile(rows, {"P1": 5.4})
+        d = days[rows[0]["settle_date"]]
+        self.assertEqual(d["n_rows"], 2)
+        self.assertEqual(d["n_reconciled"], 1)
+        self.assertAlmostEqual(d["paid"], 5.4, places=9)
+        self.assertAlmostEqual(d["model"], 5.0, places=9)
+        self.assertAlmostEqual(d["ratio"], 5.4 / 5.0, places=9)
+
+    def test_standdown_ratio_trigger(self):
+        days = {"2026-07-26": {"paid": 1.0, "model": 5.0, "ratio": 0.2, "n_reconciled": 1,
+                               "n_rows": 1},
+                "2026-07-27": {"paid": 1.0, "model": 6.0, "ratio": 1.0 / 6.0,
+                               "n_reconciled": 1, "n_rows": 1}}
+        breached, why = M.standdown_check(days)
+        self.assertTrue(breached)
+        self.assertIn("ratio", why)
+
+    def test_standdown_nodata_trigger_is_independent(self):
+        days = {"2026-07-26": {"paid": 0.0, "model": 0.0, "ratio": None,
+                               "n_reconciled": 0, "n_rows": 3},
+                "2026-07-27": {"paid": 0.0, "model": 0.0, "ratio": None,
+                               "n_reconciled": 0, "n_rows": 2}}
+        breached, why = M.standdown_check(days)
+        self.assertTrue(breached)
+        self.assertIn("zero reconcilable rows", why)
+
+    def test_a_healthy_book_does_not_stand_down(self):
+        days = {"2026-07-26": {"paid": 5.0, "model": 5.4, "ratio": 5.0 / 5.4,
+                               "n_reconciled": 2, "n_rows": 2},
+                "2026-07-27": {"paid": 6.0, "model": 5.0, "ratio": 1.2,
+                               "n_reconciled": 2, "n_rows": 2}}
+        self.assertEqual(M.standdown_check(days), (False, None))
+
+    def test_credit_overdue_only_after_24h_and_only_when_paid_out(self):
+        row = M.recon_program_row(self._prog("P1"), 5.0, 1.0, 1.0, 0.9, 0, now=1000.0)
+        row["paid_out_ts"] = 1000.0
+        self.assertFalse(M.credit_overdue(row, {}, now=1000.0 + 3600))
+        self.assertTrue(M.credit_overdue(row, {}, now=1000.0 + 86400))
+        self.assertFalse(M.credit_overdue(row, {"P1": 5.4}, now=1000.0 + 86400))
+        row["paid_out_flag"] = False
+        self.assertFalse(M.credit_overdue(row, {}, now=1000.0 + 86400))
+
+    # ---- wired layer ----------------------------------------------------------------
+    def _maker(self, raw_programs):
+        st = M.LedgerState()
+        m = M.Maker(None, st, [])
+        m.accrued = {"P1": 5.0}
+        m.collateral_avg = {"P1": 10.0}
+        m.collateral_peak = {"P1": 12.0}
+        m.fills_ct = {"P1": 3}
+        self._raw = raw_programs
+        return m
+
+    def test_the_poller_writes_a_recon_row_when_paid_out_flips(self):
+        m = self._maker([{"id": "P1", "market_ticker": "KXA-26JUL28-1",
+                          "period_reward": 1_000_000.0, "paid_out": True,
+                          "start_date": "2026-07-27T12:00:00Z",
+                          "end_date": "2026-07-28T03:59:00Z"}])
+        old = M.scan_programs_raw
+        try:
+            M.scan_programs_raw = lambda: self._raw
+            m.poll_paid_out(99999.0)
+        finally:
+            M.scan_programs_raw = old
+        rows = M.read_jsonl(M.RECON_PATH)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["program_id"], "P1")
+        self.assertAlmostEqual(rows[0]["pool_usd"], 100.0, places=6)
+        self.assertAlmostEqual(rows[0]["model_usd"], 5.0, places=6)
+        self.assertTrue(rows[0]["paid_out_flag"])
+        self.assertIn("credit_pending", [e["event"] for e in self.events()])
+
+    def test_the_row_is_written_once_and_the_poll_is_throttled(self):
+        m = self._maker([{"id": "P1", "market_ticker": "KXA-26JUL28-1",
+                          "period_reward": 1_000_000.0, "paid_out": True,
+                          "start_date": "2026-07-27T12:00:00Z",
+                          "end_date": "2026-07-28T03:59:00Z"}])
+        calls = []
+        old = M.scan_programs_raw
+        try:
+            M.scan_programs_raw = lambda: (calls.append(1), self._raw)[1]
+            m.poll_paid_out(99999.0)
+            m.poll_paid_out(99999.0 + 10)                    # inside PAID_OUT_POLL_S
+            self.assertEqual(len(calls), 1)
+            m.poll_paid_out(99999.0 + M.PAID_OUT_POLL_S + 1)  # due again, but P1 is written
+            self.assertEqual(len(calls), 1)
+        finally:
+            M.scan_programs_raw = old
+        self.assertEqual(len(M.read_jsonl(M.RECON_PATH)), 1)
+
+    def test_an_unflipped_program_writes_nothing(self):
+        m = self._maker([{"id": "P1", "market_ticker": "KXA-26JUL28-1",
+                          "period_reward": 1_000_000.0, "paid_out": False,
+                          "start_date": "2026-07-27T12:00:00Z",
+                          "end_date": "2026-07-28T03:59:00Z"}])
+        old = M.scan_programs_raw
+        try:
+            M.scan_programs_raw = lambda: self._raw
+            m.poll_paid_out(99999.0)
+        finally:
+            M.scan_programs_raw = old
+        self.assertEqual(M.read_jsonl(M.RECON_PATH), [])
+
+    def test_a_standdown_breach_halts_and_flattens(self):
+        """§12.3 -- HALT DEPLOYMENT.  Not a warning: capital stops scaling until a human
+        re-derives against the captured book tape."""
+        os.makedirs(M.DATA_DIR, exist_ok=True)
+        with open(M.RECON_PATH, "w") as fh:
+            for i, day in enumerate(("2026-07-26", "2026-07-27")):
+                row = M.recon_program_row(self._prog("P%d" % i, "KXA-%d" % i), 5.0,
+                                          1.0, 1.0, 0.9, 0)
+                row["settle_date"] = day
+                fh.write(json.dumps(row) + "\n")
+        with open(M.OPERATOR_PATH, "w") as fh:
+            fh.write(json.dumps({"kind": "credit", "program_id": "P0",
+                                 "paid_usd": 0.5}) + "\n")
+            fh.write(json.dumps({"kind": "credit", "program_id": "P1",
+                                 "paid_usd": 0.5}) + "\n")
+        m = M.Maker(None, M.LedgerState(), [])
+        m.do_cancel = lambda oid: (200, {"reduced_by": "0.00"})
+        old = M.scan_programs_raw
+        try:
+            M.scan_programs_raw = lambda: []
+            m.poll_paid_out(99999.0)
+        finally:
+            M.scan_programs_raw = old
+        ev = [e["event"] for e in self.events()]
+        self.assertIn("standdown", ev)
+        self.assertTrue(m.halted)
+        self.assertTrue(m.stopping)
+
+    def test_the_overdue_credit_alert_fires_once(self):
+        os.makedirs(M.DATA_DIR, exist_ok=True)
+        row = M.recon_program_row(self._prog("P1"), 5.0, 1.0, 1.0, 0.9, 0, now=1.0)
+        row["paid_out_ts"] = 1.0
+        with open(M.RECON_PATH, "w") as fh:
+            fh.write(json.dumps(row) + "\n")
+        m = M.Maker(None, M.LedgerState(), [])
+        old = M.scan_programs_raw
+        try:
+            M.scan_programs_raw = lambda: []
+            m.poll_paid_out(1.0 + 2 * 86400)
+            m.poll_paid_out(1.0 + 4 * 86400)
+        finally:
+            M.scan_programs_raw = old
+        overdue = [e for e in self.events() if e["event"] == "credit_overdue"]
+        self.assertEqual(len(overdue), 1)          # once, not every poll
+
+    def test_coverage_pct_is_per_program(self):
+        m = M.Maker(None, M.LedgerState(), [])
+        m.slot_program = {("T", "bid"): "P1", ("U", "bid"): "P2"}
+        m.at_best_s = {("T", "bid"): 95.0, ("U", "bid"): 10.0}
+        m.rest_s = {("T", "bid"): 100.0, ("U", "bid"): 100.0}
+        self.assertAlmostEqual(m.coverage_pct("P1"), 0.95, places=9)
+        self.assertAlmostEqual(m.coverage_pct("P2"), 0.10, places=9)
+        self.assertEqual(m.coverage_pct("NOPE"), 0.0)
 
 
 class StartupAssertions(unittest.TestCase):
