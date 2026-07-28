@@ -21,7 +21,7 @@ timescale — far slower than the 1 Hz quoting loop.  That is the cadence's deri
 also why `classify` is degrade step 1: it is the cheapest requests to give up.
 """
 
-from . import alloc, config as C, money as M, presence as P
+from . import alloc, clusters as CL, config as C, money as M, presence as P
 from . import runtime as R
 
 
@@ -195,8 +195,42 @@ class Classifier:
                 if C.series_denied(tk):
                     continue
                 rows.append((prog["rho"], tk, prog))
-        rows.sort(key=lambda r: (-r[0], str(r[1])))
-        return rows[:self.max_markets]
+        # RANK BY CLUSTER DIVERSITY, NOT BY RAW POOL.  Sorting on rho alone loads the whole
+        # classify budget onto the biggest cluster: measured live, the top of the board is
+        # treasury rungs, all five tenors are ONE cluster sharing ONE $75 cap, and the sweep
+        # kept surfacing the tenth rung of a cluster that was already full while never
+        # discovering a second underlying.  Capital is capped PER CLUSTER, so a new cluster is
+        # worth a whole fresh cap and the eleventh rung of an existing one is worth nothing.
+        #
+        # Round-robin: take each cluster's best market in turn, then each cluster's second,
+        # and so on.  Within a cluster the order is still rho-descending, so the ranking that
+        # matters inside a cluster is unchanged — what changes is that breadth is discovered
+        # FIRST rather than after 200 rungs of one ladder.
+        #
+        # MIRROR (diversity ↔ concentration): this does not spread CAPITAL thin — the cliff
+        # pass and the caps still decide sizing, and a cluster with nothing worth funding
+        # simply gets none.  It spreads DISCOVERY, which is free.
+        by_cluster = {}
+        for rho, tk, prog in rows:
+            by_cluster.setdefault(CL.cluster_of(tk), []).append((rho, tk, prog))
+        for lst in by_cluster.values():
+            lst.sort(key=lambda r: (-r[0], str(r[1])))
+        # clusters themselves ordered by their best market, so the strongest lead the rounds
+        order = sorted(by_cluster, key=lambda c: (-by_cluster[c][0][0], c))
+        out, depth = [], 0
+        while len(out) < self.max_markets:
+            took = False
+            for c in order:
+                lst = by_cluster[c]
+                if depth < len(lst):
+                    out.append(lst[depth])
+                    took = True
+                    if len(out) >= self.max_markets:
+                        break
+            if not took:
+                break
+            depth += 1
+        return out
 
     def classify_one(self, ticker, book_body, program, now):
         yes_levels, no_levels = _book_levels(book_body)

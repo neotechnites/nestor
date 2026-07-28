@@ -698,3 +698,38 @@ class TestPlumbingWakes(RunnerCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClassifyDiscoversBreadth(LipTestCase):
+    """Capital is capped PER CLUSTER, so a new cluster is worth a whole fresh cap while the
+    eleventh rung of a full cluster is worth nothing.  Ranking classify candidates by rho
+    alone loaded the entire budget onto treasury (five tenors, ONE cluster, ONE $75 cap) and
+    never discovered a second underlying."""
+
+    def _programs(self):
+        now = 1785268000.0
+        mk = lambda pid, tks, rho: {"program_id": pid, "series": tks[0].split("-")[0],
+                                    "tickers": list(tks), "period_reward": 1000000,
+                                    "start_ts": now - 3600, "end_ts": now + 36000,
+                                    "window_h": 11.0, "rho": rho, "target_size": 1000.0,
+                                    "paid_out": False}
+        # one fat cluster with many rungs, two thinner but DISTINCT clusters
+        return [mk("p1", ["KXUST10AD-26JUL29-T%d" % i for i in range(10)], 9.0),
+                mk("p2", ["KXAAAGASD-26JUL29-4.1"], 5.0),
+                mk("p3", ["KXTRUEV-26JUL28-T1"], 4.0)], now
+
+    def test_every_cluster_is_reached_before_one_is_exhausted(self):
+        progs, now = self._programs()
+        c = scan.Classifier(max_markets=5)
+        picked = [tk for _, tk, _ in c.candidates(progs, now)]
+        clusters = {t.split("-")[0] for t in picked}
+        self.assertIn("KXAAAGASD", clusters, "a distinct cluster must be discovered early")
+        self.assertIn("KXTRUEV", clusters, "and so must the third")
+        self.assertEqual(len(picked), 5)
+
+    def test_the_strongest_cluster_still_leads(self):
+        progs, now = self._programs()
+        c = scan.Classifier(max_markets=5)
+        picked = [tk for _, tk, _ in c.candidates(progs, now)]
+        self.assertTrue(picked[0].startswith("KXUST10AD"),
+                        "within the rounds, the richest cluster still goes first")
