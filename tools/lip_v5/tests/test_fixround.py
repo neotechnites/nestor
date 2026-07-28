@@ -605,3 +605,53 @@ class TestBooksWired(FixRoundCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheEmptyBookIsEnterable(FixRoundCase if 'FixRoundCase' in dir() else __import__('unittest').TestCase):
+    """G2 measured it live: the highest-rho programs on the board are EMPTY on both sides, and
+    an empty side yielded no `p`, so 200 classified markets produced ZERO slots.  A market
+    nobody has quoted is the cheapest presence there is (S = 0, whole pool addressable)."""
+
+    def test_an_empty_book_produces_a_land_grab_slot(self):
+        import time
+        from lip_v5 import scan, config as C
+        now = time.time()
+        prog = {"program_id": "p1", "series": "KXEMPTY", "tickers": ["KXEMPTY-26JUL29-T1"],
+                "period_reward": 1000000, "start_ts": now - 3600, "end_ts": now + 36000,
+                "window_h": 11.0, "rho": 9.0, "target_size": 1000.0, "paid_out": False}
+
+        class C0(object):
+            table = {"KXEMPTY-26JUL29-T1": {
+                "ticker": "KXEMPTY-26JUL29-T1", "program_id": "p1", "series": "KXEMPTY",
+                "pinned": False, "target_size": 1000.0, "yes_mid": None, "ts": now,
+                "sides": {"bid": {"S": 0.0, "qualifies": False, "cum_size": 0.0,
+                                  "p": None, "legal": False},
+                          "ask": {"S": 0.0, "qualifies": False, "cum_size": 0.0,
+                                  "p": None, "legal": False}}}}
+
+        slots = scan.build_slots([prog], C0(), now, p6=lambda t: True)
+        self.assertTrue(slots, "an empty book must still be enterable — it is the cheapest presence")
+        for s in slots:
+            self.assertTrue(s.is_land_grab, "empty side must enter via the qualification pass")
+            self.assertEqual(s.land_grab_size, 1000)
+            self.assertAlmostEqual(s.p, C.LAND_GRAB_PRICE_C / 100.0)
+            self.assertEqual(s.S, 0.0)
+
+    def test_a_pinned_empty_book_is_still_refused(self):
+        import time
+        from lip_v5 import scan
+        now = time.time()
+        prog = {"program_id": "p1", "series": "KXEMPTY", "tickers": ["KXEMPTY-26JUL29-T1"],
+                "period_reward": 1000000, "start_ts": now - 3600, "end_ts": now + 36000,
+                "window_h": 11.0, "rho": 9.0, "target_size": 1000.0, "paid_out": False}
+
+        class C0(object):
+            table = {"KXEMPTY-26JUL29-T1": {
+                "ticker": "KXEMPTY-26JUL29-T1", "program_id": "p1", "series": "KXEMPTY",
+                "pinned": True, "target_size": 1000.0, "yes_mid": None, "ts": now,
+                "sides": {"bid": {"S": 0.0, "qualifies": False, "cum_size": 0.0,
+                                  "p": None, "legal": False},
+                          "ask": {"S": 0.0, "qualifies": False, "cum_size": 0.0,
+                                  "p": None, "legal": False}}}}
+
+        self.assertEqual(scan.build_slots([prog], C0(), now, p6=lambda t: True), [])

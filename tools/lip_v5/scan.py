@@ -422,7 +422,29 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
         for side in ("bid", "ask"):
             sd = rec["sides"][side]
             p = sd["p"]
-            if not sd["legal"] or p is None or p <= 0:
+            if p is None or p <= 0:
+                # THE EMPTY BOOK.  `p` is the collateral at the SAME-SIDE BEST, and an empty
+                # side has no best — so this guard skipped it and such a market could never be
+                # entered.  Measured live at G2: the highest-rho programs on the board are
+                # EMPTY on both sides, so 200 classified markets produced ZERO slots and v5
+                # would have quoted nothing at all.
+                #
+                # An empty side is not an absent opportunity, it is the cheapest one: no rival
+                # score to split (S = 0), the whole pool addressable, and note 43 §6 — "empty
+                # book moments are when presence is cheapest to establish".  The qualification
+                # pass (spec §4.5) exists exactly for this and prices it as a DISCRETE
+                # PRECONDITION rather than a rate; it simply never received a slot to act on.
+                #
+                # A legal price always exists on an empty side, so the slot is built at the
+                # LAND-GRAB collateral — 1c either way, since a yes bid at 1c costs 1c and the
+                # ask side's 99c is a no bid at 1c.  Pinned markets are excluded above, so no
+                # illegal price can reach here.  MIRROR (entering an empty book ↔ entering a
+                # book that is empty because the market is dead): P6 is that guard, and it is
+                # applied before this loop.
+                if rec["pinned"]:
+                    continue
+                p = C.LAND_GRAB_PRICE_C / 100.0
+            elif not sd["legal"]:
                 continue
             key = (ticker, side)
             # SF-5: S is the RIVAL score — the classified book contains our own orders.
