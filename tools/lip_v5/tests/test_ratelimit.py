@@ -82,12 +82,27 @@ class TestBucket(LipTestCase):
         self.assertTrue(ok_exit)
         self.assertEqual(why_exit, "exit_cancel_never_refused")
 
-    def test_the_reserve_floor_keeps_one_token_for_the_exit_lane(self):
+    def test_the_reserve_floor_is_PRIORITY_AWARE(self):
+        """The floor is `reserve + 0.5 x rank`, so a deferrable lane yields BEFORE an earning
+        one instead of whoever asks first winning (measured live: the sweeps drained the bucket
+        every cycle and `place` never ran)."""
         b = RL.Bucket(now=0.0)
-        b.tokens = 1.5
-        self.assertFalse(b.admit("place", 0.0)[0])         # 1.5 − 1 < 1
-        b.tokens = 2.0
+        b.tokens = 2.5
+        self.assertFalse(b.admit("place", 0.0)[0])         # place floor = 1 + 0.5x2 = 2.0
+        b.tokens = 3.0
         self.assertTrue(b.admit("place", 0.0)[0])
+
+    def test_the_earning_lane_outlives_the_deferrable_ones(self):
+        for lane, ok_at_4 in (("place", True), ("book_poll", True),
+                              ("classify_sweep", False)):
+            b = RL.Bucket(now=0.0)
+            b.tokens = 4.0
+            self.assertEqual(b.admit(lane, 0.0)[0], ok_at_4, lane)
+        # and at genuine scarcity only the highest-priority work survives
+        for lane, ok_at_3 in (("place", True), ("verify", False), ("book_poll", False)):
+            b = RL.Bucket(now=0.0)
+            b.tokens = 3.0
+            self.assertEqual(b.admit(lane, 0.0)[0], ok_at_3, lane)
 
     def test_exit_cancel_may_drive_the_bucket_negative_and_refill_repays_it(self):
         b = RL.Bucket(now=0.0)
@@ -178,7 +193,7 @@ class TestCancelShare(LipTestCase):
 class TestScheduler(LipTestCase):
     def test_strict_priority_order(self):
         b = RL.Bucket(now=0.0)
-        b.tokens = 3.0                                     # room for exactly two non-exit
+        b.tokens = 5.0                       # room for exit + place under priority floors
         s = RL.Scheduler(b)
         s.submit("classify_sweep", "c")
         s.submit("book_poll", "p")
@@ -192,7 +207,7 @@ class TestScheduler(LipTestCase):
 
     def test_deferred_requests_stay_queued(self):
         b = RL.Bucket(now=0.0)
-        b.tokens = 2.0
+        b.tokens = 4.0                       # book_poll floor = 1 + 0.5x4 = 3.0
         s = RL.Scheduler(b)
         for i in range(5):
             s.submit("book_poll", "p%d" % i)

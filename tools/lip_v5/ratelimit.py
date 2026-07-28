@@ -141,7 +141,29 @@ class Bucket(object):
                     R.log("cancel_share_exceeded", key=key, share=share, n=n)
                     return False, "cancel_share_exceeded"
 
-        if self.tokens - 1.0 < float(reserve):
+        # LANE PRIORITY IS A TOKEN HEADROOM REQUIREMENT (wired 2026-07-28, live).
+        # `LANE_PRIORITY` existed and ordered nothing: every lane faced the SAME floor, so
+        # whichever asked FIRST won — and the cycle asks in the order classify → book_poll →
+        # requote, i.e. strictly worst-to-best.  Measured live: the deferrable sweeps drained
+        # the bucket every cycle and `place` was refused with `reserve_floor` forever, so a
+        # book with 96 slots, 7 admitted venues and $4.10 allocated placed NOTHING.
+        #
+        # A lower-priority lane must therefore leave MORE behind than a higher-priority one:
+        # its floor is the shared reserve plus its own rank.  `place` (rank 2) may spend down
+        # to 3 tokens where `classify_sweep` (rank 5) must stop at 6, so the deferrable work
+        # yields to the earning work by construction rather than by ordering luck.  The one
+        # lane with no floor at all is still `exit_cancel`, handled above.
+        #
+        # MIRROR (starving the sweeps ↔ starving the quotes): the sweeps degrade honestly —
+        # a stale classification is a rate loss and the degrade ladder already accounts for
+        # it — while a starved `place` lane is a dead bot that looks alive.  The asymmetry is
+        # why priority resolves toward placing.
+        # HALF a token per rank: the whole ladder (ranks 0-5) then spans 2.5 tokens, which fits
+        # inside RATE_BURST_TOKENS = 8 with room for every lane to run at steady state.  A full
+        # token per rank puts `classify_sweep` at a floor of 6 against a 4/s refill — the
+        # deferrable lanes would never run at all, which trades one starvation for another.
+        lane_floor = float(reserve) + 0.5 * float(C.LANE_PRIORITY.get(lane, 0))
+        if self.tokens - 1.0 < lane_floor:
             self.refused += 1
             return False, "reserve_floor"
         self.tokens -= 1.0
