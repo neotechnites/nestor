@@ -399,3 +399,23 @@ class TestAMakerNeverTakes(__import__('unittest').TestCase):
                                {bid.key: 50, ask.key: 50}, 0.0625)
         self.assertEqual(stats["placed"], 0, "a locked book must place NOTHING")
         self.assertEqual(ex.placed, [], "nothing may reach the wire")
+
+
+class TestThePlanMeasuresTheSameBookAsTheRails(__import__('unittest').TestCase):
+    """Live 2026-07-28: the planner seeded cluster usage from HELD inventory only, while
+    `place()` measures positions PLUS resting orders.  So every cycle the plan saw an empty
+    RATES cluster, planned a second order into it, and the rails refused — 180 refusals a
+    minute per rung, $4.71 deployed of a $300 ceiling."""
+
+    def test_a_resting_order_consumes_its_cluster_in_the_PLAN(self):
+        from lip_v5 import alloc
+        mk = lambda tk, p: alloc.Slot(tk, "bid", rho=9.0, S=500.0, p=p, venue="KXUST5AD",
+                                      hours_left=10.0)
+        a = mk("KXUST5AD-26JUL29-T4.25", 0.30)
+        b = mk("KXUST5AD-26JUL29-T4.35", 0.30)
+        # 100 contracts of `a` already RESTING = $30 of a $50 cluster.
+        plan, spent, _ = alloc.allocate([a, b], 300.0, 0.0625, cluster_cap_usd=50.0,
+                                        resting={a.key: 100.0})
+        used = spent + 30.0
+        self.assertLessEqual(used, 50.0 + 1e-9,
+                             "the plan must not exceed the cluster the rails will measure")

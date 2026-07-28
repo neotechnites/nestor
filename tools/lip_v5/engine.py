@@ -757,8 +757,17 @@ class Maker(object):
             # 90 cycles on a 4-rung ladder, every cycle, forever).
             cluster_cap = CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward),
                                              ceiling_usd=self.ceiling_usd)
+            # The plan must measure the same book the rails do: OPEN positions (`held`) PLUS
+            # RESTING orders.  Omitting the second made every cycle plan an order `place()`
+            # would refuse on a cluster already full of our own quotes.
+            resting_by_slot = {}
+            for o in self.orders.values():
+                if o.get("remaining", 0) > 0 and not o.get("gone_404"):
+                    k = (o["ticker"], o["side"])
+                    resting_by_slot[k] = resting_by_slot.get(k, 0.0) + float(o["remaining"])
             a, spent, res = alloc.allocate_with_rstar(slots, budget, caps=caps,
                                                       venue_caps=venue_caps, held=held,
+                                                      resting=resting_by_slot,
                                                       cluster_cap_usd=cluster_cap)
             self.last_alloc = dict(a)
             out["allocate"] = {"spent": spent, "r_star": res.r_star,

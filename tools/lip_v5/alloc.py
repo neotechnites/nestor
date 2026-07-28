@@ -419,7 +419,7 @@ def rescue(A, rate_now, h, rho, S, q, p, r_star, C_slot, phi, d,
 # ALLOCATE  (spec §1.3)
 # =============================================================================================
 def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.FLOOR_RATE_PER_H,
-             venue_caps=None, step_fraction=C.STEP_FRACTION, held=None,
+             venue_caps=None, step_fraction=C.STEP_FRACTION, held=None, resting=None,
              cluster_cap_usd=None):
     """Marginal-rate water-filling under (★).  Returns (alloc, spent, marginal_at_stop).
 
@@ -456,7 +456,13 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.FLOOR_RATE_PER_H
     per_cluster = {}
     seen_cluster_held = set()
     for s in slots:
-        h_q = float((held or {}).get(s.key, 0.0))
+        # RESTING ORDERS COUNT TOO.  `place()` measures the cluster over OPEN POSITIONS PLUS
+        # RESTING ORDERS; seeding the plan from held inventory alone made the planner see an
+        # empty cluster every cycle while the rails saw a full one — so it planned a second
+        # order and place() refused it, 180 times a minute per rung, with $4.71 deployed of a
+        # $300 ceiling.  The comment above this loop already SAID place() reads both; the code
+        # read one.  Plan and rail must measure the same book or the plan is fiction.
+        h_q = float((held or {}).get(s.key, 0.0)) + float((resting or {}).get(s.key, 0.0))
         if h_q > 0 and s.key not in seen_cluster_held:
             seen_cluster_held.add(s.key)
             ck = _cluster_key(s)
@@ -615,6 +621,7 @@ def _cliff_decision(ps, alloc, r_star, caps, venue_caps, held, budget_room, per_
 def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
                                floor_usd=C.ENTRY_FLOOR_USD, floor_rate=C.FLOOR_RATE_PER_H,
                                venue_caps=None, max_passes=C.MAX_GATE_PASSES, held=None,
+                               resting=None,
                                cluster_cap_usd=None):
     """v1 §2.4 lines 12-15 — the forfeit gate is per PROGRAM-PERIOD, applied AFTER
     water-filling, and a dropped program's dollars are RE-WATER-FILLED.
@@ -635,7 +642,7 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
     for _ in range(int(max_passes)):
         live = [s for s in slots if s.program_id not in dropped]
         alloc, spent, marginal = allocate(live, budget_usd, r_star, caps, floor_rate,
-                                          venue_caps, held=held,
+                                          venue_caps, held=held, resting=resting,
                                           cluster_cap_usd=cluster_cap_usd)
         by_prog = {}
         for s in live:
@@ -707,6 +714,7 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
 
 def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
                         floor_rate=C.FLOOR_RATE_PER_H, venue_caps=None, held=None,
+                        resting=None,
                         cluster_cap_usd=None):
     """The full cycle: solve spec §1.3's r* fixpoint around ALLOCATE — the FORFEIT-GATED
     ALLOCATE, because the allocation the requoter diffs against must be the post-gate one
@@ -724,7 +732,7 @@ def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
     def run(r_star):
         a, sp, marg, dropped = allocate_with_forfeit_gate(
             slots, budget_usd, r_star, caps, floor_rate=floor_rate, venue_caps=venue_caps,
-            held=held, cluster_cap_usd=cluster_cap_usd)
+            held=held, resting=resting, cluster_cap_usd=cluster_cap_usd)
         return (a, sp, dropped), (marg if marg > 0 else floor_rate)
 
     res = M.solve_rstar(lambda r: run(r), r0)
