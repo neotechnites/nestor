@@ -241,7 +241,7 @@ def horizon_multiplier_display(t_hat_gross, carry):
     return max(0.0, 1.0 - float(carry) / tg)
 
 
-def admits(net, floor_rate=C.FLOOR_RATE_PER_H):
+def admits(net, floor_rate=C.ADMIT_FLOOR_RATE_PER_H):
     """spec §0.3: ALLOCATE admits a slot iff `net(q) > λ_min/16`.  Strict, per the spec's
     own wording; the boundary case is worth exactly the floor and therefore worth nothing
     over the alternative use of the dollar."""

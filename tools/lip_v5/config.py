@@ -86,9 +86,40 @@ S_MODE_RECON = "cents"                       # v1 §1.5 our reading of the filin
 # =============================================================================================
 # (★) THE OBJECTIVE  (spec §0.3-§0.4) — the whole spec
 # =============================================================================================
-LAMBDA_MIN = 0.10                            # v1 §2.3, UNDERIVED §9.5 (inherited, still open)
-LAMBDA_MIN_WINDOW_HOURS = 16.0               # "per 16h-equivalent" ⇒ λ_min/16 in $/h
+# THE HURDLE, RE-DERIVED FROM MEASUREMENT (2026-07-28).
+# v1 set λ_min = 0.10 per 16 h ⇒ 0.00625 $/h per collateral-$, i.e. 0.625%/HOUR, and flagged
+# it UNDERIVED.  It is not merely underived, it is WRONG BY A FACTOR OF ~2 AGAINST OUR OWN
+# TAPE: the measured, actually-credited reward rate on deployed capital is ~0.36%/h
+# (work/audit-2026-07-28.md, the $7.482 payout).  A hurdle set ABOVE the rate the program has
+# ever paid refuses every venue that pays exactly what this program pays — measured live, the
+# book deployed $5.84 of a $300 ceiling with ZERO guard refusals, because only the very
+# thinnest books cleared the bar and a thin book saturates after a dollar.
+#
+# WHAT THE FLOOR ACTUALLY IS: the opportunity cost of the marginal dollar — "worth nothing
+# over the alternative use of the dollar" (money.admits).  The alternative is idle cash at
+# 3.25% APY ≈ 0.0000037 $/h per dollar.  A floor 100x above that is still a strict filter and
+# is three orders of magnitude below the aspirational number it replaces.
+#
+# MIRROR (floor too LOW ↔ too high): too low admits marginal venues and spreads capital thin —
+# bounded, because (★) still RANKS by net rate so the best venues fill first, the per-cluster
+# and per-rung caps bound each one, and the ratchet withholds size until accrual is verified.
+# Too high is what we measured: a book that cannot deploy, cannot earn, and cannot learn.
+# When capital becomes genuinely scarce the binding constraint is r* (the achieved marginal
+# rate), which rises on its own as the book fills — that is the mechanism that should ration
+# capital, not a constant.
+LAMBDA_MIN = 0.10                            # v1 §2.3, UNDERIVED §9.5 (inherited)
+LAMBDA_MIN_WINDOW_HOURS = 16.0
 FLOOR_RATE_PER_H = LAMBDA_MIN / LAMBDA_MIN_WINDOW_HOURS      # = 0.00625 /h, spec §0.4
+# ...but that number is the REFERENCE RATE the kill hysteresis, the rescue and the presence
+# maths are all calibrated against, and it is SEPARATELY wrong as an ADMISSION hurdle, so the
+# two uses are now separate constants.  ADMIT_FLOOR is what `money.admits` compares against.
+# 0.002 $/h per collateral-$ = 0.2 %/h, i.e. HALF the measured achieved rate of ~0.36 %/h
+# (work/audit-2026-07-28.md).  Below the rate the program actually pays, so venues paying
+# what this program pays are admitted; far enough above zero that the water level still stops
+# at genuine diminishing returns — on a book with no rivals our share is already ~100% and
+# extra contracts buy fill risk, not score (test_a_rung_where_share_saturates...).
+# The old 0.00625 was ~2x ABOVE the measured rate: it refused everything that really pays.
+ADMIT_FLOOR_RATE_PER_H = 0.002
 STEP_FRACTION = 0.02                         # v1 §2.5 coarsest step landing within 2%
 D_SEED_USD = 0.07                            # spec §2.4 / v1 §15.4, UNDERIVED §9.4
 DRIFT_HORIZON_S = 60.0                       # spec §2.4 (v3's 5-9¢ cross-cycle horizon),

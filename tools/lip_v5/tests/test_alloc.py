@@ -201,7 +201,13 @@ class TestDerivedSlotCap(LipTestCase):
         caps = alloc.Caps(inv_cap_usd=C.slot_cap_usd(100.0))   # cap $50: NOT the binder
         a, spent, _ = alloc.allocate([s], 300.0, RSTAR, caps=caps)
         self.assertGreater(spent, 0.0)
-        self.assertLess(spent, 15.0)
+        # SATURATION, not the cap, is what stops it: the rung takes ~$18 of a $50 cap and
+        # lands at ~95% of the side's score, where further size buys fill risk rather than
+        # share.  (The old $15 bound was calibrated to the pre-2026-07-28 admission hurdle of
+        # 0.00625/h, which sat ABOVE the rate this program actually pays.)
+        self.assertLess(spent, caps.inv_cap_usd,
+                        "share saturation must bind before the per-rung cap does")
+        self.assertLess(spent, 25.0)
 
     def test_the_old_flat_cap_would_have_refused_the_50(self):
         """The defect, pinned: the same rung under the inherited flat floor stops at ~$10."""

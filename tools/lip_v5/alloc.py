@@ -418,7 +418,7 @@ def rescue(A, rate_now, h, rho, S, q, p, r_star, C_slot, phi, d,
 # =============================================================================================
 # ALLOCATE  (spec §1.3)
 # =============================================================================================
-def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.FLOOR_RATE_PER_H,
+def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE_PER_H,
              venue_caps=None, step_fraction=C.STEP_FRACTION, held=None, resting=None,
              cluster_cap_usd=None):
     """Marginal-rate water-filling under (★).  Returns (alloc, spent, marginal_at_stop).
@@ -628,7 +628,7 @@ def _cliff_decision(ps, alloc, r_star, caps, venue_caps, held, budget_room, per_
 
 
 def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
-                               floor_usd=C.ENTRY_FLOOR_USD, floor_rate=C.FLOOR_RATE_PER_H,
+                               floor_usd=C.ENTRY_FLOOR_USD, floor_rate=C.ADMIT_FLOOR_RATE_PER_H,
                                venue_caps=None, max_passes=C.MAX_GATE_PASSES, held=None,
                                resting=None,
                                cluster_cap_usd=None):
@@ -722,7 +722,7 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
 
 
 def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
-                        floor_rate=C.FLOOR_RATE_PER_H, venue_caps=None, held=None,
+                        floor_rate=C.ADMIT_FLOOR_RATE_PER_H, venue_caps=None, held=None,
                         resting=None,
                         cluster_cap_usd=None):
     """The full cycle: solve spec §1.3's r* fixpoint around ALLOCATE — the FORFEIT-GATED
@@ -736,7 +736,10 @@ def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
     `rstar_no_converge`.
     """
     caps = caps or Caps()
-    r0 = M.rstar_seed(trailing_rate, floor_rate)
+    # r* is the OPPORTUNITY COST of a dollar, not the admission bar: it stays seeded at the
+    # reference floor (and rises with the book's own achieved rate).  The admission hurdle is
+    # a separate, much lower number — see config.ADMIT_FLOOR_RATE_PER_H.
+    r0 = M.rstar_seed(trailing_rate, C.FLOOR_RATE_PER_H)
 
     def run(r_star):
         a, sp, marg, dropped = allocate_with_forfeit_gate(
