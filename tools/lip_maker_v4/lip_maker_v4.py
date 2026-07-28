@@ -266,7 +266,7 @@ INV_CAP_USD = 10.00                     # §8.1 n_cap = floor($10/p) on NET.  A 
                                         #      earning is ~$50/window; $10 = 20% of that.
 PER_MARKET_POOL_MULT = 4.0              # §8.2 never risk 4x a market's own maximum prize
 PER_MARKET_BUDGET_FRAC = 0.25           # §8.2 no single-market concentration
-MAX_TOTAL_COLLATERAL_USD = 45.0         # §8.3 FIRST-RUN rung of the R168 ladder.  Each rung
+MAX_TOTAL_COLLATERAL_USD = 65.0         # §8.3 FIRST-RUN rung of the R168 ladder.  Each rung
                                         #      is funded by the previous window's OBSERVED
                                         #      print, never by the model.  Hard refuse.
 DAY_STOP_FRAC = 0.35                    # §8.4 largest drag leaving the day net-positive
