@@ -383,7 +383,16 @@ class TestDenyList(LipTestCase):
         KXRAINBOW.  The match is exact-or-dash-anchored."""
         self.assertTrue(C.series_denied("KXRAIN"))
         self.assertTrue(C.series_denied("KXRAIN-26JUL29-T1"))
-        self.assertFalse(C.series_denied("KXRAINBOW-26JUL29-T1"))
+        # KXRAIN* is DELIBERATELY BROAD (see config.DENY_SUBSTRINGS): the real toxic series
+        # are KXRAINAUSM / KXRAINHOUM / ..., so an exact-prefix rule un-banned the whole
+        # family and rain came back into a live book on 2026-07-28.  A hypothetical
+        # "KXRAINBOW" is therefore caught too — an acceptable false positive, because
+        # admitting measured-toxic rain costs money while over-denying one hypothetical
+        # venue costs one venue.  Un-deny it explicitly if it ever exists and matters.
+        self.assertTrue(C.series_denied("KXRAINBOW-26JUL29-T1"))
+        # The over-matching guard itself still holds for everything else:
+        self.assertFalse(C.series_denied("KXUSTAR-26JUL29-T1"))     # not KXUST2AD etc.
+        self.assertFalse(C.series_denied("KXGASOLINE-26JUL29-T1"))
         self.assertFalse(C.series_denied("KXINXHUDX-1"))
 
 

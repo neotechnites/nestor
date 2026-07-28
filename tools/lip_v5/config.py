@@ -348,7 +348,14 @@ DENY_SERIES = {
 # the quote the instant the news moves, accrual is ~0, and the position outlives the reward
 # window.  A list that enumerates victims re-learns the same lesson at full price for every
 # new ticker; a list that names the MECHANISM refuses the whole family at once.
-DENY_SUBSTRINGS = ("MENTION",)
+# "MENTION": the news-event family (PYPL, BA, MLB, WNBA, F) — informed flow takes the quote
+#   the instant the news moves; see the block above.
+# "KXRAIN":  v4's measured-toxic rain family, 40 markets wide.  It was on DENY_SERIES as a
+#   PREFIX, and tightening prefix matching (so KXRAINBOW would not be caught) made it too
+#   strict: the real series are KXRAINAUSM / KXRAINHOUM / … and stopped matching entirely, so
+#   rain came back into a live book on 2026-07-28.  A family that was banned by measurement
+#   must not be un-banned by a string-matching refinement.
+DENY_SUBSTRINGS = ("MENTION", "KXRAIN")
 
 
 def family_denied(ticker):
