@@ -50,7 +50,9 @@ class Exchange(object):
     def orders(self):                                        # pragma: no cover - network
         """Resting orders — the v1 §9.4 step-4 recovery sweep's evidence.  Same path family
         as place/cancel (`/portfolio/orders` 410s; the events form is the live one)."""
-        return R.signed(self.auth, "GET", C.ORDERS_PATH, params={"status": "resting"})
+        # GET is /portfolio/orders (200, {cursor, orders}); the events form 404s on GET.
+        # C.ORDERS_PATH is the POST path — the 410 in its comment is about PLACING, not reading.
+        return R.signed(self.auth, "GET", "/portfolio/orders", params={"status": "resting"})
 
     def balance(self):                                       # pragma: no cover - network
         return R.signed(self.auth, "GET", "/portfolio/balance")
