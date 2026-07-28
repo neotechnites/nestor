@@ -245,6 +245,25 @@ MIN_RANK_POLL_SLOTS = 2
 # any market whose WS book is missing, stale, gapped or corrupt falls back to its REST poll,
 # so the failure mode is slower, never wrong.
 WS_ENABLED = False
+# W2 — WS-vs-REST DIVERGENCE GATE.  A websocket book is a RECONSTRUCTION; a REST book is the
+# exchange's own statement.  Until the reconstruction has been shown to match the statement,
+# it may not price a quote.  While gating (and periodically after), the market is REST-polled
+# as normal and the two best bid/ask pairs are compared; the WS book drives quoting only
+# after WS_AGREE_REQUIRED consecutive agreements, and reverts to REST on ANY divergence.
+# Derivation of WS_AGREE_REQUIRED = 3.  The dominant risk is a systematic parse error — a
+# dollars-vs-cents unit slip, an inverted side, a wrong field — and every one of those
+# disagrees on the FIRST non-empty comparison, so N=1 already kills them.  What N>1 buys is
+# protection against certifying on a degenerate sample (both books empty, an untraded
+# market): three agreements at the WS_VERIFY_INTERVAL_S cadence is three independent
+# statements spanning ~3 minutes, over which the measured 20%/45s best-change rate makes at
+# least one book change ~63% likely, so the gate is usually proven against a MOVING book
+# rather than a still one.  Residual, stated: on a genuinely static book three agreements
+# prove only that the two sources agree on a static book.  Staleness (WS_MAX_BOOK_AGE_S) is
+# the independent control for that case.
+WS_AGREE_REQUIRED = 3
+WS_VERIFY_INTERVAL_S = SAFETY_RESYNC_S  # §4.3(e)'s existing "catch missed stream events"
+                                        # cadence — the same job, so the same number.
+WS_UNIT_RATIO_TOL = 0.25                # a dollars-vs-cents slip shows up as a ~100x ratio
 CLASSIFY_RATE_HZ = 5.0                  # half the ~10 req/s shared budget; the sweep is
                                         # one-shot at start and every CLASSIFY_REFRESH_S
 REVIVAL_PRICE_USD = 0.01                # §6.2 the cheapest legal price on a dead side
@@ -279,6 +298,12 @@ SHED_ESCALATE_HOURS_LEFT = 2.0          # §5.4(iii) h < 2
 # is measured rather than asserted.  README documents that inventory does not self-clear
 # beyond the maker shed while this is False.
 TAKER_EXIT_ENABLED = False
+# The startup assertion previously refused $300 with the exit OFF, full stop.  That is
+# wrong: "$300 with the taker exit off, decided and accepted" is a legitimate outcome — the
+# thing that must never happen is reaching $300 having never MADE the decision.  So the gate
+# is on the DECISION, not on the answer.  "undecided" refuses; "on" and "off_accepted" both
+# run, and both are recorded in the ledger at every start so the choice is never implicit.
+TAKER_EXIT_DECISION = "undecided"       # "undecided" | "on" | "off_accepted"
 # NEW-5: the derivation above is a function of the CEILING, so the two must not drift.  At
 # or above this ceiling a startup assertion REFUSES TO RUN while TAKER_EXIT_ENABLED is
 # False.  Deliberately NOT an auto-enable: crossing the spread is a human decision and this
@@ -291,6 +316,12 @@ TAKER_EXIT_REQUIRED_ABOVE_USD = 300.0
 # qualifying rungs (verify-lip-gas §3c: median 1-2c, 6c on the widest), so it clears a
 # normal book in one shot without reaching for depth we cannot see.
 TAKER_EXIT_MAX_SLIPPAGE_C = 3
+# T3: one cross, then wait.  A partial fill leaves a net that satisfies every escalation
+# condition again, so without a cooldown the exit refires on the loop cadence and pays the
+# spread repeatedly — it converges, but the cost is unbounded inside the refill cap.  One
+# SHED_PATIENCE_S is the natural interval: it is the same "give the maker path a chance"
+# constant §5.4(ii) already uses, applied to the second and subsequent crosses.
+TAKER_EXIT_COOLDOWN_S = SHED_PATIENCE_S
 
 # ---- risk caps (§8) ---------------------------------------------------------------------
 INV_CAP_USD = 10.00                     # §8.1 n_cap = floor($10/p) on NET.  A slot's max
@@ -329,6 +360,13 @@ PROGRAM_EV_HIGH_USD = 8000.0            #       revocation tradeoff is never mad
 REVIVAL_EV_USD = 3400.0                 # §10.1 ~$100/day x 34 days
 
 # ---- reconciliation / stand-down (§12) --------------------------------------------------
+# R1 — the §12.3(b) no-data stand-down halts on two days of missing credits, and the credits
+# come from a HUMAN ritual (§7.3a).  A halt that arrives because nobody was reminded is a
+# self-inflicted outage, so the reminder fires daily, loudly, BEFORE the second day can
+# accrue.  16:00 MT = 22:00Z (MDT, UTC-6) — after the previous window has settled and
+# `paid_out` has flipped (~2h post-close, verified across 330 programs), and early enough in
+# the evening that the operator can still act on it.
+CREDIT_RITUAL_HOUR_UTC = 22
 PAID_OUT_POLL_S = 1800                  # §7.3 poll every 30 min; flips within ~2h of close
 CREDIT_MISSING_ALERT_S = 86400          # §7.3a alert if paid_out and no credit row after 24h
 STANDDOWN_LOG2_RATIO = 1.0              # §12.3(a) |log2(paid/model)| > 1 == worse than 2x
@@ -951,6 +989,43 @@ def market_poll_rank(classified, max_markets=MAX_REST_MARKETS, count_unqualified
         scored.append((-v, -float(entry.get("rho", 0.0)), str(ticker)))
     scored.sort()
     return [t for _, _, t in scored[:max_markets]]
+
+
+WS_AGREE, WS_DIVERGE, WS_DEGENERATE = "agree", "diverge", "degenerate"
+
+
+def ws_compare(ws_body, rest_body):
+    """W2 — compare a reconstructed WS book against the exchange's own REST statement.
+
+    Returns (verdict, detail).  `degenerate` means the sample proves nothing (one or both
+    sides missing on BOTH sources) and must not be counted toward the gate — certifying on
+    an empty book is certifying on nothing.
+
+    The unit probe lives here rather than in the feed because THIS is the place where REST
+    tells us the answer: if the WS book were in dollars while we read it as cents (or the
+    reverse), the best prices differ by ~100x, which is reported explicitly as
+    `unit_mismatch` rather than as an ordinary disagreement.
+    """
+    wb, wa = best_from_book(ws_body)
+    rb, ra = best_from_book(rest_body)
+    if (wb is None and wa is None) or (rb is None and ra is None):
+        return WS_DEGENERATE, {"ws": (wb, wa), "rest": (rb, ra), "why": "empty_side"}
+    detail = {"ws_bid": wb, "ws_ask": wa, "rest_bid": rb, "rest_ask": ra}
+    for w, r in ((wb, rb), (wa, ra)):
+        if w is None or r is None:
+            continue
+        if w == r:
+            continue
+        if r != 0:
+            ratio = float(w) / float(r)
+            for factor in (100.0, 0.01):
+                if abs(ratio - factor) <= WS_UNIT_RATIO_TOL * factor:
+                    detail["unit_mismatch"] = ratio
+                    return WS_DIVERGE, detail
+        return WS_DIVERGE, detail
+    if wb != rb or wa != ra:
+        return WS_DIVERGE, detail
+    return WS_AGREE, detail
 
 
 def unpriced_positions(positions, yes_mids):
@@ -2511,13 +2586,19 @@ def startup_assertions(auth, auth_note, programs=None):
     #    ceiling bump would silently inherit a decision made for a different rung.  Refuse
     #    to run rather than auto-enable: crossing the spread is a human decision, and this
     #    forces it to be made explicitly AT the rung.
-    ok_taker = not (MAX_TOTAL_COLLATERAL_USD >= TAKER_EXIT_REQUIRED_ABOVE_USD
-                    and not TAKER_EXIT_ENABLED)
+    decision = str(TAKER_EXIT_DECISION or "undecided").strip().lower()
+    needs_decision = MAX_TOTAL_COLLATERAL_USD >= TAKER_EXIT_REQUIRED_ABOVE_USD
+    ok_taker = (not needs_decision) or decision in ("on", "off_accepted")
+    if decision == "on" and not TAKER_EXIT_ENABLED:
+        ok_taker = False                       # the decision and the flag must agree
+    if decision == "off_accepted" and TAKER_EXIT_ENABLED:
+        ok_taker = False
     results.append((
         "taker_exit_decision_matches_ceiling", ok_taker,
-        "ceiling=$%.2f taker_exit_enabled=%s (an explicit decision is REQUIRED at or above "
-        "$%.2f)" % (MAX_TOTAL_COLLATERAL_USD, TAKER_EXIT_ENABLED,
-                    TAKER_EXIT_REQUIRED_ABOVE_USD)))
+        "ceiling=$%.2f decision=%s enabled=%s (an explicit decision is REQUIRED at or "
+        "above $%.2f; 'off_accepted' is a valid answer, 'undecided' is not)"
+        % (MAX_TOTAL_COLLATERAL_USD, decision, TAKER_EXIT_ENABLED,
+           TAKER_EXIT_REQUIRED_ABOVE_USD)))
 
     return all(r[1] for r in results), results
 
@@ -2561,8 +2642,13 @@ class Maker(object):
         self.unknown_retries = {}       # D7: order_id -> attempts
         self.last_orphan_poll = 0.0     # C6: orphan-shed poll throttle
         self.ws = None                  # §4.6 websocket feed, when WS_ENABLED
+        self.taker_exit_ts = {}         # T3: ticker -> last taker cross, for the cooldown
+        self.ws_agreements = {}         # W2: ticker -> consecutive ws/rest agreements
+        self.ws_verified_ts = {}        # W2: ticker -> last comparison
+        self.ws_divergences = {}        # W2: ticker -> lifetime divergences
         self.recon_written = set()      # §12.1 program rows already written
         self.recon_alerted = set()      # §7.3a alerts already sent (once each)
+        self.credit_reminder_day = None # R1: last date the ritual reminder fired
         self.collateral_avg = {}        # program_id -> running mean collateral
         self.collateral_peak = {}       # program_id -> peak collateral
         self.fills_ct = {}              # program_id -> fills observed
@@ -2663,6 +2749,17 @@ class Maker(object):
     # -- placement ------------------------------------------------------------------------
     def place(self, ticker, side, price_c, size, expiration_ts):
         self.last_place_skip = None
+        # T1: a FRACTIONAL residual (net 0.95) int()s to 0 and built a count "0.00" order,
+        # which the exchange rejects — at 1 Hz, until MAX_POST_ERRORS trips a global
+        # cancel-all.  A sub-contract remainder is not tradeable; it is noise that must
+        # never reach the wire, and it must not burn the error budget either.
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            size = 0
+        if size < 1:
+            self.last_place_skip = "size_below_one"
+            return None
         if self.halted and not self._closing_exempt(ticker, side, size):
             self.last_place_skip = "halted"
             # §8.4/§8.5: a halted process posts nothing that could OPEN exposure.  C3: a
@@ -3025,11 +3122,19 @@ class Maker(object):
         the operator must be told in those words.
         """
         posted, residual_n, residual_usd = 0, 0.0, 0.0
+        covered_n, covered_usd, dust_n = 0.0, 0.0, 0.0
         for ticker in sorted(self.st.positions.keys()):
             net = self.st.net_position(ticker)
             if abs(net) < 1e-9:
                 continue
             cost = self.st.position_cost.get(ticker, 0.0)
+            if int(abs(net)) < 1:
+                # T1: a sub-contract remainder cannot be traded at all.  It is dust, not a
+                # stranded position, and calling it stranded overstates the alarm.
+                dust_n += abs(net)
+                log("flatten_dust", ticker=ticker, net=net,
+                    why="sub-contract remainder; not tradeable")
+                continue
             if ticker in self.st.assume_filled:
                 residual_n += abs(net); residual_usd += cost
                 log("flatten_skipped", ticker=ticker, net=net,
@@ -3050,32 +3155,48 @@ class Maker(object):
                     price_c=px, skip=self.last_place_skip)
                 continue
             posted += 1
+            covered_n += abs(net)
+            covered_usd += cost
             self.live_by_slot[(ticker, shed_side)] = o
             self.shed_since.setdefault(ticker, now)
             self.shed_target[(ticker, shed_side)] = size
             self.flatten_only.add(ticker)          # C6: keep requoting it after the window
             log("flatten_shed_posted", ticker=ticker, side=shed_side, size=size,
                 price_c=px, net=net)
+        # D1: a position whose shed IS RESTING is being worked — reporting it as stranded
+        # alongside one we could not price at all conflates "in progress" with "given up",
+        # and the operator reads the same number for two different situations.
         log("flatten_summary", reason=reason, sheds_posted=posted,
-            residual_contracts=round(residual_n, 4),
-            residual_cost_usd=round(residual_usd, 4),
+            shed_covered_contracts=round(covered_n, 4),
+            shed_covered_cost_usd=round(covered_usd, 4),
+            stranded_contracts=round(residual_n, 4),
+            stranded_cost_usd=round(residual_usd, 4),
+            dust_contracts=round(dust_n, 4),
             taker_exit_enabled=TAKER_EXIT_ENABLED,
-            note=("exited holding %.0f contracts, $%.2f - no further mechanism, "
-                  "TAKER_EXIT_ENABLED is False" % (residual_n, residual_usd))
-            if residual_n > 0 else "flat")
+            note=("STRANDED: exited holding %.0f contracts, $%.2f with no mechanism"
+                  % (residual_n, residual_usd)) if residual_n > 0 else
+                 ("sheds resting on %.0f contracts, $%.2f - being worked"
+                  % (covered_n, covered_usd)) if covered_n > 0 else "flat")
         return posted, residual_n, residual_usd
 
     def taker_exit(self, ticker, now):
         """§5.4(iii) escalation, live only when TAKER_EXIT_ENABLED.  A MARKETABLE LIMIT
         bounded by abs(net) and by TAKER_EXIT_MAX_SLIPPAGE_C, so §8.8's "a fill at a price
-        we did not intend" is checkable rather than hoped for.  Never reverses."""
+        we did not intend" is checkable rather than hoped for.  Never reverses.
+        """
         if not TAKER_EXIT_ENABLED:
             return None
         net = self.st.net_position(ticker)
-        if abs(net) < 1e-9 or ticker in self.st.assume_filled:
+        size = int(abs(net))
+        if size < 1 or ticker in self.st.assume_filled:      # T1
             return None
         if now - self.shed_since.get(ticker, now) < SHED_PATIENCE_S:
             return None                     # §5.4(ii): the shed gets its 30 minutes first
+        # T3: after a PARTIAL fill the remaining net still satisfies every condition above,
+        # so the exit refired on the loop cadence and paid the spread again and again.  It
+        # converges, but the cost is unbounded within the refill cap.  One cross, then wait.
+        if now - self.taker_exit_ts.get(ticker, -1e9) < TAKER_EXIT_COOLDOWN_S:
+            return None
         held = "bid" if net > 0 else "ask"
         side = shed_slot(held)
         info = self.scores.get(ticker) or {}
@@ -3084,18 +3205,38 @@ class Maker(object):
             log("taker_exit_skipped", ticker=ticker, why="no_two_sided_book")
             return None
         if yb >= ya:
-            # §8.8: crossed or locked — abort rather than trade into it.
-            log("taker_exit_abort", ticker=ticker, yes_bid=yb, yes_ask=ya,
-                why="crossed_or_locked_book")
-            self.st.poisoned.add(ticker)
+            # §8.8: crossed or locked.  T4: SKIP THIS CYCLE — do not poison.  A crossed book
+            # is a transient market state, not evidence about our own orders, and poisoning
+            # on it strands the very inventory the exit exists to clear (a poisoned market
+            # is refused by place(), so the shed dies with it).
+            log("taker_exit_skipped", ticker=ticker, yes_bid=yb, yes_ask=ya,
+                why="crossed_or_locked_book_this_cycle")
+            return None
+        # T2: the STALE SHED that triggered this escalation is itself consuming the closing
+        # room, so the exit priced as fresh exposure, failed the ceiling check, and
+        # _closing_exempt() returned False during a halt — blocked at exactly the moment it
+        # is needed.  The shed is being REPLACED, so cancel it first, then compute room.
+        stale = self.live_by_slot.get((ticker, side))
+        if stale is not None and stale.resting > 0:
+            log("taker_exit_cancels_stale_shed", ticker=ticker,
+                order_id=stale.order_id, resting=stale.resting)
+            self.cancel(stale)
+            self.live_by_slot.pop((ticker, side), None)
+            self.shed_target.pop((ticker, side), None)
+        net = self.st.net_position(ticker)                   # re-read: the cancel may fill
+        size = int(abs(net))
+        if size < 1:
+            log("taker_exit_done", ticker=ticker, filled=0.0, net_after=net,
+                why="flat_after_cancelling_the_stale_shed")
             return None
         if side == "bid":
             limit_c = min(MAX_LEGAL_PRICE_C, ya + TAKER_EXIT_MAX_SLIPPAGE_C)
         else:
             limit_c = max(MIN_LEGAL_PRICE_C, yb - TAKER_EXIT_MAX_SLIPPAGE_C)
-        size = int(abs(net))
         log("taker_exit_attempt", ticker=ticker, side=side, size=size, limit_c=limit_c,
-            yes_bid=yb, yes_ask=ya, slippage_cap_c=TAKER_EXIT_MAX_SLIPPAGE_C)
+            yes_bid=yb, yes_ask=ya, slippage_cap_c=TAKER_EXIT_MAX_SLIPPAGE_C,
+            closing_room=round(self.st.closing_room(ticker, side), 4))
+        self.taker_exit_ts[ticker] = now
         o = self.place(ticker, side, limit_c, size, int(now + 60))
         if o is None:
             log("taker_exit_failed", ticker=ticker, skip=self.last_place_skip)
@@ -3331,6 +3472,48 @@ class Maker(object):
         except Exception:
             return None
 
+    def ws_trusted(self, ticker, now):
+        """W2 — may the WS book price a quote for this market right now?  Only after
+        WS_AGREE_REQUIRED consecutive agreements with REST, and only until the next
+        scheduled re-verification falls due."""
+        if not WS_ENABLED:
+            return False
+        if self.ws_agreements.get(ticker, 0) < WS_AGREE_REQUIRED:
+            return False
+        last = self.ws_verified_ts.get(ticker, 0.0)
+        return (now - last) < WS_VERIFY_INTERVAL_S
+
+    def ws_verify(self, ticker, ws_body, rest_body, now):
+        """W2 — one comparison.  Agreement advances the gate; ANY divergence resets it to
+        zero, reverts the market to REST and alerts.  A degenerate sample (an empty book)
+        proves nothing and is not counted in either direction."""
+        verdict, detail = ws_compare(ws_body, rest_body)
+        self.ws_verified_ts[ticker] = now
+        if verdict == WS_DEGENERATE:
+            return verdict
+        if verdict == WS_AGREE:
+            n = self.ws_agreements.get(ticker, 0) + 1
+            self.ws_agreements[ticker] = n
+            if n == WS_AGREE_REQUIRED:
+                log("ws_gate_passed", ticker=ticker, agreements=n, **detail)
+            return verdict
+        prev = self.ws_agreements.get(ticker, 0)
+        self.ws_agreements[ticker] = 0
+        self.ws_divergences[ticker] = self.ws_divergences.get(ticker, 0) + 1
+        log("ws_divergence", ticker=ticker, agreements_lost=prev,
+            total_divergences=self.ws_divergences[ticker], **detail)
+        if detail.get("unit_mismatch"):
+            # The dollars-vs-cents question, killed by the one source that knows.
+            ntfy("LIP v4 WS UNIT MISMATCH",
+                 "%s: ws/rest best price ratio %.3f - the websocket book is in the wrong "
+                 "unit; reverted to REST" % (ticker, detail["unit_mismatch"]))
+        elif self.ws_divergences[ticker] == 1:
+            ntfy("LIP v4 WS divergence",
+                 "%s: ws %s/%s vs rest %s/%s - reverted to REST"
+                 % (ticker, detail.get("ws_bid"), detail.get("ws_ask"),
+                    detail.get("rest_bid"), detail.get("rest_ask")))
+        return verdict
+
     def poll_cap(self):
         """§4.6 — 6 on REST; ws_feed.MAX_WS_MARKETS only while the socket is CONNECTED.
         A configured-but-down websocket must not buy breadth it cannot serve."""
@@ -3385,7 +3568,10 @@ class Maker(object):
                 why="beyond the clamp's inventory room; tracked on the orphan cadence")
         ranked = [t for t in market_poll_rank(self.classified)
                   if t in by_ticker and t not in inv_polled]
-        rank_budget = max(MIN_RANK_POLL_SLOTS, cap - len(inv_polled))
+        # I1: clamp to the cap.  With cap < MIN_RANK_POLL_SLOTS (reachable if the WS cap
+        # were ever configured below the floor) the max() alone would hand back MORE slots
+        # than the rate budget allows.
+        rank_budget = min(cap, max(MIN_RANK_POLL_SLOTS, cap - len(inv_polled)))
         rank_chosen = ranked[:rank_budget]
         shed_only = set(inv_polled) - set(rank_chosen)
         return inv_polled + rank_chosen, shed_only
@@ -3501,6 +3687,7 @@ class Maker(object):
                     ntfy("LIP v4 credit missing 24h after paid_out",
                          "%s: paid_out is true but no credit row - the reconciliation loop "
                          "may have stopped" % r.get("market_ticker"))
+        self.credit_ritual_reminder(rows, credits, now)
         days = daily_reconcile(rows, credits)
         breached, why = standdown_check(days)
         log("recon_summary", days={d: {k: (round(v, 4) if isinstance(v, float) else v)
@@ -3516,6 +3703,31 @@ class Maker(object):
             self.flatten(now, "standdown")
             self.halted = True
             self.stopping = True
+
+    def credit_ritual_reminder(self, rows, credits, now):
+        """R1 — remind the operator, once a day, while a reminder can still prevent the
+        §12.3(b) halt rather than explain it."""
+        dt = datetime.fromtimestamp(now, timezone.utc)
+        if dt.hour < CREDIT_RITUAL_HOUR_UTC:
+            return
+        today = dt.strftime("%Y-%m-%d")
+        if self.credit_reminder_day == today:
+            return
+        missing = [r for r in rows
+                   if r.get("row") == "program" and r.get("paid_out_flag")
+                   and r.get("program_id") not in credits]
+        self.credit_reminder_day = today
+        if not missing:
+            log("credit_ritual_ok", checked=len(rows), credits=len(credits))
+            return
+        tickers = sorted({str(r.get("market_ticker")) for r in missing})
+        log("credit_ritual_due", n_missing=len(missing), tickers=tickers[:10],
+            why="paid_out has flipped on these; §12.3(b) halts after 2 days with no credits")
+        ntfy("LIP v4 CREDITS RITUAL DUE (%d programs)" % len(missing),
+             "Rewards -> Current month -> reward details; append credit rows to "
+             "pools_operator.jsonl for: %s%s. Two days without these HALTS deployment "
+             "(§12.3b)." % (", ".join(tickers[:6]),
+                            "" if len(tickers) <= 6 else " (+%d more)" % (len(tickers) - 6)))
 
     def coverage_pct(self, program_id):
         at_best = sum(v for k, v in self.at_best_s.items()
@@ -3646,12 +3858,17 @@ class Maker(object):
         slots = []
         for p in progs:
             tk = p["market_ticker"]
-            body = self.ws_book(tk)                    # §4.6 WS first, REST as the fallback
+            # §4.6 + W2: the WS book may drive quoting only once it has been PROVEN against
+            # REST.  Until then (and periodically after) we REST-poll as normal and compare.
+            ws_body = self.ws_book(tk)
+            body = ws_body if self.ws_trusted(tk, now) else None
             if body is None:
                 st, body = public_get("/markets/%s/orderbook" % tk, {"depth": "50"})
                 if st != 200:
                     log("book_error", ticker=tk, http=st)
                     continue
+                if ws_body is not None:
+                    self.ws_verify(tk, ws_body, body, now)
             # NEW-4: classify from the book the quoting loop just fetched, so the rank
             # table is never staler than the last poll of that market.
             # A shed-only market is polled so its fills are learned and its closing order

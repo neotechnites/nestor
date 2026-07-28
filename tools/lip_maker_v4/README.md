@@ -8,7 +8,7 @@ Python 3.12 + requests + cryptography. Tests: `python3 -m unittest discover tool
     ssh ubuntu@VPS 'mkdir -p ~/nestor/data/lip && python3 ~/kalshi_data/scripts/lip_maker_v4.py --check'
 
 ## First-run checklist (all must pass before --live)
-0. **`python3 -m unittest discover tools/lip_maker_v4/` — 256 tests, must print `OK`.** Run it on the
+0. **`python3 -m unittest discover tools/lip_maker_v4/` — 280 tests, must print `OK`.** Run it on the
    VPS against the file you just scp'd, not only on the Mac.
 1. `--check` prints `[OK ]` for all four startup assertions: `env_and_pem`, `data_dir_writable`,
    `ledger_replay_clean`, `taker_exit_decision_matches_ceiling`, and **`unit_assertion_eq_100.00`** — at least 30
@@ -33,6 +33,9 @@ Python 3.12 + requests + cryptography. Tests: `python3 -m unittest discover tool
     ssh ubuntu@VPS 'pip3 install --user websockets'      # the one authorized extra dependency
     scp tools/lip_maker_v4/ws_feed.py ubuntu@VPS:~/kalshi_data/scripts/
     # then set WS_ENABLED = True and restart
+A ws book may drive quoting only after 3 consecutive agreements with a REST poll of the same
+market (`ws_gate_passed`), re-proven every 60s, and reverts to REST + alerts on ANY divergence
+(`ws_divergence`; a dollars/cents slip names itself as `unit_mismatch`).
 Breadth lifts from 6 to 32 markets ONLY while the socket is connected; any market whose WS
 book is missing/stale/gapped/corrupt falls back to its REST poll. `grep ws_ ~/nestor/data/lip/
 v4_ledger.jsonl` for connect/gap/resubscribe events. Roll back = set the flag False + restart.
@@ -56,6 +59,12 @@ fill was unverifiable. Reconcile the position by hand on the exchange, then:
     sudo systemctl restart lip-maker-v4
 Never clear it without checking the real position first — the freeze exists because the ledger and
 the exchange disagreed.
+
+**Credits ritual (daily, 16:00 MT).** v4 alerts `CREDITS RITUAL DUE` when programs have
+flipped `paid_out` with no credit row. Append them to `pools_operator.jsonl` the same evening:
+`{"ts":"...","kind":"credit","program_id":"<id>","paid_usd":5.40,"date":"YYYY-MM-DD"}`.
+**Two days without credits HALTS deployment (§12.3b)** — the reminder exists so that halt
+never surprises anyone.
 
 Ledger `~/nestor/data/lip/v4_ledger.jsonl` · alerts ntfy `senate-nestor-2732e947` ·
 stop `sudo systemctl stop lip-maker-v4` (SIGTERM cancels all; `expiration_ts` = close−4min backstop).

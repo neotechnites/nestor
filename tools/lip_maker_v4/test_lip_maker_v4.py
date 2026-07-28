@@ -1462,25 +1462,29 @@ class NEW4_RankTableIsRefreshedByTheOneHzLoop(unittest.TestCase):
 
 class NEW5_TakerExitIsCoupledToTheCeiling(unittest.TestCase):
 
-    def _assert_with(self, ceiling, enabled, programs):
+    def _assert_with(self, ceiling, enabled, programs, decision=None):
         tmp = tempfile.mkdtemp()
-        old = (M.DATA_DIR, M.LEDGER_PATH, M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_ENABLED)
+        old = (M.DATA_DIR, M.LEDGER_PATH, M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_ENABLED,
+               M.TAKER_EXIT_DECISION)
         try:
             M.DATA_DIR = os.path.join(tmp, "lip")
             M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
             M.MAX_TOTAL_COLLATERAL_USD = ceiling
             M.TAKER_EXIT_ENABLED = enabled
+            if decision is None:
+                decision = "on" if enabled else "undecided"
+            M.TAKER_EXIT_DECISION = decision
             ok, results = M.startup_assertions(None, "n/a", programs=programs)
             return ok, {n: (g, d) for n, g, d in results}
         finally:
             (M.DATA_DIR, M.LEDGER_PATH, M.MAX_TOTAL_COLLATERAL_USD,
-             M.TAKER_EXIT_ENABLED) = old
+             M.TAKER_EXIT_ENABLED, M.TAKER_EXIT_DECISION) = old
             shutil.rmtree(tmp, ignore_errors=True)
 
     GOOD_PROGS = unit_progs(40, gas=17)
 
     def test_first_run_ceiling_passes_with_the_taker_exit_off(self):
-        ok, r = self._assert_with(45.0, False, self.GOOD_PROGS)
+        ok, r = self._assert_with(45.0, False, self.GOOD_PROGS, decision="undecided")
         self.assertTrue(r["taker_exit_decision_matches_ceiling"][0])
         self.assertTrue(ok)
 
@@ -1496,6 +1500,34 @@ class NEW5_TakerExitIsCoupledToTheCeiling(unittest.TestCase):
     def test_the_300_dollar_rung_runs_once_the_decision_is_explicit(self):
         ok, r = self._assert_with(300.0, True, self.GOOD_PROGS)
         self.assertTrue(r["taker_exit_decision_matches_ceiling"][0])
+        self.assertTrue(ok)
+
+    def test_off_accepted_is_a_LEGITIMATE_answer_at_300(self):
+        """The gate is on the DECISION, not the answer.  "$300 with the taker exit off,
+        decided and accepted" is a real morning outcome; the thing that must never happen is
+        reaching $300 having never made the call."""
+        ok, r = self._assert_with(300.0, False, self.GOOD_PROGS, decision="off_accepted")
+        self.assertTrue(r["taker_exit_decision_matches_ceiling"][0])
+        self.assertTrue(ok)
+        self.assertIn("off_accepted", r["taker_exit_decision_matches_ceiling"][1])
+
+    def test_undecided_at_300_still_refuses(self):
+        ok, r = self._assert_with(300.0, False, self.GOOD_PROGS, decision="undecided")
+        self.assertFalse(r["taker_exit_decision_matches_ceiling"][0])
+        self.assertFalse(ok)
+        ok2, _ = self._assert_with(300.0, True, self.GOOD_PROGS, decision="undecided")
+        self.assertFalse(ok2)                 # even with the flag on, undecided refuses
+
+    def test_the_decision_and_the_flag_must_agree(self):
+        """A decision of "on" with the flag off (or the reverse) is a half-applied change,
+        which is exactly the mistake a coordinated morning commit can make."""
+        self.assertFalse(self._assert_with(300.0, False, self.GOOD_PROGS,
+                                           decision="on")[0])
+        self.assertFalse(self._assert_with(300.0, True, self.GOOD_PROGS,
+                                           decision="off_accepted")[0])
+
+    def test_below_the_rung_the_decision_is_not_demanded(self):
+        ok, _ = self._assert_with(65.0, False, self.GOOD_PROGS, decision="undecided")
         self.assertTrue(ok)
 
     def test_the_threshold_is_the_next_ladder_rung(self):
@@ -2905,13 +2937,20 @@ class Phase1_TakerExitPathIsReadyForEitherAnswer(_RunnerCase):
         m.shed_since["T"] = 99999.0 - M.SHED_PATIENCE_S
         self.assertIsNotNone(self._enabled(lambda: m.taker_exit("T", 99999.0)))
 
-    def test_it_aborts_on_a_crossed_book_per_8_8(self):
+    def test_it_skips_a_crossed_book_this_cycle_and_does_NOT_poison(self):
+        """T4 -- §8.8 says do not trade into a crossed book, but a crossed book is a
+        transient MARKET state, not evidence about our own orders.  Poisoning on it strands
+        the very inventory the exit exists to clear, because a poisoned market is refused by
+        place() and the shed dies with it."""
         m = self._maker(yb=50, ya=48)                 # our_bid >= our_ask
         m.shed_since["T"] = 0.0
         self.assertIsNone(self._enabled(lambda: m.taker_exit("T", 99999.0)))
-        self.assertIn("T", m.st.poisoned)
+        self.assertNotIn("T", m.st.poisoned)          # was: permanently poisoned
         ev = [e["event"] for e in self.events()]
-        self.assertIn("taker_exit_abort", ev)
+        self.assertIn("taker_exit_skipped", ev)
+        # and the very next cycle, on an uncrossed book, it proceeds normally
+        m.scores["T"] = {"yes_bid_c": 40, "yes_ask_c": 42}
+        self.assertIsNotNone(self._enabled(lambda: m.taker_exit("T", 99999.0)))
 
     def test_it_never_touches_a_frozen_market_or_a_flat_one(self):
         m = self._maker()
@@ -3441,6 +3480,319 @@ class Phase2_ReconPoller(_RunnerCase):
         self.assertAlmostEqual(m.coverage_pct("P1"), 0.95, places=9)
         self.assertAlmostEqual(m.coverage_pct("P2"), 0.10, places=9)
         self.assertEqual(m.coverage_pct("NOPE"), 0.0)
+
+
+class FinalGate_T1_T4(_RunnerCase):
+
+    def _maker(self, net_yes=0.95, yb=40, ya=42):
+        st = M.LedgerState()
+        st.positions = {"T": {"yes": max(0.0, net_yes), "no": max(0.0, -net_yes)}}
+        st.position_cost = {"T": abs(net_yes) * 0.40}
+        st.position_cost_leg = {"T": {"yes": max(0.0, net_yes) * 0.40,
+                                      "no": max(0.0, -net_yes) * 0.40}}
+        m = M.Maker(None, st, [])
+        m.scores = {"T": {"yes_bid_c": yb, "yes_ask_c": ya}}
+        self.posted = []
+        m.do_post = lambda b: (self.posted.append(b),
+                               (201, {"order_id": "N%d" % (len(self.posted) + 1),
+                                      "fill_count": "0.00",
+                                      "remaining_count": b["count"]}))[1]
+        m.do_cancel = lambda oid: (200, {"reduced_by": "0.00"})
+        return m
+
+    def test_T1_a_fractional_residual_never_reaches_the_wire(self):
+        """net 0.95 int()s to 0 and built a count "0.00" order the exchange rejects — at
+        1 Hz, until MAX_POST_ERRORS tripped a GLOBAL cancel-all.  A sub-contract remainder
+        is noise, and it must not burn the error budget either."""
+        m = self._maker(net_yes=0.95)
+        self.assertIsNone(m.place("T", "ask", 42, 0.95, 1785000000))
+        self.assertEqual(self.posted, [])
+        self.assertEqual(m.last_place_skip, "size_below_one")
+        self.assertEqual(m.st.post_error_ts, [])            # error budget untouched
+        for bad in (0, 0.4, -3, None, "x"):
+            self.assertIsNone(m.place("T", "ask", 42, bad, 1785000000))
+        self.assertEqual(self.posted, [])
+        self.assertEqual(m.st.post_error_ts, [])
+
+    def test_T1_flatten_reports_dust_separately_from_stranded(self):
+        m = self._maker(net_yes=0.95)
+        posted, residual, usd = m.flatten(1000.0, "day_stop")
+        self.assertEqual(posted, 0)
+        self.assertEqual(self.posted, [])
+        self.assertEqual(residual, 0.0)                     # dust is not "stranded"
+        row = [e for e in self.events() if e["event"] == "flatten_summary"][0]
+        self.assertAlmostEqual(row["dust_contracts"], 0.95, places=6)
+        self.assertEqual(row["stranded_contracts"], 0.0)
+        self.assertEqual(row["note"], "flat")
+
+    def test_T1_taker_exit_refuses_a_sub_contract_net(self):
+        m = self._maker(net_yes=0.95)
+        m.shed_since["T"] = 0.0
+        old = M.TAKER_EXIT_ENABLED
+        try:
+            M.TAKER_EXIT_ENABLED = True
+            self.assertIsNone(m.taker_exit("T", 99999.0))
+            self.assertEqual(self.posted, [])
+        finally:
+            M.TAKER_EXIT_ENABLED = old
+
+    def test_D1_a_resting_shed_is_reported_as_covered_not_stranded(self):
+        """Reporting an in-progress unwind with the same number as one we gave up on makes
+        the operator read two different situations as one."""
+        m = self._maker(net_yes=20.0)
+        posted, residual, usd = m.flatten(1000.0, "day_stop")
+        self.assertEqual(posted, 1)
+        row = [e for e in self.events() if e["event"] == "flatten_summary"][0]
+        self.assertAlmostEqual(row["shed_covered_contracts"], 20.0, places=6)
+        self.assertEqual(row["stranded_contracts"], 0.0)
+        self.assertIn("being worked", row["note"])
+        # a position we could NOT price is still reported as stranded
+        m2 = self._maker(net_yes=20.0)
+        m2.scores = {}
+        m2.flatten(1000.0, "day_stop")
+        row2 = [e for e in self.events() if e["event"] == "flatten_summary"][-1]
+        self.assertAlmostEqual(row2["stranded_contracts"], 20.0, places=6)
+        self.assertIn("STRANDED", row2["note"])
+
+
+class FinalGate_T2_T3_I1(_RunnerCase):
+
+    def _maker(self, net_yes=29.0):
+        st = M.LedgerState()
+        st.positions = {"T": {"yes": net_yes, "no": 0.0}}
+        st.position_cost = {"T": net_yes * 0.45}
+        st.position_cost_leg = {"T": {"yes": net_yes * 0.45, "no": 0.0}}
+        m = M.Maker(None, st, [])
+        m.scores = {"T": {"yes_bid_c": 40, "yes_ask_c": 42}}
+        self.posted = []
+
+        def post(b):
+            self.posted.append(b)
+            o = "N%d" % len(self.posted)
+            return (201, {"order_id": o, "fill_count": b["count"],
+                          "remaining_count": "0.00"})
+        m.do_post = post
+        m.do_cancel = lambda oid: (200, {"reduced_by": "29.00"})
+        return m
+
+    def _enabled(self, fn):
+        old = M.TAKER_EXIT_ENABLED
+        M.TAKER_EXIT_ENABLED = True
+        try:
+            return fn()
+        finally:
+            M.TAKER_EXIT_ENABLED = old
+
+    def test_T2_the_stale_shed_is_cancelled_before_the_room_is_computed(self):
+        """The 30-minute stale shed that TRIGGERS the escalation is itself consuming the
+        closing room, so the exit priced as fresh exposure, failed the ceiling check, and
+        _closing_exempt() returned False during a halt -- blocked at exactly the moment it
+        is needed."""
+        m = self._maker(net_yes=29.0)
+        stale = M.OrderState("STALE", "v4-c", "T", "ask", 0.42, 29, 0.0, 29.0)
+        m.st.orders["STALE"] = stale
+        m.live_by_slot[("T", "ask")] = stale
+        m.shed_since["T"] = 0.0
+        # BEFORE: the room is fully consumed by the stale shed, so the exit prices as fresh
+        self.assertAlmostEqual(m.st.closing_room("T", "ask"), 0.0, places=9)
+        self.assertGreater(M.order_collateral_usd("ask", 0.37, 29,
+                                                  room=m.st.closing_room("T", "ask")), 10.0)
+        self.assertFalse(m._closing_exempt("T", "ask", 29))
+        o = self._enabled(lambda: m.taker_exit("T", 99999.0))
+        self.assertIsNotNone(o)
+        ev = [e["event"] for e in self.events()]
+        self.assertIn("taker_exit_cancels_stale_shed", ev)
+        self.assertEqual(len(self.posted), 1)
+
+    def test_T2_the_exit_is_halt_exempt_once_the_stale_shed_is_gone(self):
+        m = self._maker(net_yes=29.0)
+        stale = M.OrderState("STALE", "v4-c", "T", "ask", 0.42, 29, 0.0, 29.0)
+        m.st.orders["STALE"] = stale
+        m.live_by_slot[("T", "ask")] = stale
+        m.shed_since["T"] = 0.0
+        m.halted = True
+        m.do_cancel = lambda oid: (200, {"reduced_by": "29.00"})
+        o = self._enabled(lambda: m.taker_exit("T", 99999.0))
+        self.assertIsNotNone(o)               # exempt: it is fully closing once room is free
+        self.assertAlmostEqual(
+            M.order_collateral_usd("ask", 0.37, 29, room=29.0), 0.0, places=9)
+
+    def test_T3_the_cooldown_stops_repeated_spread_paying(self):
+        """A partial fill leaves a net that satisfies every escalation condition again, so
+        without a cooldown the exit refires on the LOOP cadence and pays the spread over and
+        over -- it converges, but the cost is unbounded inside the refill cap."""
+        m = self._maker(net_yes=29.0)
+        m.shed_since["T"] = 0.0
+        t = 99999.0
+        self.assertIsNotNone(self._enabled(lambda: m.taker_exit("T", t)))
+        self.assertEqual(len(self.posted), 1)
+        m.st.positions["T"] = {"yes": 20.0, "no": 0.0}       # partial fill
+        self.assertIsNone(self._enabled(lambda: m.taker_exit("T", t + 1)))
+        self.assertIsNone(self._enabled(lambda: m.taker_exit("T", t + 60)))
+        self.assertEqual(len(self.posted), 1)                # still one cross
+        self.assertIsNotNone(self._enabled(
+            lambda: m.taker_exit("T", t + M.TAKER_EXIT_COOLDOWN_S + 1)))
+        self.assertEqual(len(self.posted), 2)
+        self.assertEqual(M.TAKER_EXIT_COOLDOWN_S, M.SHED_PATIENCE_S)
+
+    def test_I1_rank_budget_never_exceeds_the_cap(self):
+        m = M.Maker(None, M.LedgerState(), [])
+        progs = {}
+        for i in range(40):
+            tk = "M%03d" % i
+            progs[tk] = {"program_id": "P" + tk, "market_ticker": tk, "series": "KX",
+                         "period_reward": 1e6, "target_size_fp": 1000.0,
+                         "discount_factor_bps": 5000.0, "start_ts": 0.0, "end_ts": 9e9,
+                         "paid_out": False}
+            m.classified[tk] = {"rho": 6.25, "pinned": False, "denied": False,
+                                "sides": [{"S": 10.0 + i, "p": 0.40, "qualifies": True}]}
+        for cap in (1, 2, 3, 6, 32):
+            m.poll_cap = (lambda c: (lambda: c))(cap)
+            chosen, shed_only = m.poll_set(progs, 1000.0)
+            self.assertLessEqual(len(chosen), cap, "cap=%d" % cap)
+
+
+class FinalGate_W2_DivergenceGate(_RunnerCase):
+
+    def body(self, yb=40, ya=42):
+        return {"orderbook": {"orderbook_fp": {
+            "yes_dollars": [["%.4f" % (yb / 100.0), "50.00"]],
+            "no_dollars": [["%.4f" % ((100 - ya) / 100.0), "50.00"]]}}}
+
+    def test_agreement_and_divergence_are_distinguished_from_a_degenerate_sample(self):
+        self.assertEqual(M.ws_compare(self.body(), self.body())[0], M.WS_AGREE)
+        self.assertEqual(M.ws_compare(self.body(40, 42), self.body(41, 42))[0],
+                         M.WS_DIVERGE)
+        empty = {"orderbook": {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}}}
+        self.assertEqual(M.ws_compare(empty, self.body())[0], M.WS_DEGENERATE)
+
+    def test_a_unit_slip_is_named_rather_than_reported_as_ordinary_disagreement(self):
+        """The dollars-vs-cents question, killed by the one source that knows the answer."""
+        # the detectable direction: the feed writes CENTS into the dollars field, so 40c
+        # reads back as 4000c -- a clean 100x that names itself
+        ws = {"orderbook": {"orderbook_fp": {"yes_dollars": [["40.0000", "50"]],
+                                             "no_dollars": [["58.0000", "50"]]}}}
+        verdict, detail = M.ws_compare(ws, self.body(40, 42))
+        self.assertEqual(verdict, M.WS_DIVERGE)
+        self.assertAlmostEqual(detail["unit_mismatch"], 100.0, delta=1.0)
+        # the other direction (dollars written where cents are expected) rounds to 0c, so
+        # the RATIO is lost -- but it still DIVERGES, which is what actually protects us.
+        # Naming the unit is a convenience; never gating in is the control.
+        ws2 = {"orderbook": {"orderbook_fp": {"yes_dollars": [["0.0040", "50"]],
+                                              "no_dollars": [["0.0058", "50"]]}}}
+        self.assertEqual(M.ws_compare(ws2, self.body(40, 42))[0], M.WS_DIVERGE)
+
+    def test_ws_may_not_drive_quoting_until_it_has_been_PROVEN(self):
+        old = M.WS_ENABLED
+        try:
+            M.WS_ENABLED = True
+            m = M.Maker(None, M.LedgerState(), [])
+            for i in range(M.WS_AGREE_REQUIRED):
+                self.assertFalse(m.ws_trusted("T", 1000.0 + i))
+                self.assertEqual(m.ws_verify("T", self.body(), self.body(), 1000.0 + i),
+                                 M.WS_AGREE)
+            self.assertTrue(m.ws_trusted("T", 1000.0 + M.WS_AGREE_REQUIRED))
+            self.assertIn("ws_gate_passed", [e["event"] for e in self.events()])
+        finally:
+            M.WS_ENABLED = old
+
+    def test_any_divergence_reverts_to_REST_and_resets_the_gate(self):
+        old = M.WS_ENABLED
+        try:
+            M.WS_ENABLED = True
+            m = M.Maker(None, M.LedgerState(), [])
+            for i in range(M.WS_AGREE_REQUIRED):
+                m.ws_verify("T", self.body(), self.body(), 1000.0 + i)
+            self.assertTrue(m.ws_trusted("T", 1000.0))
+            m.ws_verify("T", self.body(41, 43), self.body(40, 42), 2000.0)
+            self.assertEqual(m.ws_agreements["T"], 0)
+            self.assertFalse(m.ws_trusted("T", 2000.0))       # back to REST
+            self.assertIn("ws_divergence", [e["event"] for e in self.events()])
+        finally:
+            M.WS_ENABLED = old
+
+    def test_a_degenerate_sample_advances_nothing(self):
+        old = M.WS_ENABLED
+        try:
+            M.WS_ENABLED = True
+            m = M.Maker(None, M.LedgerState(), [])
+            empty = {"orderbook": {"orderbook_fp": {"yes_dollars": [], "no_dollars": []}}}
+            for i in range(10):
+                m.ws_verify("T", empty, empty, 1000.0 + i)
+            self.assertEqual(m.ws_agreements.get("T", 0), 0)
+            self.assertFalse(m.ws_trusted("T", 1010.0))
+        finally:
+            M.WS_ENABLED = old
+
+    def test_trust_expires_and_must_be_re_proven(self):
+        old = M.WS_ENABLED
+        try:
+            M.WS_ENABLED = True
+            m = M.Maker(None, M.LedgerState(), [])
+            for i in range(M.WS_AGREE_REQUIRED):
+                m.ws_verify("T", self.body(), self.body(), 1000.0 + i)
+            t = 1000.0 + M.WS_AGREE_REQUIRED
+            self.assertTrue(m.ws_trusted("T", t))
+            self.assertFalse(m.ws_trusted("T", t + M.WS_VERIFY_INTERVAL_S + 1))
+        finally:
+            M.WS_ENABLED = old
+
+    def test_the_gate_is_inert_while_the_flag_is_off(self):
+        m = M.Maker(None, M.LedgerState(), [])
+        m.ws_agreements["T"] = 99
+        self.assertFalse(M.WS_ENABLED)
+        self.assertFalse(m.ws_trusted("T", 1000.0))
+
+
+class FinalGate_R1_CreditsRitual(_RunnerCase):
+
+    def _rows(self):
+        prog = {"program_id": "P1", "market_ticker": "KXA-26JUL28-1", "series": "KXA",
+                "period_reward": 1_000_000.0, "start_ts": 0.0, "end_ts": 16 * 3600.0,
+                "paid_out": True}
+        r = M.recon_program_row(prog, 5.0, 1.0, 1.0, 0.9, 0, now=1.0)
+        r["paid_out_ts"] = 1.0
+        return [r]
+
+    def _at(self, hour_utc, day=28):
+        import datetime as _d
+        return _d.datetime(2026, 7, day, hour_utc, 5, tzinfo=_d.timezone.utc).timestamp()
+
+    def test_it_fires_after_16_MT_when_credits_are_missing(self):
+        m = M.Maker(None, M.LedgerState(), [])
+        m.credit_ritual_reminder(self._rows(), {}, self._at(M.CREDIT_RITUAL_HOUR_UTC))
+        ev = [e for e in self.events() if e["event"] == "credit_ritual_due"]
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["n_missing"], 1)
+
+    def test_it_does_not_fire_before_the_ritual_hour(self):
+        m = M.Maker(None, M.LedgerState(), [])
+        m.credit_ritual_reminder(self._rows(), {}, self._at(M.CREDIT_RITUAL_HOUR_UTC - 1))
+        self.assertEqual([e for e in self.events()
+                          if e["event"] == "credit_ritual_due"], [])
+
+    def test_it_fires_once_a_day_not_once_a_poll(self):
+        m = M.Maker(None, M.LedgerState(), [])
+        for _ in range(5):
+            m.credit_ritual_reminder(self._rows(), {}, self._at(M.CREDIT_RITUAL_HOUR_UTC))
+        self.assertEqual(len([e for e in self.events()
+                              if e["event"] == "credit_ritual_due"]), 1)
+        m.credit_ritual_reminder(self._rows(), {}, self._at(M.CREDIT_RITUAL_HOUR_UTC, 29))
+        self.assertEqual(len([e for e in self.events()
+                              if e["event"] == "credit_ritual_due"]), 2)
+
+    def test_a_complete_ritual_logs_ok_and_pages_nobody(self):
+        m = M.Maker(None, M.LedgerState(), [])
+        m.credit_ritual_reminder(self._rows(), {"P1": 5.4},
+                                 self._at(M.CREDIT_RITUAL_HOUR_UTC))
+        ev = [e["event"] for e in self.events()]
+        self.assertIn("credit_ritual_ok", ev)
+        self.assertNotIn("credit_ritual_due", ev)
+
+    def test_it_precedes_the_standdown_it_exists_to_prevent(self):
+        """§12.3(b) halts after TWO days with no credits; the reminder fires on day one."""
+        self.assertEqual(M.STANDDOWN_DAYS, 2)
+        self.assertEqual(M.CREDIT_RITUAL_HOUR_UTC, 22)
 
 
 class StartupAssertions(unittest.TestCase):
