@@ -208,7 +208,11 @@ def by_cluster(positions):
 # =============================================================================================
 # THE CAP
 # =============================================================================================
-def cluster_cap_usd(day_stop_threshold_usd, inv_cap_usd=C.INV_CAP_USD):
+MAX_CLUSTER_FRAC = 1.0 / 6.0      # see cluster_cap_usd
+
+
+def cluster_cap_usd(day_stop_threshold_usd, inv_cap_usd=C.INV_CAP_USD,
+                    ceiling_usd=None, max_frac=MAX_CLUSTER_FRAC):
     """`max(INV_CAP_USD, 0.5 × day_stop_threshold)` — the SAME derivation as `cap_series_usd`,
     for the same reason and at the same factor: **no single correlated bet may trip the global
     day stop on its own**, because one underlying halting the whole book contradicts charter §5
@@ -231,7 +235,28 @@ def cluster_cap_usd(day_stop_threshold_usd, inv_cap_usd=C.INV_CAP_USD):
     `alloc.allocate` now carries this same cap so the plan can never exceed what `place()`
     will fund.
     """
-    return max(float(inv_cap_usd), 0.5 * float(day_stop_threshold_usd))
+    # THE COLD-START FLOOR (added 2026-07-28, live).  The day-stop derivation is circular at
+    # cold start: day_stop = 0.35 x PROJECTED REWARD, projected reward is ~0 until we are
+    # quoting, and we cannot quote because the cap it produces ($10 at the $20 day-stop floor)
+    # cannot fund a single qualifying set.  Measured: EVERY placement refused for five minutes,
+    # `cluster_worst_case_cap`, on four different clusters — including one where we held no
+    # position at all and the PROSPECTIVE order alone was $35.52.
+    #
+    # So the cap also carries a floor derived from CAPITAL rather than from reward: no single
+    # settle-source may hold more than 1/6 of the book, i.e. a total loss in one cluster costs
+    # at most ~17% of the ceiling — comfortably inside the 35% drawdown halt, and the same
+    # order of magnitude as the per-cluster sizing Ryan asked for at $300.  Six is the
+    # diversification bound the objective wants anyway (note 43 §3: exposure is meaningful only
+    # per settle-source, and breadth beats depth once share saturates).
+    #
+    # MIRROR (floor too HIGH ↔ the reward-derived cap too LOW): too high concentrates risk in
+    # one underlying and is bounded by the 1/6 fraction plus the drawdown halt; too low is what
+    # we just measured — a book that cannot enter any venue, which earns nothing and therefore
+    # never raises the day stop that would have unblocked it.  Once we ARE earning, the
+    # reward-derived term overtakes the floor and this stops binding.
+    reward_derived = 0.5 * float(day_stop_threshold_usd)
+    capital_floor = (float(max_frac) * float(ceiling_usd)) if ceiling_usd else 0.0
+    return max(float(inv_cap_usd), reward_derived, capital_floor)
 
 
 ADMIT, REFUSE_SIGNED, REFUSE_WORST = "admit", "cluster_signed_cap", "cluster_worst_case_cap"

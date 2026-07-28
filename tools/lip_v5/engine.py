@@ -247,7 +247,8 @@ class Maker(object):
             halt_state=self.halt, positions=open_pos, resting_basis=resting,
             nestor_orders=self.nestor_orders, nestor_positions=self.nestor_positions,
             available_cash_usd=available_cash_usd,
-            cluster_cap_usd=CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward)),
+            cluster_cap_usd=CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward),
+                                              ceiling_usd=self.ceiling_usd),
             frozen=self.frozen, refill=self.refill,
             n_cap_fn=lambda p: alloc.n_cap(p, caps),
             day_stopped=self.day_stopped, skew_ok=self.skew_ok)
@@ -754,7 +755,8 @@ class Maker(object):
             # NEW-1b: the SAME cluster cap the rails read, brought inside the plan — an
             # allocator that plans what `place()` must refuse is not a plan (264 refusals in
             # 90 cycles on a 4-rung ladder, every cycle, forever).
-            cluster_cap = CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward))
+            cluster_cap = CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward),
+                                             ceiling_usd=self.ceiling_usd)
             a, spent, res = alloc.allocate_with_rstar(slots, budget, caps=caps,
                                                       venue_caps=venue_caps, held=held,
                                                       cluster_cap_usd=cluster_cap)
@@ -808,7 +810,8 @@ class Maker(object):
             [{"ticker": t, "side": leg, "n": abs(p[leg]),
               "basis": self.entry_basis.get((t, leg), 0.0)}
              for t, p in self.positions.items() for leg in ("yes", "no") if abs(p[leg]) > 0],
-            CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward)))
+            CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward),
+                               ceiling_usd=self.ceiling_usd))
         out["bucket_hz"] = self.bucket.b
         out["halted"] = self.halt.halted
         out["rollback_clean"] = self.rollback.clean

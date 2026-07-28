@@ -176,8 +176,10 @@ class TestPlaceIsTheOnlyPath(EngineCase):
 
     def test_the_cluster_cap_refuses_before_the_wire(self):
         m = self.maker()
-        m.projected_day_reward = 100.0                # cluster cap = 0.5 x 35 = 17.50
-        for i in range(4):
+        m.projected_day_reward = 100.0
+        # Cap is max(reward-derived, ceiling/6) = $50 at the default $300 ceiling, so the
+        # correlated book must exceed THAT: 8 rungs x 20 x $0.50 = $80 one-direction RATES.
+        for i in range(8):
             m.positions["KXUST10AD-26JUL28-T%.2f" % (4.0 + 0.05 * i)] = {"yes": 20.0,
                                                                          "no": 0.0}
             m.entry_basis[("KXUST10AD-26JUL28-T%.2f" % (4.0 + 0.05 * i), "yes")] = 0.50

@@ -159,7 +159,8 @@ class TestTheLadderPlanIsFundable(NewRoundCase):
         for _ in range(90):
             out = r.iteration(t)
             t += 1.0
-        cap = CL.cluster_cap_usd(G.day_stop_usd(r.m.projected_day_reward))
+        cap = CL.cluster_cap_usd(G.day_stop_usd(r.m.projected_day_reward),
+                                 ceiling_usd=r.m.ceiling_usd)
         rested = sum(float(b["count"]) * float(b["price"]) for b in ex.resting.values())
         self.assertLessEqual(rested, cap + 1e-9)
         self.assertGreater(rested, 0.0, "nothing rests at all")
