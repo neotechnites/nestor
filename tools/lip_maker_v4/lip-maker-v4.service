@@ -12,8 +12,10 @@ Restart=on-failure
 RestartSec=30
 # SIGTERM triggers the §9.6 cancel-all-on-every-exit-path handler; give it room to finish
 # the DELETEs before SIGKILL.  expiration_ts (= window_close - 4 min) is the backstop.
+# 180s (D1): bulk cancels now defer the §9.4a 36s re-query so shutdown is seconds, not
+# minutes -- this is belt, not the mechanism.
 KillSignal=SIGTERM
-TimeoutStopSec=120
+TimeoutStopSec=180
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lip-maker-v4

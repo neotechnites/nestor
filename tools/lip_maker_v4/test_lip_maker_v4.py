@@ -15,6 +15,7 @@ import math
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
 import lip_maker_v4 as M
@@ -2220,6 +2221,315 @@ class C2_SettlementRelease(unittest.TestCase):
         finally:
             M.DATA_DIR, M.LEDGER_PATH = old
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class _RunnerCase(unittest.TestCase):
+    """Shared harness: a Maker with no network and a real ledger file."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = (M.DATA_DIR, M.LEDGER_PATH, M.DRY)
+        M.DATA_DIR = os.path.join(self.tmp, "lip")
+        M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+        M.DRY = False
+
+    def tearDown(self):
+        M.DATA_DIR, M.LEDGER_PATH, M.DRY = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def events(self):
+        if not os.path.exists(M.LEDGER_PATH):
+            return []
+        return [json.loads(l) for l in open(M.LEDGER_PATH)]
+
+
+class B2_PhantomOrderRisk(_RunnerCase):
+
+    def test_a_timed_out_place_poisons_the_market_and_records_the_coid(self):
+        """B2 — status 0 is a TRANSPORT failure, not a rejection: the exchange may have
+        accepted the order and we simply never learned its order_id.  Such an order is
+        invisible to resting_collateral, to cancel_all and to the restart sweep."""
+        m = M.Maker(None, M.LedgerState(), [])
+        m.do_post = lambda body: (0, {"_transport_error": "timeout"})
+        self.assertIsNone(m.place("T", "bid", 40, 10, 1785000000))
+        self.assertIn("T", m.st.poisoned)
+        self.assertIn("T", m.st.phantom_risk)
+        rows = [e for e in self.events() if e["event"] == "phantom_risk"]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["coid"].startswith("v4-"))
+        self.assertEqual(rows[0]["size"], 10)
+        # no further posts to that market
+        self.assertIsNone(m.place("T", "bid", 40, 10, 1785000000))
+        # ... and the risk is NOT assumed away: it survives replay
+        st = M.ledger_replay(self.events())
+        self.assertIn("T", st.phantom_risk)
+        self.assertIn("T", st.poisoned)
+
+    def test_an_ordinary_rejection_is_not_phantom(self):
+        m = M.Maker(None, M.LedgerState(), [])
+        m.do_post = lambda body: (400, {"error": "invalid_parameters"})
+        self.assertIsNone(m.place("T", "bid", 40, 10, 1785000000))
+        self.assertNotIn("T", m.st.phantom_risk)
+        self.assertEqual([e for e in self.events() if e["event"] == "phantom_risk"], [])
+
+
+class B3_CrashGapFillsAreAppliedAndCorrectlySigned(_RunnerCase):
+    """B3 — crash-gap fills were logged but never applied to running state, AND the replay
+    mapping was sign-INVERTED (side came raw from the fills payload as yes|no while replay
+    tested for "bid"), with `action` dropped entirely."""
+
+    def _maker_with_fills(self, fills):
+        st = M.LedgerState()
+        st.last_ts = 1000.0
+        m = M.Maker(object(), st, [])
+        m.do_fills = lambda **kw: (M.FillsRead(True, sum(
+            M.num(f.get("count"), 0.0) for f in fills)), fills)
+        return m
+
+    def test_A4_crash_gap_buy_25_yes_at_30c(self):
+        """The audit's A4: a buy of 25 YES at 30c must book as yes:25 costing $7.50 -- it
+        was booking as no:25 at 70c, i.e. net -25."""
+        self.assertEqual(M.normalize_fill("yes", "buy"), ("bid", 1.0))
+        m = self._maker_with_fills([{"trade_id": "t1", "ticker": "DXY", "side": "yes",
+                                     "action": "buy", "count": 25, "yes_price": 30}])
+        m.restart_recovery()
+        self.assertEqual(m.st.positions["DXY"], {"yes": 25.0, "no": 0.0})
+        self.assertAlmostEqual(m.st.position_cost["DXY"], 7.50, places=9)
+        self.assertAlmostEqual(m.st.net_position("DXY"), 25.0, places=9)
+        # and the replay of what it wrote is IDENTICAL to the live state
+        st = M.ledger_replay(self.events())
+        self.assertEqual(st.positions["DXY"], m.st.positions["DXY"])
+        self.assertAlmostEqual(st.position_cost["DXY"], m.st.position_cost["DXY"],
+                               places=9)
+        self.assertAlmostEqual(st.net_position("DXY"), 25.0, places=9)
+
+    def test_A4_a_manual_SELL_of_held_inventory_decreases_the_position(self):
+        """The live case: the operator is flattening DXY by hand while v4 is down.  A
+        `action=sell` fill must DECREASE the position -- dropping `action` booked it as
+        MORE inventory, which the recycler would then shed against contracts we no longer
+        hold."""
+        self.assertEqual(M.normalize_fill("yes", "sell"), ("bid", -1.0))
+        st = M.LedgerState()
+        st.last_ts = 1000.0
+        st.apply_fill("DXY", "bid", 25, 0.30, 1.0)          # 25 YES already held
+        m = M.Maker(object(), st, [])
+        m.do_fills = lambda **kw: (M.FillsRead(True, 10.0), [
+            {"trade_id": "t2", "ticker": "DXY", "side": "yes", "action": "sell",
+             "count": 10, "yes_price": 32}])
+        m.restart_recovery()
+        self.assertAlmostEqual(m.st.positions["DXY"]["yes"], 15.0, places=9)
+        self.assertAlmostEqual(m.st.net_position("DXY"), 15.0, places=9)
+        self.assertLess(m.st.position_cost["DXY"], 7.50)
+        rows = [e for e in self.events()
+                if e["event"] == "fill_obs" and e.get("why") == "crash_gap"]
+        self.assertEqual(rows[0]["side"], "bid")            # normalised, not raw "yes"
+        self.assertEqual(rows[0]["action"], "sell")
+        self.assertEqual(rows[0]["sign"], -1.0)
+
+    def test_a_full_manual_flatten_leaves_no_phantom_inventory(self):
+        st = M.LedgerState()
+        st.last_ts = 1000.0
+        st.apply_fill("DXY", "bid", 25, 0.30, 1.0)
+        m = M.Maker(object(), st, [])
+        m.do_fills = lambda **kw: (M.FillsRead(True, 25.0), [
+            {"trade_id": "t3", "ticker": "DXY", "side": "yes", "action": "sell",
+             "count": 25, "yes_price": 32}])
+        m.restart_recovery()
+        self.assertAlmostEqual(m.st.net_position("DXY"), 0.0, places=9)
+        self.assertAlmostEqual(m.st.position_cost["DXY"], 0.0, places=9)
+        # a disposal can never take the position negative
+        st2 = M.LedgerState()
+        st2.apply_fill("T", "bid", 5, 0.30, 1.0)
+        st2.apply_fill("T", "bid", 50, 0.30, -1.0)
+        self.assertAlmostEqual(st2.positions["T"]["yes"], 0.0, places=9)
+
+    def test_a_no_side_buy_books_on_the_no_leg(self):
+        self.assertEqual(M.normalize_fill("no", "buy"), ("ask", 1.0))
+        st = M.LedgerState()
+        st.apply_fill("T", "ask", 25, 0.30, 1.0)            # yes_price 30 => NO at 70c
+        self.assertEqual(st.positions["T"], {"yes": 0.0, "no": 25.0})
+        self.assertAlmostEqual(st.position_cost["T"], 25 * 0.70, places=9)
+        self.assertAlmostEqual(st.net_position("T"), -25.0, places=9)
+
+
+class B4_404IsResolvedExactlyOnce(_RunnerCase):
+
+    def test_A3_restart_with_one_unresolved_404_books_10_not_20(self):
+        """B4 — restart runs two passes that can both reach the same order: the UNKNOWN loop
+        cancels it, gets a 404 and resolves; then the unresolved_404 loop resolves it AGAIN
+        and credits the same contracts twice.  Doubled inventory drives an oversized shed
+        against contracts we never held: a real naked short from pure bookkeeping."""
+        recs = [rec_place("O1", T, "bid", 0.40, 10), rec_cancel("O1", 404)]
+        st = M.ledger_replay(recs)
+        self.assertEqual(st.unresolved_404, ["O1"])
+        m = M.Maker(object(), st, [])
+        m.do_cancel = lambda oid: (404, {"error": "not_found"})
+        m.do_fills = lambda **kw: (M.FillsRead(True, 10.0),
+                                   [{"trade_id": "f1", "count": 10}])
+        m.restart_recovery()
+        self.assertAlmostEqual(m.st.filled(T, "bid"), 10.0)      # was 20.0
+        self.assertAlmostEqual(m.st.net_position(T), 10.0)
+        self.assertAlmostEqual(m.st.position_cost[T], 4.00, places=9)
+        self.assertEqual(m.st.unresolved_404, [])
+        # live state and a fresh replay of the same ledger agree
+        replayed = M.ledger_replay(recs + self.events())
+        self.assertAlmostEqual(replayed.net_position(T), m.st.net_position(T), places=9)
+        skipped = [e for e in self.events() if e["event"] == "resolve_404_skipped"]
+        self.assertEqual(len(skipped), 1)
+
+    def test_resolving_an_already_resolved_order_is_a_no_op(self):
+        m = M.Maker(object(), M.LedgerState(), [])
+        o = M.OrderState("O1", "v4-c", T, "bid", 0.40, 10, 0.0, 10.0)
+        o.reduced_by = 0.0
+        o.extra_fills = 10.0
+        m.st.orders["O1"] = o
+        m.do_fills = lambda **kw: (M.FillsRead(True, 10.0), [{"trade_id": "x", "count": 10}])
+        m.resolve_404(o)
+        self.assertEqual(o.extra_fills, 10.0)
+        self.assertEqual(m.st.filled(T, "bid"), 0.0)
+
+
+class D1_ShutdownDoesNotBlockOnRequeries(_RunnerCase):
+
+    def test_cancel_all_with_six_pending_404s_completes_fast(self):
+        """D1 — the §9.4a re-query is a BLOCKING 36s sleep.  Six pending 404s in a bulk
+        cancel is 216s against TimeoutStopSec, so systemd SIGKILLs us mid-shutdown, leaving
+        stranded orders AND unresolved 404s -- the B4 amplifier."""
+        m = M.Maker(object(), M.LedgerState(), [])
+        for i in range(6):
+            o = M.OrderState("O%d" % i, "v4-c", T, "bid", 0.40, 10, 0.0, 10.0)
+            m.st.orders[o.order_id] = o
+        m.do_cancel = lambda oid: (404, {"error": "not_found"})
+        m.do_fills = lambda **kw: (M.FillsRead(True, 0.0), [])
+        t0 = time.time()
+        m.cancel_all("shutdown")
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 5.0)
+        self.assertGreaterEqual(M.FILLS_REQUERY_DELAY_S * 6, 216)   # what it would have been
+        deferred = [e for e in self.events() if e["event"] == "resolve_404_deferred"]
+        self.assertEqual(len(deferred), 6)
+        # the 404s are on the ledger, so replay hands them to restart_recovery
+        tape = [rec_place("O%d" % i, T, "bid", 0.40, 10, ts=100.0 + i) for i in range(6)]
+        self.assertEqual(sorted(M.ledger_replay(tape + self.events()).unresolved_404),
+                         ["O%d" % i for i in range(6)])
+        self.assertEqual(m.defer_404, False)                # flag restored
+
+    def test_the_live_loop_single_cancel_still_requeries(self):
+        m = M.Maker(object(), M.LedgerState(), [])
+        o = M.OrderState("O1", "v4-c", T, "bid", 0.40, 10, 0.0, 10.0)
+        m.st.orders["O1"] = o
+        m.do_cancel = lambda oid: (404, {"error": "not_found"})
+        m.do_fills = lambda **kw: (M.FillsRead(True, 10.0), [{"trade_id": "f", "count": 10}])
+        m.cancel(o)
+        self.assertAlmostEqual(m.st.filled(T, "bid"), 10.0)   # resolved inline, not deferred
+        self.assertEqual([e for e in self.events()
+                          if e["event"] == "resolve_404_deferred"], [])
+
+    def test_the_unit_file_allows_room_for_shutdown(self):
+        unit = open(os.path.join(os.path.dirname(os.path.abspath(M.__file__)),
+                                 "lip-maker-v4.service")).read()
+        self.assertIn("TimeoutStopSec=180", unit)
+
+
+class C3_ProjectionScalesWithRemainingWindow(unittest.TestCase):
+
+    def test_A8_228h_program_with_2h_left_is_refused(self):
+        """C3 — the projection multiplied the FULL-period pool by the CURRENT share with no
+        hours_left scaling, so a 228h program with 2h left projected as if it had all 228.
+        A gate that mis-grades permissively is worse than no gate: it launders a bad entry
+        as a checked one."""
+        rho = 100.0 / 228.0
+        late = M.Slot("T", "bid", rho, 1.0, 0.02, program_id="P1", window_h=228.0,
+                      pool=100.0, hours_left=2.0)
+        alloc = {late.key: 100}
+        proj = M.projected_period_payout([late], alloc)
+        reachable = M.our_share(100, 1.0) * (rho / 2.0) * 2.0
+        self.assertAlmostEqual(proj, reachable, places=9)
+        self.assertLess(proj, 0.50)                          # ~$0.43, not ~$25
+        self.assertFalse(M.forfeit_gate(proj))
+        # the old, unscaled form is what waved it through
+        self.assertGreater((100.0 / 2.0) * M.our_share(100, 1.0), 25.0)
+
+    def test_a_full_window_is_unchanged(self):
+        """share*(rho/2)*window_h == share*(pool/2), so nothing moves for a fresh program."""
+        s = M.Slot("T", "bid", 6.25, 50.0, 0.40, pool=100.0, window_h=16.0)
+        alloc = {s.key: 100}
+        self.assertAlmostEqual(M.projected_period_payout([s], alloc),
+                               (100.0 / 2.0) * M.our_share(100, 50.0), places=9)
+
+    def test_accrued_is_added_and_not_scaled(self):
+        """§3.6 -- accrued score is already banked; only the un-accrued portion scales."""
+        rho = 100.0 / 228.0
+        s = M.Slot("T", "bid", rho, 1.0, 0.02, pool=100.0, window_h=228.0,
+                   hours_left=2.0, accrued=1.20)
+        proj = M.projected_period_payout([s], {s.key: 100})
+        self.assertAlmostEqual(proj, 1.20 + M.our_share(100, 1.0) * (rho / 2.0) * 2.0,
+                               places=9)
+        self.assertGreater(proj, M.RESCUE_TARGET_USD)        # worth rescuing
+        self.assertFalse(M.forfeit_gate(proj))               # but not worth ENTERING
+
+    def test_the_gate_drops_a_program_it_can_no_longer_reach(self):
+        """Two independent layers now refuse a dying program, and it is worth knowing which
+        fires: the RUNWAY guard rejects the un-accrued case at entry (18.2h needed, 2h
+        left), so the scaled projection never even gets a chance.  The gate is what catches
+        the case runway lets through -- one already accrued past RESCUE_TARGET."""
+        rho = 100.0 / 228.0
+        late = M.Slot("T", "bid", rho, 1.0, 0.02, program_id="P1", window_h=228.0,
+                      pool=100.0, hours_left=2.0, phi=0.0, d=0.0)
+        self.assertFalse(M.runway_ok(rho, 2.0, 0.0))
+        alloc, spent, dropped = M.allocate_with_forfeit_gate([late], 45.0, BIG,
+                                                             lambda_min=0.0)
+        self.assertEqual(alloc[late.key], 0)                 # no capital, either way
+        self.assertEqual(spent, 0.0)
+        # now the case runway ALLOWS through: accrued past RESCUE_TARGET, still unreachable
+        accrued = M.Slot("T", "bid", rho, 1.0, 0.02, program_id="P1", window_h=228.0,
+                         pool=100.0, hours_left=2.0, phi=0.0, d=0.0, accrued=1.20)
+        self.assertTrue(M.runway_ok(rho, 2.0, 1.20))
+        proj = M.projected_period_payout([accrued], {accrued.key: 100})
+        self.assertLess(proj, M.ENTRY_FLOOR_USD)
+        self.assertFalse(M.forfeit_gate(proj))
+
+
+class C4_ShedRetriesAloneWhenTheCombinedOrderIsRejected(_RunnerCase):
+
+    def test_A7_shed_posts_at_29_when_the_combined_size_fails_the_cap(self):
+        """C4 -- q = max(alloc, shed) is submitted as ONE order.  If the allocator wants more
+        than the shed size, the combined order fails the C1 cap, place() returns None, and
+        the shed inside it vanishes: the inventory locks.  A closing-only order always
+        passes by netting, so it must be retried alone."""
+        st = M.LedgerState()
+        st.positions = {"DXY": {"yes": 29.0, "no": 0.0}}
+        st.position_cost = {"DXY": 29 * 0.34}
+        st.position_cost_leg = {"DXY": {"yes": 29 * 0.34, "no": 0.0}}
+        m = M.Maker(None, st, [])
+        posted = []
+
+        def post(body):
+            posted.append(int(float(body["count"])))
+            return (201, {"order_id": "N%d" % len(posted), "fill_count": "0.00",
+                          "remaining_count": body["count"]})
+        m.do_post = post
+        shed_q = 29
+        combined = 60                                   # allocator wants far more
+        # the combined order is refused by the C1 cap ...
+        self.assertIsNone(m.place("DXY", "ask", 36, combined, 1785000000))
+        self.assertEqual(m.last_place_skip, "net_inventory_cap")
+        self.assertEqual(posted, [])
+        # ... and the closing-only retry succeeds, because it nets to zero exposure
+        room_before = m.st.closing_room("DXY", "ask")
+        self.assertAlmostEqual(room_before, 29.0, places=9)
+        self.assertAlmostEqual(
+            M.order_collateral_usd("ask", 0.36, shed_q, room=room_before), 0.0, places=9)
+        o = m.place("DXY", "ask", 36, shed_q, 1785000000)
+        self.assertIsNotNone(o)
+        self.assertEqual(posted, [29])
+        # and once it rests it has consumed the room, so a SECOND shed cannot free-ride
+        self.assertAlmostEqual(m.st.closing_room("DXY", "ask"), 0.0, places=9)
+
+    def test_the_retry_is_wired_and_logged(self):
+        src = open(M.__file__.replace(".pyc", ".py")).read()
+        self.assertIn("shed_retry_after_combined_reject", src)
+        self.assertIn("if placed is None and shed_q > 0 and q > shed_q:", src)
 
 
 class StartupAssertions(unittest.TestCase):

@@ -470,6 +470,31 @@ def order_collateral_usd(side, price_dollars, size, net_yes=0.0, room=None):
     return opening * unit_collateral(side, price_dollars)
 
 
+def normalize_fill(side, action="buy"):
+    """B3 — translate the FILLS API's vocabulary into the ledger's own.  Returns
+    (leg_side, sign) where leg_side is "bid"|"ask" and sign is +1 for an acquisition and
+    -1 for a disposal.
+
+    The fills payload speaks (side=yes|no, action=buy|sell).  The ledger speaks the ORDER
+    axis: "bid" means the YES leg, "ask" means the NO leg.  Replay previously mapped raw
+    fills-payload sides with `"yes" if side == "bid" else "no"`, so a fills row carrying
+    side="yes" fell through to the NO leg — a buy of 25 YES at 30c was booked as no:25 at
+    70c, i.e. net -25 instead of +25.  Sign-INVERTED, on the exact path that imports fills
+    we did not see.
+    And `action` was dropped entirely, so a SELL was booked as an acquisition — which is
+    precisely how an operator's manual sale of a position would import as MORE inventory.
+    """
+    s = str(side or "").strip().lower()
+    a = str(action or "buy").strip().lower()
+    if s in ("yes", "bid"):
+        leg = "bid"
+    elif s in ("no", "ask"):
+        leg = "ask"
+    else:
+        leg = "bid"
+    return leg, (-1.0 if a == "sell" else 1.0)
+
+
 def order_body(ticker, side, price_dollars, expiration_ts, coid, count):
     """§4.7 — the exact v3-proven V2 resting-order body."""
     return {
@@ -966,15 +991,24 @@ def allocate(slots, budget_usd, caps=None, lambda_min=LAMBDA_MIN, r_star_wall=No
 
 
 def projected_period_payout(program_slots, alloc):
-    """§0.2 — payout = pool * (share_yes + share_no)/2 = sum_sides (pool/2)*q/(q+S), over the
-    WHOLE program period (§3.1 — not per day)."""
+    """§0.2/§3.5 — projected PERIOD payout:  accrued + share * (rho/2) * hours_left.
+
+    C3: this previously multiplied the FULL-period pool by the CURRENT share regardless of
+    how much window remained, so a program with two hours left on a 228h window projected
+    as if it had all 228 — the forfeit gate waved through entries whose reachable payout was
+    $0.22 as $25 projections.  A gate that mis-grades in the permissive direction is worse
+    than no gate, because it launders a bad entry as a checked one.
+    Only the UN-ACCRUED portion scales; `accrued` is already banked (§3.6) and is a property
+    of the program, carried identically on each of its slots.
+    """
+    accrued = max([s.accrued for s in program_slots] or [0.0])
     total = 0.0
     for s in program_slots:
         q = alloc.get(s.key, 0)
         if q <= 0:
             continue
-        total += (s.pool / 2.0) * our_share(q, s.S + s.W)
-    return total
+        total += our_share(q, s.S + s.W) * (s.rho / 2.0) * max(0.0, s.hours_left)
+    return accrued + total
 
 
 def top_up_to_floor(program_slots, alloc, spent, budget_usd, caps=None,
@@ -1444,6 +1478,7 @@ class LedgerState(object):
         self.position_cost_leg = {}   # ticker -> {"yes": $, "no": $}  (C9 entry basis)
         self.realized_pnl = 0.0       # C2: released at settlement, feeds the §8.4 stop
         self.assume_filled = set()    # §9.4b freeze, survives restart
+        self.phantom_risk = set()     # B2: markets where a POST timed out mid-flight
         self.poisoned = set()         # §8.5
         self.unknown_orders = []      # §9.4 step 2
         self.consec_cancel_anomalies = 0
@@ -1558,17 +1593,32 @@ class LedgerState(object):
 
     # -- mutation (shared by the live path and by replay) --------------------------------
     def _credit_fill(self, order, n):
+        self.apply_fill(order.ticker, order.side, n, order.price, 1.0)
+
+    def apply_fill(self, ticker, side, n, price_dollars, sign=1.0):
+        """B3 — book `n` contracts on `side` ("bid" = YES leg, "ask" = NO leg) at
+        `price_dollars` on the YES axis.  `sign` is -1 for a DISPOSAL (an `action=sell`
+        fill, e.g. an operator flattening a position by hand while this process is down),
+        which must DECREASE the position rather than add to it."""
+        n = float(n)
         if n <= 0:
             return
-        k = (order.ticker, order.side)
+        leg = "yes" if side == "bid" else "no"
+        # filled_cum is a GROSS cumulative fill counter (v3 F7) and only ever increases
+        k = (ticker, side)
         self.filled_cum[k] = self.filled_cum.get(k, 0.0) + n
-        pos = self.positions.setdefault(order.ticker, {"yes": 0.0, "no": 0.0})
-        leg = "yes" if order.side == "bid" else "no"
-        pos[leg] += n
-        spent = n * unit_collateral(order.side, order.price)
-        self.position_cost[order.ticker] = self.position_cost.get(order.ticker, 0.0) + spent
-        legs = self.position_cost_leg.setdefault(order.ticker, {"yes": 0.0, "no": 0.0})
-        legs[leg] += spent
+        pos = self.positions.setdefault(ticker, {"yes": 0.0, "no": 0.0})
+        unit = unit_collateral(side, price_dollars)
+        if sign < 0:
+            # a disposal can only release what is actually held
+            n = min(n, max(0.0, pos[leg]))
+            if n <= 0:
+                return
+        pos[leg] += sign * n
+        spent = sign * n * unit
+        self.position_cost[ticker] = max(0.0, self.position_cost.get(ticker, 0.0) + spent)
+        legs = self.position_cost_leg.setdefault(ticker, {"yes": 0.0, "no": 0.0})
+        legs[leg] = max(0.0, legs[leg] + spent)
 
 
 def ledger_replay(records):
@@ -1682,13 +1732,12 @@ def ledger_replay(records):
                     st.unresolved_404.remove(str(oid))
             else:
                 # §9.4 step 4 (S3): a crash-gap fill belonging to no specific UNKNOWN order.
-                k = (rec.get("ticker"), rec.get("side"))
-                st.filled_cum[k] = st.filled_cum.get(k, 0.0) + n
-                pos = st.positions.setdefault(rec.get("ticker"), {"yes": 0.0, "no": 0.0})
-                pos["yes" if rec.get("side") == "bid" else "no"] += n
-                st.position_cost[rec.get("ticker")] = st.position_cost.get(
-                    rec.get("ticker"), 0.0) + n * unit_collateral(
-                        rec.get("side"), num(rec.get("price_c"), 0.0) / 100.0)
+                # B3: side/action are NORMALISED at write time, so replay speaks one
+                # vocabulary.  `sign` is honoured, so a sell DECREASES the position.
+                leg, sign = normalize_fill(rec.get("side"), rec.get("action", "buy"))
+                st.apply_fill(rec.get("ticker"), leg, n,
+                              num(rec.get("price_c"), 0.0) / 100.0,
+                              num(rec.get("sign"), sign))
         elif kind == "expired":
             oid = str(rec.get("order_id"))
             o = st.orders.get(oid)
@@ -1713,6 +1762,11 @@ def ledger_replay(records):
             # §9.4b — clears ONLY on an explicit operator record.
             st.assume_filled.discard(rec.get("ticker"))
             st.poisoned.discard(rec.get("ticker"))
+        elif kind == "phantom_risk":
+            # B2 — a POST whose transport failed.  The order may be LIVE with no order_id,
+            # so the market stays poisoned and the restart sweep must look for its fills.
+            st.phantom_risk.add(rec.get("ticker"))
+            st.poisoned.add(rec.get("ticker"))
         elif kind == "poison":
             st.poisoned.add(rec.get("ticker"))
         elif kind == "settlement":
@@ -2206,6 +2260,7 @@ class Maker(object):
         self.halted = False             # §8.4 day stop / §8.5 budget trip
         self.last_place_skip = None     # FIX-B: why the last place() declined, if it did
         self.released = set()           # program_ids whose window-end release already ran
+        self.defer_404 = False          # D1: suppress the blocking 36s re-query in bulk
         self.fees_paid = 0.0            # taker fees, for the §8.4 mark
         self.last_resync = 0.0
         self.last_snapshot = 0.0
@@ -2343,12 +2398,28 @@ class Maker(object):
             return None
         if not (200 <= status < 300):
             self.st.post_error_ts.append(_now())
-            poison = (status == 409)                                   # §8.5
+            # B2: status 0 is a TRANSPORT failure, not a rejection.  The exchange may well
+            # have accepted the order — we simply never learned its order_id.  Booking that
+            # as a plain post error leaves an order that is invisible to
+            # resting_collateral, to cancel_all and to the restart sweep: unbounded,
+            # untrackable exposure.  Treat it exactly like a 2xx without an order_id:
+            # poison the market, and record the coid so the restart sweep knows to look for
+            # fills on it.
+            phantom = (status == 0)
+            poison = (status == 409) or phantom                        # §8.5
             if poison:
                 self.st.poisoned.add(ticker)
+            if phantom:
+                self.st.phantom_risk.add(ticker)
+                log("phantom_risk", k="phantom_risk", coid=coid, ticker=ticker, side=side,
+                    price=price, size=size,
+                    why="place transport failure - order MAY BE LIVE with no order_id")
+                ntfy("LIP v4 PHANTOM ORDER RISK",
+                     "%s %s coid=%s: POST timed out; the order may be live and is not "
+                     "tracked. Market poisoned." % (ticker, side, coid))
             log("place_resp", k="place_resp", coid=coid, ticker=ticker, side=side,
                 price=price, size=size, err="http_%d" % status, poison=poison,
-                body=json.dumps(resp, default=str)[:200])
+                phantom=phantom, body=json.dumps(resp, default=str)[:200])
             return None
         oid = dig(resp, "order_id")
         if not oid:
@@ -2402,7 +2473,25 @@ class Maker(object):
         return False
 
     def resolve_404(self, order):
-        """§9.4a — never book zero silently.  Two reads, 36s apart."""
+        """§9.4a — never book zero silently.  Two reads, 36s apart.
+
+        B4: this is idempotent.  Restart runs TWO passes that can both reach a given order
+        (the UNKNOWN loop cancels it, gets a 404 and resolves here; then the unresolved_404
+        loop calls here again), and the second pass recomputed the same `n` and credited it
+        a second time — doubled inventory, which the recycler then sheds against contracts
+        we never held: a real naked short out of pure bookkeeping.
+        """
+        if order.reduced_by is not None:
+            log("resolve_404_skipped", order_id=order.order_id, ticker=order.ticker,
+                why="already_resolved")
+            return
+        if self.defer_404:
+            # D1: no blocking re-query on a bulk/shutdown path.  The cancel_resp 404 row is
+            # already on the ledger, so replay will list it in unresolved_404 and
+            # restart_recovery — now idempotent per B4 — owns it.
+            log("resolve_404_deferred", order_id=order.order_id, ticker=order.ticker,
+                why="bulk_cancel_path")
+            return
         r1, f1 = self.do_fills(order_id=order.order_id)
         rows = list(f1)
         verdict, filled, requery_at = disambiguate_404(order, r1)
@@ -2471,6 +2560,15 @@ class Maker(object):
             if o.state in (ST_LIVE, ST_UNKNOWN) and owns_coid(o.coid) and \
                     o.reduced_by is None:
                 self.cancel(o)
+        if self.st.phantom_risk:
+            # B2: these markets had a POST whose transport failed, so an untracked order may
+            # be live.  We cannot cancel what we cannot name, but we CAN discover what it
+            # filled — the time-windowed fills query below covers them, and they stay
+            # poisoned until an operator reconciles.
+            log("phantom_risk_markets", tickers=sorted(self.st.phantom_risk),
+                why="untracked order may be live; fills query and poison are the mitigation")
+            ntfy("LIP v4 phantom-risk markets on restart",
+                 "%s - poisoned; reconcile by hand" % sorted(self.st.phantom_risk))
         if self.st.last_ts > 0 and self.auth and not DRY:
             lo, hi = crash_gap_window(self.st.last_ts)
             read, fills = self.do_fills(min_ts=lo, max_ts=hi)
@@ -2485,11 +2583,22 @@ class Maker(object):
                         # crash loop re-observes these.  Skip what the ledger already has.
                         continue
                     self.st.seen_fill_ids.add(fid)
+                    # B3: normalise (side=yes|no, action=buy|sell) into the ledger's own
+                    # (bid|ask, sign) BEFORE writing, so the row means the same thing to
+                    # this process and to every future replay.
+                    leg, sign = normalize_fill(f.get("side"), f.get("action"))
+                    cnt = num(f.get("count"), 0.0)
+                    px_c = int(round(num(f.get("yes_price"), 0.0)))
                     log("fill_obs", k="fill_obs", order_id=None, fill_id=fid,
-                        ticker=f.get("ticker"), side=f.get("side"),
-                        count=num(f.get("count"), 0.0),
-                        price_c=int(round(num(f.get("yes_price"), 0.0))), src="fills_api",
-                        why="crash_gap")
+                        ticker=f.get("ticker"), side=leg, sign=sign,
+                        action=str(f.get("action") or "buy").lower(),
+                        raw_side=f.get("side"), count=cnt,
+                        price_c=px_c, src="fills_api", why="crash_gap")
+                    # B3: and APPLY them.  They were logged but never folded into running
+                    # state, so the process restarted believing it held nothing while the
+                    # ledger said otherwise — live and replayed state disagreed from the
+                    # first second.
+                    self.st.apply_fill(f.get("ticker"), leg, cnt, px_c / 100.0, sign)
             else:
                 log("crash_gap_query_failed", lo=lo, hi=hi)
         log("restart_recovered", collateral=round(self.st.collateral, 4),
@@ -2565,8 +2674,17 @@ class Maker(object):
         if not live:
             return
         log("cancel_all_begin", reason=reason, n=len(live))
-        for o in live:
-            self.cancel(o)
+        # D1: the §9.4a 36s re-query is a BLOCKING sleep.  Six pending 404s in a bulk cancel
+        # is 216s against the unit's TimeoutStopSec, so systemd SIGKILLs us mid-shutdown —
+        # stranded orders AND unresolved 404s, which is the B4 amplifier.  Defer the
+        # re-query here; the single-cancel path in the live loop keeps it.
+        prev = self.defer_404
+        self.defer_404 = True
+        try:
+            for o in live:
+                self.cancel(o)
+        finally:
+            self.defer_404 = prev
         self.live_by_slot.clear()
 
     # -- one cycle ------------------------------------------------------------------------
@@ -2865,7 +2983,20 @@ class Maker(object):
                 age, now - self.last_resync)
             self.S_ref[s.key] = s.S
             if cur is None or trig:
-                self.requote(s.ticker, s.side, best_c, q, exp_by_ticker[s.ticker])
+                placed = self.requote(s.ticker, s.side, best_c, q,
+                                      exp_by_ticker[s.ticker])
+                # C4: the combined order (allocator size OR shed size, whichever is larger)
+                # can fail the C1 cap as ONE order, and the whole quote then vanishes —
+                # including the shed inside it, so the inventory locks.  A CLOSING-only
+                # order always passes by netting, so retry at exactly the shed size.  The
+                # earning tail is forgone this cycle; unwinding the inventory is not.
+                if placed is None and shed_q > 0 and q > shed_q:
+                    log("shed_retry_after_combined_reject", ticker=s.ticker, side=s.side,
+                        combined=q, shed_only=shed_q, skip=self.last_place_skip)
+                    placed = self.requote(s.ticker, s.side, best_c, shed_q,
+                                          exp_by_ticker[s.ticker])
+                    if placed is not None:
+                        q = shed_q
             self.target_q[s.key] = q
             if at_best(our_c, best_c):
                 self.at_best_s[s.key] = self.at_best_s.get(s.key, 0.0) + 1.0
