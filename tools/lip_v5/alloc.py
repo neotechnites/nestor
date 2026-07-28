@@ -518,121 +518,138 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
             seen_held.add(s.key)
             per_venue[s.venue] = per_venue.get(s.venue, 0.0) + h_q * s.p
 
-    unaffordable = set()
-    last_rate = 0.0
-    guard = 0
-    while True:
-        guard += 1
-        if guard > 200000:                                   # never spin
-            break
-        best, best_rate = None, float("-inf")
-        for s in elig:
-            if s.key in unaffordable:
+    # THE CLIFF PASS FREES CAPITAL — SOMETHING MUST THEN SPEND IT.  Water-filling runs to
+    # exhaustion, then the cliff pass zeroes rungs that cannot reach $2 and returns their
+    # dollars to the budget.  With a single pass those dollars simply EVAPORATED: the loop
+    # that would spend them had already finished, so the book deployed $30 of $300 while
+    # nothing was refused and nothing was over-cap — capital was not moved elsewhere, it was
+    # not allocated at all.  So: water-fill, prune, and if the prune freed anything, water-fill
+    # AGAIN over the survivors.  Bounded by MAX_GATE_PASSES, and monotone because every pass
+    # permanently removes at least one slot from `elig`.
+    cliff_dead = set()
+    for _cliff_pass in range(int(C.MAX_GATE_PASSES)):
+        elig = [x for x in elig if x.key not in cliff_dead]
+        unaffordable = set()
+        last_rate = 0.0
+        guard = 0
+        while True:
+            guard += 1
+            if guard > 200000:                                   # never spin
+                break
+            best, best_rate = None, float("-inf")
+            for s in elig:
+                if s.key in unaffordable:
+                    continue
+                q = alloc[s.key]
+                # v1 §8.1: the per-slot cap binds NET exposure — held inventory + resting.
+                if held.get(s.key, 0.0) + q + 1 > n_cap(s.p, caps):
+                    continue
+                if per_market.get(s.ticker, 0.0) + s.p > market_cap_usd(s, budget_usd, caps) + 1e-9:
+                    continue
+                vcap = venue_caps.get(s.venue)
+                if vcap is not None and per_venue.get(s.venue, 0.0) + s.p > float(vcap) + 1e-9:
+                    continue
+                # NEW-1b: the cluster cap `place()` will apply, applied HERE so the plan is
+                # fundable.  Caps do not compose (clusters.py's own note): a cluster spanning
+                # several series inherits several per-venue caps, so this term is not implied by
+                # the one above.
+                if cluster_cap_usd is not None and \
+                        per_cluster.get(_cluster_key(s), 0.0) + s.p > float(cluster_cap_usd) + 1e-9:
+                    continue
+                # ---- THE ONE SUBSTITUTION (spec §1.3): (★) replaces v1 §2.2's hurdle line ----
+                r = s.net_at(q, r_star)
+                if not M.admits(r, floor_rate):
+                    continue
+                # -------------------------------------------------------------------------------
+                if r > best_rate + 1e-15 or (abs(r - best_rate) <= 1e-15 and best is not None
+                                             and (s.ticker, s.side) < (best.ticker, best.side)):
+                    best, best_rate = s, r
+            if best is None:
+                break
+            step = max(1, int(round(step_fraction * budget_usd / best.p)))    # v1 §2.5
+            step = min(step, n_cap(best.p, caps) - int(held.get(best.key, 0.0))
+                       - alloc[best.key])
+            room = market_cap_usd(best, budget_usd, caps) - per_market.get(best.ticker, 0.0)
+            step = min(step, int(room / best.p + 1e-9))
+            vcap = venue_caps.get(best.venue)
+            if vcap is not None:
+                step = min(step, int((float(vcap) - per_venue.get(best.venue, 0.0)) / best.p + 1e-9))
+            best_ck = _cluster_key(best)
+            if cluster_cap_usd is not None:
+                step = min(step, int((float(cluster_cap_usd)
+                                      - per_cluster.get(best_ck, 0.0)) / best.p + 1e-9))
+            if spent + step * best.p > budget_usd + 1e-12:
+                step = int((budget_usd - spent) / best.p + 1e-9)
+            if step < 1:
+                unaffordable.add(best.key)
                 continue
-            q = alloc[s.key]
-            # v1 §8.1: the per-slot cap binds NET exposure — held inventory + resting.
-            if held.get(s.key, 0.0) + q + 1 > n_cap(s.p, caps):
-                continue
-            if per_market.get(s.ticker, 0.0) + s.p > market_cap_usd(s, budget_usd, caps) + 1e-9:
-                continue
-            vcap = venue_caps.get(s.venue)
-            if vcap is not None and per_venue.get(s.venue, 0.0) + s.p > float(vcap) + 1e-9:
-                continue
-            # NEW-1b: the cluster cap `place()` will apply, applied HERE so the plan is
-            # fundable.  Caps do not compose (clusters.py's own note): a cluster spanning
-            # several series inherits several per-venue caps, so this term is not implied by
-            # the one above.
-            if cluster_cap_usd is not None and \
-                    per_cluster.get(_cluster_key(s), 0.0) + s.p > float(cluster_cap_usd) + 1e-9:
-                continue
-            # ---- THE ONE SUBSTITUTION (spec §1.3): (★) replaces v1 §2.2's hurdle line ----
-            r = s.net_at(q, r_star)
-            if not M.admits(r, floor_rate):
-                continue
-            # -------------------------------------------------------------------------------
-            if r > best_rate + 1e-15 or (abs(r - best_rate) <= 1e-15 and best is not None
-                                         and (s.ticker, s.side) < (best.ticker, best.side)):
-                best, best_rate = s, r
-        if best is None:
-            break
-        step = max(1, int(round(step_fraction * budget_usd / best.p)))    # v1 §2.5
-        step = min(step, n_cap(best.p, caps) - int(held.get(best.key, 0.0))
-                   - alloc[best.key])
-        room = market_cap_usd(best, budget_usd, caps) - per_market.get(best.ticker, 0.0)
-        step = min(step, int(room / best.p + 1e-9))
-        vcap = venue_caps.get(best.venue)
-        if vcap is not None:
-            step = min(step, int((float(vcap) - per_venue.get(best.venue, 0.0)) / best.p + 1e-9))
-        best_ck = _cluster_key(best)
-        if cluster_cap_usd is not None:
-            step = min(step, int((float(cluster_cap_usd)
-                                  - per_cluster.get(best_ck, 0.0)) / best.p + 1e-9))
-        if spent + step * best.p > budget_usd + 1e-12:
-            step = int((budget_usd - spent) / best.p + 1e-9)
-        if step < 1:
-            unaffordable.add(best.key)
-            continue
-        alloc[best.key] += step
-        spent += step * best.p
-        per_market[best.ticker] = per_market.get(best.ticker, 0.0) + step * best.p
-        per_venue[best.venue] = per_venue.get(best.venue, 0.0) + step * best.p
-        per_cluster[best_ck] = per_cluster.get(best_ck, 0.0) + step * best.p
-        last_rate = best_rate
-    # ---- THE CLIFF PASS.  A rung under $1 of projected accrual pays ZERO. ----------------
-    # Water-filling maximises RATE and is blind to the forfeit cliff, so it happily leaves
-    # eight rungs at $3-9 each — which is what v5 did live on 2026-07-28, earning 2-9 CENTS
-    # per treasury market while v4, with $10-50 on a handful of rungs, cleared dollars.
-    # Reward is share and share is ~q/S, so size is LINEAR in earnings; below the cliff,
-    # linear-in-nothing is nothing.  Every funded rung is therefore raised to its
-    # cliff-clearing size if the caps and budget allow, and ZEROED if they do not — freeing
-    # its capital for a rung that can clear.  Richest-first, because when the budget cannot
-    # fund every rung above the cliff the right book is FEWER, BIGGER rungs.
-    by_rate = sorted((k for k, q in alloc.items() if q > 0),
-                     key=lambda k: -next((sl.net_at(alloc[k], r_star)
-                                          for sl in elig if sl.key == k), 0.0))
-    slot_of = {sl.key: sl for sl in elig}
-    for key in by_rate:
-        sl = slot_of.get(key)
-        if sl is None:
-            continue                                  # land-grab rungs: sized by §4.5
-        if float(getattr(sl, "accrued", 0.0) or 0.0) > 0:
-            continue                                  # accrued dollars are the RESCUE's
-                                                      # business: it prices the recovery
-                                                      # value of the stranded accrual and
-                                                      # decides TOP_UP vs ABANDON.  A blunt
-                                                      # cliff drop here would throw away the
-                                                      # accrual the rescue exists to save.
-        q_min = cliff_clearing_q(sl)
-        q_now = alloc[key]
-        if q_min is not None and q_now >= q_min:
-            continue                                  # already clears
-        if q_min is not None:
-            add = q_min - q_now
-            cost = add * sl.p
-            room_ok = (spent + cost <= budget_usd + 1e-9
-                       and q_min <= n_cap(sl.p, caps)
-                       and per_market.get(sl.ticker, 0.0) + cost
-                       <= market_cap_usd(sl, budget_usd, caps) + 1e-9)
+            alloc[best.key] += step
+            spent += step * best.p
+            per_market[best.ticker] = per_market.get(best.ticker, 0.0) + step * best.p
+            per_venue[best.venue] = per_venue.get(best.venue, 0.0) + step * best.p
+            per_cluster[best_ck] = per_cluster.get(best_ck, 0.0) + step * best.p
+            last_rate = best_rate
+        # ---- THE CLIFF PASS.  A rung under $2 of projected accrual pays ZERO. ------------
+        # Water-filling maximises RATE and is blind to the forfeit cliff, so it happily leaves
+        # eight rungs at $3-9 each — which is what v5 did live on 2026-07-28, earning 2-9 CENTS
+        # per treasury market while v4, with $10-50 on a handful of rungs, cleared dollars.
+        # Reward is share and share is ~q/S, so size is LINEAR in earnings; below the cliff,
+        # linear-in-nothing is nothing.  Every funded rung is therefore raised to its
+        # cliff-clearing size if the caps and budget allow, and ZEROED if they do not — freeing
+        # its capital for a rung that can clear.  Richest-first, because when the budget cannot
+        # fund every rung above the cliff the right book is FEWER, BIGGER rungs.
+        freed_any = False
+        by_rate = sorted((k for k, q in alloc.items() if q > 0),
+                         key=lambda k: -next((sl.net_at(alloc[k], r_star)
+                                              for sl in elig if sl.key == k), 0.0))
+        slot_of = {sl.key: sl for sl in elig}
+        for key in by_rate:
+            sl = slot_of.get(key)
+            if sl is None:
+                continue                                  # land-grab rungs: sized by §4.5
+            if float(getattr(sl, "accrued", 0.0) or 0.0) > 0:
+                continue                                  # accrued dollars are the RESCUE's
+                                                          # business: it prices the recovery
+                                                          # value of the stranded accrual and
+                                                          # decides TOP_UP vs ABANDON.  A blunt
+                                                          # cliff drop here would throw away the
+                                                          # accrual the rescue exists to save.
+            q_min = cliff_clearing_q(sl)
+            q_now = alloc[key]
+            if q_min is not None and q_now >= q_min:
+                continue                                  # already clears
+            if q_min is not None:
+                add = q_min - q_now
+                cost = add * sl.p
+                room_ok = (spent + cost <= budget_usd + 1e-9
+                           and q_min <= n_cap(sl.p, caps)
+                           and per_market.get(sl.ticker, 0.0) + cost
+                           <= market_cap_usd(sl, budget_usd, caps) + 1e-9)
+                ck = _cluster_key(sl)
+                if room_ok and cluster_cap_usd is not None:
+                    room_ok = per_cluster.get(ck, 0.0) + cost <= float(cluster_cap_usd) + 1e-9
+                if room_ok:
+                    alloc[key] = q_min
+                    spent += cost
+                    per_market[sl.ticker] = per_market.get(sl.ticker, 0.0) + cost
+                    per_venue[sl.venue] = per_venue.get(sl.venue, 0.0) + cost
+                    per_cluster[ck] = per_cluster.get(ck, 0.0) + cost
+                    continue
+            # cannot reach the cliff here — free the capital for a rung that can
+            freed = q_now * sl.p
+            alloc[key] = 0
+            spent = max(0.0, spent - freed)
+            per_market[sl.ticker] = max(0.0, per_market.get(sl.ticker, 0.0) - freed)
+            per_venue[sl.venue] = max(0.0, per_venue.get(sl.venue, 0.0) - freed)
             ck = _cluster_key(sl)
-            if room_ok and cluster_cap_usd is not None:
-                room_ok = per_cluster.get(ck, 0.0) + cost <= float(cluster_cap_usd) + 1e-9
-            if room_ok:
-                alloc[key] = q_min
-                spent += cost
-                per_market[sl.ticker] = per_market.get(sl.ticker, 0.0) + cost
-                per_venue[sl.venue] = per_venue.get(sl.venue, 0.0) + cost
-                per_cluster[ck] = per_cluster.get(ck, 0.0) + cost
-                continue
-        # cannot reach the cliff here — free the capital for a rung that can
-        freed = q_now * sl.p
-        alloc[key] = 0
-        spent = max(0.0, spent - freed)
-        per_market[sl.ticker] = max(0.0, per_market.get(sl.ticker, 0.0) - freed)
-        per_venue[sl.venue] = max(0.0, per_venue.get(sl.venue, 0.0) - freed)
-        ck = _cluster_key(sl)
-        per_cluster[ck] = max(0.0, per_cluster.get(ck, 0.0) - freed)
-        R.log("below_cliff_dropped", ticker=sl.ticker, side=sl.side, had=q_now,
-              needed=q_min, freed_usd=round(freed, 4))
+            per_cluster[ck] = max(0.0, per_cluster.get(ck, 0.0) - freed)
+            cliff_dead.add(key)
+            freed_any = freed_any or freed > 0
+            R.log("below_cliff_dropped", ticker=sl.ticker, side=sl.side, had=q_now,
+                  needed=q_min, freed_usd=round(freed, 4))
+        # Nothing pruned ⇒ the plan is stable; anything pruned ⇒ re-water-fill its dollars.
+        if not freed_any:
+            break
     return alloc, spent, last_rate
 
 

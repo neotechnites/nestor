@@ -468,3 +468,39 @@ class TestTheRungCapMustExceedTheCliff(LipTestCase):
         caps = alloc.Caps(inv_cap_usd=30.0)
         a, _, _ = alloc.allocate(rungs, 300.0, 0.0625, caps=caps, cluster_cap_usd=75.0)
         self.assertGreaterEqual(a[("KXV-0", "bid")], 42)
+
+
+class TestPrunedCapitalIsRedeployed(LipTestCase):
+    """Ryan, 2026-07-28: "it's not allocating that capital at all, not just in a different
+    place."  Exactly right — the cliff pass zeroed sub-$2 rungs and returned their dollars to
+    the budget, but water-filling had already finished, so the freed capital evaporated: $30
+    deployed of $300 with nothing refused and nothing over-cap."""
+
+    def _good(self, i):
+        return alloc.Slot("KXA-%d" % i, "bid", rho=9.0, S=800.0, p=0.30, hours_left=16.0,
+                          venue="KXA", window_h=16.0)
+
+    def _hopeless(self, i):
+        return alloc.Slot("KXB-%d" % i, "bid", rho=0.4, S=5000.0, p=0.30, hours_left=16.0,
+                          venue="KXB", window_h=16.0)
+
+    def test_freed_dollars_land_on_rungs_that_can_clear(self):
+        slots = [self._good(i) for i in range(3)] + [self._hopeless(i) for i in range(5)]
+        caps = alloc.Caps(inv_cap_usd=30.0)
+        a, spent, _ = alloc.allocate(slots, 300.0, 0.0625, caps=caps, cluster_cap_usd=75.0)
+        funded = {k: q for k, q in a.items() if q > 0}
+        self.assertTrue(all(k[0].startswith("KXA") for k in funded),
+                        "only rungs that can reach the floor may be funded")
+        self.assertGreater(spent, 60.0,
+                           "the pruned dollars must be REDEPLOYED, not evaporated")
+        for k, q in funded.items():
+            sl = [x for x in slots if x.key == k][0]
+            self.assertGreaterEqual(q, alloc.cliff_clearing_q(sl))
+
+    def test_a_book_with_nothing_fundable_spends_nothing(self):
+        """The mirror: re-filling must not manufacture spend where no rung can clear."""
+        slots = [self._hopeless(i) for i in range(5)]
+        caps = alloc.Caps(inv_cap_usd=30.0)
+        a, spent, _ = alloc.allocate(slots, 300.0, 0.0625, caps=caps, cluster_cap_usd=75.0)
+        self.assertEqual(sum(a.values()), 0)
+        self.assertAlmostEqual(spent, 0.0, places=6)
