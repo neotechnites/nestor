@@ -179,6 +179,15 @@ CLASSIFY_MAX_MARKETS = 200              # bound the cold-start sweep.  rho DOES 
 CLASSIFY_RATE_HZ = 5.0                  # half the ~10 req/s shared budget; the sweep is
                                         # one-shot at start and every CLASSIFY_REFRESH_S
 REVIVAL_PRICE_USD = 0.01                # §6.2 the cheapest legal price on a dead side
+# NEW-1: §6.2's T0 qualification path (post `target_size - cum_size` on a short side) is
+# DERIVED and TESTED (`t0_qualification_size`) but has ZERO CALL SITES — the same class of
+# defect as the unwired day stop.  Until it is wired, an unqualified side is worth exactly
+# nothing to us: ALLOCATE sees S=0, computes a marginal rate of 0, and funds it $0 forever.
+# Ranking such a market highly therefore burns one of six REST slots on a market that
+# receives no capital (measured: a REVIVE market ranked #1 at 0.3125 and allocated 0).
+# While this is False the §4.6 clamp ignores unqualified sides.  Flip it ONLY together with
+# the T0 call site — the flag exists so the two can never drift apart again.
+T0_QUALIFICATION_WIRED = False
 COVERAGE_TARGET = 0.95                  # §4.5 probe §4
 COVERAGE_ALERT_FLOOR = 0.90             # §4.5 alert if a slot is <90% for 10 min
 COVERAGE_ALERT_WINDOW_S = 600           # §4.5
@@ -201,6 +210,11 @@ SHED_ESCALATE_HOURS_LEFT = 2.0          # §5.4(iii) h < 2
 # is measured rather than asserted.  README documents that inventory does not self-clear
 # beyond the maker shed while this is False.
 TAKER_EXIT_ENABLED = False
+# NEW-5: the derivation above is a function of the CEILING, so the two must not drift.  At
+# or above this ceiling a startup assertion REFUSES TO RUN while TAKER_EXIT_ENABLED is
+# False.  Deliberately NOT an auto-enable: crossing the spread is a human decision and this
+# forces it to be taken explicitly at the rung, not inherited from a smaller one.
+TAKER_EXIT_REQUIRED_ABOVE_USD = 300.0
 
 # ---- risk caps (§8) ---------------------------------------------------------------------
 INV_CAP_USD = 10.00                     # §8.1 n_cap = floor($10/p) on NET.  A slot's max
@@ -653,23 +667,34 @@ def slot_first_dollar_rate(rho, S, p, qualifies=True, legal=True,
     return marginal_rate(rho, float(S), 0, float(p))
 
 
-def market_rank_value(entry):
+def market_rank_value(entry, count_unqualified=None):
     """Best first-dollar rate available on one market.  `entry` carries the LAST OBSERVED
     classification: {"rho", "pinned", "denied", "sides": [{"S","p","qualifies","legal"}]}.
     A pinned or denied market is worth exactly zero — no snapshot on it can ever be
-    included, so no dollar spent on it can ever be paid (§1.3)."""
+    included, so no dollar spent on it can ever be paid (§1.3).
+
+    NEW-1: an UNQUALIFIED side is likewise worth zero TO THE CLAMP while
+    T0_QUALIFICATION_WIRED is False, because nothing in this binary will ever post the size
+    that creates the qualifying side, so ALLOCATE funds it $0 and the REST slot is wasted.
+    The revival arithmetic in `slot_first_dollar_rate` stays correct and tested; this gates
+    USING it to spend a poll budget.
+    """
+    if count_unqualified is None:
+        count_unqualified = T0_QUALIFICATION_WIRED
     if entry.get("pinned") or entry.get("denied"):
         return 0.0
     rho = float(entry.get("rho", 0.0))
     best = 0.0
     for s in entry.get("sides", []):
+        if not s.get("qualifies", True) and not count_unqualified:
+            continue
         best = max(best, slot_first_dollar_rate(
             rho, s.get("S", 0.0), s.get("p", 0.0), s.get("qualifies", True),
             s.get("legal", True), s.get("target_size", 1000.0)))
     return best
 
 
-def market_poll_rank(classified, max_markets=MAX_REST_MARKETS):
+def market_poll_rank(classified, max_markets=MAX_REST_MARKETS, count_unqualified=None):
     """§4.6 CLASSIFY-THEN-CLAMP.  Returns the tickers to poll at 1 Hz, best first.
 
     Ranking by rho alone is degenerate within one event (every rung shares one pool and one
@@ -682,7 +707,7 @@ def market_poll_rank(classified, max_markets=MAX_REST_MARKETS):
     for ticker, entry in classified.items():
         if entry.get("pinned") or entry.get("denied"):
             continue
-        v = market_rank_value(entry)
+        v = market_rank_value(entry, count_unqualified)
         if v <= 0:
             continue
         scored.append((-v, -float(entry.get("rho", 0.0)), str(ticker)))
@@ -690,17 +715,35 @@ def market_poll_rank(classified, max_markets=MAX_REST_MARKETS):
     return [t for _, _, t in scored[:max_markets]]
 
 
+def unpriced_positions(positions, yes_mids):
+    """Tickers holding inventory for which no two-sided mid exists (§8.4 / NEW-2)."""
+    return sorted(t for t, pos in (positions or {}).items()
+                  if (abs(pos.get("yes", 0.0)) + abs(pos.get("no", 0.0))) > 0
+                  and yes_mids.get(t) is None)
+
+
 def mark_to_market_pnl(positions, position_cost, yes_mids, fees_paid_usd=0.0):
     """§8.4 realised+unrealised P&L on inventory.  `yes_mids` is {ticker: yes mid in $}.
     A YES contract marks at the yes mid; a NO contract marks at (1 - yes mid).  Cost comes
-    from the ledger replay (§9.3), never from an exchange index."""
+    from the ledger replay (§9.3), never from an exchange index.
+
+    NEW-2: a position on a market with NO two-sided mid (a PINNED rung is one-sided BY
+    DEFINITION, §1.3) cannot be marked.  Subtracting its full cost while contributing no
+    value reads that inventory as a TOTAL LOSS: two pinned $10 slots alone print -$20,
+    which is exactly the §8.4 floor, and the day stop then cancels everything mid-window on
+    precisely the gas books we are there for.  An unmarkable position marks AT COST — zero
+    P&L contribution, the only honest statement about a price we cannot observe.  The count
+    is surfaced separately so "we cannot see it" never reads as "it is fine".
+    """
     value = 0.0
+    cost = dict(position_cost or {})
     for ticker, pos in (positions or {}).items():
         mid = yes_mids.get(ticker)
         if mid is None:
+            value += cost.get(ticker, 0.0)          # mark at cost => contributes 0.0
             continue
         value += pos.get("yes", 0.0) * float(mid) + pos.get("no", 0.0) * (1.0 - float(mid))
-    return value - sum((position_cost or {}).values()) - float(fees_paid_usd)
+    return value - sum(cost.values()) - float(fees_paid_usd)
 
 
 def day_stop_breached(pnl_usd, projected_day_reward_usd):
@@ -1863,6 +1906,22 @@ def startup_assertions(auth, auth_note, programs=None):
                                                    UNIT_ASSERT_EXPECT_USD),
                     ok_unit, detail))
 
+    # 5. NEW-5 — the ladder gate.  TAKER_EXIT_ENABLED is False because at a $45 ceiling
+    #    the §8.1 net cap bounds what a taker exit could recover at single dollars (see the
+    #    constant's derivation).  That argument is a FUNCTION OF THE CEILING and stops
+    #    holding as it rises: at $300 the blocked-slot value scales with deployed size while
+    #    the crossing risk stays a fixed tail.  Nothing structurally couples the two, so a
+    #    ceiling bump would silently inherit a decision made for a different rung.  Refuse
+    #    to run rather than auto-enable: crossing the spread is a human decision, and this
+    #    forces it to be made explicitly AT the rung.
+    ok_taker = not (MAX_TOTAL_COLLATERAL_USD >= TAKER_EXIT_REQUIRED_ABOVE_USD
+                    and not TAKER_EXIT_ENABLED)
+    results.append((
+        "taker_exit_decision_matches_ceiling", ok_taker,
+        "ceiling=$%.2f taker_exit_enabled=%s (an explicit decision is REQUIRED at or above "
+        "$%.2f)" % (MAX_TOTAL_COLLATERAL_USD, TAKER_EXIT_ENABLED,
+                    TAKER_EXIT_REQUIRED_ABOVE_USD)))
+
     return all(r[1] for r in results), results
 
 
@@ -1961,19 +2020,33 @@ class Maker(object):
         return FillsRead(ok=True, count=sum(num(f.get("count"), 0.0) for f in fills)), fills
 
     @staticmethod
-    def fill_key(f):
-        """S2 — the fills API's own immutable identity for one fill.  Kalshi returns
-        `trade_id` on fills; `fill_id`/`id` are accepted as aliases.  If none is present we
-        SYNTHESISE a deterministic key from the fill's own immutable fields rather than
-        writing None — a row with no key is a row replay cannot deduplicate, and the crash
-        loop re-reads an overlapping window by construction (§9.4 step 4)."""
+    def fill_key(f, idx=None):
+        """S2/NEW-3 — the fills API's own immutable identity for one fill.  Kalshi returns
+        `trade_id`; `fill_id`/`id` are accepted as aliases.  If none is present we
+        SYNTHESISE a key rather than writing None — a row with no key is a row replay cannot
+        deduplicate, and §9.4 step 4 re-reads an overlapping window by construction.
+
+        NEW-3: the first synthetic form keyed on (order_id, ticker, side, count, time) and
+        COLLIDED on two genuinely distinct fills of equal size at the same timestamp — the
+        exchange fills a 10-lot order as 5+5 routinely.  Colliding keys make replay DROP the
+        second fill, i.e. UNDER-count inventory, which is the §9/§9.4b naked-short direction
+        and the one error this whole subsystem exists to prevent.  The key therefore adds
+        the fill PRICE and the fill's ENUMERATION INDEX within its response.
+
+        Tradeoff, stated: the index makes the synthetic key response-order dependent, so a
+        reordered re-read can fail to dedupe and DOUBLE-count.  That is the deliberate
+        direction — over-counting inventory is conservative (§9.4a books the ambiguous case
+        as fully filled), under-counting is not.  The synthetic path is a fallback only:
+        real fills carry `trade_id`, which is stable under reordering.
+        """
         for k in ("trade_id", "fill_id", "id"):
             v = f.get(k)
             if v:
                 return str(v)
-        return "syn-%s-%s-%s-%s-%s" % (f.get("order_id"), f.get("ticker"), f.get("side"),
-                                       num(f.get("count"), 0.0),
-                                       f.get("created_time") or f.get("ts"))
+        return "syn-%s|%s|%s|%s|%s|%s|%s" % (
+            f.get("order_id"), f.get("ticker"), f.get("side"), num(f.get("count"), 0.0),
+            f.get("yes_price", f.get("price")), f.get("created_time") or f.get("ts"),
+            "?" if idx is None else int(idx))
 
     # -- placement ------------------------------------------------------------------------
     def place(self, ticker, side, price_c, size, expiration_ts):
@@ -2109,9 +2182,10 @@ class Maker(object):
             # S2: one order-scoped resolution is one idempotent event.  The key is the set
             # of underlying trade ids when we have them, and the order id otherwise, so a
             # repeated restart cannot resolve the same 404 twice.
-            fill_id="o404-%s-%s" % (order.order_id,
-                                    ",".join(sorted(self.fill_key(f) for f in rows))
-                                    or "none"))
+            fill_id="o404-%s-%s" % (
+                order.order_id,
+                ",".join(sorted(self.fill_key(f, i) for i, f in enumerate(rows)))
+                or "none"))
         order.extra_fills += n
         order.reduced_by = 0.0
         order.state = ST_CLOSED
@@ -2144,10 +2218,10 @@ class Maker(object):
             read, fills = self.do_fills(min_ts=lo, max_ts=hi)
             if read.ok:
                 known = set(self.st.orders.keys())
-                for f in fills:
+                for i, f in enumerate(fills):
                     if str(f.get("order_id")) in known:
                         continue                       # already attributed above
-                    fid = self.fill_key(f)
+                    fid = self.fill_key(f, i)
                     if fid in self.st.seen_fill_ids:
                         # S2: the re-query window OVERLAPS the previous one by design, so a
                         # crash loop re-observes these.  Skip what the ledger already has.
@@ -2204,10 +2278,20 @@ class Maker(object):
         self.live_by_slot.clear()
 
     # -- one cycle ------------------------------------------------------------------------
-    def classify_market(self, prog, body, now):
-        """Fold one book poll into the classification table used by the §4.6 clamp."""
+    def classify_market(self, prog, body, now, denied=False, assume_filled=False):
+        """Fold one book poll into the classification table used by the §4.6 clamp.
+
+        NEW-4: this is called from the 1 Hz loop as well as the sweep.  Every book the
+        quoting loop already fetched is free classification evidence; not folding it in left
+        the rank table up to CLASSIFY_REFRESH_S stale for the very markets being polled
+        every second, so a rung that flipped pinned kept its REST slot for up to 15 minutes,
+        and if all six flipped at once the `if not chosen` escape re-sweep never fired
+        because `chosen` was computed from the stale table.  Money-safe (ALLOCATE still
+        sees the fresh book and funds nothing) but it is B1 again in the time dimension.
+        """
         tk = prog["market_ticker"]
-        _, info = slots_from_market(prog, body, now)
+        slots, info = slots_from_market(prog, body, now, denied=denied,
+                                        assume_filled=assume_filled)
         H = window_hours(prog["start_ts"], prog["end_ts"])
         rho = pool_rate(prog["period_reward"], H)
         yb, ya = info["yes_bid_c"], info["yes_ask_c"]
@@ -2224,7 +2308,7 @@ class Maker(object):
                                "sides": sides, "ts": now}
         self.books[tk] = body
         self.scores[tk] = info
-        return info
+        return slots, info
 
     def classify_sweep(self, progs, now):
         """§4.6 cold start / low-cadence refresh.  One classification poll per candidate
@@ -2246,7 +2330,7 @@ class Maker(object):
             if st != 200:
                 log("book_error", ticker=tk, http=st, phase="classify")
                 continue
-            info = self.classify_market(p, body, now)
+            _, info = self.classify_market(p, body, now)
             if info["pinned"]:
                 pinned_ct += 1
             time.sleep(1.0 / CLASSIFY_RATE_HZ)
@@ -2267,6 +2351,12 @@ class Maker(object):
                 mids[tk] = (yb + ya) / 200.0
         pnl = mark_to_market_pnl(self.st.positions, self.st.position_cost, mids,
                                  self.fees_paid)
+        unpriced = unpriced_positions(self.st.positions, mids)
+        if unpriced:
+            # NEW-2: these are marked at cost, i.e. excluded from the stop's evidence.
+            # Never let that silence look like a clean book.
+            log("unpriced_positions", unpriced_position_count=len(unpriced),
+                tickers=unpriced[:10])
         proj_day = sum(reward_rate(s.rho, alloc.get(s.key, 0), s.S + s.W)
                        for s in slots) * 24.0
         self.day_pnl = pnl
@@ -2324,11 +2414,11 @@ class Maker(object):
             if st != 200:
                 log("book_error", ticker=tk, http=st)
                 continue
-            self.books[tk] = body
-            s2, info = slots_from_market(p, body, now,
-                                         denied=(tk in self.st.poisoned),
-                                         assume_filled=(tk in self.st.assume_filled))
-            self.scores[tk] = info
+            # NEW-4: classify from the book the quoting loop just fetched, so the rank
+            # table is never staler than the last poll of that market.
+            s2, info = self.classify_market(
+                p, body, now, denied=(tk in self.st.poisoned),
+                assume_filled=(tk in self.st.assume_filled))
             slots.extend(s2)
         if not slots:
             return

@@ -1109,8 +1109,10 @@ class S1_DayStop(unittest.TestCase):
         no = {"T": {"yes": 0.0, "no": 10.0}}
         self.assertAlmostEqual(M.mark_to_market_pnl(no, {"T": 6.00}, {"T": 0.40}), 0.0,
                                places=9)
-        # a market with no mid available cannot be marked and must not be guessed at
-        self.assertAlmostEqual(M.mark_to_market_pnl(pos, cost, {}), -4.00, places=9)
+        # NEW-2: a market with no two-sided mid cannot be marked, so it marks AT COST and
+        # contributes exactly zero -- NOT minus its whole cost (that read pinned-rung
+        # inventory as a total loss and tripped the day stop on the gas books).
+        self.assertAlmostEqual(M.mark_to_market_pnl(pos, cost, {}), 0.0, places=9)
 
     def test_breach_thresholds(self):
         """§8.4 — -max($20, 0.35*projected), capped at -$150."""
@@ -1276,6 +1278,214 @@ class S4_TakerExitIsSuppressedAtThisRung(unittest.TestCase):
         # the bound the derivation rests on: stranded inventory is capped per slot at $10
         self.assertAlmostEqual(M.n_cap(0.40) * 0.40, 10.0, places=9)
         self.assertLessEqual(M.n_cap(0.02) * 0.02, 10.0 + 1e-9)
+
+
+# =============================================================================================
+# VERIFICATION-ROUND REGRESSIONS (NEW-1 .. NEW-5)
+# =============================================================================================
+class NEW1_RevivalsDoNotBurnARestSlot(unittest.TestCase):
+
+    def test_a_market_allocate_will_never_fund_does_not_take_the_slot(self):
+        """NEW-1 — market_rank_value promoted revival markets whose sides ALLOCATE then
+        skips (S=0 => marginal rate 0 => $0 forever), because §6.2's T0 qualification path
+        has zero call sites.  A REVIVE market took a top-6 REST slot and earned nothing."""
+        revive = {"rho": 6.25, "pinned": False, "denied": False,
+                  "sides": [{"S": 0.0, "p": 0.99, "qualifies": False, "legal": True,
+                             "target_size": 1000.0}]}
+        good = {"rho": 6.25, "pinned": False, "denied": False,
+                "sides": [{"S": 60.5, "p": 0.68, "qualifies": True, "legal": True}]}
+        # the revival PROXY really does out-rank the good market -- that was the defect
+        self.assertGreater(M.market_rank_value(revive, count_unqualified=True),
+                           M.market_rank_value(good))
+        # ... and ALLOCATE funds the revival exactly $0, which is why the slot was wasted
+        rev_slot = M.Slot("REVIVE", "bid", 6.25, 0.0, 0.99)
+        al, spent = M.allocate([rev_slot], 45.0, BIG)
+        self.assertEqual(al[rev_slot.key], 0)
+        self.assertEqual(spent, 0.0)
+        # FIX: while the T0 path is unwired the clamp ignores unqualified sides, so with one
+        # REST slot the GOOD market takes it.
+        self.assertFalse(M.T0_QUALIFICATION_WIRED)
+        self.assertEqual(M.market_rank_value(revive), 0.0)
+        self.assertEqual(M.market_poll_rank({"REVIVE": revive, "GOOD": good}, 1), ["GOOD"])
+        self.assertEqual(M.market_poll_rank({"REVIVE": revive, "GOOD": good}), ["GOOD"])
+
+    def test_the_revival_arithmetic_itself_is_untouched_and_returns_when_wired(self):
+        """The gate is on USING the value, not on the maths -- §1.4 stays correct so that
+        wiring the T0 call site is a one-flag change with a test already covering it."""
+        revive = {"rho": 6.25, "pinned": False, "denied": False,
+                  "sides": [{"S": 0.0, "p": 0.99, "qualifies": False, "legal": True,
+                             "target_size": 1000.0}]}
+        self.assertAlmostEqual(M.market_rank_value(revive, count_unqualified=True),
+                               M.marginal_rate(6.25, 1000.0, 0, 0.01), places=12)
+        self.assertGreater(M.t0_qualification_size(M.score_side([], 1000, 0.5), 1000), 0)
+
+    def test_pinned_exclusion_is_unaffected(self):
+        pinned = {"rho": 6.25, "pinned": True, "denied": False,
+                  "sides": [{"S": 5.0, "p": 0.02, "qualifies": True, "legal": False}]}
+        self.assertEqual(M.market_rank_value(pinned, count_unqualified=True), 0.0)
+
+
+class NEW2_UnpricedPositionsDoNotTripTheDayStop(unittest.TestCase):
+
+    def test_pinned_rung_inventory_does_not_move_pnl(self):
+        """NEW-2 — a pinned rung is ONE-SIDED BY DEFINITION (§1.3), so it has no mid.
+        Subtracting its full cost printed two $10 slots as -$20 = the §8.4 floor, and the
+        stop cancelled everything mid-window on exactly the gas books."""
+        pos = {"PIN1": {"yes": 1000.0, "no": 0.0}, "PIN2": {"yes": 1000.0, "no": 0.0}}
+        cost = {"PIN1": 10.0, "PIN2": 10.0}
+        self.assertAlmostEqual(M.mark_to_market_pnl(pos, cost, {}), 0.0, places=9)
+        self.assertFalse(M.day_stop_breached(M.mark_to_market_pnl(pos, cost, {}), 0.0))
+        # the old behaviour, stated so the regression is unmistakable
+        self.assertAlmostEqual(-sum(cost.values()), -20.0, places=9)
+        self.assertTrue(M.day_stop_breached(-20.0, 0.0))
+        # and it is surfaced, never silent
+        self.assertEqual(M.unpriced_positions(pos, {}), ["PIN1", "PIN2"])
+        self.assertEqual(M.unpriced_positions(pos, {"PIN1": 0.5}), ["PIN2"])
+        self.assertEqual(M.unpriced_positions({"F": {"yes": 0.0, "no": 0.0}}, {}), [])
+
+    def test_a_priced_position_still_marks_and_still_stops(self):
+        """The fix must not blunt the stop where a mark DOES exist."""
+        pos = {"T": {"yes": 1000.0, "no": 0.0}}
+        cost = {"T": 40.0}
+        self.assertAlmostEqual(M.mark_to_market_pnl(pos, cost, {"T": 0.02}), -20.0,
+                               places=9)
+        self.assertTrue(M.day_stop_breached(M.mark_to_market_pnl(pos, cost, {"T": 0.02}),
+                                            0.0))
+
+    def test_mixed_book_marks_only_what_it_can_see(self):
+        pos = {"SEEN": {"yes": 100.0, "no": 0.0}, "BLIND": {"yes": 100.0, "no": 0.0}}
+        cost = {"SEEN": 40.0, "BLIND": 40.0}
+        self.assertAlmostEqual(M.mark_to_market_pnl(pos, cost, {"SEEN": 0.30}), -10.0,
+                               places=9)
+
+
+class NEW3_FillKeyDoesNotCollide(unittest.TestCase):
+
+    def test_two_distinct_equal_size_fills_both_book(self):
+        """NEW-3 — the exchange fills a 10-lot order as 5+5 routinely.  The first synthetic
+        key collided on (order_id, ticker, side, count, time), so replay DROPPED the second
+        fill: under-counted inventory, the §9.4b naked-short direction."""
+        f = {"order_id": "O1", "ticker": T, "side": "yes", "count": 5, "yes_price": 40,
+             "created_time": "2026-07-28T02:00:00Z"}
+        k0, k1 = M.Maker.fill_key(f, 0), M.Maker.fill_key(dict(f), 1)
+        self.assertNotEqual(k0, k1)
+        rows = [{"k": "fill_obs", "t": 1010.0, "order_id": None, "fill_id": k0,
+                 "ticker": T, "side": "bid", "count": 5, "price_c": 40,
+                 "src": "fills_api", "why": "crash_gap"},
+                {"k": "fill_obs", "t": 1010.0, "order_id": None, "fill_id": k1,
+                 "ticker": T, "side": "bid", "count": 5, "price_c": 40,
+                 "src": "fills_api", "why": "crash_gap"}]
+        st = M.ledger_replay(rows)
+        self.assertAlmostEqual(st.filled(T, "bid"), 10.0)      # was 5.0 -- under-counted
+        self.assertAlmostEqual(st.net_position(T), 10.0)
+
+    def test_price_is_part_of_the_key(self):
+        base = {"order_id": "O1", "ticker": T, "side": "yes", "count": 5,
+                "created_time": "2026-07-28T02:00:00Z"}
+        self.assertNotEqual(M.Maker.fill_key(dict(base, yes_price=40), 0),
+                            M.Maker.fill_key(dict(base, yes_price=41), 0))
+
+    def test_a_real_trade_id_still_wins_and_is_order_independent(self):
+        """The synthetic form is a FALLBACK.  A real trade_id is stable under reordering,
+        which is what keeps the crash-loop dedup correct in the normal case."""
+        f = {"trade_id": "abc-123", "order_id": "O1", "count": 5}
+        self.assertEqual(M.Maker.fill_key(f, 0), "abc-123")
+        self.assertEqual(M.Maker.fill_key(f, 7), "abc-123")
+        self.assertEqual(M.Maker.fill_key({"fill_id": "z"}, 0), "z")
+        # dedup still holds on the real key across any number of restarts
+        row = {"k": "fill_obs", "t": 1010.0, "order_id": None, "fill_id": "abc-123",
+               "ticker": T, "side": "bid", "count": 5, "price_c": 40,
+               "src": "fills_api", "why": "crash_gap"}
+        st = M.ledger_replay([row, dict(row, t=1035.0), dict(row, t=1060.0)])
+        self.assertAlmostEqual(st.filled(T, "bid"), 5.0)
+
+
+class NEW4_RankTableIsRefreshedByTheOneHzLoop(unittest.TestCase):
+
+    BOOK_OK = {"orderbook": {"orderbook_fp": {
+        "yes_dollars": [["0.4000", "600"], ["0.3900", "600"]],
+        "no_dollars": [["0.5900", "600"], ["0.5800", "600"]]}}}
+    BOOK_PINNED = {"orderbook": {"orderbook_fp": {
+        "yes_dollars": [["0.9900", "5000"]], "no_dollars": []}}}
+
+    def prog(self):
+        return {"program_id": "P1", "market_ticker": "M1", "series": "KX",
+                "period_reward": 1000000.0, "target_size_fp": 1000.0,
+                "discount_factor_bps": 5000.0, "start_ts": 0.0, "end_ts": 16 * 3600.0,
+                "paid_out": False}
+
+    def test_classify_market_returns_slots_and_updates_the_rank_table(self):
+        """NEW-4 — the 1 Hz loop updated books/scores but never `classified`, so the rank
+        table went up to CLASSIFY_REFRESH_S (900s) stale for markets polled every second."""
+        m = M.Maker(None, M.LedgerState(), [])
+        slots, info = m.classify_market(self.prog(), self.BOOK_OK, 100.0)
+        self.assertEqual(len(slots), 2)
+        self.assertIn("M1", m.classified)
+        self.assertIn("M1", m.scores)
+        self.assertIn("M1", m.books)
+        self.assertFalse(m.classified["M1"]["pinned"])
+        self.assertGreater(M.market_rank_value(m.classified["M1"]), 0.0)
+        self.assertEqual(M.market_poll_rank(m.classified), ["M1"])
+
+    def test_a_rung_that_flips_pinned_loses_its_slot_on_the_next_poll(self):
+        m = M.Maker(None, M.LedgerState(), [])
+        m.classify_market(self.prog(), self.BOOK_OK, 100.0)
+        self.assertEqual(M.market_poll_rank(m.classified), ["M1"])
+        m.classify_market(self.prog(), self.BOOK_PINNED, 101.0)   # one second later
+        self.assertTrue(m.classified["M1"]["pinned"])
+        self.assertEqual(M.market_poll_rank(m.classified), [])    # slot released at once
+        self.assertEqual(m.classified["M1"]["ts"], 101.0)
+
+    def test_denied_and_frozen_markets_are_carried_into_the_table(self):
+        st = M.LedgerState()
+        st.poisoned.add("M1")
+        m = M.Maker(None, st, [])
+        m.classify_market(self.prog(), self.BOOK_OK, 100.0, denied=True)
+        self.assertTrue(m.classified["M1"]["denied"])
+        self.assertEqual(M.market_poll_rank(m.classified), [])
+
+
+class NEW5_TakerExitIsCoupledToTheCeiling(unittest.TestCase):
+
+    def _assert_with(self, ceiling, enabled, programs):
+        tmp = tempfile.mkdtemp()
+        old = (M.DATA_DIR, M.LEDGER_PATH, M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_ENABLED)
+        try:
+            M.DATA_DIR = os.path.join(tmp, "lip")
+            M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+            M.MAX_TOTAL_COLLATERAL_USD = ceiling
+            M.TAKER_EXIT_ENABLED = enabled
+            ok, results = M.startup_assertions(None, "n/a", programs=programs)
+            return ok, {n: (g, d) for n, g, d in results}
+        finally:
+            (M.DATA_DIR, M.LEDGER_PATH, M.MAX_TOTAL_COLLATERAL_USD,
+             M.TAKER_EXIT_ENABLED) = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    GOOD_PROGS = [{"series": "KXAAAGASD", "period_reward": 1_000_000.0}]
+
+    def test_first_run_ceiling_passes_with_the_taker_exit_off(self):
+        ok, r = self._assert_with(45.0, False, self.GOOD_PROGS)
+        self.assertTrue(r["taker_exit_decision_matches_ceiling"][0])
+        self.assertTrue(ok)
+
+    def test_the_300_dollar_rung_REFUSES_TO_RUN_until_the_decision_is_made(self):
+        """NEW-5 — nothing coupled TAKER_EXIT_ENABLED to the ceiling, so a ceiling bump
+        would silently inherit a decision derived for a $45 sleeve.  Refuse, do NOT
+        auto-enable: crossing the spread is a human decision, taken AT the rung."""
+        ok, r = self._assert_with(300.0, False, self.GOOD_PROGS)
+        self.assertFalse(r["taker_exit_decision_matches_ceiling"][0])
+        self.assertFalse(ok)
+        self.assertIn("300", r["taker_exit_decision_matches_ceiling"][1])
+
+    def test_the_300_dollar_rung_runs_once_the_decision_is_explicit(self):
+        ok, r = self._assert_with(300.0, True, self.GOOD_PROGS)
+        self.assertTrue(r["taker_exit_decision_matches_ceiling"][0])
+        self.assertTrue(ok)
+
+    def test_the_threshold_is_the_next_ladder_rung(self):
+        self.assertEqual(M.TAKER_EXIT_REQUIRED_ABOVE_USD, 300.0)
+        self.assertLess(M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_REQUIRED_ABOVE_USD)
 
 
 class StartupAssertions(unittest.TestCase):

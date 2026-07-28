@@ -8,10 +8,10 @@ Python 3.12 + requests + cryptography. Tests: `python3 -m unittest discover tool
     ssh ubuntu@VPS 'mkdir -p ~/nestor/data/lip && python3 ~/kalshi_data/scripts/lip_maker_v4.py --check'
 
 ## First-run checklist (all must pass before --live)
-0. **`python3 -m unittest discover tools/lip_maker_v4/` — 84 tests, must print `OK`.** Run it on the
+0. **`python3 -m unittest discover tools/lip_maker_v4/` — 100 tests, must print `OK`.** Run it on the
    VPS against the file you just scp'd, not only on the Mac.
 1. `--check` prints `[OK ]` for all four startup assertions: `env_and_pem`, `data_dir_writable`,
-   `ledger_replay_clean`, and **`unit_assertion_KXAAAGASD_eq_100.00`** — a live gas rung must read
+   `ledger_replay_clean`, `taker_exit_decision_matches_ceiling`, and **`unit_assertion_KXAAAGASD_eq_100.00`** — a live gas rung must read
    `$100.00 ± $0.01`; the process REFUSES TO RUN on failure (§0.3).
 2. `~/nestor/.env` has `KALSHI_API_KEY_ID`; `~/nestor/secrets/prod.pem` exists. Config read-back: `MAX_TOTAL_COLLATERAL_USD = 45.0`, `EVENT_ALLOWLIST = []` (OFF — scanner ranks
    everything; set to e.g. `["KXAAAGASD-26JUL29"]` to pen the shakeout to gas), `COID_PREFIX = "v4-"`.
@@ -38,5 +38,7 @@ ceiling, repeat A. The make leg must be REJECTED, the ledger must log `mbb_degra
 and the slot must still hold a resting order afterwards (cancel-first at 46s). A silent presence
 drop is a FAIL and blocks deploy.
 
+Inventory does not self-clear beyond the maker shed (`TAKER_EXIT_ENABLED=False`); at a $300 ceiling the
+startup assertion refuses to run until that decision is made explicitly.
 Ledger `~/nestor/data/lip/v4_ledger.jsonl` · alerts ntfy `senate-nestor-2732e947` ·
 stop `sudo systemctl stop lip-maker-v4` (SIGTERM cancels all; `expiration_ts` = close−4min backstop).
