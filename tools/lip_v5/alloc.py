@@ -578,7 +578,95 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
         per_venue[best.venue] = per_venue.get(best.venue, 0.0) + step * best.p
         per_cluster[best_ck] = per_cluster.get(best_ck, 0.0) + step * best.p
         last_rate = best_rate
+    # ---- THE CLIFF PASS.  A rung under $1 of projected accrual pays ZERO. ----------------
+    # Water-filling maximises RATE and is blind to the forfeit cliff, so it happily leaves
+    # eight rungs at $3-9 each — which is what v5 did live on 2026-07-28, earning 2-9 CENTS
+    # per treasury market while v4, with $10-50 on a handful of rungs, cleared dollars.
+    # Reward is share and share is ~q/S, so size is LINEAR in earnings; below the cliff,
+    # linear-in-nothing is nothing.  Every funded rung is therefore raised to its
+    # cliff-clearing size if the caps and budget allow, and ZEROED if they do not — freeing
+    # its capital for a rung that can clear.  Richest-first, because when the budget cannot
+    # fund every rung above the cliff the right book is FEWER, BIGGER rungs.
+    by_rate = sorted((k for k, q in alloc.items() if q > 0),
+                     key=lambda k: -next((sl.net_at(alloc[k], r_star)
+                                          for sl in elig if sl.key == k), 0.0))
+    slot_of = {sl.key: sl for sl in elig}
+    for key in by_rate:
+        sl = slot_of.get(key)
+        if sl is None:
+            continue                                  # land-grab rungs: sized by §4.5
+        if float(getattr(sl, "accrued", 0.0) or 0.0) > 0:
+            continue                                  # accrued dollars are the RESCUE's
+                                                      # business: it prices the recovery
+                                                      # value of the stranded accrual and
+                                                      # decides TOP_UP vs ABANDON.  A blunt
+                                                      # cliff drop here would throw away the
+                                                      # accrual the rescue exists to save.
+        q_min = cliff_clearing_q(sl)
+        q_now = alloc[key]
+        if q_min is not None and q_now >= q_min:
+            continue                                  # already clears
+        if q_min is not None:
+            add = q_min - q_now
+            cost = add * sl.p
+            room_ok = (spent + cost <= budget_usd + 1e-9
+                       and q_min <= n_cap(sl.p, caps)
+                       and per_market.get(sl.ticker, 0.0) + cost
+                       <= market_cap_usd(sl, budget_usd, caps) + 1e-9)
+            ck = _cluster_key(sl)
+            if room_ok and cluster_cap_usd is not None:
+                room_ok = per_cluster.get(ck, 0.0) + cost <= float(cluster_cap_usd) + 1e-9
+            if room_ok:
+                alloc[key] = q_min
+                spent += cost
+                per_market[sl.ticker] = per_market.get(sl.ticker, 0.0) + cost
+                per_venue[sl.venue] = per_venue.get(sl.venue, 0.0) + cost
+                per_cluster[ck] = per_cluster.get(ck, 0.0) + cost
+                continue
+        # cannot reach the cliff here — free the capital for a rung that can
+        freed = q_now * sl.p
+        alloc[key] = 0
+        spent = max(0.0, spent - freed)
+        per_market[sl.ticker] = max(0.0, per_market.get(sl.ticker, 0.0) - freed)
+        per_venue[sl.venue] = max(0.0, per_venue.get(sl.venue, 0.0) - freed)
+        ck = _cluster_key(sl)
+        per_cluster[ck] = max(0.0, per_cluster.get(ck, 0.0) - freed)
+        R.log("below_cliff_dropped", ticker=sl.ticker, side=sl.side, had=q_now,
+              needed=q_min, freed_usd=round(freed, 4))
     return alloc, spent, last_rate
+
+
+def cliff_clearing_q(slot, target_usd=1.0):
+    """The SMALLEST size on this rung that can still reach the $1 forfeit cliff.
+
+    Solve `share(q) x (rho/2) x hours_left + accrued >= target` for q, with
+    `share = q/(q+S)`:
+
+        need  = target - accrued
+        avail = (rho/2) x hours_left          the whole side's remaining pool
+        share_needed = need / avail
+        q = S x share_needed / (1 - share_needed)
+
+    THE POINT.  A rung that accrues $0.90 pays ZERO, so capital below this size is not "less
+    earning", it is NO earning — measured live 2026-07-28: v5 held eight treasury rungs at
+    $3-9 each and their per-market estimates were 2-9 CENTS, while v4 put $10-50 on a handful
+    of rungs and cleared dollars.  Reward is share, share is ~q/S for q << S, so it is LINEAR
+    in size: a third of the size earns a third as much, and below the cliff a third as much
+    of nothing is nothing.
+
+    Returns None when the cliff is unreachable at ANY size (share_needed >= 1): the whole
+    side's remaining pool cannot pay $1, so no amount of capital rescues it.
+    """
+    avail = (float(slot.rho) / 2.0) * max(0.0, float(slot.hours_left))
+    need = max(0.0, float(target_usd) - float(getattr(slot, "accrued", 0.0) or 0.0))
+    if need <= 0:
+        return 0
+    if avail <= 0:
+        return None
+    share_needed = need / avail
+    if share_needed >= 1.0:
+        return None                                   # unreachable at any size
+    return int(math.ceil(float(slot.S) * share_needed / (1.0 - share_needed)))
 
 
 def projected_period_payout(program_slots, alloc):

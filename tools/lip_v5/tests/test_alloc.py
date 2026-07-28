@@ -403,3 +403,65 @@ class TestRStarIntegration(LipTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheCliffSetsMinimumSize(LipTestCase):
+    """v5 live 2026-07-28 held eight treasury rungs at $3-9 each and earned 2-9 CENTS per
+    market, while v4 put $10-50 on a handful and cleared dollars.  Reward is share, share is
+    ~q/S, so earnings are LINEAR in size — and below the $1 forfeit cliff, linear-in-nothing
+    is nothing.  A rung is funded ABOVE its cliff or not at all."""
+
+    def _rung(self, tk, S=1000.0, p=0.50, rho=6.25, h=16.0):
+        return alloc.Slot(tk, "bid", rho=rho, S=S, p=p, hours_left=h, venue="KXV",
+                          window_h=16.0)
+
+    def test_the_cliff_size_matches_the_closed_form(self):
+        s = self._rung("KXV-1")
+        self.assertEqual(alloc.cliff_clearing_q(s), 21)      # 2% of a 1000-lot side
+
+    def test_an_unreachable_cliff_returns_None(self):
+        s = self._rung("KXV-1", h=0.1)                       # side's whole pool < $1
+        self.assertIsNone(alloc.cliff_clearing_q(s))
+
+    def test_funded_rungs_all_clear_the_cliff(self):
+        rungs = [self._rung("KXV-%d" % i) for i in range(6)]
+        caps = alloc.Caps(inv_cap_usd=30.0)                  # the live derived rung cap
+        a, spent, _ = alloc.allocate(rungs, 300.0, 0.0625, caps=caps, cluster_cap_usd=75.0)
+        funded = {k: q for k, q in a.items() if q > 0}
+        self.assertTrue(funded, "nothing funded at all")
+        for key, q in funded.items():
+            s = [x for x in rungs if x.key == key][0]
+            self.assertGreaterEqual(q, alloc.cliff_clearing_q(s),
+                                    "%s funded at %d, below its cliff size" % (key[0], q))
+
+    def test_a_thin_spread_becomes_fewer_bigger_rungs(self):
+        """The whole point: a budget too small to clear every rung funds FEWER, not thinner."""
+        rungs = [self._rung("KXV-%d" % i) for i in range(10)]
+        caps = alloc.Caps(inv_cap_usd=30.0)
+        a, spent, _ = alloc.allocate(rungs, 40.0, 0.0625, caps=caps, cluster_cap_usd=75.0)
+        funded = [q for q in a.values() if q > 0]
+        self.assertLess(len(funded), 10, "must not spread below the cliff across all rungs")
+        for q in funded:
+            self.assertGreaterEqual(q, 21)
+
+
+class TestTheRungCapMustExceedTheCliff(LipTestCase):
+    """A per-rung cap BELOW the cliff-clearing size makes every mid-priced rung unearnable:
+    20 contracts is the most a $10 cap buys at $0.50, and the cliff needs 21.  Live this
+    would silently fund nothing — so the drop is LOGGED, never silent."""
+
+    def test_a_cap_below_the_cliff_funds_nothing_and_says_so(self):
+        rungs = [alloc.Slot("KXV-0", "bid", rho=6.25, S=1000.0, p=0.50, hours_left=16.0,
+                            venue="KXV", window_h=16.0)]
+        caps = alloc.Caps(inv_cap_usd=10.0)                  # one contract short of the cliff
+        a, spent, _ = alloc.allocate(rungs, 300.0, 0.0625, caps=caps, cluster_cap_usd=75.0)
+        self.assertEqual(sum(a.values()), 0)
+        self.assertTrue(self.logs_of("below_cliff_dropped"),
+                        "capital refused for being unearnable must be logged, never silent")
+
+    def test_the_live_cap_clears_it(self):
+        rungs = [alloc.Slot("KXV-0", "bid", rho=6.25, S=1000.0, p=0.50, hours_left=16.0,
+                            venue="KXV", window_h=16.0)]
+        caps = alloc.Caps(inv_cap_usd=30.0)
+        a, _, _ = alloc.allocate(rungs, 300.0, 0.0625, caps=caps, cluster_cap_usd=75.0)
+        self.assertGreaterEqual(a[("KXV-0", "bid")], 21)
