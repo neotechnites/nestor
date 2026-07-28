@@ -1929,14 +1929,14 @@ class RunwayGuardAndProgramEndRelease(unittest.TestCase):
             cancelled = []
             m.do_cancel = lambda oid: (cancelled.append(oid),
                                        (200, {"reduced_by": "10.00"}))[1]
-            m.release_ended_programs(1001.0)
+            m.release_out_of_window(1001.0)
             self.assertEqual(cancelled, ["A_QUOTE"])            # the earning quote goes
             self.assertEqual(shed.state, M.ST_LIVE)             # the shed stays
             self.assertNotIn(("T", "bid"), m.live_by_slot)
             self.assertIn(("T", "ask"), m.live_by_slot)
             self.assertNotIn("T", m.classified)                 # leaves the poll ranking
             # idempotent: a second pass does nothing
-            m.release_ended_programs(1002.0)
+            m.release_out_of_window(1002.0)
             self.assertEqual(cancelled, ["A_QUOTE"])
         finally:
             M.DATA_DIR, M.LEDGER_PATH, M.DRY = old
@@ -1957,7 +1957,7 @@ class RunwayGuardAndProgramEndRelease(unittest.TestCase):
             m.live_by_slot[("T", "bid")] = quote
             cancelled = []
             m.do_cancel = lambda oid: (cancelled.append(oid), (200, {"reduced_by": "0"}))[1]
-            m.release_ended_programs(1001.0)
+            m.release_out_of_window(1001.0)
             self.assertEqual(cancelled, [])
             self.assertIn(("T", "bid"), m.live_by_slot)
         finally:
@@ -2609,6 +2609,139 @@ class UnitAssertionIsAboutTheUnitNotAboutGas(unittest.TestCase):
         finally:
             M.DATA_DIR, M.LEDGER_PATH = old
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class WindowStartGuardAndPrepositioning(_RunnerCase):
+    """LIVE DEFECT: the allocator checked the window END and never the START, so v4 entered
+    three WNBA-mention slots whose programs open 10.5h later (15:00Z), locking ~$11 of a
+    BINDING ceiling while live-window PYPL posts were being refused on `collateral_ceiling`
+    in the same second.  Under a binding ceiling every non-earning dollar displaces an
+    earning dollar 1:1."""
+
+    def test_a_program_that_opens_in_10_hours_is_excluded(self):
+        far = M.Slot("KXWNBAMENTION-26JUL29", "bid", 6.25, 50.0, 0.02, hours_to_start=10.5)
+        self.assertFalse(M.preposition_ok(10.5))
+        al, spent = M.allocate([far], 45.0, BIG)
+        self.assertEqual(al[far.key], 0)
+        self.assertEqual(spent, 0.0)
+
+    def test_the_displaced_earning_slot_gets_the_capital_instead(self):
+        """The 1:1 displacement, made concrete: with the ceiling binding, the pre-start slot
+        was taking the dollars the live-window slot was then refused."""
+        far = M.Slot("WNBA", "bid", 6.25, 50.0, 0.02, hours_to_start=10.5)
+        live = M.Slot("PYPL", "bid", 6.25, 50.0, 0.02, hours_to_start=0.0)
+        al, spent = M.allocate([far, live], 11.0, M.Caps())
+        self.assertEqual(al[far.key], 0)
+        self.assertGreater(al[live.key], 0)
+        self.assertGreater(spent, 0.0)
+
+    def test_a_program_that_opens_in_10_minutes_is_allowed_under_the_lead(self):
+        """§6.1/6.2's land-grab is real -- the 6am gas open still gets first-mover quotes 15
+        minutes early, just never 10 hours early."""
+        self.assertEqual(M.PREPOSITION_LEAD_H, 0.25)
+        self.assertTrue(M.preposition_ok(10.0 / 60.0))
+        soon = M.Slot("KXAAAGASD", "bid", 6.25, 50.0, 0.02, hours_to_start=10.0 / 60.0)
+        self.assertGreater(M.allocate([soon], 45.0, BIG)[0][soon.key], 0)
+
+    def test_the_boundary_is_exactly_the_lead(self):
+        self.assertTrue(M.preposition_ok(0.25))
+        self.assertFalse(M.preposition_ok(0.2501))
+        self.assertTrue(M.preposition_ok(0.0))
+        at_lead = M.Slot("T", "bid", 6.25, 50.0, 0.02, hours_to_start=0.25)
+        past = M.Slot("T2", "bid", 6.25, 50.0, 0.02, hours_to_start=0.26)
+        self.assertGreater(M.allocate([at_lead], 45.0, BIG)[0][at_lead.key], 0)
+        self.assertEqual(M.allocate([past], 45.0, BIG)[0][past.key], 0)
+
+    def test_the_transition_at_start_ts_admits_the_slot(self):
+        """The same program, one poll before and one poll after its own start_ts."""
+        prog = {"program_id": "P1", "market_ticker": "T", "series": "KX",
+                "period_reward": 1000000.0, "target_size_fp": 10.0,
+                "discount_factor_bps": 5000.0, "start_ts": 10000.0,
+                "end_ts": 10000.0 + 16 * 3600.0, "paid_out": False}
+        book = {"orderbook": {"orderbook_fp": {
+            "yes_dollars": [["0.4000", "100"], ["0.3900", "100"]],
+            "no_dollars": [["0.5900", "100"], ["0.5800", "100"]]}}}
+        early, _ = M.slots_from_market(prog, book, 10000.0 - 10 * 3600.0)   # 10h before
+        self.assertAlmostEqual(early[0].hours_to_start, 10.0, places=6)
+        self.assertEqual(sum(M.allocate(early, 45.0, BIG)[0].values()), 0)
+        inside, _ = M.slots_from_market(prog, book, 10000.0 - 600.0)        # 10 min before
+        self.assertAlmostEqual(inside[0].hours_to_start, 10.0 / 60.0, places=6)
+        self.assertGreater(sum(M.allocate(inside, 45.0, BIG)[0].values()), 0)
+        started, _ = M.slots_from_market(prog, book, 10000.0)               # exactly at open
+        self.assertEqual(started[0].hours_to_start, 0.0)
+        self.assertGreater(sum(M.allocate(started, 45.0, BIG)[0].values()), 0)
+
+    # ---- release ---------------------------------------------------------------------
+    def _prog2(self, pid, ticker, start, end):
+        return {"program_id": pid, "market_ticker": ticker, "series": "KX",
+                "period_reward": 1000000.0, "target_size_fp": 1000.0,
+                "discount_factor_bps": 5000.0, "start_ts": start, "end_ts": end,
+                "paid_out": False}
+
+    def test_a_pre_start_market_has_its_non_closing_orders_released(self):
+        st = M.LedgerState()
+        st.positions = {"T": {"yes": 20.0, "no": 0.0}}
+        st.position_cost = {"T": 8.0}
+        st.position_cost_leg = {"T": {"yes": 8.0, "no": 0.0}}
+        quote = M.OrderState("A_QUOTE", "v4-c", "T", "bid", 0.40, 10, 0.0, 10.0)
+        shed = M.OrderState("B_SHED", "v4-c", "T", "ask", 0.42, 20, 0.0, 20.0)
+        st.orders["A_QUOTE"] = quote
+        st.orders["B_SHED"] = shed
+        m = M.Maker(None, st, [self._prog2("P1", "T", 100000.0, 200000.0)])   # far future
+        m.live_by_slot[("T", "bid")] = quote
+        m.live_by_slot[("T", "ask")] = shed
+        m.classified["T"] = {"rho": 6.25, "pinned": False, "denied": False, "sides": []}
+        cancelled = []
+        m.do_cancel = lambda oid: (cancelled.append(oid), (200, {"reduced_by": "10.00"}))[1]
+        m.release_out_of_window(1000.0)
+        self.assertEqual(cancelled, ["A_QUOTE"])          # the pre-start quote goes
+        self.assertEqual(shed.state, M.ST_LIVE)           # inventory still outlives it
+        self.assertNotIn("T", m.classified)
+        rows = [e for e in self.events() if e["event"] == "out_of_window_release"]
+        self.assertEqual(rows[0]["reason"], "pre_start")
+
+    def test_release_re_arms_when_the_program_actually_starts(self):
+        """A pre-start release must not be permanent -- the program WILL start, unlike an
+        ended one, and the market has to be re-enterable when it does."""
+        st = M.LedgerState()
+        m = M.Maker(None, st, [self._prog2("P1", "T", 5000.0, 90000.0)])
+        m.do_cancel = lambda oid: (200, {"reduced_by": "0.00"})
+        m.release_out_of_window(1000.0)                   # 4000s early: released
+        self.assertIn("P1", m.released)
+        m.release_out_of_window(5000.0)                   # now open: re-armed
+        self.assertNotIn("P1", m.released)
+
+    def test_an_ended_program_still_releases(self):
+        st = M.LedgerState()
+        quote = M.OrderState("A", "v4-c", "T", "bid", 0.40, 10, 0.0, 10.0)
+        st.orders["A"] = quote
+        m = M.Maker(None, st, [self._prog2("P1", "T", 0.0, 1000.0)])
+        m.live_by_slot[("T", "bid")] = quote
+        cancelled = []
+        m.do_cancel = lambda oid: (cancelled.append(oid), (200, {"reduced_by": "10.00"}))[1]
+        m.release_out_of_window(1001.0)
+        self.assertEqual(cancelled, ["A"])
+        rows = [e for e in self.events() if e["event"] == "out_of_window_release"]
+        self.assertEqual(rows[0]["reason"], "ended")
+
+    def test_an_earning_program_on_the_same_market_keeps_the_quotes(self):
+        st = M.LedgerState()
+        quote = M.OrderState("A", "v4-c", "T", "bid", 0.40, 10, 0.0, 10.0)
+        st.orders["A"] = quote
+        m = M.Maker(None, st, [self._prog2("P1", "T", 100000.0, 200000.0),   # pre-start
+                               self._prog2("P2", "T", 0.0, 90000.0)])        # earning now
+        m.live_by_slot[("T", "bid")] = quote
+        cancelled = []
+        m.do_cancel = lambda oid: (cancelled.append(oid), (200, {"reduced_by": "0"}))[1]
+        m.release_out_of_window(1000.0)
+        self.assertEqual(cancelled, [])
+        self.assertIn(("T", "bid"), m.live_by_slot)
+
+    def test_in_window_combines_both_ends(self):
+        self.assertTrue(M.in_window(0.0, 5.0))
+        self.assertTrue(M.in_window(0.2, 5.0))
+        self.assertFalse(M.in_window(10.5, 5.0))          # not started
+        self.assertFalse(M.in_window(0.0, 0.0))           # ended
 
 
 class StartupAssertions(unittest.TestCase):
