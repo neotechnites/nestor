@@ -8,7 +8,7 @@ Python 3.12 + requests + cryptography. Tests: `python3 -m unittest discover tool
     ssh ubuntu@VPS 'mkdir -p ~/nestor/data/lip && python3 ~/kalshi_data/scripts/lip_maker_v4.py --check'
 
 ## First-run checklist (all must pass before --live)
-0. **`python3 -m unittest discover tools/lip_maker_v4/` — 280 tests, must print `OK`.** Run it on the
+0. **`python3 -m unittest discover tools/lip_maker_v4/` — 299 tests, must print `OK`.** Run it on the
    VPS against the file you just scp'd, not only on the Mac.
 1. `--check` prints `[OK ]` for all four startup assertions: `env_and_pem`, `data_dir_writable`,
    `ledger_replay_clean`, `taker_exit_decision_matches_ceiling`, and **`unit_assertion_eq_100.00`** — at least 30
@@ -53,6 +53,11 @@ drop is a FAIL and blocks deploy.
 
 Inventory does not self-clear beyond the maker shed (`TAKER_EXIT_ENABLED=False`); at a $300 ceiling the
 startup assertion refuses to run until that decision is made explicitly.
+**Position divergence.** v4 reconciles against `GET /portfolio/positions` at startup and every
+600s. If the exchange and the ledger disagree on a market v4 has touched, it FREEZES that market
+(quoting and recycling) and pages with both numbers. There is deliberately no auto-import — the
+endpoint has no cost basis. Check the real position, fix the cause, then `--clear-freeze TICKER`.
+
 **Frozen market (§9.4b `assume_filled`)** — v4 froze quoting AND recycling on a market because a
 fill was unverifiable. Reconcile the position by hand on the exchange, then:
     python3 ~/kalshi_data/scripts/lip_maker_v4.py --clear-freeze KXXXX-26JUL28-4.100

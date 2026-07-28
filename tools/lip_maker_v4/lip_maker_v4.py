@@ -375,6 +375,21 @@ BOOK_SNAPSHOT_S = 30                    # §12.4 sample the window's OWN book ev
 
 # ---- restart / recovery (§9) ------------------------------------------------------------
 FILLS_REQUERY_DELAY_S = 36              # §9.4a 3x the ~12s worst observed index lag
+# POSITION RECONCILIATION against exchange truth (cold-audit #1).
+# Live evidence of the gap: the exchange holds a PYPL position (~$4) that v4's book has never
+# learned and now never will — its order was terminally mis-resolved as expired by a pre-B3
+# restart, and the §9.4 crash-gap window closed long ago.  Every other control in this file
+# reasons from the LEDGER, so a ledger that is wrong is invisible to all of them: the
+# recycler sheds against contracts we do not own, the ceiling under-reads, and the day stop
+# marks a position that is not there.  Nothing detects it, forever.
+# Cadence derivation.  LOWER bound: the positions index is eventually consistent (R169), so
+# polling faster than it converges manufactures false divergences, and a false freeze is a
+# self-inflicted outage — §9.4a already prices that lag class at 36s, so the floor is well
+# above it.  UPPER bound: undetected divergence is exposure, and at the §4.1 hot-slot rate of
+# ~8 fills/h, 600s is ~1.3 fills of drift before we notice.  600s sits ~16x above the lag
+# constant and ~1 fill below meaningful exposure, and nests inside every other cadence here
+# (SHED_PATIENCE_S 1800, PAID_OUT_POLL_S 1800, CLASSIFY_REFRESH_S 900).
+RECON_POSITIONS_S = 600
 CRASH_GAP_LOOKBACK_S = 60               # §9.4(4) fills query over [last_ledger_ts-60s, now]
 # C10: in-memory retention of TERMINAL orders.  closing_room()/resting_collateral() walk
 # st.orders on every placement, so an unbounded dict makes a multi-day run quadratic.  400
@@ -1026,6 +1041,58 @@ def ws_compare(ws_body, rest_body):
     if wb != rb or wa != ra:
         return WS_DIVERGE, detail
     return WS_AGREE, detail
+
+
+def parse_exchange_positions(body):
+    """{ticker: net_yes_contracts} from GET /portfolio/positions.
+
+    Tolerant of the envelope and of the field naming, because getting this WRONG in the
+    permissive direction (reading zero where a position exists) reproduces the exact defect
+    it is here to catch: a missing key must not silently look like a flat book.
+    """
+    out = {}
+    if not isinstance(body, dict):
+        return out
+    rows = body.get("market_positions")
+    if rows is None:
+        rows = body.get("positions")
+    if not isinstance(rows, (list, tuple)):
+        return out
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        tk = r.get("ticker") or r.get("market_ticker")
+        if not tk:
+            continue
+        qty = None
+        for k in ("position", "net_position", "quantity", "market_position"):
+            if r.get(k) is not None:
+                qty = num(r.get(k), None)
+                break
+        if qty is None:
+            continue
+        out[str(tk)] = float(qty)
+    return out
+
+
+def position_divergences(exchange_net, ledger_net, known_tickers, tol=0.5):
+    """Compare exchange truth against the ledger, ATTRIBUTED to us.
+
+    The account is shared (§13.4 — the subaccount does not exist yet), so a position on a
+    market v4 has never touched is nestor's or the operator's business and is ignored
+    outright.  A market v4 HAS touched is ours to explain, in both directions: the exchange
+    holding what we do not know about, AND us believing in a position the exchange does not
+    have.  `tol` is half a contract — positions are integral, so anything at or above this
+    is a real disagreement rather than a rounding artefact.
+    """
+    out = []
+    for tk in sorted(set(known_tickers)):
+        ex = float(exchange_net.get(tk, 0.0))
+        led = float(ledger_net.get(tk, 0.0))
+        if abs(ex - led) >= tol:
+            out.append({"ticker": tk, "exchange_net": ex, "ledger_net": led,
+                        "delta": ex - led})
+    return out
 
 
 def unpriced_positions(positions, yes_mids):
@@ -1871,6 +1938,16 @@ class LedgerState(object):
             opening += open_qty * unit_collateral(o.side, o.price)
         return held + opening
 
+    def known_tickers(self):
+        """Every market this ledger has ANY history on — the attribution rule for a shared
+        account.  Orders and positions and filled_cum all count: a market we placed on and
+        then flattened is still ours to explain if the exchange disagrees."""
+        out = set(self.positions.keys())
+        out.update(t for t, _ in self.filled_cum.keys())
+        out.update(o.ticker for o in self.orders.values())
+        out.update(self.assume_filled)
+        return {t for t in out if t}
+
     def net_position(self, ticker):
         pos = self.positions.get(ticker, {})
         return pos.get("yes", 0.0) - pos.get("no", 0.0)
@@ -2112,6 +2189,15 @@ def ledger_replay(records):
                 st._credit_fill(o, n)
                 if str(oid) in st.unresolved_404:
                     st.unresolved_404.remove(str(oid))
+        elif kind == "position_divergence":
+            # The exchange and the ledger disagree about a market we have touched.  Freeze
+            # it for QUOTING AND RECYCLING both (§9.4b's mechanism, same reasoning): acting
+            # on a position we cannot account for is how a bookkeeping gap becomes a real
+            # naked short.  Deliberately NO auto-import — the positions endpoint carries no
+            # cost basis, so importing would mean synthesising one, and a synthesised basis
+            # is a worse lie than a known gap.  Clears only on an operator record.
+            st.assume_filled.add(rec.get("ticker"))
+            st.poisoned.add(rec.get("ticker"))
         elif kind == "assume_filled_clear":
             # §9.4b — clears ONLY on an explicit operator record.
             st.assume_filled.discard(rec.get("ticker"))
@@ -2589,10 +2675,15 @@ def startup_assertions(auth, auth_note, programs=None):
     decision = str(TAKER_EXIT_DECISION or "undecided").strip().lower()
     needs_decision = MAX_TOTAL_COLLATERAL_USD >= TAKER_EXIT_REQUIRED_ABOVE_USD
     ok_taker = (not needs_decision) or decision in ("on", "off_accepted")
+    # N1 — the implication is UNCONDITIONAL, at any ceiling: code that crosses the spread
+    # may only be armed by a RECORDED decision.  Previously $65/undecided/enabled passed,
+    # because the ceiling gate never fired below the rung — so the one combination that
+    # spends money with nobody's name on it was the one nothing checked.  This subsumes the
+    # off_accepted+enabled case (off_accepted != "on").
+    if TAKER_EXIT_ENABLED and decision != "on":
+        ok_taker = False
     if decision == "on" and not TAKER_EXIT_ENABLED:
         ok_taker = False                       # the decision and the flag must agree
-    if decision == "off_accepted" and TAKER_EXIT_ENABLED:
-        ok_taker = False
     results.append((
         "taker_exit_decision_matches_ceiling", ok_taker,
         "ceiling=$%.2f decision=%s enabled=%s (an explicit decision is REQUIRED at or "
@@ -2646,6 +2737,8 @@ class Maker(object):
         self.ws_agreements = {}         # W2: ticker -> consecutive ws/rest agreements
         self.ws_verified_ts = {}        # W2: ticker -> last comparison
         self.ws_divergences = {}        # W2: ticker -> lifetime divergences
+        self.last_position_recon = 0.0  # cold-audit #1: last exchange reconciliation
+        self.ws_epoch = 0               # N2: feed reconnect generation
         self.recon_written = set()      # §12.1 program rows already written
         self.recon_alerted = set()      # §7.3a alerts already sent (once each)
         self.credit_reminder_day = None # R1: last date the ritual reminder fired
@@ -3035,6 +3128,9 @@ class Maker(object):
                     self.st.apply_fill(f.get("ticker"), leg, cnt, px_c / 100.0, sign)
             else:
                 log("crash_gap_query_failed", lo=lo, hi=hi)
+        # Startup reconciliation: the ledger has just been rebuilt from disk, so this is the
+        # first and best moment to ask the exchange whether it agrees.
+        self.reconcile_positions(_now(), force=True)
         log("restart_recovered", collateral=round(self.st.collateral, 4),
             filled_cum={"%s|%s" % k: v for k, v in self.st.filled_cum.items()},
             positions=self.st.positions, frozen=sorted(self.st.assume_filled))
@@ -3468,9 +3564,20 @@ class Maker(object):
         if not WS_ENABLED or mod is None or self.ws is None:
             return None
         try:
-            return mod.ws_book_or_none(ticker)
+            body = mod.ws_book_or_none(ticker)
         except Exception:
-            return None
+            body = None
+        if body is None and self.ws_agreements.get(ticker, 0):
+            # N2 — the feed withheld a book it had been TRUSTED for: a socket drop, a seq
+            # gap, corruption or staleness.  Trust must not survive that.  A reconnect
+            # resubscribes and re-snapshots, and a bad resubscribe snapshot arriving into
+            # retained trust is exactly the unverified book driving quotes that W2 exists to
+            # prevent — the gap is the moment the gate matters most, not a moment to skip it.
+            log("ws_trust_reset", ticker=ticker,
+                agreements_lost=self.ws_agreements.get(ticker, 0),
+                why="feed withheld a book for a trusted market; re-proof required")
+            self.ws_agreements[ticker] = 0
+        return body
 
     def ws_trusted(self, ticker, now):
         """W2 — may the WS book price a quote for this market right now?  Only after
@@ -3478,6 +3585,18 @@ class Maker(object):
         scheduled re-verification falls due."""
         if not WS_ENABLED:
             return False
+        # N2 — a reconnect invalidates every agreement proven on the old socket.
+        try:
+            epoch = self.ws.reproof_epoch() if self.ws is not None else 0
+        except Exception:
+            epoch = 0
+        if epoch != self.ws_epoch:
+            if self.ws_agreements:
+                log("ws_trust_reset_all", was_epoch=self.ws_epoch, now_epoch=epoch,
+                    markets=sorted(self.ws_agreements),
+                    why="socket reconnected; every agreement must be re-proven")
+            self.ws_epoch = epoch
+            self.ws_agreements.clear()
         if self.ws_agreements.get(ticker, 0) < WS_AGREE_REQUIRED:
             return False
         last = self.ws_verified_ts.get(ticker, 0.0)
@@ -3736,6 +3855,69 @@ class Maker(object):
                    if self.slot_program.get(k) == program_id)
         return (at_best / rest) if rest > 0 else 0.0
 
+    def reconcile_positions(self, now, force=False):
+        """Cold-audit #1 — compare EXCHANGE TRUTH against the ledger, on startup and every
+        RECON_POSITIONS_S.
+
+        THE R169 DISTINCTION, and the reason this is the one sanctioned read of the
+        positions index.  §8.6 forbids the resting-orders and positions indexes as
+        SELF-KNOWLEDGE FOR TRADING DECISIONS: they are eventually consistent, so v1 trusted
+        them and stacked 13 orders on one rung.  Nothing here decides anything to trade.
+        This is RECONCILIATION — the index is the only statement the exchange makes about
+        what we actually hold, and comparing our books to it is precisely what v1 never did.
+        The output is never a quote; it is a FREEZE and a page.
+
+        NO AUTO-IMPORT.  The positions endpoint carries no cost basis, so importing would
+        mean synthesising one, and tonight proved hand-synthesised books get worse rather
+        than better.  Freeze and page is the correct v1 behaviour.
+        """
+        if not force and (now - self.last_position_recon) < RECON_POSITIONS_S:
+            return None
+        self.last_position_recon = now
+        if self.auth is None or DRY:
+            return None
+        try:
+            st_code, body = signed(self.auth, "GET", "/portfolio/positions",
+                                   params={"limit": 1000})
+        except Exception as exc:
+            # This runs inside restart_recovery.  A diagnostic must never be the thing that
+            # takes down recovery — failing to reconcile leaves us exactly where we were,
+            # while raising here would strand the orders the sweep exists to cancel.
+            log("position_recon_failed", err="%s: %s" % (type(exc).__name__, exc))
+            return None
+        if st_code != 200:
+            log("position_recon_failed", http=st_code)
+            return None
+        exchange = parse_exchange_positions(body)
+        known = self.st.known_tickers()
+        ledger = {t: self.st.net_position(t) for t in known}
+        divs = position_divergences(exchange, ledger, known)
+        log("position_recon", n_exchange=len(exchange), n_known=len(known),
+            n_divergent=len(divs),
+            ignored_not_ours=sorted(set(exchange) - known)[:10])
+        for d in divs:
+            tk = d["ticker"]
+            if tk in self.st.assume_filled:
+                continue                            # already frozen; do not re-page
+            log("position_divergence", k="position_divergence", ticker=tk,
+                exchange_net=d["exchange_net"], ledger_net=d["ledger_net"],
+                delta=d["delta"],
+                why="exchange and ledger disagree on a market v4 has touched; frozen for "
+                    "quoting AND recycling, no auto-import (basis unknowable)")
+            self.st.assume_filled.add(tk)
+            self.st.poisoned.add(tk)
+            cur = self.live_by_slot.pop((tk, "bid"), None)
+            if cur is not None:
+                self.cancel(cur)
+            cur = self.live_by_slot.pop((tk, "ask"), None)
+            if cur is not None:
+                self.cancel(cur)
+            ntfy("LIP v4 POSITION DIVERGENCE %s" % tk,
+                 "exchange holds %.2f, ledger says %.2f (delta %.2f). Market FROZEN for "
+                 "quoting and recycling. Reconcile by hand, then --clear-freeze %s"
+                 % (d["exchange_net"], d["ledger_net"], d["delta"], tk))
+        return divs
+
     def sweep_unknown_orders(self, now):
         """D7 — an order stuck ST_UNKNOWN holds collateral and blocks its market forever.
         Retry the cancel on a cadence; after UNKNOWN_MAX_RETRIES give up and book the
@@ -3830,6 +4012,7 @@ class Maker(object):
         # §4.6 CLASSIFY-THEN-CLAMP (B1).  The 1 Hz REST budget covers 6 markets; WHICH 6 is
         # decided by the classification sweep, not by rho (degenerate inside one event —
         # see the CLASSIFY_* block).  Pinned markets are excluded outright.
+        self.reconcile_positions(now)                 # cold-audit #1: exchange truth
         self.poll_paid_out(now)                       # §7.3 / §12.3 (Phase 2)
         if self.stopping:
             return

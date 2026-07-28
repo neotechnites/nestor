@@ -510,6 +510,39 @@ class ConsumerSeam(unittest.TestCase):
         self.assertGreater(len(chosen), M.MAX_REST_MARKETS)  # breadth really did lift
 
 
+class N2_ReconnectCostsTrust(unittest.TestCase):
+
+    def test_the_feed_bumps_a_reproof_epoch_on_every_connect(self):
+        f = W.WsFeed(auth=None, tickers=[T])
+        self.assertEqual(f.reproof_epoch(), 0)
+        f.on_open()
+        self.assertEqual(f.reproof_epoch(), 1)
+        f.on_close("dropped")
+        f.on_open()
+        self.assertEqual(f.reproof_epoch(), 2)
+
+    def test_a_reconnect_drops_every_markets_trust_in_the_consumer(self):
+        """A reconnect resubscribes and re-snapshots; a bad resubscribe snapshot arriving
+        into RETAINED trust is exactly the unverified book driving quotes that W2 exists to
+        prevent.  The gap is when the gate matters most, not a moment to skip it."""
+        old = M.WS_ENABLED
+        try:
+            M.WS_ENABLED = True
+            feed = W.WsFeed(auth=None, tickers=[T])
+            feed.on_open()
+            m = M.Maker(None, M.LedgerState(), [])
+            m.ws = feed
+            m.ws_epoch = feed.reproof_epoch()
+            m.ws_agreements[T] = M.WS_AGREE_REQUIRED
+            m.ws_verified_ts[T] = 1000.0
+            self.assertTrue(m.ws_trusted(T, 1000.0))
+            feed.on_close("socket dropped")
+            feed.on_open()                        # epoch moves
+            self.assertFalse(m.ws_trusted(T, 1000.0))
+            self.assertEqual(m.ws_agreements.get(T, 0), 0)
+        finally:
+            M.WS_ENABLED = old
+
 class AuthSigning(unittest.TestCase):
 
     def test_the_ws_signature_covers_the_ws_path_and_excludes_any_query(self):

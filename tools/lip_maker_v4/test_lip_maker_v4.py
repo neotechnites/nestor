@@ -3795,6 +3795,248 @@ class FinalGate_R1_CreditsRitual(_RunnerCase):
         self.assertEqual(M.CREDIT_RITUAL_HOUR_UTC, 22)
 
 
+class PositionReconciliation(_RunnerCase):
+    """Cold audit #1.  Every other control in this file reasons from the LEDGER, so a ledger
+    that is wrong is invisible to all of them: the recycler sheds against contracts we do not
+    own, the ceiling under-reads, the day stop marks a position that is not there.  Live
+    evidence: the exchange holds a PYPL position (~$4) v4's book never learned and never
+    will — its order was terminally mis-resolved as expired by a pre-B3 restart and the §9.4
+    crash-gap window closed long ago."""
+
+    def _maker(self, exchange_rows, ledger=None):
+        st = M.LedgerState()
+        for tk, n in (ledger or {}).items():
+            st.positions[tk] = {"yes": max(0.0, n), "no": max(0.0, -n)}
+            st.position_cost[tk] = abs(n) * 0.40
+            st.position_cost_leg[tk] = {"yes": max(0.0, n) * 0.40,
+                                        "no": max(0.0, -n) * 0.40}
+        auth = type("A", (), {"headers": lambda self, m, p: {}})()
+        m = M.Maker(auth, st, [])
+        m.do_cancel = lambda oid: (200, {"reduced_by": "0.00"})
+        self._body = {"market_positions": exchange_rows}
+        return m
+
+    def _run(self, m, now=1000.0):
+        old = M.signed
+        try:
+            M.signed = lambda *a, **k: (200, self._body)
+            return m.reconcile_positions(now, force=True)
+        finally:
+            M.signed = old
+
+    # ---- pure layer -----------------------------------------------------------------
+    def test_the_positions_payload_is_parsed_tolerantly(self):
+        """Reading zero where a position EXISTS reproduces the exact defect this catches, so
+        a missing key must never silently look like a flat book."""
+        self.assertEqual(M.parse_exchange_positions(
+            {"market_positions": [{"ticker": "T", "position": 25}]}), {"T": 25.0})
+        self.assertEqual(M.parse_exchange_positions(
+            {"positions": [{"market_ticker": "T", "net_position": -8}]}), {"T": -8.0})
+        for junk in (None, {}, {"market_positions": "x"}, {"market_positions": [None]},
+                     {"market_positions": [{"ticker": "T"}]}):
+            self.assertEqual(M.parse_exchange_positions(junk), {})
+
+    def test_divergence_is_attributed_only_to_markets_v4_has_touched(self):
+        ex = {"OURS": 25.0, "THEIRS": 500.0}
+        led = {"OURS": 0.0}
+        divs = M.position_divergences(ex, led, {"OURS"})
+        self.assertEqual([d["ticker"] for d in divs], ["OURS"])
+        self.assertAlmostEqual(divs[0]["delta"], 25.0, places=6)
+
+    def test_it_diverges_in_BOTH_directions(self):
+        """The exchange holding what we do not know about, AND us believing in a position
+        the exchange does not have."""
+        self.assertEqual(len(M.position_divergences({"T": 25.0}, {"T": 0.0}, {"T"})), 1)
+        self.assertEqual(len(M.position_divergences({}, {"T": 25.0}, {"T"})), 1)
+        self.assertEqual(M.position_divergences({"T": 25.0}, {"T": 25.0}, {"T"}), [])
+
+    def test_known_tickers_is_the_attribution_rule(self):
+        st = M.LedgerState()
+        st.orders["O1"] = M.OrderState("O1", "c", "FROM_ORDER", "bid", 0.4, 10, 0.0, 10.0)
+        st.positions["FROM_POS"] = {"yes": 5.0, "no": 0.0}
+        st.filled_cum[("FROM_FILL", "bid")] = 3.0
+        st.assume_filled.add("FROM_FREEZE")
+        known = st.known_tickers()
+        for t in ("FROM_ORDER", "FROM_POS", "FROM_FILL", "FROM_FREEZE"):
+            self.assertIn(t, known)
+        self.assertNotIn("NEVER_TOUCHED", known)
+
+    # ---- wired layer ----------------------------------------------------------------
+    def test_a_divergence_freezes_the_market_and_alerts(self):
+        m = self._maker([{"ticker": "KXPYPL-1", "position": 10}], ledger={})
+        m.st.filled_cum[("KXPYPL-1", "bid")] = 0.0     # v4 history: we touched it
+        divs = self._run(m)
+        self.assertEqual(len(divs), 1)
+        self.assertIn("KXPYPL-1", m.st.assume_filled)  # frozen for quoting AND recycling
+        self.assertIn("KXPYPL-1", m.st.poisoned)
+        row = [e for e in self.events() if e["event"] == "position_divergence"][0]
+        self.assertEqual(row["exchange_net"], 10.0)
+        self.assertEqual(row["ledger_net"], 0.0)       # BOTH numbers reported
+
+    def test_the_freeze_stops_the_recycler_not_just_quoting(self):
+        m = self._maker([{"ticker": "T", "position": 10}], ledger={})
+        m.st.filled_cum[("T", "bid")] = 0.0
+        self._run(m)
+        action, info = M.recycle(10, 0, 0.41, 0.40, 8.0, 0.00625, 1.87,
+                                 assume_filled="T" in m.st.assume_filled)
+        self.assertEqual(action, M.NO_ACTION)
+        s = M.Slot("T", "bid", 6.25, 50.0, 0.02, assume_filled=True)
+        self.assertEqual(M.allocate([s], 45.0, BIG)[0][s.key], 0)
+
+    def test_agreement_passes_quietly(self):
+        m = self._maker([{"ticker": "T", "position": 25}], ledger={"T": 25.0})
+        divs = self._run(m)
+        self.assertEqual(divs, [])
+        self.assertNotIn("T", m.st.assume_filled)
+        self.assertEqual([e for e in self.events()
+                          if e["event"] == "position_divergence"], [])
+
+    def test_a_shared_account_position_with_no_v4_history_is_ignored(self):
+        """§13.4 — the subaccount does not exist yet, so nestor's and the operator's
+        positions live in the same account and are none of v4's business."""
+        m = self._maker([{"ticker": "NESTOR-THING", "position": 500}], ledger={})
+        divs = self._run(m)
+        self.assertEqual(divs, [])
+        self.assertNotIn("NESTOR-THING", m.st.assume_filled)
+        row = [e for e in self.events() if e["event"] == "position_recon"][0]
+        self.assertIn("NESTOR-THING", row["ignored_not_ours"])
+
+    def test_there_is_NO_auto_import(self):
+        """The positions endpoint carries no cost basis, so importing means SYNTHESISING
+        one — and tonight proved hand-synthesised books get worse, not better."""
+        m = self._maker([{"ticker": "T", "position": 10}], ledger={})
+        m.st.filled_cum[("T", "bid")] = 0.0
+        self._run(m)
+        self.assertEqual(m.st.net_position("T"), 0.0)        # ledger untouched
+        self.assertEqual(m.st.position_cost.get("T", 0.0), 0.0)
+
+    def test_it_does_not_re_page_an_already_frozen_market(self):
+        m = self._maker([{"ticker": "T", "position": 10}], ledger={})
+        m.st.filled_cum[("T", "bid")] = 0.0
+        self._run(m, 1000.0)
+        self._run(m, 2000.0)
+        self.assertEqual(len([e for e in self.events()
+                              if e["event"] == "position_divergence"]), 1)
+
+    def test_the_freeze_survives_replay(self):
+        m = self._maker([{"ticker": "T", "position": 10}], ledger={})
+        m.st.filled_cum[("T", "bid")] = 0.0
+        self._run(m)
+        st = M.ledger_replay(self.events())
+        self.assertIn("T", st.assume_filled)
+        self.assertIn("T", st.poisoned)
+        # and clears only on the operator record (§9.4b / C11)
+        cleared = M.ledger_replay(self.events() + [{"k": "assume_filled_clear",
+                                                    "t": 9e9, "ticker": "T"}])
+        self.assertNotIn("T", cleared.assume_filled)
+
+    def test_it_is_throttled_but_forced_at_startup(self):
+        m = self._maker([], ledger={})
+        old = M.signed
+        try:
+            M.signed = lambda *a, **k: (200, self._body)
+            self.assertIsNotNone(m.reconcile_positions(1000.0, force=True))
+            self.assertIsNone(m.reconcile_positions(1000.0 + 10))
+            self.assertIsNotNone(
+                m.reconcile_positions(1000.0 + M.RECON_POSITIONS_S + 1))
+        finally:
+            M.signed = old
+        self.assertGreater(M.RECON_POSITIONS_S, M.FILLS_REQUERY_DELAY_S)
+
+    def test_a_failed_query_never_breaks_recovery(self):
+        m = self._maker([], ledger={})
+        old = M.signed
+        try:
+            M.signed = lambda *a, **k: (500, {})
+            self.assertIsNone(m.reconcile_positions(1000.0, force=True))
+            M.signed = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+            self.assertIsNone(m.reconcile_positions(2000.0, force=True))
+        finally:
+            M.signed = old
+        self.assertIn("position_recon_failed", [e["event"] for e in self.events()])
+
+
+class Addendum_N1_N2(_RunnerCase):
+
+    def test_N1_arming_the_taker_exit_without_a_decision_refuses_at_ANY_ceiling(self):
+        """The one combination that spends money with nobody's name on it was the one
+        nothing checked: below the rung the ceiling gate never fired."""
+        tmp = tempfile.mkdtemp()
+        old = (M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_ENABLED, M.TAKER_EXIT_DECISION)
+        try:
+            for ceiling in (45.0, 65.0, 300.0):
+                M.MAX_TOTAL_COLLATERAL_USD = ceiling
+                M.TAKER_EXIT_ENABLED = True
+                M.TAKER_EXIT_DECISION = "undecided"
+                ok, res = M.startup_assertions(None, "n/a", programs=unit_progs(40))
+                names = {n: g for n, g, _ in res}
+                self.assertFalse(names["taker_exit_decision_matches_ceiling"],
+                                 "ceiling=%s" % ceiling)
+                M.TAKER_EXIT_DECISION = "off_accepted"
+                ok2, res2 = M.startup_assertions(None, "n/a", programs=unit_progs(40))
+                names2 = {n: g for n, g, _ in res2}
+                self.assertFalse(names2["taker_exit_decision_matches_ceiling"])
+                M.TAKER_EXIT_DECISION = "on"
+                ok3, res3 = M.startup_assertions(None, "n/a", programs=unit_progs(40))
+                names3 = {n: g for n, g, _ in res3}
+                self.assertTrue(names3["taker_exit_decision_matches_ceiling"])
+        finally:
+            (M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_ENABLED,
+             M.TAKER_EXIT_DECISION) = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_N1_disarmed_and_undecided_is_still_fine_below_the_rung(self):
+        old = (M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_ENABLED, M.TAKER_EXIT_DECISION)
+        try:
+            M.MAX_TOTAL_COLLATERAL_USD = 65.0
+            M.TAKER_EXIT_ENABLED = False
+            M.TAKER_EXIT_DECISION = "undecided"
+            ok, res = M.startup_assertions(None, "n/a", programs=unit_progs(40))
+            self.assertTrue({n: g for n, g, _ in res}
+                            ["taker_exit_decision_matches_ceiling"])
+        finally:
+            (M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_ENABLED,
+             M.TAKER_EXIT_DECISION) = old
+
+    def test_N2_a_withheld_book_costs_a_trusted_market_its_trust(self):
+        """A reconnect resubscribes and re-snapshots, and a bad resubscribe snapshot
+        arriving into RETAINED trust is exactly the unverified book driving quotes that W2
+        exists to prevent.  The gap is when the gate matters most."""
+        old_en, old_mod, old_tried = M.WS_ENABLED, M._WS_FEED, M._WS_IMPORT_TRIED
+        try:
+            M.WS_ENABLED = True
+            m = M.Maker(None, M.LedgerState(), [])
+            m.ws = object()
+            m.ws_agreements["T"] = M.WS_AGREE_REQUIRED
+            m.ws_verified_ts["T"] = 1000.0
+            self.assertTrue(m.ws_trusted("T", 1000.0))
+            M._WS_FEED = type("Mod", (), {"ws_book_or_none": staticmethod(
+                lambda t, n=None: None)})()
+            M._WS_IMPORT_TRIED = True
+            self.assertIsNone(m.ws_book("T"))
+            self.assertEqual(m.ws_agreements["T"], 0)     # trust dropped
+            self.assertFalse(m.ws_trusted("T", 1000.0))
+            self.assertIn("ws_trust_reset", [e["event"] for e in self.events()])
+        finally:
+            M.WS_ENABLED, M._WS_FEED, M._WS_IMPORT_TRIED = old_en, old_mod, old_tried
+
+    def test_N2_an_untrusted_market_does_not_spam_the_log(self):
+        old_en, old_mod, old_tried = M.WS_ENABLED, M._WS_FEED, M._WS_IMPORT_TRIED
+        try:
+            M.WS_ENABLED = True
+            m = M.Maker(None, M.LedgerState(), [])
+            m.ws = object()
+            M._WS_FEED = type("Mod", (), {"ws_book_or_none": staticmethod(
+                lambda t, n=None: None)})()
+            M._WS_IMPORT_TRIED = True
+            for _ in range(5):
+                self.assertIsNone(m.ws_book("T"))
+            self.assertEqual([e for e in self.events()
+                              if e["event"] == "ws_trust_reset"], [])
+        finally:
+            M.WS_ENABLED, M._WS_FEED, M._WS_IMPORT_TRIED = old_en, old_mod, old_tried
+
+
 class StartupAssertions(unittest.TestCase):
 
     def test_unit_assertion_refuses_a_wrong_unit(self):

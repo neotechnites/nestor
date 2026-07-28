@@ -528,6 +528,7 @@ class WsFeed(object):
         self._seq = SeqTracker()
         self._sid_tickers = {}          # sid -> tuple of tickers that subscription covers
         self._cmd_id = 0
+        self._reproof_epoch = 0
         self._connected = False
         self._liveness_ts = 0.0         # last time the reader confirmed the socket open
         self._last_msg_ts = 0.0
@@ -607,7 +608,13 @@ class WsFeed(object):
             self._seq.forget()
             self._sid_tickers.clear()
             self._need_resubscribe = True
-        self._log("ws_connect", url=self._url, n_tickers=len(self.tickers))
+            self._reproof_epoch += 1
+        # N2 — a reconnect invalidates every prior agreement.  The consumer's W2 gate keys
+        # off this epoch, so trust cannot survive a socket that went away and came back:
+        # a bad resubscribe snapshot arriving into retained trust is the unverified book
+        # driving quotes that the gate exists to prevent.
+        self._log("ws_connect", url=self._url, n_tickers=len(self.tickers),
+                  reproof_epoch=self._reproof_epoch)
 
     def on_close(self, reason="", now=None):
         """The socket went away.  `connected` goes False and books_for() returns {} at once --
@@ -772,6 +779,12 @@ class WsFeed(object):
         return tuple(tickers)
 
     # -- accessors the consumer calls ----------------------------------------------------
+    def reproof_epoch(self):
+        """N2 — increments on every connect.  A consumer that cached "this market's book is
+        trusted" must re-prove whenever this changes."""
+        with self._lock:
+            return self._reproof_epoch
+
     def needs_resubscribe(self):
         """True when the feed knows its subscription state is untrustworthy — after a
         connect, a seq gap, a corruption, or a resubscribe request.  Exposed because it is
