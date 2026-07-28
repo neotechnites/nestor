@@ -530,6 +530,7 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
     for _cliff_pass in range(int(C.MAX_GATE_PASSES)):
         elig = [x for x in elig if x.key not in cliff_dead]
         unaffordable = set()
+        _why, _ex = {}, []          # WHY each slot was passed over — one line per cycle
         last_rate = 0.0
         guard = 0
         while True:
@@ -543,11 +544,14 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
                 q = alloc[s.key]
                 # v1 §8.1: the per-slot cap binds NET exposure — held inventory + resting.
                 if held.get(s.key, 0.0) + q + 1 > n_cap(s.p, caps):
+                    _why["slot_cap"] = _why.get("slot_cap", 0) + 1
                     continue
                 if per_market.get(s.ticker, 0.0) + s.p > market_cap_usd(s, budget_usd, caps) + 1e-9:
+                    _why["market_cap"] = _why.get("market_cap", 0) + 1
                     continue
                 vcap = venue_caps.get(s.venue)
                 if vcap is not None and per_venue.get(s.venue, 0.0) + s.p > float(vcap) + 1e-9:
+                    _why["venue_cap"] = _why.get("venue_cap", 0) + 1
                     continue
                 # NEW-1b: the cluster cap `place()` will apply, applied HERE so the plan is
                 # fundable.  Caps do not compose (clusters.py's own note): a cluster spanning
@@ -555,10 +559,21 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
                 # the one above.
                 if cluster_cap_usd is not None and \
                         per_cluster.get(_cluster_key(s), 0.0) + s.p > float(cluster_cap_usd) + 1e-9:
+                    _why["cluster_cap"] = _why.get("cluster_cap", 0) + 1
                     continue
                 # ---- THE ONE SUBSTITUTION (spec §1.3): (★) replaces v1 §2.2's hurdle line ----
                 r = s.net_at(q, r_star)
                 if not M.admits(r, floor_rate):
+                    _why["below_hurdle"] = _why.get("below_hurdle", 0) + 1
+                    if len(_ex) < 3:
+                        t = M.net_terms(s.rho, s.S, s.p, q, s.phi, s.d, s.l_eff, r_star,
+                                        s.t_hat)
+                        _ex.append({"tk": s.ticker, "side": s.side,
+                                    "net": round(t["net"], 6), "gross": round(t["gross"], 6),
+                                    "carry": round(t["carry"], 6),
+                                    "drift": round(t["drift"], 6),
+                                    "t_hat": round(t["t_hat"], 3), "S": round(s.S, 1),
+                                    "p": s.p, "rho": round(s.rho, 4)})
                     continue
                 # -------------------------------------------------------------------------------
                 if r > best_rate + 1e-15 or (abs(r - best_rate) <= 1e-15 and best is not None
@@ -647,6 +662,14 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
             freed_any = freed_any or freed > 0
             R.log("below_cliff_dropped", ticker=sl.ticker, side=sl.side, had=q_now,
                   needed=q_min, freed_usd=round(freed, 4))
+        # WHY THE BOOK IS THE SIZE IT IS.  Four hours of eliminating one candidate per deploy
+        # cycle is what this line replaces: it names the term that passed each slot over, and
+        # carries three worked examples so the numbers can be argued with directly.
+        if _why:
+            R.log("alloc_reasons", eligible=len(elig), spent=round(spent, 2),
+                  r_star=round(r_star, 6), **{k: v for k, v in sorted(_why.items())})
+            for e in _ex:
+                R.log("alloc_example", **e)
         # Nothing pruned ⇒ the plan is stable; anything pruned ⇒ re-water-fill its dollars.
         if not freed_any:
             break

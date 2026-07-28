@@ -521,7 +521,22 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             fills = int(t.get("fills_ct", 0))
             rest_ch = float(t.get("rest_contract_hours",
                                   P.rest_contract_hours(rows, key) if rows else 0.0))
-            phi = M.phi_estimate(fills, rest_ch, p=p)
+            # THE FILL-RATE SEED MUST REFLECT THE EVIDENCE WE ALREADY HAVE.  With no tape of
+            # our own, phi falls back to PHI_SEED_MID = 0.08 fills/hour/resting-contract —
+            # a v1 guess, flagged UNDERIVED, describing a BUSY book.  Since the ratchet was
+            # generalized that seed gates admission, and it prices every fresh venue out:
+            # measured live, gross 0.005-0.02 against carry 0.012 + drift 0.011-0.062, so
+            # every unmeasured venue was pre-judged unprofitable before a single observation.
+            #
+            # But P6 already asked the exchange "does ANYONE trade here?", and a venue with no
+            # public trades in P6_LOOKBACK_DAYS cannot be filling us at 0.08/h — that is the
+            # definition of a quiet book, and note 43 §4 says a quiet book is where presence
+            # is the product.  So the seed follows the tape: untraded ⇒ the CHEAP seed.
+            # This is still a seed: one venue-hour of our OWN fills overrides it via the
+            # Rule of Three, which is an upper bound and errs toward refusing.
+            quiet = (p6 is not None and not p6(ticker))
+            phi = M.phi_estimate(fills, rest_ch,
+                                 p=(C.PHI_CHEAP_PRICE_CUT / 2.0) if quiet else p)
             d = M.d_estimate(t.get("drift_samples"), p)
             l_eff = M.l_eff_h(close_ts, now,
                               (l_shed or {}).get(key), settled=False)
