@@ -114,6 +114,9 @@ class Maker(object):
         self.readings_line = 0               # SF-4: v5_readings.jsonl lines consumed
         self._readings_stat = None           # (mtime, size) — skip unchanged files
         self.close_cache = {}                # ticker -> close_ts (halted closing pass)
+        self.resolved = set()                # tickers whose market is determined/settled:
+                                             # outcome fixed, no variance left, so they hold
+                                             # no CLUSTER risk — only pending cash
 
     # =========================================================================================
     # STARTUP
@@ -229,6 +232,18 @@ class Maker(object):
         """
         open_pos, resting = [], []
         for t, p in self.positions.items():
+            # A DETERMINED MARKET CARRIES NO CORRELATED RISK.  Once the settle source has
+            # published, the position is worth exactly $1 or $0 per contract: the outcome
+            # cannot move, we cannot trade out of it, and no new order can compound it.
+            # Charging it against the cluster cap reserves risk budget for a bet that has
+            # already resolved — measured live, our closed 26JUL28 treasury rungs were
+            # blocking the fresh 26JUL29 window in the same cluster.  The pending CASH is the
+            # cash feed's job (settled_awaiting_payout), not the risk cap's.
+            # MIRROR (excluding too early ↔ too late): "determined" is the exchange's own
+            # word, taken from its market status — never inferred from a clock, because a
+            # market we merely believe has resolved is exactly the naked-exposure case.
+            if t in self.resolved:
+                continue
             for leg in ("yes", "no"):
                 if abs(p.get(leg, 0.0)) > 0:
                     open_pos.append({"ticker": t, "side": leg, "n": abs(p[leg]),
@@ -915,6 +930,9 @@ class Maker(object):
         if ss == 200:
             for row in (srows.get("settlements") or []):
                 self.cash.settlement_row(row.get("ticker"), float(row.get("revenue", 0)) / 100.0)
+                # The exchange has SETTLED it: outcome fixed, cash pending.  It leaves the
+                # cluster's risk budget (see place_context) but stays in the cash feed.
+                self.resolved.add(row.get("ticker"))
         return exch
 
     # =========================================================================================

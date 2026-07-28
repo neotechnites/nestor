@@ -450,3 +450,33 @@ class TestTheRiskMeasureAgreesWithTheMoney(__import__('unittest').TestCase):
         ctx = m.place_context(available_cash_usd=1000.0)
         row = [r for r in ctx.resting_basis if r["ticker"] == "KXUST5AD-26JUL29-T4.31"][0]
         self.assertAlmostEqual(row["basis"], 0.16, places=6)
+
+
+class TestADeterminedMarketCarriesNoClusterRisk(__import__('unittest').TestCase):
+    """Live 2026-07-28: the 26JUL28 treasury rungs resolved at 1:30pm (status `determined`)
+    and were still charged against the RATES cluster cap, blocking the fresh 26JUL29 window
+    in the same cluster.  A resolved position is worth exactly $1 or $0 per contract: the
+    outcome cannot move, we cannot trade out of it, and no new order can compound it."""
+
+    def _maker_with_position(self):
+        from lip_v5 import engine, exchange as X
+        ex = X.FakeExchange(balance_cents=1_000_000)
+        m = engine.Maker(ex, 1785268000.0, live=False)
+        m.nestor_orders, m.nestor_positions = set(), set()
+        tk = "KXUST10AD-26JUL28-T4.61"
+        m.positions[tk] = {"yes": 100.0, "no": 0.0}
+        m.entry_basis[(tk, "yes")] = 0.56
+        return m, tk
+
+    def test_an_unresolved_position_consumes_its_cluster(self):
+        m, tk = self._maker_with_position()
+        ctx = m.place_context(available_cash_usd=1000.0)
+        self.assertTrue([p for p in ctx.positions if p["ticker"] == tk],
+                        "a LIVE position must still count as correlated risk")
+
+    def test_a_resolved_position_frees_its_cluster(self):
+        m, tk = self._maker_with_position()
+        m.resolved.add(tk)
+        ctx = m.place_context(available_cash_usd=1000.0)
+        self.assertEqual([p for p in ctx.positions if p["ticker"] == tk], [],
+                         "a determined market cannot lose more; it must not hold risk budget")
