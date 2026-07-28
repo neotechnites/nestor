@@ -279,6 +279,87 @@ class TestCheckGate(LipTestCase):
         self.assertEqual(tickers, {"KXNESTOR-1"})
 
 
+class TestBinaryWiring(LipTestCase):
+    """NOTE-G and NOTE-H, plus the commands the README's staged steps actually invoke."""
+
+    def test_NOTE_H_both_halves_of_nestor_state_are_read(self):
+        p = self.path("state.json")
+        R.atomic_write_json(p, {"open_orders": [{"ticker": "ORD"}],
+                                "positions": [{"ticker": "POS"}]})
+        self.assertEqual(BIN.nestor_open_tickers(p)[0], {"ORD"})
+        self.assertEqual(BIN.nestor_position_tickers(p), {"POS"})
+        st = BIN.nestor_state(p)
+        self.assertEqual(st["open_order_tickers"], ["ORD"])
+        self.assertEqual(st["position_tickers"], ["POS"])
+
+    def test_NOTE_H_unreadable_state_is_None_which_startup_refuses(self):
+        self.assertIsNone(BIN.nestor_state(self.path("absent.json")))
+
+    def test_NOTE_G_check_reports_nestor_state_as_ADVISORY_at_G1(self):
+        """`--check` proves the BINARY, not the deployment: at G1 v5 quotes nothing, so a
+        missing nestor state must not block the gate that proves the artifact is sound."""
+        os.environ[C.NESTOR_READER_FLAG_ENV] = "true"
+        try:
+            ok, results = BIN.run_check(C.CASH_MODE_SHARED, data_dir=self.tmp)
+        finally:
+            os.environ.pop(C.NESTOR_READER_FLAG_ENV, None)
+        by = {n: o for n, o, _ in results}
+        self.assertIsNone(by["nestor_state_readable"])       # SKIP, not FAIL
+        self.assertTrue(ok)
+
+    def test_NOTE_G_it_becomes_FATAL_when_required(self):
+        os.environ[C.NESTOR_READER_FLAG_ENV] = "true"
+        try:
+            ok, results = BIN.run_check(C.CASH_MODE_SHARED, data_dir=self.tmp,
+                                        require_nestor_state=True)
+        finally:
+            os.environ.pop(C.NESTOR_READER_FLAG_ENV, None)
+        by = {n: o for n, o, _ in results}
+        self.assertFalse(by["nestor_state_readable"])
+        self.assertFalse(ok)
+
+    def test_NOTE_G_the_unit_assertion_SKIPs_rather_than_claiming_OK(self):
+        ok, results = BIN.run_check(C.CASH_MODE_SUBACCOUNT, data_dir=self.tmp, programs=None)
+        by = {n: o for n, o, _ in results}
+        self.assertIsNone(by["unit_assertion"])
+
+    def test_handback_reconstructs_from_the_adopt_file_when_v5_is_dead(self):
+        """A handback command that only works while the process is alive is useless in exactly
+        the case it exists for."""
+        saved = (C.LEDGER_PATH, C.ADOPT_PATH, C.HANDBACK_PATH)
+        C.LEDGER_PATH = self.path("v5_ledger.jsonl")
+        C.ADOPT_PATH = self.path("v5_adopt.json")
+        C.HANDBACK_PATH = self.path("v5_handback.json")
+        try:
+            R.atomic_write_json(C.ADOPT_PATH, {"positions": [
+                {"ticker": "T", "side": "yes", "net": 5.0, "basis": 0.4}]})
+            obj = BIN.run_handback(now=1.0)
+            self.assertEqual(obj["positions"][0]["ticker"], "T")
+            self.assertEqual(obj["positions"][0]["source"], "v5")
+        finally:
+            C.LEDGER_PATH, C.ADOPT_PATH, C.HANDBACK_PATH = saved
+
+    def test_handback_prefers_v5s_OWN_ledger_when_it_has_one(self):
+        saved = (C.LEDGER_PATH, C.ADOPT_PATH, C.HANDBACK_PATH)
+        C.LEDGER_PATH = self.path("v5_ledger.jsonl")
+        C.ADOPT_PATH = self.path("v5_adopt.json")
+        C.HANDBACK_PATH = self.path("v5_handback.json")
+        try:
+            R.append_jsonl(C.LEDGER_PATH, {"k": "place_resp", "order_id": "1",
+                                           "ticker": "LEDGER", "side": "bid", "price": 0.4,
+                                           "size": 10, "fill_count": 10})
+            R.atomic_write_json(C.ADOPT_PATH, {"positions": [
+                {"ticker": "ADOPT", "side": "yes", "net": 5.0, "basis": 0.4}]})
+            obj = BIN.run_handback(now=1.0)
+            self.assertEqual(obj["positions"][0]["ticker"], "LEDGER")
+        finally:
+            C.LEDGER_PATH, C.ADOPT_PATH, C.HANDBACK_PATH = saved
+
+    def test_bare_live_is_refused(self):
+        """G3 is a human gate; the binary refuses to be the one that opens it."""
+        self.assertEqual(BIN.main(["--live"]), 2)
+
+
 class TestNoExternalEffects(LipTestCase):
     """The guards themselves.  Two real incidents this week: a unit suite paged a phone, and a
     unit suite wrote outside tmp.  A regression in these guards must fail the SUITE."""

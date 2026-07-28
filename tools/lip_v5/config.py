@@ -358,6 +358,38 @@ IDLE_CAPITAL_WINDOW_S = 3600.0               # book-wide net < λ_min/16 for 1 h
 LAND_GRAB_MAX_COLLATERAL_FRAC = 0.25         # spec §4.5 / v1 §6.2
 LAND_GRAB_MAX_MARKETS = 6
 LAND_GRAB_PRICE_C = 1
+# --- B9: refill / turnover cap ---
+# v1 §8.7 — post-size and refill-cap are DECOUPLED knobs (the v3 lesson).  Beyond 4 turnovers
+# of its own inventory cap in one window a slot is a FLOW MAGNET, not a maker.  This is the
+# 1 Hz-timescale bound that §2.5's 15-minute kill cadence structurally cannot provide.
+REFILL_CAP_TURNOVERS = 4
+UNKNOWN_RETRY_S = 300                        # v4 D7 — retry an ST_UNKNOWN cancel on this
+UNKNOWN_MAX_RETRIES = 3                      # cadence, then book it FILLED (conservative)
+# --- B3: all-time peak / drawdown halt ---
+# A DAILY loss limit cannot see a slow bleed — lose 4% a day for ten days and no day trips.
+# Drawdown-from-peak is the measure that does.  35% matches DAY_STOP_FRAC deliberately: the
+# largest single-day drag we accept is also the largest cumulative one, because a bleed that
+# reaches the same magnitude more slowly is not more acceptable for being patient.
+MAX_DRAWDOWN_FRAC = 0.35
+# --- B4: daily loss limit ---
+# Same magnitude as the day stop, computed on REALIZED + unrealized with OPEN-DAY attribution;
+# the day stop is the intraday circuit and this is the end-of-day accounting check.
+DAILY_LOSS_LIMIT_USD = DAY_STOP_CAP_USD
+# --- B6: persist-failure fail-closed ---
+# 3 attempts: one covers a transient fsync hiccup, three distinguishes that from a full disk
+# without turning a stall into a long stall.  Matches MAX_CONSEC_CANCEL_ANOMALIES' shape.
+PERSIST_MAX_RETRIES = 3
+# --- B11: capital floor ---
+# v5 spending the last dollars is v5 deciding, unilaterally, that nestor does not get to
+# trade.  $25 is one nestor position at the observed sizes — the smallest floor that still
+# leaves the other bot ABLE to act, which is the property being bought.  UNDERIVED as a
+# distribution; derived as "not zero, and at least one action's worth".
+CAPITAL_FLOOR_USD = 25.0
+# --- B12: clock skew ---
+# Our signatures and every `expiration_ts` come from the LOCAL clock.  Kalshi's own auth window
+# is on the order of tens of seconds, and CLOSE_MARGIN_S is 240 s, so 30 s is well inside the
+# margin that would move an order's effective lifetime.
+CLOCK_SKEW_TOL_S = 30.0
 MAX_CONSEC_CANCEL_ANOMALIES = 3              # v1 §8.5 poison, v3-inherited, non-negotiable
 MAX_POST_ERRORS = 6
 POST_ERROR_WINDOW_S = 300

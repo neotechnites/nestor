@@ -50,6 +50,13 @@ COMMANDS (each maps to one human gate in README.md; no gate bundles a capital ch
 code change)
 =================================================================================================
   --check          G1: assertions only, no capital, no network writes.  Prints OK/FAIL per check.
+                   NOTE-G: `--check` proves the BINARY, not the deployment.  It runs against
+                   whatever data dir it is pointed at, does not read live programs unless a
+                   scan is supplied (the unit assertion then prints SKIP, not OK), and reports
+                   nestor-state readability as ADVISORY because at G1 v5 quotes nothing.  A
+                   green `--check` therefore means "this artifact is internally consistent and
+                   its money rule reproduces spec §0.4" — it does NOT mean "safe to quote".
+                   That claim belongs to G2's shadow read-out and G3's first `allocate` line.
   --gen-adopt      §6.3-C.1: read v4's ledger READ-ONLY, write `v5_adopt.json`.  Re-runnable.
   --handback       §6.3 SF-2: write `v5_handback.json` from current state (also on SIGTERM).
   --shadow         G2: quote nothing, meter PSDH, publish a ZEROED cash feed.
@@ -126,7 +133,7 @@ def unit_assertion_check(programs, expect_usd=C.UNIT_ASSERT_EXPECT_USD,
 
 
 def nestor_open_tickers(path=None):
-    """spec §11 Collisions — v5 never quotes a ticker nestor holds an open order on.
+    """spec §11 Collisions — v5 never quotes a ticker nestor holds an open ORDER on.
     Returns (set, ok).  `ok=False` is a STARTUP REFUSAL, not a warning: silently quoting into
     nestor's book because we could not read its state is the collision we are preventing."""
     obj = R.read_json(path or C.NESTOR_STATE_PATH, default=None)
@@ -138,6 +145,34 @@ def nestor_open_tickers(path=None):
         if t:
             tickers.add(str(t))
     return tickers, True
+
+
+def nestor_position_tickers(path=None):
+    """Guard B13's second half — v5 never quotes a ticker nestor holds a POSITION on either.
+
+    The order half alone is not enough: nestor can hold a position on a market it currently has
+    no resting order in, and v5 quoting there attributes nestor's inventory to itself at the
+    next position reconcile.  The two halves are ONE guard, which is why they are read together.
+    """
+    obj = R.read_json(path or C.NESTOR_STATE_PATH, default=None)
+    if obj is None:
+        return set()
+    tickers = set()
+    for p in (obj.get("positions") or []):
+        t = p.get("ticker") if isinstance(p, dict) else p
+        if t:
+            tickers.add(str(t))
+    return tickers
+
+
+def nestor_state(path=None):
+    """Both halves, in the shape `Maker.startup` consumes.  `None` when unreadable — which
+    `startup` treats as a REFUSAL."""
+    orders, ok = nestor_open_tickers(path)
+    if not ok:
+        return None
+    return {"open_order_tickers": sorted(orders),
+            "position_tickers": sorted(nestor_position_tickers(path))}
 
 
 # =============================================================================================
@@ -206,10 +241,18 @@ def run_check(argv_mode=C.CASH_MODE_SHARED, data_dir=None, programs=None, now=No
     out.append(("v4_not_running", not fresh,
                 "newest v4 file %s" % ("none" if ts is None else "%.0fs ago" % (now - ts))))
 
-    # 8. nestor state readable (spec §11 Collisions) — a refusal only once we intend to quote
-    _, ok_state = nestor_open_tickers()
-    out.append(("nestor_state_readable", ok_state if require_nestor_state else True,
-                "%s" % C.NESTOR_STATE_PATH))
+    # 8. NOTE-H — nestor collision state (spec §11 Collisions).  WIRED: `Maker.startup`
+    #    REFUSES when this is unreadable, and takes BOTH halves (open orders AND positions,
+    #    guard B13).  It is reported here as advisory rather than fatal because `--check` runs
+    #    at G1, where v5 quotes nothing: refusing the arming step for a file that only matters
+    #    once we intend to quote would block the gate that proves the binary is sound.
+    #    `require_nestor_state=True` makes it fatal, and G3's command sets it.
+    tickers, ok_state = nestor_open_tickers()
+    positions = nestor_position_tickers()
+    out.append(("nestor_state_readable", ok_state if require_nestor_state else (ok_state or None),
+                "%s (%d open orders, %d positions)%s"
+                % (C.NESTOR_STATE_PATH, len(tickers), len(positions),
+                   "" if ok_state else " — REFUSAL at G3, advisory at G1")))
 
     # 9. (★) self-check against spec §0.4's own worked numbers.  A binary whose money rule
     #    disagrees with the spec's own table must not start.
@@ -240,11 +283,47 @@ def run_gen_adopt(v4_ledger_path=None, out_path=None, now=None):
     return obj
 
 
-def run_handback(positions, out_path=None, now=None):
+def run_handback(positions=None, out_path=None, now=None, adopt_path=None):
+    """§6.3 SF-2 — write a v4-readable position statement.
+
+    With no `positions` supplied this reconstructs them the same way a cold operator would: from
+    v5's own ledger if it has one, else from the adopt file.  A handback command that only works
+    while the process is alive is useless in precisely the case it exists for — v5 already
+    dead, and v4 needing to be restarted onto reality.
+    """
     now = R._now() if now is None else float(now)
+    if positions is None:
+        rows = R.read_jsonl(C.LEDGER_PATH)
+        if rows:
+            positions = cutover.V4Positions().replay(rows).rows()
+        else:
+            adopt = R.read_json(adopt_path or C.ADOPT_PATH, default=None) or {}
+            positions = adopt.get("positions", [])
     obj = cutover.handback(positions, now)
     R.atomic_write_json(out_path or C.HANDBACK_PATH, obj)
     return obj
+
+
+def run_shadow(now=None, slots=None, ex=None):
+    """G2's REAL read-out: metering + `venue_rank` + a zeroed cash feed, quoting NOTHING.
+
+    `shadow=True` makes `Maker.place` refuse before the rate lane, so "quotes nothing" is a
+    property of the one path to the wire rather than of this function remembering not to call
+    it.
+    """
+    from . import engine as E, exchange as X
+    now = R._now() if now is None else float(now)
+    m = E.Maker(ex or X.FakeExchange(), now, shadow=True)
+    out = m.shadow_readout(now, slots=slots or [])
+    print("venue_rank: %d slots ranked, %d admitted"
+          % (len(out["venue_rank"]), sum(1 for r in out["venue_rank"] if r["admits"])))
+    for r in out["venue_rank"][:20]:
+        print("  %-32s %-4s net=%+.5f gross=%.5f carry=%.5f drift=%.5f T=%.2f %s"
+              % (r["ticker"], r["side"], r["net"], r["gross"], r["carry"], r["drift"],
+                 r["t_hat"], "ADMIT" if r["admits"] else "refuse"))
+    print("PSDH populated for %d (m,s); cash feed %s; orders placed %d"
+          % (out["psdh_covered"], out["cash_feed"], out["quoted"]))
+    return out
 
 
 # =============================================================================================
@@ -279,14 +358,25 @@ def main(argv=None):
         return 0
 
     if args.handback:
-        print("handback requires a running v5 with state; see README staged-deploy step 9")
-        return 2
+        obj = run_handback()
+        print("wrote %s: %d positions (%s)"
+              % (C.HANDBACK_PATH, len(obj["positions"]),
+                 "from v5 ledger" if R.read_jsonl(C.LEDGER_PATH) else "from adopt file"))
+        return 0
 
     if args.shadow:
         print("G2 shadow mode: quoting disabled, metering only, cash feed zeroed.")
-        print("Run under systemd per README; this entrypoint is intentionally not a loop yet —")
-        print("the quoting/metering loop is wired at G2 and G3, each its own human gate.")
+        run_shadow()
         return 0
+
+    if args.live:
+        # G3+ is a HUMAN GATE, and the binary refuses to be the one that opens it.  Reaching
+        # here means someone passed --live without the staged sequence; the README's step 4 is
+        # the only path, and it is a Ryan-owned decision with its own read-out and rollback.
+        print("--live requires the staged sequence in README.md (G1 --check, G2 --shadow, then "
+              "G3 with the operator read-out). Refusing to start a quoting loop from a bare "
+              "flag.")
+        return 2
 
     ap.print_help()
     return 2

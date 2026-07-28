@@ -1,0 +1,495 @@
+"""
+lip_v5.guards — THE RAILS.  Every one of these is a refusal the run loop consults before it
+spends, and they are ordered: `place_allowed()` runs them in dependency order and returns the
+FIRST refusal, because a book that is halted does not also need to be told its cluster is full.
+
+Enumerated by cross-bot review (B1..B13).  The through-line: v4 had CONSTANTS for several of
+these and no implementation — `DAY_STOP_FRAC` existed, was tested as a pure function, and had
+zero call sites.  A guard with no call site is not a guard, it is a comment with a unit test,
+and this file exists so that can be checked in one place.
+"""
+
+import math
+import os
+
+from . import clusters as CL
+from . import config as C
+from . import runtime as R
+
+
+# =============================================================================================
+# B2 — DAY STOP.  Ported from v4's exact shape, including the two corrections that shape
+# already carries.
+# =============================================================================================
+def day_stop_usd(projected_day_reward_usd,
+                 frac=C.DAY_STOP_FRAC, floor=C.DAY_STOP_FLOOR_USD, cap=C.DAY_STOP_CAP_USD):
+    """`min($150, max($20, 0.35 × projected_day_reward))` — returned POSITIVE, as a loss
+    magnitude.  The largest drag that still leaves the day net-positive."""
+    return min(float(cap), max(float(floor), float(frac) * float(projected_day_reward_usd)))
+
+
+def unpriced_positions(positions, yes_mids):
+    """Tickers holding inventory for which NO two-sided mid exists."""
+    return sorted(t for t, pos in (positions or {}).items()
+                  if (abs(pos.get("yes", 0.0)) + abs(pos.get("no", 0.0))) > 0
+                  and yes_mids.get(t) is None)
+
+
+def mark_to_market_pnl(positions, position_cost, yes_mids, fees_paid_usd=0.0):
+    """Realised + unrealised P&L on inventory.  Cost comes from the LEDGER, never from an
+    exchange index.
+
+    **UNPRICED POSITIONS MARK AT COST** (v4's NEW-2, carried verbatim because the reasoning is
+    unchanged).  A position on a market with no two-sided mid — a PINNED rung is one-sided BY
+    DEFINITION — cannot be marked.  Subtracting its full cost while contributing no value reads
+    that inventory as a TOTAL LOSS: two pinned $10 slots alone print −$20, which is exactly the
+    day-stop floor, and the stop then cancels everything mid-window on precisely the gas books
+    we are there for.  Marking at cost contributes zero P&L, the only honest statement about a
+    price we cannot observe, and the COUNT is surfaced separately so "we cannot see it" never
+    reads as "it is fine".
+    """
+    value = 0.0
+    cost = dict(position_cost or {})
+    for ticker, pos in (positions or {}).items():
+        mid = yes_mids.get(ticker)
+        if mid is None:
+            value += cost.get(ticker, 0.0)                    # marks at cost ⇒ contributes 0
+            continue
+        value += pos.get("yes", 0.0) * float(mid) + \
+            pos.get("no", 0.0) * (1.0 - float(mid))
+    return value - sum(cost.values()) - float(fees_paid_usd)
+
+
+def day_stop_breached(pnl_usd, projected_day_reward_usd, **kw):
+    """Breach when the LOSS reaches the stop.  On breach: cancel-all → flatten → alert → halt."""
+    return -float(pnl_usd) >= day_stop_usd(projected_day_reward_usd, **kw) - 1e-12
+
+
+def day_stop_exempt(order_is_fully_closing):
+    """**THE FULLY-CLOSING EXEMPTION.**  A halted book must still be able to LEAVE.  An order
+    that only reduces inventory cannot increase exposure — its worst case is that we end up
+    flat — so refusing it would trap us in the position that tripped the stop, which is the
+    opposite of what a stop is for.  Every other order is refused."""
+    return bool(order_is_fully_closing)
+
+
+# =============================================================================================
+# B5 — HALT / RESUME STATE MACHINE.  One persisted halt, and every stand-down lands in it.
+# =============================================================================================
+class HaltState(object):
+    """`place()`'s FIRST check.
+
+    Persisted, because a halt that a restart clears is not a halt — and every historical
+    incident here ends with a process restarting into the condition that halted it.  Resume is
+    an EXPLICIT OPERATOR RECORD, never a timer: a timer converts "a human must look at this"
+    into "wait long enough", which is the failure the halt existed to prevent.
+    """
+
+    def __init__(self, path=None):
+        self.path = path or os.path.join(C.DATA_DIR, "v5_halt.json")
+        self.halted = False
+        self.reason = None
+        self.ts = None
+        self.detail = {}
+
+    def load(self):
+        obj = R.read_json(self.path, default=None)
+        if isinstance(obj, dict) and obj.get("halted"):
+            self.halted = True
+            self.reason = obj.get("reason")
+            self.ts = obj.get("ts")
+            self.detail = obj.get("detail") or {}
+        return self
+
+    def halt(self, reason, now, detail=None, persist=True):
+        self.halted = True
+        self.reason = reason
+        self.ts = float(now)
+        self.detail = dict(detail or {})
+        R.log("halt", reason=reason, **self.detail)
+        R.ntfy("halt", "lip_v5 HALT: %s" % reason)
+        if persist:
+            R.atomic_write_json(self.path, {"halted": True, "reason": reason,
+                                            "ts": self.ts, "detail": self.detail})
+        return self
+
+    def resume(self, operator_note, now):
+        """Explicit operator record ONLY."""
+        if not operator_note:
+            raise ValueError("resume requires an explicit operator note")
+        self.halted = False
+        self.reason = None
+        R.log("halt_resume", note=operator_note, ts=float(now))
+        R.atomic_write_json(self.path, {"halted": False, "resumed_ts": float(now),
+                                        "note": operator_note})
+        return self
+
+
+# =============================================================================================
+# B3 — ALL-TIME PEAK / DRAWDOWN HALT.  Persisted peak record.
+# =============================================================================================
+class PeakRecord(object):
+    """Equity high-water mark, persisted.
+
+    A daily loss limit cannot see a slow bleed: lose 4% a day for ten days and no day trips.
+    The drawdown-from-peak is the measure that does, and it must be PERSISTED or every restart
+    resets the peak to the current (lower) equity and the drawdown silently becomes zero —
+    the bleed erases its own evidence.
+    """
+
+    def __init__(self, path=None, max_drawdown_frac=None):
+        self.path = path or os.path.join(C.DATA_DIR, "v5_peak.json")
+        self.peak = None
+        self.max_drawdown_frac = (C.MAX_DRAWDOWN_FRAC if max_drawdown_frac is None
+                                  else float(max_drawdown_frac))
+
+    def load(self):
+        obj = R.read_json(self.path, default=None)
+        if isinstance(obj, dict) and obj.get("peak") is not None:
+            self.peak = float(obj["peak"])
+        return self
+
+    def observe(self, equity_usd, now, persist=True):
+        """Returns (drawdown_frac, breached)."""
+        eq = float(equity_usd)
+        if self.peak is None or eq > self.peak:
+            self.peak = eq
+            if persist:
+                R.atomic_write_json(self.path, {"peak": self.peak, "ts": float(now)})
+            return 0.0, False
+        if self.peak <= 0:
+            return 0.0, False
+        dd = (self.peak - eq) / self.peak
+        return dd, dd >= self.max_drawdown_frac
+
+
+# =============================================================================================
+# B4 — DAILY LOSS LIMIT, WITH OPEN-DAY ATTRIBUTION.
+# =============================================================================================
+def daily_realized_loss(settlements, day_key, open_day_of=None):
+    """Realized P&L attributable to `day_key`, attributed by the day the position was OPENED.
+
+    **The attribution is the whole guard.**  A multi-day position settles on ONE day but was a
+    decision taken on ANOTHER, and charging its whole loss to the settlement day trips today's
+    limit for a bet today never made — halting a healthy book because an old one resolved.
+    Symmetrically, a good settlement today must not fund fresh risk today.
+
+    `settlements`: [{"ticker", "realized_pnl", "settled_day", "opened_day"}].
+    `open_day_of`: optional fallback lookup for rows lacking `opened_day`.
+    """
+    total = 0.0
+    for s in settlements or []:
+        opened = s.get("opened_day")
+        if opened is None and open_day_of is not None:
+            opened = open_day_of(s.get("ticker"))
+        if opened is None:
+            opened = s.get("settled_day")          # unknowable ⇒ charge it where it landed
+        if opened == day_key:
+            total += float(s.get("realized_pnl", 0.0))
+    return total
+
+
+def daily_loss_breached(realized_today, unrealized_today, limit_usd):
+    loss = -(float(realized_today) + float(unrealized_today))
+    return loss >= float(limit_usd) - 1e-12
+
+
+# =============================================================================================
+# B6 — PERSIST-FAILURE FAIL-CLOSED.
+# =============================================================================================
+class PersistGuard(object):
+    """A write failure while LIVE is a HALT, not a log line.
+
+    Every control in this binary reasons from persisted state — the ledger, the halt record,
+    the peak, the cash feed.  If a write fails and we continue, each of those controls is now
+    reasoning from a world that diverges further every cycle, and NOTHING detects it.  The
+    cheapest correct response is to stop spending.
+
+    MIRROR (fail-closed on a transient ↔ running blind on a real failure): the retry bound is
+    the first end — a single fsync hiccup costs a retry, not a halt; the second is that after
+    `max_retries` we halt rather than continue, because a persistent write failure is
+    indistinguishable from a full disk, and a full disk is how a ledger silently stops being
+    the record.
+    """
+
+    def __init__(self, halt_state, max_retries=C.PERSIST_MAX_RETRIES):
+        self.halt_state = halt_state
+        self.max_retries = int(max_retries)
+        self.failures = 0
+
+    def write(self, fn, *args, **kwargs):
+        """Run `fn`, retrying; halt on persistent failure.  Returns (ok, result_or_error)."""
+        last = None
+        for attempt in range(self.max_retries):
+            try:
+                res = fn(*args, **kwargs)
+                self.failures = 0
+                return True, res
+            except Exception as exc:                          # noqa: BLE001 - deliberate
+                last = "%s: %s" % (type(exc).__name__, exc)
+                R.log("persist_retry", attempt=attempt + 1, err=last)
+        self.failures += 1
+        if R.is_live():
+            self.halt_state.halt("persist_failure", R._now(), {"err": last})
+        else:
+            R.log("persist_failure_inert", err=last)
+        return False, last
+
+
+# =============================================================================================
+# B7 — FRESH-STATE REFUSAL (before G3).
+# =============================================================================================
+def fresh_state_refusal(ledger_rows, adopt_exists, exchange_positions, allow_flag=False):
+    """A BLANK ledger plus (an adopt file OR live exchange positions) is a REFUSAL.
+
+    That combination means exactly one thing: we are about to start quoting as though flat
+    while the account is not.  Every cap, the ceiling, the day stop and the cash feed would all
+    be computed against zero inventory that demonstrably exists — the invisible-position class,
+    entered deliberately on the first cycle instead of drifting into it.
+
+    The escape is an EXPLICIT flag, because there is a legitimate case (a genuinely new
+    account) and it should have to be stated rather than inferred from the absence of evidence.
+    """
+    if allow_flag:
+        return None
+    if ledger_rows:
+        return None
+    has_positions = any(abs(float(v)) > 0 for v in (exchange_positions or {}).values())
+    if adopt_exists or has_positions:
+        return ("blank ledger with %s — refusing to start flat against a non-flat account"
+                % ("an adopt file" if adopt_exists else "live exchange positions"))
+    return None
+
+
+# =============================================================================================
+# B9 — REFILL / TURNOVER CAP (the 1 Hz fast-path bound).
+# =============================================================================================
+class RefillTracker(object):
+    """`REFILL_CAP_TURNOVERS × n_cap` per (m,s) per window.
+
+    Why this exists ALONGSIDE the §2.5 kill: the kill evaluates every 15 MINUTES, and a slot
+    being churned by informed flow can turn over its whole inventory cap many times inside one
+    of those buckets.  T̂'s cadence cannot bound a 1 Hz failure; this can.  Beyond the cap the
+    slot is a FLOW MAGNET, not a maker, which is a statement about the venue and not about our
+    sizing.
+    """
+
+    def __init__(self, turnovers=C.REFILL_CAP_TURNOVERS):
+        self.turnovers = int(turnovers)
+        self.filled = {}                                      # (ticker, side) -> contracts
+
+    def note_fill(self, ticker, side, contracts):
+        k = (ticker, side)
+        self.filled[k] = self.filled.get(k, 0.0) + abs(float(contracts))
+
+    def cap_for(self, price, n_cap_fn):
+        return self.turnovers * n_cap_fn(price)
+
+    def exhausted(self, ticker, side, price, n_cap_fn):
+        return self.filled.get((ticker, side), 0.0) >= self.cap_for(price, n_cap_fn)
+
+    def reset_window(self):
+        self.filled = {}
+
+
+# =============================================================================================
+# B10 — UNKNOWN-ORDER RETRY BOUND.
+# =============================================================================================
+class UnknownOrders(object):
+    """An order left in ST_UNKNOWN holds collateral FOREVER.
+
+    Retry its cancel on a cadence; after `max_retries` book it as FILLED (the conservative
+    direction — assume we own it) and FREEZE the market.  Booking it as filled overstates our
+    inventory, which costs us capacity; booking it as cancelled would understate it, which
+    creates a naked short.  The freeze is because an order we could never resolve is evidence
+    about that market, not just about that order.
+    """
+
+    def __init__(self, max_retries=C.UNKNOWN_MAX_RETRIES, retry_s=C.UNKNOWN_RETRY_S):
+        self.max_retries = int(max_retries)
+        self.retry_s = float(retry_s)
+        self.pending = {}                    # oid -> {"attempts", "last_ts", "ticker", ...}
+
+    def note(self, oid, ticker, side, remaining, now):
+        # `last_ts` starts at `now`, not 0: the cadence is measured from when we LEARNED the
+        # order was unknown.  Starting at 0 would make a fresh unknown instantly "due" on a
+        # real clock, retrying inside the same second as the cancel that confused us.
+        e = self.pending.setdefault(str(oid), {"attempts": 0, "last_ts": float(now),
+                                               "ticker": ticker, "side": side,
+                                               "remaining": float(remaining)})
+        e["remaining"] = float(remaining)
+        return e
+
+    def due(self, now):
+        return [oid for oid, e in sorted(self.pending.items())
+                if float(now) - e["last_ts"] >= self.retry_s
+                and e["attempts"] < self.max_retries]
+
+    def attempted(self, oid, now):
+        e = self.pending.get(str(oid))
+        if e:
+            e["attempts"] += 1
+            e["last_ts"] = float(now)
+
+    def resolved(self, oid):
+        self.pending.pop(str(oid), None)
+
+    def exhausted(self):
+        """[(oid, entry)] to book as filled and freeze."""
+        return [(oid, e) for oid, e in sorted(self.pending.items())
+                if e["attempts"] >= self.max_retries]
+
+
+# =============================================================================================
+# B12 — CLOCK-SKEW CHECK.
+# =============================================================================================
+def clock_skew_s(server_epoch_s, local_epoch_s):
+    return float(local_epoch_s) - float(server_epoch_s)
+
+
+def clock_skew_alarming(skew_s, tol=C.CLOCK_SKEW_TOL_S):
+    """Our signature timestamps and every `expiration_ts` are computed from the LOCAL clock.
+    A skewed clock silently produces orders that expire early (lost presence) or late (an order
+    living past the window guard), and rejects that look like auth failures.  One unsigned GET
+    per cycle costs one request and makes the failure legible."""
+    return abs(float(skew_s)) > float(tol)
+
+
+# =============================================================================================
+# B11 — CAPITAL FLOOR.
+# =============================================================================================
+def capital_floor_ok(available_cash_usd, floor_usd=C.CAPITAL_FLOOR_USD):
+    """Below the floor, placement refuses and pages.
+
+    The floor is not about our own sizing — the ceiling already bounds that.  It is about the
+    SHARED ACCOUNT: v5 spending the last dollars is v5 deciding, unilaterally, that nestor does
+    not get to trade.  Leaving a floor is the same courtesy as the rate budget's residual.
+    """
+    return float(available_cash_usd) >= float(floor_usd)
+
+
+# =============================================================================================
+# B13 — CROSS-BOT EXCLUSION (positions AND orders — the pair is the guard).
+# =============================================================================================
+def cross_bot_excluded(ticker, nestor_order_tickers, nestor_position_tickers):
+    """v5 never quotes a ticker nestor holds an OPEN ORDER on (spec §11) — and never one it
+    holds a POSITION on either.
+
+    The order half alone is not enough, and the asymmetry is the bug: nestor can hold a
+    position on a market it currently has no resting order in, and v5 quoting there attributes
+    nestor's inventory to itself at the next position reconcile — a divergence that freezes the
+    market, or worse, is netted into v5's own caps.  The two halves are one guard.
+    """
+    t = str(ticker)
+    return t in (nestor_order_tickers or set()) or t in (nestor_position_tickers or set())
+
+
+# =============================================================================================
+# B8 — DUPLICATE-FILL GUARD, AT THE STATE LAYER.
+# =============================================================================================
+class FillDedupe(object):
+    """Keyed on the EXCHANGE's own fill id.
+
+    The fills API is queried over OVERLAPPING windows BY CONSTRUCTION (the crash-gap re-read),
+    so a restart loop re-observes the same fills; v4 measured `filled_cum` at 20 against a truth
+    of 10.  Dedupe belongs at the STATE layer rather than in each reader, because there is more
+    than one path into state (live fills, the crash-gap sweep, cancel `reduced_by` learning)
+    and a guard that lives in one of them is absent from the others.
+    """
+
+    def __init__(self):
+        self.seen = set()
+
+    def is_new(self, fill_id, fallback_key=None):
+        key = str(fill_id) if fill_id is not None else fallback_key
+        if key is None:
+            # An unkeyed fill cannot be deduped.  Accept it — dropping a real fill understates
+            # inventory, which is the naked-short direction — and surface the count.
+            R.log("fill_unkeyed")
+            return True
+        if key in self.seen:
+            return False
+        self.seen.add(key)
+        return True
+
+
+# =============================================================================================
+# THE ORDERED GATE.  `place()` calls THIS, not the individual guards.
+# =============================================================================================
+class PlaceContext(object):
+    """Everything `place_allowed` needs, gathered once per cycle."""
+
+    def __init__(self, halt_state=None, positions=None, resting_basis=None,
+                 nestor_orders=None, nestor_positions=None, available_cash_usd=None,
+                 cluster_cap_usd=None, frozen=None, denied_ok=True, refill=None,
+                 n_cap_fn=None, day_stopped=False, skew_ok=True):
+        self.halt_state = halt_state
+        self.positions = positions or []          # [{ticker, side, n, basis}] OPEN inventory
+        self.resting_basis = resting_basis or []  # [{ticker, side, n, basis}] RESTING orders
+        self.nestor_orders = nestor_orders or set()
+        self.nestor_positions = nestor_positions or set()
+        self.available_cash_usd = available_cash_usd
+        self.cluster_cap_usd = cluster_cap_usd
+        self.frozen = frozen or set()
+        self.refill = refill
+        self.n_cap_fn = n_cap_fn
+        self.day_stopped = day_stopped
+        self.skew_ok = skew_ok
+
+
+def place_allowed(ctx, order):
+    """The rails, in dependency order.  Returns (ok, reason, detail).
+
+    `order`: {ticker, side, n, basis, fully_closing}
+
+    ORDER MATTERS and is derived: the halt is first because a halted book needs no further
+    reasoning; the day stop is next because it is the only other condition that shuts
+    EVERYTHING; then the exclusions that make a market ineligible at all; then the caps, which
+    are about size and therefore only meaningful on a market we were allowed to quote.
+    """
+    ticker = order["ticker"]
+    fully_closing = bool(order.get("fully_closing"))
+
+    # B5 — halt is place()'s FIRST check.  The fully-closing exemption lets a halted book LEAVE.
+    if ctx.halt_state is not None and ctx.halt_state.halted:
+        if not day_stop_exempt(fully_closing):
+            return False, "halted", {"reason": ctx.halt_state.reason}
+
+    # B2 — day stop, same exemption for the same reason.
+    if ctx.day_stopped and not day_stop_exempt(fully_closing):
+        return False, "day_stop", {}
+
+    # B12 — a skewed clock makes `expiration_ts` and our signatures unreliable.
+    if not ctx.skew_ok and not fully_closing:
+        return False, "clock_skew", {}
+
+    # Frozen (assume_filled / adoption exclusion / orphan) — quoting AND recycling.
+    if ticker in ctx.frozen and not fully_closing:
+        return False, "frozen", {}
+
+    # B13 — cross-bot exclusion, orders AND positions.
+    if cross_bot_excluded(ticker, ctx.nestor_orders, ctx.nestor_positions):
+        return False, "cross_bot", {}
+
+    # DENY_SERIES — measured-toxic venues (charter: lessons as measured inputs).
+    if C.series_denied(ticker):
+        return False, "series_denied", {}
+
+    # B11 — capital floor: never spend the shared account's last dollars.
+    if not fully_closing and ctx.available_cash_usd is not None \
+            and not capital_floor_ok(ctx.available_cash_usd):
+        return False, "capital_floor", {"available": ctx.available_cash_usd}
+
+    # B9 — refill / turnover cap: the 1 Hz bound the 15-min kill cadence cannot provide.
+    if not fully_closing and ctx.refill is not None and ctx.n_cap_fn is not None:
+        if ctx.refill.exhausted(ticker, order["side"], order["basis"], ctx.n_cap_fn):
+            return False, "refill_cap", {}
+
+    # B1 — the cluster cap, on OPEN + RESTING basis, before the ceiling.
+    if not fully_closing and ctx.cluster_cap_usd is not None:
+        existing = list(ctx.positions) + list(ctx.resting_basis)
+        ok, reason, detail = CL.cluster_admits(existing, order, ctx.cluster_cap_usd)
+        if not ok:
+            return False, reason, detail
+
+    return True, "ok", {}

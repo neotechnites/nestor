@@ -49,20 +49,46 @@ hours — no settlement, no credit, no waiting.
 
 | file | lines | what |
 |---|---|---|
-| `config.py` | 458 | every constant, with its spec derivation AND its note-23 §IV mirror answer |
-| `money.py` | 410 | **(★)**, `L_eff` and the past-due escalation, φ/d estimation, the `r*` fixpoint, shading, dose-response |
+| `config.py` | 527 | every constant, with its spec derivation AND its note-23 §IV mirror answer |
+| `money.py` | 418 | **(★)**, `L_eff` and the past-due escalation, φ/d estimation, the `r*` fixpoint, shading, dose-response |
 | `presence.py` | 377 | the 1 Hz meter, PSDH/T̂, per-slot kill, the four-branch collapse predicate, compaction |
 | `ratchet.py` | 370 | verified-accrual ladder, `floor_q`, admission bounds, OUT_OF_REACH, stand-down, revive |
-| `cashfeed.py` | 419 | the computed cash feed and its one invariant |
+| `cashfeed.py` | 511 | the computed cash feed and its one invariant |
 | `alloc.py` | 450 | ALLOCATE under (★) — v4's water-filling with exactly one substitution |
+| `clusters.py` | 255 | **the underlying-cluster cap** — signed delta + exact worst-case loss per settle source |
+| `guards.py` | 495 | **the rails, B1..B13** — day stop, halt machine, drawdown, daily loss, capital floor, cross-bot, dedupe, refill, UNKNOWN bound, clock skew, and the ORDERED gate `place()` calls |
+| `engine.py` | 515 | **the run cycle** — startup/refusals/adopt/triage, `place()` (the one path to the wire), fills, meter, recon, shutdown |
+| `exchange.py` | 123 | the one wire seam, plus the `FakeExchange` the suite drives |
 | `ratelimit.py` | 265 | token bucket, AIMD, lanes, the SF-1 cancel bound, the degrade ladder |
-| `cutover.py` | 429 | `--gen-adopt`, the W2 adoption gate, **cutover triage**, handback/rollback |
+| `cutover.py` | 455 | `--gen-adopt`, the W2 adoption gate, **cutover triage**, handback/rollback |
 | `ledger.py` | 131 | the money record, and the separate presence file + compaction |
 | `wsgate.py` | 156 | the W2 3-agreement gate over the vendored feed |
 | `ws_feed.py` | 1221 | **vendored verbatim from v4** — see below |
 | `runtime.py` | 363 | the only clock, the only logger, every external effect behind a stubbable seam |
-| `lip_v5.py` | 296 | the binary; note 23 §III's five answered in its header |
-| `tests/` | 2120 | 242 tests, `python3 -m unittest` green |
+| `lip_v5.py` | 386 | the binary; note 23 §III's five answered in its header |
+| `tests/` | 2779 | **390 tests**, `python3 -m unittest` green |
+
+### The rails (`guards.py`) — B1..B13
+
+`place()` calls ONE function, `guards.place_allowed`, which runs the rails in dependency order
+and returns the FIRST refusal. The order is derived: a halted book needs no further reasoning;
+eligibility precedes sizing; caps are meaningless on a market we were not allowed to quote.
+
+| # | guard | the failure it names |
+|---|---|---|
+| B5 | halt/resume machine | a halt a restart clears is not a halt; resume is an operator record, never a timer |
+| B2 | day stop | constants existed in v4 with **zero call sites**; unpriced inventory marks AT COST, and a fully-closing order is exempt so a halted book can still leave |
+| B1 | cluster cap | 15 rungs of one ladder are ONE bet — today's live treasury loss |
+| B3 | peak/drawdown | a slow bleed no daily limit catches; the peak is persisted or the bleed erases its own evidence |
+| B4 | daily loss limit | open-day attribution, so a multi-day settlement cannot trip today's limit |
+| B6 | persist fail-closed | a write failure while live halts, because every control reasons from persisted state |
+| B7 | fresh-state refusal | blank ledger against a non-flat account — the invisible-position class, refused on cycle 1 |
+| B8 | fill dedupe | exchange-fill-id keyed, at the STATE layer, because there are three paths into state |
+| B9 | refill/turnover cap | the 1 Hz bound the 15-minute kill cadence structurally cannot provide |
+| B10 | UNKNOWN bound | an unresolved order holds collateral forever; 3 tries then book-filled + freeze |
+| B11 | capital floor | v5 spending the last dollars is v5 deciding nestor cannot trade |
+| B12 | clock skew | our signatures and every `expiration_ts` come from the local clock |
+| B13 | cross-bot exclusion | orders AND positions — nestor can hold a position in a market it has no order in |
 
 **`ws_feed.py` is vendored, not imported.** The coupling surface to its v4 host was verified by
 grep before copying and is exactly four symbols (`_now`, `price_str`, `log`, `Auth`), all
@@ -78,7 +104,7 @@ changing v5, and a v5 deploy needing v4's tree on the box.
 cd tools && python3 -m unittest discover -s lip_v5/tests -t .
 ```
 
-242 tests, ~0.05 s, no network, no filesystem outside the tmpdir, no possibility of paging.
+390 tests, ~0.1 s, no network, no filesystem outside the tmpdir, no possibility of paging.
 
 **The suite cannot page and cannot write outside tmp**, structurally, not by convention — two
 real incidents this week were a unit suite firing a push to a phone and a unit suite writing
@@ -104,16 +130,27 @@ The patch is `tools/lip_v5/g0-nestor-reader.patch`, **NOT APPLIED**. It ships be
 `LIP_CASH_FEED_ENABLED`, default FALSE.
 
 ```bash
-# 0a. review + apply the patch (SEPARATE review, per SF-4), then:
-cargo test -p engine reconcile
+# 0a. verify it applies, review it (SEPARATE review, per SF-4), then apply:
+git apply --check tools/lip_v5/g0-nestor-reader.patch    # MUST pass — part of the read-out
+git apply         tools/lip_v5/g0-nestor-reader.patch
+cargo test -p engine reconcile          # 19 pass, incl. 7 g0_* tests
 sudo systemctl restart nestor
 # READ-OUT: with the flag unset, `divergence` is byte-identical to today across >=1 pass.
 ```
 ```bash
-# 0b. LATER, and only after 0a has been observed clean — flip the flag:
+# 0b. LATER, and only after 0a has been observed clean — flip the flag.
+#     Place a HAND-BUILT fixture first so the read-out is checkable against a known number:
+cat > ~/nestor/data/lip_cash_feed.json <<'EOF'
+{"schema":"lip_cash_feed/1","ts":<now>,"seq":1,"process":"lip_v5","mode":"shared",
+ "delta_dollars":-10.00,"pending_payout_dollars":4.00,"components":{},"heartbeat_s":30}
+EOF
 sudo systemctl edit nestor      # Environment=LIP_CASH_FEED_ENABLED=true
 sudo systemctl restart nestor
-# READ-OUT: `expected_cash` moves by exactly the feed's `delta_dollars`.
+# READ-OUT, against that fixture:
+#   * `expected_cash` moves by exactly -10.00
+#   * `pending_payout` moves by exactly +4.00
+#   * one `lip_cash_feed OK - seq 1 delta $-10.00 pending $4.00 age Ns` line per pass
+#   * remove the fixture; an ABSENT file returns to (0,0) with no page
 ```
 **Rollback:** unset the flag. The reader is inert code until then.
 
@@ -150,6 +187,11 @@ sudo systemctl stop lip-maker-v4
 python3 -m lip_v5.lip_v5 --gen-adopt
 cat ~/nestor/data/lip/v5_adopt.json      # REVIEW IT. This is the gate.
 ```
+> **B7 requires you to say so.** A blank v5 ledger plus an adopt file is exactly the state the
+> fresh-state guard refuses — starting flat against a non-flat account. The cutover is the one
+> legitimate instance, so it must be STATED (`--allow-fresh`), not inferred from the absence of
+> evidence. If that flag surprises you here, stop: it means the ledger is not where you think.
+
 **READ-OUT before proceeding:** every basis in `[0.01, 0.99]`; the position count matches
 `GET /portfolio/positions`; no ticker you do not recognise.
 
@@ -219,14 +261,14 @@ rows it cancels, then verify `divergence ≈ $0.00`.
 
 Full derivations are in the build report and in the code beside each item.
 
-1. **`r*` fixpoint never converges as specified (D3, surfaced).** Spec §1.3's "4 iterations
-   covers a 16× seed error" is true of the *residual* (verified: exactly 16.0×), but the *stop
-   rule* is a 5% relative step change, which needs `log2(e/0.05)` steps — 5 for a 2× seed, 9 for
-   16×. So the fixpoint always falls back to `max(r*_0..r*_4)` and `rstar_no_converge` fires
-   every cycle. **This is safe** (the fallback errs high in both regimes, and a higher `r*`
-   always allocates less), but it is not adaptive and it will produce alarm fatigue. Two
-   one-line fixes: `RSTAR_MAX_ITERS = 9`, or make the stop rule a residual test. **Constants
-   ship unchanged pending your call.**
+1. **`r*` fixpoint (D3) — RESOLVED this round.** `RSTAR_MAX_ITERS` is now **9**, the smallest
+   value making spec §1.3's own two statements consistent (it covers the 16× seed error §1.3
+   names, at the 5% tolerance §1.3 sets). The old 4 could never trip the stop rule, so
+   `rstar_no_converge` fired every cycle on a control that was inert.
+   Also corrected: the fallback direction. `max(trace)` errs high relative to the **seed**, not
+   the **truth** — on a LOW seed the trace ascends and lands *below* the true fixed point,
+   pricing carry too cheaply, which is the PayPal direction. §1.4's unverified-exposure cap,
+   not this tie-break, is the cold-start guard.
 2. **Triage crossing-exit vs G6** — resolved in favour of the gate; see Step 3.
 3. **`rung0_cap` units (RD-1)** — spec §1.4 mixes contracts and dollars in one `min`; read as
    dollars, derivation in `ratchet.rung0_cap`.
@@ -237,9 +279,18 @@ Full derivations are in the build report and in the code beside each item.
 
 ---
 
-## What is NOT built
+## What is and is not built
 
-The quoting/metering **loop** is not wired — `--shadow` and the live path are the G2/G3 gates,
-and each is a separate human call by design. What IS built and tested is every money rule,
-every guard, every state machine and every file format that loop would use. The loop is
-plumbing over a proven core; the core is the part that must be right before capital moves.
+**Built and tested:** every money rule, all thirteen rails, the run cycle
+(`startup → adopt → triage → cycle → shutdown`), the one path to the wire, the meter, recon,
+the shadow read-out, `--gen-adopt`, `--handback`, and every file format.
+
+**Not built:** the outer `while` that calls `cycle()` on a timer under systemd, and the
+scan/classify sweep that discovers candidate markets (v5 currently takes its slot list as an
+argument). Both are deliberate: they are the G2/G3 gates' own step, and each is a separate
+human call. Everything they would call is here and under test.
+
+**The property to attack:** there is exactly ONE path to the wire (`Maker.place`), it consults
+`guards.place_allowed` before spending anything, and it publishes the cash feed before the
+POST. `test_engine.py` asserts that structurally — by counting `ex.placed` after each rail
+refuses — so a second path added later fails the suite rather than passing review.
