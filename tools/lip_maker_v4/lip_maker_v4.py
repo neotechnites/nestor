@@ -303,7 +303,7 @@ TAKER_EXIT_ENABLED = False
 # thing that must never happen is reaching $300 having never MADE the decision.  So the gate
 # is on the DECISION, not on the answer.  "undecided" refuses; "on" and "off_accepted" both
 # run, and both are recorded in the ledger at every start so the choice is never implicit.
-TAKER_EXIT_DECISION = "undecided"       # "undecided" | "on" | "off_accepted"
+TAKER_EXIT_DECISION = "off_accepted"       # "undecided" | "on" | "off_accepted"
 # NEW-5: the derivation above is a function of the CEILING, so the two must not drift.  At
 # or above this ceiling a startup assertion REFUSES TO RUN while TAKER_EXIT_ENABLED is
 # False.  Deliberately NOT an auto-enable: crossing the spread is a human decision and this
@@ -328,7 +328,7 @@ INV_CAP_USD = 10.00                     # §8.1 n_cap = floor($10/p) on NET.  A 
                                         #      earning is ~$50/window; $10 = 20% of that.
 PER_MARKET_POOL_MULT = 4.0              # §8.2 never risk 4x a market's own maximum prize
 PER_MARKET_BUDGET_FRAC = 0.25           # §8.2 no single-market concentration
-MAX_TOTAL_COLLATERAL_USD = 65.0         # §8.3 FIRST-RUN rung of the R168 ladder.  Each rung
+MAX_TOTAL_COLLATERAL_USD = 300.0         # §8.3 FIRST-RUN rung of the R168 ladder.  Each rung
                                         #      is funded by the previous window's OBSERVED
                                         #      print, never by the model.  Hard refuse.
 DAY_STOP_FRAC = 0.35                    # §8.4 largest drag leaving the day net-positive
