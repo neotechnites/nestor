@@ -110,3 +110,29 @@ def same_second(now, placed_ts):
     is ~1/s, so a sub-second cancel risks a coverage sample for zero price improvement.
     (MBB has g = 0 and needs no policy; this is the cancel-first path's guard.)"""
     return placed_ts is not None and int(float(now)) == int(float(placed_ts))
+
+
+def would_cross(side, price_yes, yes_bid, yes_ask):
+    """**A MAKER NEVER TAKES.**  True iff posting `price_yes` (YES axis) on `side` would be
+    marketable against the opposing best.
+
+    Paid for live 2026-07-28: v5 posted a 3c bid on a rung whose opposing side was AT 3c, the
+    order was taken on contact — 4 placements, ~200 contracts, $6.05 — and because a fully
+    taken order leaves nothing resting, the next cycle saw an empty slot and posted again.
+    Crossing therefore costs twice: the spread we pay, and the presence we never establish.
+    `shed_price` already refused a crossed book on the EXIT path; the entry path had no such
+    guard, which is the asymmetry this closes.
+
+    Freshness cannot substitute for this.  Even a one-second-old book can lock or cross before
+    our POST lands, so the check must be structural rather than a matter of polling harder.
+
+    MIRROR (refusing to cross ↔ never quoting at all): we do not widen away from the book —
+    the caller SKIPS this cycle and re-derives next cycle from a fresh read.  A missed cycle
+    costs presence-seconds; a crossed quote costs the spread AND the presence, so the
+    asymmetry favours skipping.  Unknown opposing side ⇒ NOT crossing: a book we cannot see is
+    not evidence of a lock, and refusing on missing data would silently empty the whole book.
+    """
+    p = float(price_yes)
+    if side == "bid":
+        return yes_ask is not None and p >= float(yes_ask) - 1e-12
+    return yes_bid is not None and p <= float(yes_bid) + 1e-12

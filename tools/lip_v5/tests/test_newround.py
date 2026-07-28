@@ -360,3 +360,42 @@ class TestFillsPollWhileHalted(NewRoundCase):
 
 if __name__ == "__main__":                                    # pragma: no cover
     unittest.main()
+
+
+class TestAMakerNeverTakes(__import__('unittest').TestCase):
+    """Paid live 2026-07-28: a 3c bid onto a rung whose opposing side was AT 3c was taken on
+    contact — 4 placements, ~200 contracts, $6.05 — and a fully-taken order leaves nothing
+    resting, so the next cycle re-posted into the same trap until the burst breaker halted it.
+    Crossing costs the spread AND the presence."""
+
+    def test_a_locked_book_is_never_crossed(self):
+        from lip_v5 import quote as Q
+        self.assertTrue(Q.would_cross("bid", 0.03, 0.03, 0.03), "bid at the ask is a TAKE")
+        self.assertTrue(Q.would_cross("ask", 0.59, 0.59, 0.59), "ask at the bid is a TAKE")
+
+    def test_joining_the_book_is_not_crossing(self):
+        from lip_v5 import quote as Q
+        self.assertFalse(Q.would_cross("bid", 0.02, 0.02, 0.03))
+        self.assertFalse(Q.would_cross("ask", 0.61, 0.59, 0.61))
+
+    def test_an_unseen_opposing_side_does_not_refuse(self):
+        """The mirror: refusing on missing data would silently empty the whole book."""
+        from lip_v5 import quote as Q
+        self.assertFalse(Q.would_cross("bid", 0.03, None, None))
+        self.assertFalse(Q.would_cross("ask", 0.50, None, None))
+
+    def test_the_requoter_skips_rather_than_crossing(self):
+        """End to end through the assembled requote pass: a locked book places NOTHING."""
+        from lip_v5 import alloc, engine, exchange as X
+        ex = X.FakeExchange(balance_cents=1_000_000)
+        m = engine.Maker(ex, 1785268000.0, live=False)
+        m.nestor_orders, m.nestor_positions = set(), set()
+        # bid best 3c and ask best 3c on the YES axis => locked.
+        bid = alloc.Slot("KXLOCK-26JUL29-T1", "bid", rho=9.0, S=500.0, p=0.03,
+                         venue="KXLOCK", hours_left=10.0)
+        ask = alloc.Slot("KXLOCK-26JUL29-T1", "ask", rho=9.0, S=500.0, p=0.97,
+                         venue="KXLOCK", hours_left=10.0)
+        stats = m.requote_pass(1785268000.0, [bid, ask],
+                               {bid.key: 50, ask.key: 50}, 0.0625)
+        self.assertEqual(stats["placed"], 0, "a locked book must place NOTHING")
+        self.assertEqual(ex.placed, [], "nothing may reach the wire")

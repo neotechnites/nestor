@@ -1279,6 +1279,22 @@ class Maker(object):
             else:
                 price = s.p if s.side == "bid" else (1.0 - s.p)
             price = round(price, 4)
+            # A MAKER NEVER TAKES (quote.would_cross).  Checked against the OPPOSING slot's
+            # best on the YES axis, for every path — entry, replenish, land grab and shed
+            # alike — because the exit path was the only one that had this guard, and the
+            # entry path is what paid the spread.  Skipping costs one cycle of presence;
+            # crossing costs the spread AND the presence, since a fully-taken order leaves
+            # nothing resting and the next cycle re-posts into the same trap.
+            _bid_s = slot_by_key.get((s.ticker, "bid"))
+            _ask_s = slot_by_key.get((s.ticker, "ask"))
+            _yes_bid = _bid_s.p if _bid_s else None
+            _yes_ask = (1.0 - _ask_s.p) if _ask_s else None
+            if Q.would_cross(s.side, price, _yes_bid, _yes_ask):
+                R.log("would_cross_skipped", ticker=s.ticker, side=s.side, price=price,
+                      yes_bid=_yes_bid, yes_ask=_yes_ask)
+                stats["skipped"] += 1
+                self.slot_examined[key] = now
+                continue
             if not (C.MIN_LEGAL_PRICE_C / 100.0 <= price <= C.MAX_LEGAL_PRICE_C / 100.0):
                 stats["skipped"] += 1
                 continue
