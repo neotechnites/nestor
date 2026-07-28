@@ -2887,7 +2887,8 @@ class Phase1_DayStopActuallyFlattens(_RunnerCase):
         self.assertAlmostEqual(usd, 8.0, places=6)
         summary = [e for e in self.events() if e["event"] == "flatten_summary"][0]
         self.assertIn("exited holding 20 contracts, $8.00", summary["note"])
-        self.assertFalse(summary["taker_exit_enabled"])
+        # config-RELATIVE: the flag is a live ladder decision and flips between sessions
+        self.assertEqual(summary["taker_exit_enabled"], M.TAKER_EXIT_ENABLED)
 
     def test_a_frozen_market_is_never_flattened(self):
         """§9.4b/§5.6 -- acting on unverified inventory is how a bookkeeping ambiguity
@@ -2921,11 +2922,17 @@ class Phase1_TakerExitPathIsReadyForEitherAnswer(_RunnerCase):
         return m
 
     def test_it_is_a_no_op_while_the_flag_is_off(self):
+        """Asserts the OFF BEHAVIOUR, not the current config — the flag is a live ladder
+        decision that flips between sessions."""
         m = self._maker()
         m.shed_since["T"] = 0.0
-        self.assertFalse(M.TAKER_EXIT_ENABLED)
-        self.assertIsNone(m.taker_exit("T", 99999.0))
-        self.assertEqual(self.posted, [])
+        old = M.TAKER_EXIT_ENABLED
+        try:
+            M.TAKER_EXIT_ENABLED = False
+            self.assertIsNone(m.taker_exit("T", 99999.0))
+            self.assertEqual(self.posted, [])
+        finally:
+            M.TAKER_EXIT_ENABLED = old
 
     def _enabled(self, fn):
         old = M.TAKER_EXIT_ENABLED
@@ -4292,6 +4299,190 @@ class RefillCapDoesNotBlockExits(_RunnerCase):
         posted, residual, usd = m.flatten(1000.0, "day_stop")
         self.assertEqual(posted, 1)
         self.assertEqual(residual, 0.0)
+
+
+class LandGrab(_RunnerCase):
+    """§6.2 / cold-audit C6 — the highest-return action ALLOCATE cannot see.  With no
+    qualifying book on a side, every snapshot is EXCLUDED and NOBODY is paid; creating the
+    side makes us the sole qualifying bidder = 50% of every included snapshot for
+    target_size x $0.01."""
+
+    def lg(self, ticker="T", side="bid", rho=6.25, target=1000, size=1000, money=5.0,
+           **kw):
+        px = M.LAND_GRAB_PRICE_C if side == "bid" else 100 - M.LAND_GRAB_PRICE_C
+        return M.Slot(ticker, side, rho, 0.0, M.unit_collateral(side, px / 100.0),
+                      target_size=target, land_grab_size=size, land_grab_price_c=px,
+                      moneyness=money, pool=rho * 16.0, **kw)
+
+    # ---- admission -------------------------------------------------------------------
+    def test_an_S_zero_slot_is_admitted_and_sized_at_the_qualification_size(self):
+        s = self.lg(size=975)
+        al, spent = M.allocate([s], 300.0, BIG)
+        self.assertEqual(al[s.key], 975)
+        self.assertAlmostEqual(spent, 975 * 0.01, places=6)
+        self.assertEqual(M.marginal_rate(s.rho, 0.0, 0, s.p), 0.0)   # the water-fill can't
+
+    def test_it_uses_the_existing_tested_sizing_function(self):
+        partial = M.score_side([(1, 25.0)], 1000, 0.5, "cents")
+        self.assertFalse(partial.qualifies)
+        self.assertEqual(M.t0_qualification_size(partial, 1000), 975)
+        empty = M.score_side([], 1000, 0.5, "cents")
+        self.assertEqual(M.t0_qualification_size(empty, 1000), 1000)
+
+    def test_only_when_the_flag_is_on(self):
+        s = self.lg()
+        old = M.T0_QUALIFICATION_WIRED
+        try:
+            M.T0_QUALIFICATION_WIRED = False
+            self.assertEqual(M.allocate([s], 300.0, BIG)[0][s.key], 0)
+            self.assertEqual(M.land_grab_pass([s], 300.0, BIG), ({}, 0.0))
+        finally:
+            M.T0_QUALIFICATION_WIRED = old
+
+    def test_only_on_a_LIVE_window(self):
+        """§6.2 fires at the program's own start_date — not before it opens, not after it
+        ends.  Composes with the window-start and runway guards rather than bypassing them."""
+        self.assertEqual(M.land_grab_pass([self.lg(hours_to_start=10.5)], 300.0, BIG)[0],
+                         {})
+        self.assertEqual(M.land_grab_pass([self.lg(hours_left=0.0)], 300.0, BIG)[0], {})
+        self.assertTrue(M.land_grab_pass([self.lg(hours_to_start=0.0,
+                                                  hours_left=8.0)], 300.0, BIG)[0])
+        # within the pre-positioning lead is still allowed
+        self.assertTrue(M.land_grab_pass(
+            [self.lg(hours_to_start=M.PREPOSITION_LEAD_H / 2)], 300.0, BIG)[0])
+
+    def test_pinned_denied_frozen_and_p6_excluded_slots_never_land_grab(self):
+        for kw in ({"pinned": True}, {"denied": True}, {"legal_price_exists": False},
+                   {"assume_filled": True}, {"p6_ok": False}):
+            self.assertEqual(M.land_grab_pass([self.lg(**kw)], 300.0, BIG)[0], {}, kw)
+
+    # ---- cap composition -------------------------------------------------------------
+    def test_n_cap_and_INV_CAP_compose_exactly_at_one_cent(self):
+        """n_cap(1c) = floor($10/0.01) = 1000 = target_size = exactly INV_CAP_USD.  The
+        collateral is REAL: $10 per rung-side, capped by the same §8.1 rule as everything
+        else."""
+        self.assertEqual(M.n_cap(0.01), 1000)
+        self.assertAlmostEqual(1000 * 0.01, M.INV_CAP_USD, places=9)
+        s = self.lg(size=5000)                       # ask for more than the cap allows
+        al, spent = M.allocate([s], 300.0, M.Caps())  # PRODUCTION caps, not the relaxed ones
+        self.assertEqual(al[s.key], 1000)            # clamped to n_cap
+        self.assertAlmostEqual(spent, M.INV_CAP_USD, places=9)
+
+    def test_the_unverified_payoff_cannot_consume_the_book(self):
+        """MY ADDITION, flagged: item 3 says whether sub-target books accrue is UNKNOWN, and
+        §8.3 funds each rung from the OBSERVED print.  6 markets x 2 sides x $10 = $120 of a
+        $300 ceiling on an unproven bet; the fraction holds it to $75."""
+        slots = []
+        for i in range(12):
+            for side in ("bid", "ask"):
+                slots.append(self.lg("M%02d" % i, side, money=float(i)))
+        al, spent = M.land_grab_pass(slots, 300.0, BIG)
+        self.assertLessEqual(spent, M.LAND_GRAB_MAX_COLLATERAL_FRAC * 300.0 + 1e-9)
+        self.assertEqual(M.LAND_GRAB_MAX_COLLATERAL_FRAC, 0.25)
+
+    def test_at_most_LAND_GRAB_MAX_MARKETS_markets(self):
+        slots = [self.lg("M%02d" % i, side, money=float(i))
+                 for i in range(12) for side in ("bid", "ask")]
+        al, _ = M.land_grab_pass(slots, 1e6, BIG)
+        self.assertEqual(len({k[0] for k in al}), M.LAND_GRAB_MAX_MARKETS)
+
+    def test_it_prefers_rungs_nearest_the_money(self):
+        """Optics are load-bearing (§10.2/P9): a wall of penny bids across all 17 rungs is
+        the picture of farming; a few two-sided quotes near the money is making."""
+        slots = [self.lg("R%02d" % i, "bid", money=float(i)) for i in range(12)]
+        al, _ = M.land_grab_pass(slots, 1e6, BIG)
+        taken = sorted(k[0] for k in al)
+        self.assertEqual(taken, ["R%02d" % i for i in range(M.LAND_GRAB_MAX_MARKETS)])
+
+    def test_it_takes_both_sides_where_affordable(self):
+        slots = [self.lg("M1", "bid", money=1.0), self.lg("M1", "ask", money=1.0)]
+        al, _ = M.land_grab_pass(slots, 1e6, BIG)
+        self.assertEqual(sorted(al), [("M1", "ask"), ("M1", "bid")])
+        self.assertTrue(M.LAND_GRAB_BOTH_SIDES)
+
+    def test_the_per_market_cap_still_binds(self):
+        slots = [self.lg("M1", "bid", rho=0.001, money=1.0),
+                 self.lg("M1", "ask", rho=0.001, money=1.0)]
+        al, _ = M.land_grab_pass(slots, 300.0, M.Caps())
+        cost = sum(al.values()) * 0.01
+        self.assertLessEqual(cost, M.market_cap_usd(slots[0], 300.0, M.Caps()) + 1e-9)
+
+    def test_determinism(self):
+        slots = [self.lg("M%02d" % i, side, money=float(i % 4))
+                 for i in range(9) for side in ("bid", "ask")]
+        first = M.land_grab_pass(slots, 300.0, BIG)
+        for _ in range(20):
+            self.assertEqual(M.land_grab_pass(list(slots), 300.0, BIG), first)
+
+    # ---- interaction with the water-fill and the rest of the stack --------------------
+    def test_the_water_fill_spends_only_what_is_left(self):
+        grab = self.lg("GRAB", "bid", size=1000)
+        normal = M.Slot("NORM", "bid", 6.25, 50.0, 0.02, phi=0.0, d=0.0)
+        # $300 budget: the 0.25 land-grab fraction affords the $10 grab, and the water-fill
+        # then spends the remainder — the two passes compose rather than competing.
+        al, spent = M.allocate([grab, normal], 300.0, BIG, lambda_min=0.0)
+        self.assertEqual(al[grab.key], 1000)
+        self.assertGreater(al[normal.key], 0)
+        self.assertLessEqual(spent, 300.0 + 1e-9)
+        self.assertAlmostEqual(spent, 10.0 + al[normal.key] * 0.02, places=6)
+        # and a budget too small for a full grab takes none of it (all-or-nothing)
+        self.assertEqual(M.land_grab_pass([grab], 30.0, BIG)[0], {})
+
+    def test_a_land_grab_order_is_an_OPENING_order_for_the_refill_cap(self):
+        """It creates inventory, so it must consume refill capacity — the exemption is for
+        CLOSING orders only, and this is the opposite."""
+        st = M.LedgerState()
+        m = M.Maker(None, st, [])
+        self.posted = []
+        m.do_post = lambda b: (self.posted.append(b),
+                               (201, {"order_id": "N1", "fill_count": "0.00",
+                                      "remaining_count": b["count"]}))[1]
+        m.place("T", "bid", 1, 500, 1785000000)
+        self.assertEqual(m.refilled.get(("T", "bid"), 0), 500)
+        m.refilled[("T", "bid")] = M.refill_cap(0.01)
+        self.assertIsNone(m.place("T", "bid", 1, 500, 1785000000))
+        self.assertEqual(m.last_place_skip, "refill_cap")
+
+    def test_slots_from_market_builds_the_plan_and_never_crosses(self):
+        prog = {"program_id": "P1", "market_ticker": "T", "series": "KX",
+                "period_reward": 1_000_000.0, "target_size_fp": 1000.0,
+                "discount_factor_bps": 5000.0, "start_ts": 0.0, "end_ts": 16 * 3600.0,
+                "paid_out": False}
+        # one-sided book: yes bid 98, no side empty -> the NO side is land-grabbable at 99
+        book = {"orderbook": {"orderbook_fp": {
+            "yes_dollars": [["0.9800", "25"]], "no_dollars": []}}}
+        slots, info = M.slots_from_market(prog, book, 0.0)
+        ask = [x for x in slots if x.side == "ask"][0]
+        self.assertTrue(ask.is_land_grab)
+        self.assertEqual(ask.land_grab_price_c, 99)
+        self.assertEqual(ask.land_grab_size, 1000)
+        self.assertGreater(ask.land_grab_price_c, 98)          # does not cross the yes bid
+        # a PINNED market never land-grabs
+        pinned = {"orderbook": {"orderbook_fp": {
+            "yes_dollars": [["0.9900", "5000"]], "no_dollars": []}}}
+        for x in M.slots_from_market(prog, pinned, 0.0)[0]:
+            self.assertFalse(x.is_land_grab)
+
+    def test_a_qualifying_side_is_not_a_land_grab_candidate(self):
+        prog = {"program_id": "P1", "market_ticker": "T", "series": "KX",
+                "period_reward": 1_000_000.0, "target_size_fp": 10.0,
+                "discount_factor_bps": 5000.0, "start_ts": 0.0, "end_ts": 16 * 3600.0,
+                "paid_out": False}
+        book = {"orderbook": {"orderbook_fp": {
+            "yes_dollars": [["0.4000", "100"]], "no_dollars": [["0.5900", "100"]]}}}
+        for x in M.slots_from_market(prog, book, 0.0)[0]:
+            self.assertFalse(x.is_land_grab)
+
+    def test_the_instrumentation_record_carries_what_the_referee_needs(self):
+        """Item 3: whether a sub-target book accrues AT ALL is unverified.  No code depends
+        on the answer; the record is what the operator reconciles the popover against."""
+        src = open(M.__file__.replace(".pyc", ".py")).read()
+        i = src.index('log("land_grab"')
+        rec = src[i:i + 700]
+        for field in ("ticker", "side", "size", "price_c", "target_size", "cum_size",
+                      "pool_usd", "collateral_usd", "moneyness"):
+            self.assertIn(field, rec, field)
+        self.assertIn("unverified", rec)
 
 
 class StartupAssertions(unittest.TestCase):
