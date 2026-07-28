@@ -318,6 +318,33 @@ class TestTriage(LipTestCase):
         adopted, venues = self._book()
         self.assertEqual(CU.triage(adopted, venues, self.NOW, RSTAR, enabled=False), [])
 
+    def test_NOTE43_S2_carry_uses_the_MARK_not_the_sunk_entry_basis(self):
+        """note 43 §2 — "The exit's price of impatience is spread + taker fee; its price of
+        patience is carry.  Both are computable, and ENTRY PRICE BELONGS IN NEITHER (sunk — a
+        rule that anchors on entry cuts winners and rides losers by construction)."
+
+        A deeply underwater position rents only what it could still recover.  Anchoring on
+        basis overstates its carry and crosses the spread to escape a sunk number.
+        """
+        adopted, venues = self._book()
+        v = dict(venues["MENTION"])
+        v["mark"] = 0.02                                  # basis was 0.30; it collapsed
+        out = CU.triage_position(adopted[2], v, self.NOW, RSTAR)
+        self.assertAlmostEqual(out["mark_used"], 0.02, places=9)
+        self.assertAlmostEqual(out["locked_usd"], 20.0 * 0.02, places=9)
+        # the basis-anchored figure would have been 15x larger
+        self.assertLess(out["hold_cost_usd"], 20.0 * 0.30 * out["h_wait_h"] * RSTAR)
+
+    def test_NOTE43_S2_an_unpriced_position_falls_back_to_cost(self):
+        """The day stop's mark-at-cost convention, reused: the only honest statement about a
+        price we cannot observe."""
+        adopted, venues = self._book()
+        v = dict(venues["MENTION"])
+        v.pop("mark", None)
+        v.pop("p", None)
+        out = CU.triage_position(adopted[2], v, self.NOW, RSTAR)
+        self.assertAlmostEqual(out["mark_used"], adopted[2]["basis"], places=9)
+
     def test_taker_fee_rounds_UP_to_the_cent(self):
         """Rounding down would under-price every crossing decision in the direction that makes
         crossing look better than it is."""

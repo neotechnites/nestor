@@ -1,0 +1,378 @@
+"""
+lip_v5.scan — programs feed → classify sweep → SLOT TABLE.
+
+This is the front of the cycle: it turns "what exists on the exchange" into the `slots` argument
+`engine.cycle()` consumes.  Three stages, each on its own cadence and each drawing from the same
+rate budget:
+
+    scan      (SCAN_REFRESH_S)     the LIP programs feed — pools, windows, series
+    classify  (CLASSIFY_REFRESH_S) per-market book reads: pinned? qualifies? S? p?
+    build     (every cycle)        slots, from the two above plus our own tape
+
+**Why classify is a separate, slower stage** (v4's B1 fix, kept on merits): ranking by ρ alone is
+DEGENERATE INSIDE ONE EVENT — every rung of a gas daily carries the identical `period_reward` and
+the identical window, so ρ cannot separate them and the ticker tie-break decides.  Measured live:
+a ρ-ranked clamp picked six deep-ITM rungs of which FOUR were pinned and could never pay, and
+never polled the three best slots on the board.  So: classify first (cheap, low cadence, learns
+pinned/qualifies/S/p), then rank by the ALLOCATOR'S OWN first-dollar rate.
+
+Pinned-ness changes only when a 99c/1c tick-boundary order moves, which is a 15-minute
+timescale — far slower than the 1 Hz quoting loop.  That is the cadence's derivation, and it is
+also why `classify` is degrade step 1: it is the cheapest requests to give up.
+"""
+
+from . import alloc, config as C, money as M, presence as P
+from . import runtime as R
+
+
+# =============================================================================================
+# STAGE 1 — the programs feed.
+# =============================================================================================
+def parse_iso(s):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def pool_usd(period_reward):
+    """spec §0.2 — `pool_usd = period_reward × 1e-4`.  A wrong unit is a 10x or 10,000x sizing
+    error, which is why `lip_v5.unit_assertion_check` refuses to run on a mismatch."""
+    return float(period_reward or 0.0) * C.PERIOD_REWARD_UNIT_USD
+
+
+def window_hours(start_ts, end_ts):
+    if start_ts is None or end_ts is None:
+        return None
+    h = (float(end_ts) - float(start_ts)) / 3600.0
+    return h if h > 0 else None
+
+
+def pool_rate(period_reward, window_h):
+    """`ρ = pool_usd / window_hours` ($/h).  Program periods are MULTI-DAY (modal 228 h), so
+    every window quantity is a FRACTION of that program's own [start_date, end_date] — never a
+    calendar day (spec §0.2)."""
+    if not window_h or window_h <= 0:
+        return 0.0
+    return pool_usd(period_reward) / float(window_h)
+
+
+def parse_programs(body):
+    """The LIP programs feed → normalized program dicts.  Unparseable rows are DROPPED, loudly:
+    a program we cannot read is a program we must not size against."""
+    out = []
+    rows = (body or {}).get("liquidity_incentive_programs") or []
+    for row in rows:
+        try:
+            start = parse_iso(row.get("start_date"))
+            end = parse_iso(row.get("end_date"))
+            wh = window_hours(start, end)
+            if wh is None:
+                R.log("program_unparseable", program_id=row.get("id"))
+                continue
+            out.append({
+                "program_id": row.get("id") or row.get("program_id"),
+                "series": row.get("series_ticker") or row.get("series"),
+                "tickers": list(row.get("market_tickers") or ([row["market_ticker"]]
+                                                              if row.get("market_ticker")
+                                                              else [])),
+                "period_reward": row.get("period_reward"),
+                "start_ts": start, "end_ts": end, "window_h": wh,
+                "rho": pool_rate(row.get("period_reward"), wh),
+                "target_size": float(row.get("target_size_fp") or row.get("target_size")
+                                     or 1000.0),
+                "paid_out": bool(row.get("paid_out")),
+            })
+        except Exception as exc:                              # noqa: BLE001 - row is untrusted
+            R.log("program_unparseable", err="%s: %s" % (type(exc).__name__, exc))
+    return out
+
+
+class Scanner(object):
+    """Cadence-gated programs pull.  Every request goes through the rate bucket's
+    `classify_sweep` lane — the LOWEST priority, because the programs feed is the most
+    deferrable thing we read: pools re-price on a multi-day timescale."""
+
+    def __init__(self, refresh_s=C.SCAN_REFRESH_S):
+        self.refresh_s = float(refresh_s)
+        self.last_scan = None
+        self.programs = []
+
+    def due(self, now):
+        return self.last_scan is None or (float(now) - self.last_scan) >= self.refresh_s
+
+    def scan(self, ex, bucket, now, max_pages=C.SCAN_MAX_PAGES):
+        if not self.due(now):
+            return self.programs
+        pages, cursor, collected = 0, None, []
+        while pages < int(max_pages):
+            ok, _ = bucket.admit("classify_sweep", now)
+            if not ok:
+                # Out of budget mid-scan: keep what we have.  A PARTIAL program table is
+                # correct-but-narrow (we simply see fewer venues); a stale one is also fine,
+                # since pools move on a multi-day timescale.  Neither is wrong, so neither halts.
+                R.log("scan_deferred", pages=pages)
+                break
+            status, body = ex.programs(cursor)
+            if status != 200:
+                R.log("scan_failed", status=status)
+                break
+            collected.extend(parse_programs(body))
+            cursor = (body or {}).get("cursor")
+            pages += 1
+            if not cursor:
+                break
+        if collected:
+            self.programs = collected
+            self.last_scan = float(now)
+        return self.programs
+
+
+# =============================================================================================
+# STAGE 2 — the classify sweep.
+# =============================================================================================
+class Classifier:
+    """Per-market: pinned? does each side qualify?  S and p per side.
+
+    Cadence `CLASSIFY_REFRESH_S`; rate `CLASSIFY_HZ`, degrading to `CLASSIFY_HZ_DEGRADED` as
+    §3.4 step 1.  Bounded to `CLASSIFY_MAX_MARKETS` by ρ, which DOES rank across events (they
+    have different pools) — it only fails WITHIN one, which is precisely why the rank that
+    matters is computed after this stage, not before it.
+    """
+
+    def __init__(self, refresh_s=C.CLASSIFY_REFRESH_S, max_markets=C.CLASSIFY_MAX_MARKETS):
+        self.refresh_s = float(refresh_s)
+        self.max_markets = int(max_markets)
+        self.table = {}                      # ticker -> classification
+        self.last = {}                       # ticker -> ts
+
+    def due(self, ticker, now):
+        t = self.last.get(ticker)
+        return t is None or (float(now) - t) >= self.refresh_s
+
+    def candidates(self, programs, now):
+        """Top-N markets by ρ, denied series removed BEFORE we spend a request on them."""
+        rows = []
+        for prog in programs:
+            for tk in prog["tickers"]:
+                if C.series_denied(tk):
+                    continue
+                rows.append((prog["rho"], tk, prog))
+        rows.sort(key=lambda r: (-r[0], str(r[1])))
+        return rows[:self.max_markets]
+
+    def classify_one(self, ticker, book_body, program, now):
+        yes_levels, no_levels = _book_levels(book_body)
+        ys = alloc.score_side(yes_levels, program["target_size"], mode=C.S_MODE_ENTRY)
+        ns = alloc.score_side(no_levels, program["target_size"], mode=C.S_MODE_ENTRY)
+        yes_bid_c = ys.ref_c
+        no_bid_c = ns.ref_c
+        yes_ask_c = (100 - no_bid_c) if no_bid_c is not None else None
+        rec = {
+            "ticker": ticker, "program_id": program["program_id"],
+            "series": program["series"] or str(ticker).split("-", 1)[0],
+            "pinned": alloc.is_pinned(yes_bid_c, yes_ask_c),
+            "target_size": program["target_size"],
+            "sides": {
+                "bid": {"S": ys.S, "qualifies": ys.qualifies, "cum_size": ys.cum_size,
+                        "p": (yes_bid_c / 100.0) if yes_bid_c else None,
+                        "legal": yes_bid_c is not None and yes_bid_c < C.MAX_LEGAL_PRICE_C},
+                "ask": {"S": ns.S, "qualifies": ns.qualifies, "cum_size": ns.cum_size,
+                        "p": (no_bid_c / 100.0) if no_bid_c else None,
+                        "legal": no_bid_c is not None and no_bid_c < C.MAX_LEGAL_PRICE_C},
+            },
+            "yes_mid": _mid(yes_bid_c, yes_ask_c),
+            "ts": float(now),
+        }
+        self.table[ticker] = rec
+        self.last[ticker] = float(now)
+        return rec
+
+    def sweep(self, ex, bucket, programs, now, books=None):
+        """One pass.  Returns the number of markets (re)classified."""
+        books = books or {}
+        n = 0
+        for rho, ticker, program in self.candidates(programs, now):
+            if not self.due(ticker, now):
+                continue
+            body = books.get(ticker)
+            if body is None:
+                ok, _ = bucket.admit("classify_sweep", now)
+                if not ok:
+                    break                     # out of budget: the rest waits for the next pass
+                status, body = ex.book(ticker)
+                if status != 200:
+                    continue
+            self.classify_one(ticker, body, program, now)
+            n += 1
+        return n
+
+
+def _book_levels(body):
+    ob = (body or {}).get("orderbook") if isinstance(body, dict) else None
+    fp = (ob or {}).get("orderbook_fp") or (body or {}).get("orderbook_fp") or {}
+    def lv(rows):
+        out = []
+        for r in rows or []:
+            try:
+                out.append((int(round(float(r[0]) * 100)), float(r[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        return out
+    return lv(fp.get("yes_dollars")), lv(fp.get("no_dollars"))
+
+
+def _mid(yes_bid_c, yes_ask_c):
+    if yes_bid_c is None or yes_ask_c is None:
+        return None
+    return (yes_bid_c + yes_ask_c) / 200.0
+
+
+# =============================================================================================
+# STAGE 3 — the slot table.
+# =============================================================================================
+_P6_WARNED = False
+
+
+def _warn_p6_unwired():
+    """Say it ONCE per process, loudly enough to appear in the G2 read-out."""
+    global _P6_WARNED
+    _P6_WARNED = True
+    R.log("p6_pre_entry_filter_UNWIRED",
+          note="no public-trade-tape source supplied; markets are admitted without the "
+               "revealed-usefulness check (note 43 §5). Wire `p6=` before G3.")
+
+
+def runway_ok(rho, hours_left, accrued_usd=0.0, floor_usd=C.ENTRY_FLOOR_USD,
+              share=C.ENTRY_SHARE_ASSUMPTION):
+    """The window-END guard.  ALLOCATE optimises a RATE and is blind to how many hours remain to
+    earn it, so a dying program looks identical to a fresh one — measured live as 735 lots posted
+    with under 25 minutes left.  Entering is only rational if the entry floor is still REACHABLE:
+
+        share · (ρ/2) · h ≥ ENTRY_FLOOR − accrued
+
+    with a CONSERVATIVE share, because assuming we take the whole side is exactly the optimism
+    that produces late entries.
+
+    MIRROR (window END ↔ window START): `preposition_ok` below.
+    """
+    need = max(0.0, float(floor_usd) - float(accrued_usd))
+    if need <= 0:
+        return True
+    if float(rho) <= 0:
+        return False
+    return float(share) * (float(rho) / 2.0) * float(hours_left) >= need
+
+
+def preposition_ok(hours_to_start, lead_h=C.PREPOSITION_LEAD_H):
+    """The window-START guard.  Before its window opens a resting order earns EXACTLY ZERO and
+    carries the full marginal fill cost — and under a binding ceiling EVERY NON-EARNING DOLLAR
+    DISPLACES AN EARNING DOLLAR 1:1, so a pre-start quote is a transfer out of the earning book.
+    v4 locked ~$11 in slots whose programs opened 10.5 h later while live-window posts were being
+    refused on `collateral_ceiling` in the same second."""
+    return float(hours_to_start) <= float(lead_h) + 1e-12
+
+
+def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen=None,
+                l_shed=None, prior_t_hat=None, p6=None):
+    """The slot table `engine.cycle()` consumes.
+
+    Every exclusion that can be decided WITHOUT a request is applied here, so the rate budget is
+    never spent on a market we would refuse anyway.  What this stage may NOT do is decide size —
+    that is ALLOCATE's, under (★).
+
+    `p6(ticker) -> bool` is the P6 PRE-ENTRY FILTER (note 43 §5's mirror: "zero fills forever
+    means either the perfect rewards venue or a market nobody wants — the difference is whether
+    ANYONE EVER TRADES THERE AT ALL").  It needs the public trade tape, which this build does not
+    yet pull, so the seam is explicit and its absence is LOGGED rather than silently defaulting
+    to admit.  An unwired filter that looks wired is the same defect class as a constant with no
+    call site.
+    """
+    if p6 is None and not _P6_WARNED:
+        _warn_p6_unwired()
+    frozen = frozen or set()
+    tape = tape or {}
+    presence_rows = presence_rows or []
+    slots = []
+    by_prog = {p["program_id"]: p for p in programs}
+
+    for ticker, rec in sorted(classifier.table.items()):
+        prog = by_prog.get(rec["program_id"])
+        if prog is None or C.series_denied(ticker) or ticker in frozen:
+            continue
+        hours_left = max(0.0, (prog["end_ts"] - float(now)) / 3600.0)
+        hours_to_start = max(0.0, (prog["start_ts"] - float(now)) / 3600.0)
+        if hours_left <= 0 or not preposition_ok(hours_to_start):
+            continue
+        if not runway_ok(prog["rho"], hours_left):
+            continue
+
+        if p6 is not None and not p6(ticker):
+            continue                          # P6: nobody trades here; presence buys nothing
+        for side in ("bid", "ask"):
+            sd = rec["sides"][side]
+            p = sd["p"]
+            if not sd["legal"] or p is None or p <= 0:
+                continue
+            key = (ticker, side)
+            rows = [r for r in presence_rows
+                    if (r.get("ticker"), r.get("side")) == key]
+            t = tape.get(key, {})
+            fills = int(t.get("fills_ct", 0))
+            rest_ch = float(t.get("rest_contract_hours",
+                                  P.rest_contract_hours(rows, key) if rows else 0.0))
+            phi = M.phi_estimate(fills, rest_ch, p=p)
+            d = M.d_estimate(t.get("drift_samples"), p)
+            l_eff = M.l_eff_h(prog["end_ts"], now,
+                              (l_shed or {}).get(key), settled=False)
+            t_hat = (P.t_hat_shrunk(rows, key, prior=prior_t_hat) if rows
+                     else (prior_t_hat if prior_t_hat is not None
+                           else C.SHRINK_PRIOR_DEFAULT))
+            land_grab = 0
+            if not sd["qualifies"] and not rec["pinned"]:
+                land_grab = alloc.t0_qualification_size(sd["cum_size"], rec["target_size"])
+            slots.append(alloc.Slot(
+                ticker, side, rho=prog["rho"], S=sd["S"], p=p, venue=rec["series"],
+                pinned=rec["pinned"], legal_price_exists=sd["legal"],
+                phi=phi, d=d, l_eff=l_eff, t_hat=t_hat,
+                program_id=prog["program_id"], window_h=prog["window_h"],
+                hours_left=hours_left, hours_to_start=hours_to_start,
+                target_size=rec["target_size"], cum_size=sd["cum_size"],
+                land_grab_size=land_grab,
+                close_ts=prog["end_ts"], program_end_ts=prog["end_ts"],
+                moneyness=abs((rec["yes_mid"] or 0.5) - 0.5) * 100.0))
+    return slots
+
+
+def rank_for_poll(slots, r_star=C.FLOOR_RATE_PER_H, limit=None):
+    """The §4.6 clamp: which markets get the 1 Hz book poll.  Ranked by the ALLOCATOR'S OWN
+    first-dollar rate under (★), so the clamp and the allocator agree — the whole point of the
+    classify-then-rank ordering.
+
+    MIRROR (rank picks the best ↔ inventory we already hold): the INVENTORY-SLOT GUARANTEE.  A
+    market with a nonzero position or a non-terminal order is ALWAYS polled, whatever it ranks:
+    fills are learned from cancels and polls, so a de-polled market is never requoted, never
+    cancelled, and its fills are never learned — the position becomes invisible to our own books
+    and no shed is ever posted.  Callers pass those tickers in `always`; `rank_for_poll` only
+    orders the rest.
+    """
+    scored = [(s.net_at(0, r_star), s) for s in slots]
+    scored.sort(key=lambda kv: (-kv[0], kv[1].ticker, kv[1].side))
+    out = [s for _, s in scored]
+    return out[:int(limit)] if limit else out
+
+
+def poll_set(slots, always_tickers, connected, r_star=C.FLOOR_RATE_PER_H):
+    """The tickers to poll this cycle: every market we hold or have an order in, plus the best
+    of the rest up to the breadth the connection supports (6 REST, 32 while the WS is up)."""
+    breadth = C.MAX_WS_MARKETS if connected else C.MAX_REST_MARKETS
+    held = [t for t in sorted(always_tickers)]
+    ranked = [s.ticker for s in rank_for_poll(slots, r_star)]
+    out = list(held)
+    for t in ranked:
+        if len(out) >= breadth:
+            break
+        if t not in out:
+            out.append(t)
+    return out

@@ -304,17 +304,37 @@ def run_handback(positions=None, out_path=None, now=None, adopt_path=None):
     return obj
 
 
-def run_shadow(now=None, slots=None, ex=None):
-    """G2's REAL read-out: metering + `venue_rank` + a zeroed cash feed, quoting NOTHING.
+def run_shadow(now=None, ex=None, iterations=3, auth=None):
+    """G2's REAL read-out, produced by the ASSEMBLED loop: scan → classify → slots → metering →
+    `venue_rank` → zeroed cash feed, quoting NOTHING.
 
     `shadow=True` makes `Maker.place` refuse before the rate lane, so "quotes nothing" is a
-    property of the one path to the wire rather than of this function remembering not to call
-    it.
+    property of the one path to the wire rather than of this function remembering not to call it.
+
+    **G2 reads but does not write.**  Metering and venue ranking need the programs feed and the
+    books, so shadow needs the NETWORK — which `runtime.set_live` gates.  Without `--live` this
+    runs against a `FakeExchange` and says so: an offline rehearsal of the loop's shape, useful
+    for proving the wiring and useless as a venue ranking.  The distinction is printed, because
+    a shadow read-out that silently ranked nothing would look exactly like a healthy quiet book.
     """
-    from . import engine as E, exchange as X
+    from . import exchange as X, runner as RUN
     now = R._now() if now is None else float(now)
-    m = E.Maker(ex or X.FakeExchange(), now, shadow=True)
-    out = m.shadow_readout(now, slots=slots or [])
+    online = ex is not None or (R.is_live() and auth is not None)
+    ex = ex or (X.Exchange(auth) if (R.is_live() and auth is not None) else X.FakeExchange())
+    r = RUN.build(ex, now, shadow=True)
+    ok, refusals = r.init(now, nestor_state=nestor_state(), reader_enabled=True)
+    if not ok:
+        for msg in refusals:
+            print("REFUSED: %s" % msg)
+        return {"refused": refusals}
+    for i in range(int(iterations)):
+        r.iteration(now + i)
+    out = r.m.shadow_readout(now + iterations, slots=r.slots)
+    out["online"] = online
+    print("source: %s" % ("LIVE exchange" if online
+                          else "FakeExchange (offline rehearsal — NOT a venue ranking)"))
+    print("programs %d, classified %d, slots %d"
+          % (len(r.scanner.programs), len(r.classifier.table), len(r.slots)))
     print("venue_rank: %d slots ranked, %d admitted"
           % (len(out["venue_rank"]), sum(1 for r in out["venue_rank"] if r["admits"])))
     for r in out["venue_rank"][:20]:
@@ -366,7 +386,11 @@ def main(argv=None):
 
     if args.shadow:
         print("G2 shadow mode: quoting disabled, metering only, cash feed zeroed.")
-        run_shadow()
+        auth, note = R.load_auth()
+        if args.live and auth is None:
+            print("--shadow --live needs a key: %s" % note)
+            return 1
+        run_shadow(auth=auth)
         return 0
 
     if args.live:

@@ -64,9 +64,11 @@ hours — no settlement, no credit, no waiting.
 | `ledger.py` | 131 | the money record, and the separate presence file + compaction |
 | `wsgate.py` | 156 | the W2 3-agreement gate over the vendored feed |
 | `ws_feed.py` | 1221 | **vendored verbatim from v4** — see below |
+| `scan.py` | 378 | **programs feed → classify sweep → slot table** — window guards, runway, deny list, P6 seam |
+| `runner.py` | 171 | **the outer loop** — init/recovery, the systemd cycle, always-shutdown |
 | `runtime.py` | 363 | the only clock, the only logger, every external effect behind a stubbable seam |
 | `lip_v5.py` | 386 | the binary; note 23 §III's five answered in its header |
-| `tests/` | 2779 | **390 tests**, `python3 -m unittest` green |
+| `tests/` | 3300 | **429 tests**, `python3 -m unittest` green |
 
 ### The rails (`guards.py`) — B1..B13
 
@@ -104,7 +106,7 @@ changing v5, and a v5 deploy needing v4's tree on the box.
 cd tools && python3 -m unittest discover -s lip_v5/tests -t .
 ```
 
-390 tests, ~0.1 s, no network, no filesystem outside the tmpdir, no possibility of paging.
+429 tests, ~0.1 s, no network, no filesystem outside the tmpdir, no possibility of paging.
 
 **The suite cannot page and cannot write outside tmp**, structurally, not by convention — two
 real incidents this week were a unit suite firing a push to a phone and a unit suite writing
@@ -257,6 +259,40 @@ rows it cancels, then verify `divergence ≈ $0.00`.
 
 ---
 
+## Contradictions with note 43 (THE MONEY GAME)
+
+43 is now the transmission layer. Checked the build against it; one real contradiction, one
+incompleteness, everything else consistent.
+
+1. **CONTRADICTION, FIXED — §2's sunk-cost rule.** "The exit's price of impatience is spread +
+   taker fee; its price of patience is carry. Both are computable, and **entry price belongs in
+   neither** (sunk — a rule that anchors on entry cuts winners and rides losers by
+   construction)." Two places anchored on entry basis:
+   - `cutover.triage_position` computed `hold_cost = n · basis · H_wait · r*`. What holding a
+     position rents is the capital recoverable *today* (`n × mark`); the gap to basis is spent
+     and no decision can un-spend it. Anchoring on basis systematically overstates the carry of
+     underwater positions and so **crosses the spread to escape a sunk number**.
+   - `clusters` measured exposure in basis, which made the risk cap *tighten* as positions moved
+     against us and *loosen* as they moved for us — the same anchor, in a guard.
+   Both now use `mark → p → basis`, the last being the unpriced case only (matching the day
+   stop's mark-at-cost). At placement mark == basis, so prospective orders are unaffected.
+
+2. **INCOMPLETENESS, flagged — §7's "fills reduce reward earning TWICE".** (★) prices the first
+   ("the capital leaves the book") through `carry_cost` and the presence metric. The second
+   ("the exit consumes room") is modelled only qualitatively — a shed order occupies a slot that
+   could hold a fresh quote, and v4's "inventory BLOCKS THE SLOT" lineage carries that as prose.
+   It is not a term in (★). Under-pricing fills in the *permissive* direction, so it is worth a
+   decision rather than a silent omission.
+
+3. **Consistent, checked:** §1 (YES+NO=$1, netting, collateral = price of what you bought);
+   §3 (settle-source clusters, and a box nets to riskless — asserted); §4 (maker fees ≡ 0, taker
+   only on the crossing exit; adverse selection measured per (m,s) so a trending day's
+   one-sided flow shows up); §5 (PSDH, and its zero-fills mirror — see the P6 gap above);
+   §6 (horizon as cost, and the value of paying to exit decaying as settlement nears — the
+   triage's `H_wait` produces exactly that); §7 (per-pool saturation: marginal rate → 0 as share
+   → 1, so ALLOCATE moves to breadth by itself); §8 (one writer per file, attribution by our own
+   ledger, and the cash feed as the "tell the others what you did" mechanism).
+
 ## Open decisions for Ryan
 
 Full derivations are in the build report and in the code beside each item.
@@ -281,16 +317,22 @@ Full derivations are in the build report and in the code beside each item.
 
 ## What is and is not built
 
-**Built and tested:** every money rule, all thirteen rails, the run cycle
-(`startup → adopt → triage → cycle → shutdown`), the one path to the wire, the meter, recon,
-the shadow read-out, `--gen-adopt`, `--handback`, and every file format.
-
-**Not built:** the outer `while` that calls `cycle()` on a timer under systemd, and the
-scan/classify sweep that discovers candidate markets (v5 currently takes its slot list as an
-argument). Both are deliberate: they are the G2/G3 gates' own step, and each is a separate
-human call. Everything they would call is here and under test.
+**The build is complete.** Every money rule, all thirteen rails, the scan/classify sweep, the
+slot table, the run cycle, the outer systemd loop with recovery and always-shutdown, the one
+path to the wire, `--gen-adopt`, `--shadow`, `--handback`, and the unit file.
 
 **The property to attack:** there is exactly ONE path to the wire (`Maker.place`), it consults
-`guards.place_allowed` before spending anything, and it publishes the cash feed before the
-POST. `test_engine.py` asserts that structurally — by counting `ex.placed` after each rail
-refuses — so a second path added later fails the suite rather than passing review.
+`guards.place_allowed` before spending anything, and it publishes the cash feed before the POST.
+`test_engine.py` asserts it on `place()` and `test_runner.py` asserts it on the **assembled
+loop** — by driving whole iterations and comparing what the exchange saw against what
+`Maker.place` sent. A second path added later fails the suite rather than passing review.
+
+**Known gaps, stated rather than hidden:**
+- **P6's pre-entry filter is a seam, not a source.** It needs the public trade tape, which this
+  build does not pull. `scan.build_slots(p6=...)` takes it; with nothing supplied the absence is
+  logged once per process (`p6_pre_entry_filter_UNWIRED`). Wire it before G3 — note 43 §5's
+  mirror is exactly this check.
+- **`--shadow` without `--live` runs against a `FakeExchange`** and says so. It rehearses the
+  loop's shape; it is not a venue ranking. G2's real read-out needs `--shadow --live`.
+- **Note 43 §7's "the exit consumes room"** is modelled qualitatively (inventory blocks the
+  slot) but is not a term in (★). See "Contradictions with note 43" below.

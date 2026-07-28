@@ -325,9 +325,22 @@ def triage_position(pos, venue, now, r_star, floor_rate=C.FLOOR_RATE_PER_H,
         (v1 §5.4) and always available.  The crossing exit is worth its spread only when the
         carry we avoid exceeds the spread we pay:
 
-            hold_cost  = n · basis · H_wait · r*            $ of opportunity cost while stuck
+            locked     = n · MARK                           capital actually recoverable now
+            hold_cost  = locked · H_wait · r*               $ of opportunity cost while stuck
             cross_cost = n · slippage + taker_fee(n, p)     $ paid once, immediately
             CROSS iff cross_cost < hold_cost
+
+        **`MARK`, NOT `basis` — note 43 §2.**  "The exit's price of impatience is spread + taker
+        fee; its price of patience is carry.  Both are computable, and ENTRY PRICE BELONGS IN
+        NEITHER (sunk — a rule that anchors on entry cuts winners and rides losers by
+        construction)."  What holding this position rents is the capital we could recover by
+        selling it TODAY, which is `n × mark`; the difference between mark and basis is already
+        spent and no decision can un-spend it.  Anchoring on basis systematically overstates the
+        carry of underwater positions and so crosses the spread to escape losers whose remaining
+        locked capital is small — paying real money for a sunk number.
+        Fallback order is `mark → p → basis`, and the last is the unpriced case only: it matches
+        the day stop's mark-at-cost convention, where marking at cost is the only honest
+        statement about a price we cannot observe.
 
         `H_wait` is the honest wait: the measured shed horizon if we HAVE one, otherwise
         `L_eff` — i.e. "the shed does not complete and we hold to settlement".  That default is
@@ -360,12 +373,17 @@ def triage_position(pos, venue, now, r_star, floor_rate=C.FLOOR_RATE_PER_H,
         return verdict
 
     h_wait = venue["l_shed_h"] if venue.get("l_shed_h") is not None else l_eff
-    hold_cost = n * basis * float(h_wait) * float(r_star)
+    mark = venue.get("mark")
+    if mark is None:
+        mark = venue.get("p", basis)
+    locked_usd = n * float(mark)                             # note 43 §2: NOT n × basis
+    hold_cost = locked_usd * float(h_wait) * float(r_star)
     slippage = min(float(venue.get("spread_c", max_slippage_c)),
                    float(max_slippage_c)) / 100.0
     cross_cost = n * slippage + taker_fee_usd(n, p)
     verdict.update({"hold_cost_usd": hold_cost, "cross_cost_usd": cross_cost,
-                    "h_wait_h": float(h_wait),
+                    "h_wait_h": float(h_wait), "locked_usd": locked_usd,
+                    "mark_used": float(mark),
                     "reason": "horizon_excluded" if horizon_out else "fails_star"})
 
     if cross_cost < hold_cost:

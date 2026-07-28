@@ -294,6 +294,28 @@ DEGRADE_NEVER = ("exit_cancel", "t3_close_sweep", "day_stop_flatten", "cash_feed
 CLASSIFY_HZ = 5.0                            # spec §3.4 step 1 from
 CLASSIFY_HZ_DEGRADED = 1.0                   # spec §3.4 step 1 to
 CLASSIFY_REFRESH_S = 900.0                   # v4-proven; pinned-ness timescale
+CLASSIFY_MAX_MARKETS = 200                   # bound the cold-start sweep.  ρ DOES rank ACROSS
+                                             # events (different pools); it only fails WITHIN
+                                             # one, which is why the rank that matters is
+                                             # computed AFTER classification, not before.
+# Programs re-price on a multi-day timescale (modal window 228 h), so the feed is the most
+# deferrable read we make — hence the lowest lane and the slowest cadence.  15 min is 1% of the
+# modal window: fast enough that a new program is quotable within one classify cycle of listing,
+# slow enough that the scan never competes with quoting.
+SCAN_REFRESH_S = 900.0
+SCAN_PAGE_LIMIT = 1000                       # cursor-paged
+SCAN_MAX_PAGES = 200                         # ~120 pages observed at limit=1000; bound the pull
+ENTRY_SHARE_ASSUMPTION = 0.5                 # the runway guard's CONSERVATIVE share.  Assuming
+                                             # we take the whole side is exactly the optimism
+                                             # that produced 735 lots posted with 25 min left.
+# --- the outer loop ---
+# 1 Hz: the quoting loop's own cadence (v1 §4.3 evaluates requote triggers at 1 Hz), and the
+# metering tick's fixed phase is 1 Hz by construction (§2.1), so one cycle per second keeps the
+# two in step without the sampler ever being triggered by our own action.
+CYCLE_HZ = 1.0
+# A cycle that overruns its budget is a cycle whose telemetry lies about cadence; log it rather
+# than silently drifting.  100 ms is 10% of the period.
+CYCLE_OVERRUN_WARN_S = 0.100
 BOOK_POLL_HZ = 1.0                           # spec §3.4 step 4 from
 BOOK_POLL_HZ_DEGRADED = 0.5                  # spec §3.4 step 4 to
 RECON_POSITIONS_S = 600.0                    # spec §3.4 step 5 from

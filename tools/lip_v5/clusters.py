@@ -109,11 +109,28 @@ def signed_delta_usd(positions):
     underlying — a modelled delta would import a distributional assumption into a risk cap,
     which is how caps become opinions.
     """
-    return sum(leg_sign(p["side"]) * float(p["n"]) * float(p["basis"]) for p in positions or [])
+    return sum(leg_sign(p["side"]) * float(p["n"]) * _at_risk_per_contract(p)
+               for p in positions or [])
+
+
+def _at_risk_per_contract(p):
+    """What one contract of this position can still LOSE.
+
+    **note 43 §2: the entry price is sunk.**  A contract bought at $0.40 and now marked $0.05
+    can lose $0.05, not $0.40 — the other $0.35 is already gone and no cap can un-spend it.
+    Using basis would make a risk cap tighten as positions moved AGAINST us (refusing new,
+    possibly good, exposure because of an old loss) and loosen as they moved for us: precisely
+    the anchor-on-entry behaviour that "cuts winners and rides losers by construction".
+
+    Fallback `mark → basis` is the unpriced case only, matching the day stop's mark-at-cost
+    convention.  At PLACEMENT the two coincide, so a prospective order is unaffected either way.
+    """
+    m = p.get("mark")
+    return float(p["basis"] if m is None else m)
 
 
 def gross_basis_usd(positions):
-    return sum(abs(float(p["n"])) * float(p["basis"]) for p in positions or [])
+    return sum(abs(float(p["n"])) * _at_risk_per_contract(p) for p in positions or [])
 
 
 def worst_case_loss_usd(positions):
@@ -145,7 +162,7 @@ def worst_case_loss_usd(positions):
         return 0.0
     total_basis = gross_basis_usd(positions)
     nettable = [p for p in positions if p.get("strike") is not None]
-    unnettable_basis = sum(abs(float(p["n"])) * float(p["basis"])
+    unnettable_basis = sum(abs(float(p["n"])) * _at_risk_per_contract(p)
                            for p in positions if p.get("strike") is None)
     if not nettable:
         return total_basis

@@ -1,0 +1,34 @@
+# lip_v5 — STAGED-INERT.  Installed only at gate G3, and never before G2's shadow read-out has
+# been observed for a full program period.  See README.md; each gate is a separate human call.
+#
+# This unit deliberately does NOT carry `--live`.  Arming is a Ryan-owned decision and lives in
+# a drop-in (`systemctl edit lip-v5`), so that installing the unit and arming it are two acts
+# with two rollbacks — no gate bundles a capital change with a code change.
+[Unit]
+Description=lip_v5 presence-portfolio maker (staged)
+After=network-online.target
+Wants=network-online.target
+# v4 and v5 must never quote together: two makers on one rung is self-trade plus double
+# collateral.  v5 refuses to start on a fresh v4 heartbeat anyway; this makes it explicit.
+Conflicts=lip-maker-v4.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ryan/nestor
+Environment=NESTOR_HOME=/home/ryan/nestor
+Environment=PYTHONUNBUFFERED=1
+# G0's reader flag is read at startup: mode=shared with it FALSE is a startup REFUSAL.
+Environment=LIP_CASH_FEED_ENABLED=true
+ExecStart=/usr/bin/python3 -m lip_v5.lip_v5 --shadow
+# SIGTERM runs the shutdown path: cancel-all -> shed -> handback (ALWAYS) -> zeroed cash feed.
+# The timeout must exceed that sequence or systemd SIGKILLs mid-cancel, leaving orders resting
+# and no handback — the "v5 dead, v4 blind" state SF-2 exists to prevent.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=10
+# A halt is PERSISTED, so a restart re-reads it and refuses rather than resuming into the
+# condition that halted it.  Restart=on-failure is therefore safe: it cannot loop past a halt.
+
+[Install]
+WantedBy=multi-user.target
