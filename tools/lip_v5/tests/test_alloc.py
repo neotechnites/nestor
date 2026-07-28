@@ -240,6 +240,140 @@ class TestForfeitGate(LipTestCase):
         self.assertAlmostEqual(alloc.projected_period_payout([s], {("T", "bid"): 10}), 5.0)
 
 
+class TestCliffRecovery(LipTestCase):
+    """SECOND CHARTER AMENDMENT (Ryan): the forfeit cliff.  Today's tape: $4.82 estimated
+    across 16 programs, only $2.38 above the $1 cliffs; $0.87 and $0.83 forfeiting.  These
+    fixtures pin both directions at A = $0.70."""
+
+    # A starved rung with 70¢ at stake: q=4 resting, S=100 rivals, ρ=$0.50/h pool rate.
+    CLIFF = dict(A=0.70, h=8.0, rho=0.5, S=100.0, q=4, p=0.5, r_star=0.00625,
+                 C_slot=2.0, phi=0.02, d=0.07)
+
+    def _rescue(self, **over):
+        kw = dict(self.CLIFF)
+        kw.update(over)
+        kw["rate_now"] = alloc.reward_rate(kw["rho"], kw["q"], kw["S"])
+        return alloc.rescue(**kw)
+
+    def test_at_70c_the_next_30c_is_worth_a_dollar_plus(self):
+        """THE 70¢ CLIFF-RECOVERY FIXTURE.  Reaching $1.10 needs qq=25 (Δq=21); its cost is
+        redeploy $0.625 + fill $0.28 = $0.905.  The next 40¢ of NEW accrual alone ($0.40)
+        does NOT cover that — only the recovered 70¢ does (0.40 < 0.905 < 1.10).  A rescue
+        that priced the marginal accrual at face value would forfeit; this one tops up."""
+        res = self._rescue(max_q=100)                     # amendment-1 cap: day stop $100
+        self.assertEqual(res.action, alloc.TOP_UP)
+        self.assertEqual(res.delta_q, 21)
+        self.assertAlmostEqual(res.proj, 1.10, places=9)
+        # the load-bearing arithmetic, pinned: new accrual alone loses, A+new wins
+        new_accrual = alloc.reward_rate(0.5, 25, 100.0) * 8.0
+        cost = (2.0 + 21 * 0.5) * 0.00625 * 8.0 + 0.02 * 0.07 * 25 * 8.0
+        self.assertLess(new_accrual, cost)                # 0.40 < 0.905: naive forfeits
+        self.assertGreater(0.70 + new_accrual, cost)      # the stranded 70¢ decides
+
+    def test_the_amendments_compose_the_flat_cap_could_not_reach_the_cliff(self):
+        """Under the inherited flat $10 rung (n_cap = 20 at 50c), qq=25 is UNREACHABLE and
+        the same program is ABANDONED — bigger derived rungs make cliff-clearing easier,
+        which is exactly the first amendment's composition clause."""
+        res = self._rescue(max_q=alloc.n_cap(0.5))        # flat cap ⇒ 20 < 25
+        self.assertEqual(res.action, alloc.ABANDON)
+
+    def test_a_genuinely_unreachable_cliff_is_abandoned(self):
+        """Don't throw good money after dead accrual: at h=1 even the ρ/2 ceiling attains
+        $0.95 < $1.10, so P(recover) = 0 by construction and redeploy wins."""
+        res = self._rescue(h=1.0, max_q=100)
+        self.assertEqual(res.action, alloc.ABANDON)
+        self.assertGreater(res.abandon_value, res.hold_value)
+
+    def test_a_healthy_projection_keeps(self):
+        res = self._rescue(rho=6.25, q=25, max_q=100)
+        self.assertEqual(res.action, alloc.KEEP)
+
+    def test_hold_when_alone_and_recovery_is_possible(self):
+        """§3.7: with one live program abandon_value is 0 identically, so HOLD wins while
+        the cliff is still attainable and fill risk is small."""
+        res = self._rescue(max_q=100, r_star=0.5, has_other_program=False, p_recover=0.5)
+        self.assertEqual(res.action, alloc.HOLD)
+
+    # ---- the gate, both directions -----------------------------------------------------
+    def _cliff_slot(self, **kw):
+        kw.setdefault("hours_left", 8.0)
+        kw.setdefault("window_h", 8.0)
+        kw.setdefault("accrued", 0.70)
+        kw.setdefault("S", 100.0)
+        return slot("KXCLIFF-1", rho=0.5, p=0.5, phi=0.02, d=0.07, l_eff=8.0,
+                    t_hat=1.0, program_id="PC", **kw)
+
+    def test_the_gate_rescues_a_cliff_recoverable_program(self):
+        """(★) refuses the rung (marginal net < floor), the $2 entry floor is unreachable —
+        and the program is still NOT dropped, because 70¢ is at stake and $1.10 is
+        reachable: the top-up Δq is applied so the requoter posts it."""
+        s = self._cliff_slot()
+        caps = alloc.Caps(inv_cap_usd=C.slot_cap_usd(100.0))
+        a, spent, marg, dropped = alloc.allocate_with_forfeit_gate([s], 300.0, RSTAR,
+                                                                   caps=caps)
+        self.assertNotIn("PC", dropped)
+        self.assertEqual(a[s.key], 25)                    # the Δq that reaches $1.10
+        self.assertAlmostEqual(spent, 12.5, places=9)
+        self.assertTrue(self.logs_of("cliff_top_up"))
+
+    def test_the_gate_abandons_dead_accrual_and_frees_its_dollars(self):
+        """A rung (★) still funds (S=20 ⇒ marginal admits) whose 70¢ is DEAD at h=1 (even
+        ρ/2 attains $0.95 < $1.10): the gate drops it, freeing the collateral the water
+        level had committed — good money stops following dead accrual."""
+        s = self._cliff_slot(S=20.0, hours_left=1.0, window_h=8.0)
+        caps = alloc.Caps(inv_cap_usd=C.slot_cap_usd(100.0))
+        a, spent, marg, dropped = alloc.allocate_with_forfeit_gate([s], 300.0, RSTAR,
+                                                                   caps=caps)
+        self.assertIn("PC", dropped)
+        self.assertEqual(a[s.key], 0)
+        self.assertTrue(self.logs_of("cliff_abandon"))
+
+    def test_under_the_flat_cap_the_same_program_is_not_rescued(self):
+        """Composition with amendment 1, at the gate: the flat $10 cap cannot reach qq=25,
+        so no top-up posts and the 70¢ rides to forfeit — exactly today's tape.  (It parks
+        as an unfunded HOLD, not a drop: with zero committed there is nothing to free.)"""
+        s = self._cliff_slot()
+        a, _, _, dropped = alloc.allocate_with_forfeit_gate(
+            [s], 300.0, RSTAR, caps=alloc.Caps(inv_cap_usd=C.INV_CAP_USD))
+        self.assertEqual(a[s.key], 0)
+        self.assertFalse(self.logs_of("cliff_top_up"))
+
+    def test_zero_accrual_below_the_floor_still_drops(self):
+        """The entry floor is untouched where nothing is at stake."""
+        s = self._cliff_slot(accrued=0.0)
+        s2 = slot("TSY", program_id="P2")                 # a healthy program alongside
+        caps = alloc.Caps(inv_cap_usd=C.slot_cap_usd(100.0))
+        a, _, _, dropped = alloc.allocate_with_forfeit_gate([s, s2], 300.0, RSTAR,
+                                                            caps=caps)
+        self.assertEqual(a[s.key], 0)
+        self.assertNotIn("P2", dropped)
+
+
+class TestHeldAwareAllocation(LipTestCase):
+    """SECOND AMENDMENT (a): v1 §8.1's cap binds NET exposure — held + resting — so the
+    replenish target after a fill is n_cap − held, not a fresh full-size order."""
+
+    def test_held_inventory_shrinks_the_resting_target(self):
+        s = slot("TSY")                                   # n_cap = 20 at 50c under $10
+        a_flat, _, _ = alloc.allocate([s], 300.0, RSTAR)
+        a_held, _, _ = alloc.allocate([s], 300.0, RSTAR, held={s.key: 12})
+        self.assertEqual(a_flat[s.key], 20)
+        self.assertEqual(a_held[s.key], 8)                # 20 − 12 held
+
+    def test_a_full_position_allocates_zero_resting(self):
+        s = slot("TSY")
+        a, spent, _ = alloc.allocate([s], 300.0, RSTAR, held={s.key: 20})
+        self.assertEqual(a[s.key], 0)
+
+    def test_held_inventory_counts_against_the_venue_cap(self):
+        """A filled probe IS the venue's exposure: replenish must fit under what remains."""
+        s = slot("TSY", venue="V")
+        a, spent, _ = alloc.allocate([s], 300.0, RSTAR, held={s.key: 10},
+                                     venue_caps={"V": 7.0})
+        # held basis $5 leaves $2 of venue room ⇒ at most 4 more contracts
+        self.assertLessEqual(a[s.key], 4)
+
+
 class TestReserveBudget(LipTestCase):
     def test_make_before_break_reserve(self):
         """v1 §2.4 B3 — MBB transiently holds TWO copies of one slot's collateral."""

@@ -310,14 +310,22 @@ def runway_ok(rho, hours_left, accrued_usd=0.0, floor_usd=C.ENTRY_FLOOR_USD,
     earn it, so a dying program looks identical to a fresh one — measured live as 735 lots posted
     with under 25 minutes left.  Entering is only rational if the entry floor is still REACHABLE:
 
-        share · (ρ/2) · h ≥ ENTRY_FLOOR − accrued
+        share · (ρ/2) · h ≥ floor − accrued
 
     with a CONSERVATIVE share, because assuming we take the whole side is exactly the optimism
     that produces late entries.
 
+    SECOND AMENDMENT (b): with accrual AT STAKE the reachability target is the forfeit CLIFF
+    ($1.10), not the entry floor ($2.00) — this is an EXIT question, and excluding a program
+    whose 70¢ could still be rescued is the runway guard confiscating the very accrual the
+    rescue exists to recover (v4 carried the same exemption).
+
     MIRROR (window END ↔ window START): `preposition_ok` below.
     """
-    need = max(0.0, float(floor_usd) - float(accrued_usd))
+    floor = float(floor_usd)
+    if float(accrued_usd) > 0.0:
+        floor = min(floor, C.RESCUE_TARGET_USD)
+    need = max(0.0, floor - float(accrued_usd))
     if need <= 0:
         return True
     if float(rho) <= 0:
@@ -335,7 +343,7 @@ def preposition_ok(hours_to_start, lead_h=C.PREPOSITION_LEAD_H):
 
 
 def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen=None,
-                l_shed=None, prior_t_hat=None, p6=None):
+                l_shed=None, prior_t_hat=None, p6=None, accrued=None):
     """The slot table `engine.cycle()` consumes.
 
     Every exclusion that can be decided WITHOUT a request is applied here, so the rate budget is
@@ -353,6 +361,7 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
         _warn_p6_unwired()
     frozen = frozen or set()
     tape = tape or {}
+    accrued = accrued or {}                   # program_id -> $ accrued (the cliff's memory)
     presence_rows = presence_rows or []
     slots = []
     by_prog = {p["program_id"]: p for p in programs}
@@ -365,7 +374,8 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
         hours_to_start = max(0.0, (prog["start_ts"] - float(now)) / 3600.0)
         if hours_left <= 0 or not preposition_ok(hours_to_start):
             continue
-        if not runway_ok(prog["rho"], hours_left):
+        if not runway_ok(prog["rho"], hours_left,
+                         accrued_usd=accrued.get(prog["program_id"], 0.0)):
             continue
 
         if p6 is not None and not p6(ticker):
@@ -422,6 +432,7 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                 hours_left=hours_left, hours_to_start=hours_to_start,
                 target_size=rec["target_size"], cum_size=sd["cum_size"],
                 land_grab_size=land_grab, land_grab_price_c=lg_px_c,
+                accrued=float(accrued.get(prog["program_id"], 0.0)),
                 close_ts=close_ts, program_end_ts=prog["end_ts"],
                 moneyness=abs((rec["yes_mid"] or 0.5) - 0.5) * 100.0))
     return slots

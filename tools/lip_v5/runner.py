@@ -108,6 +108,13 @@ class Runner(object):
             if (r.get("k") or r.get("kind")) == "assume_filled" and \
                     r.get("ticker") not in cleared:
                 self.m.frozen.add(r.get("ticker"))
+        # SECOND AMENDMENT (b): accrued value survives restart — the cliff decision is only
+        # as good as the A it remembers, and a restart that forgot 70¢ of accrual would
+        # abandon the very program the rescue exists to recover.  Rows are cumulative; the
+        # LAST per program wins.
+        for r in rows:
+            if (r.get("k") or r.get("kind")) == "accrual" and r.get("program_id"):
+                self.m.accrued[r["program_id"]] = float(r.get("accrued") or 0.0)
 
         self.recover_orders(rows, now)
 
@@ -262,7 +269,8 @@ class Runner(object):
                   for k, v in self.m.shed_completed_h.items()}
         self.slots = scan.build_slots(programs, self.classifier, now,
                                       presence_rows=seg, frozen=self.m.frozen,
-                                      l_shed=l_shed, p6=self.classifier.p6_ok)
+                                      l_shed=l_shed, p6=self.classifier.p6_ok,
+                                      accrued=self.m.accrued)
         self.m.projected_day_reward = sum(
             (s.rho / 2.0) * min(24.0, s.hours_left) for s in self.slots) or \
             self.m.projected_day_reward

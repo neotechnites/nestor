@@ -271,8 +271,12 @@ class TestB9RefillCap(LipTestCase):
         self.assertFalse(rt.exhausted("T", "bid", 0.50, n_cap))
 
     def test_it_is_enforced_through_place_allowed(self):
+        """The tracker is fed by `book_fill` in the ORDER axis ("bid"/"ask"); the guard
+        converts the order dict's leg axis to match.  The earlier form of this test noted
+        fills keyed "yes" — encoding the exact axis mismatch that kept the guard from ever
+        firing in the assembled loop (found by the replenish fixture)."""
         rt = G.RefillTracker()
-        rt.note_fill("KXAAAGASD-1", "yes", 1000)
+        rt.note_fill("KXAAAGASD-1", "bid", 1000)          # what book_fill actually writes
         ctx = G.PlaceContext(refill=rt, n_cap_fn=lambda p: int(10.0 / p))
         ok, reason, _ = G.place_allowed(ctx, order(ticker="KXAAAGASD-1"))
         self.assertFalse(ok)

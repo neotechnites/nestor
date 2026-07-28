@@ -481,8 +481,12 @@ def place_allowed(ctx, order):
         return False, "capital_floor", {"available": ctx.available_cash_usd}
 
     # B9 — refill / turnover cap: the 1 Hz bound the 15-min kill cadence cannot provide.
+    # The tracker is keyed on the ORDER axis ("bid"/"ask" — what `book_fill` notes); the
+    # order dict speaks the leg axis ("yes"/"no").  Convert, or the guard silently never
+    # fires (found by the replenish fixture: 4-turnover churn sailed through).
     if not fully_closing and ctx.refill is not None and ctx.n_cap_fn is not None:
-        if ctx.refill.exhausted(ticker, order["side"], order["basis"], ctx.n_cap_fn):
+        order_side = "bid" if order["side"] == "yes" else "ask"
+        if ctx.refill.exhausted(ticker, order_side, order["basis"], ctx.n_cap_fn):
             return False, "refill_cap", {}
 
     # B1 — the cluster cap, on OPEN + RESTING basis, before the ceiling.

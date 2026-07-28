@@ -76,6 +76,11 @@ def our_share(q, S):
     return float(q) / (float(q) + float(S))
 
 
+def reward_rate(rho, q, S):
+    """$/h of PAYOUT accrual at resting size q: `share × ρ/2` (per side)."""
+    return our_share(q, S) * float(rho) / 2.0
+
+
 def is_pinned(yes_bid_c, yes_ask_c):
     """Permanently unscoreable: no LEGAL resting price exists on the missing side.
     yes_bid at 99c ⇒ a NO bid would need a yes ask above 99c: illegal.
@@ -286,10 +291,99 @@ def qualification_pass(slots, budget_usd, caps=None,
 
 
 # =============================================================================================
+# THE CLIFF DECISION — v1 §3.5-3.7 KEEP/TOP_UP/HOLD/ABANDON, ported from v4's prod-proven
+# `rescue` (SECOND CHARTER AMENDMENT).  The one idea: accrued score below the $1.00 payout
+# cliff is CONDITIONAL, not banked — abandoning yields $0, so A counts at FULL value in the
+# top-up inequality.  That is exactly why the marginal value of the next 30¢ at A = $0.70 is
+# $1.00+, and why (★) — which prices only MARGINAL presence — cannot make this call alone.
+# MIRROR ((★) prices the flow ↔ rescue prices the cliff OPTION): the two disagree precisely
+# when accrual is stranded, and rescue governs only there (proj below the entry floor with
+# A > 0); everywhere else the water level decides.
+# =============================================================================================
+KEEP, TOP_UP, HOLD, ABANDON = "keep", "top_up", "hold", "abandon"
+
+
+class RescueResult(object):
+    __slots__ = ("action", "delta_q", "proj", "abandon_value", "hold_value", "note")
+
+    def __init__(self, action, delta_q, proj, abandon_value=0.0, hold_value=0.0, note=""):
+        self.action = action
+        self.delta_q = int(delta_q)
+        self.proj = proj
+        self.abandon_value = abandon_value
+        self.hold_value = hold_value
+        self.note = note
+
+    def __repr__(self):
+        return "Rescue(%s dq=%d proj=%.4f)" % (self.action, self.delta_q, self.proj)
+
+
+def rescue(A, rate_now, h, rho, S, q, p, r_star, C_slot, phi, d,
+           p_recover=0.0, has_other_program=True, target_usd=C.RESCUE_TARGET_USD,
+           max_q=None):
+    """v1 §3.5/§3.6/§3.7, all quantities PER PROGRAM-PERIOD.
+
+      A         accrued projected payout ($) — CONDITIONAL on clearing the cliff
+      rate_now  current $/h of payout accrual        h       hours left in the period
+      C_slot    current collateral ($) on the slot   r_star  achieved water level ($/h/$)
+      max_q     ABSOLUTE cap on total size after top-up.  Callers pass the BINDING minimum
+                of n_cap(derived slot cap) − held, venue-cap room, and budget room — which is
+                where the FIRST amendment composes with this one: a bigger derived rung makes
+                the cliff reachable (today's $0.87/$0.83 forfeits were unreachable under a
+                flat $10 cap and reachable under a $50 one).
+
+    KEEP     projection already clears the target.
+    TOP_UP   the smallest Δq reaching the target whose value beats redeploy + fill cost:
+                 A + r_new·h  >  (C + Δq·p)·r*·h  +  φ·d·(q+Δq)·h
+             The A on the left is THE RECOVERED-ACCRUAL TERM — remove it and the inequality
+             prices the next 30¢ at 30¢, which is today's forfeit tape (test T-CLIFF-1).
+    ABANDON  the cliff is unreachable (even the ρ/2 ceiling cannot reach it, or no Δq under
+             `max_q` pays) AND redeploying the collateral beats holding — never throw good
+             money after dead accrual (test T-CLIFF-2).
+    HOLD     otherwise: keep what rests, add nothing.
+    """
+    phi = float(phi)
+    d = min(float(d), float(p))                              # d capped at p, as everywhere
+    proj = float(A) + float(rate_now) * float(h)
+    if proj >= float(target_usd) - 1e-12:
+        return RescueResult(KEEP, 0, proj, note="projection_clears_target")
+
+    # -- TOP_UP: the smallest Δq that clears the target and pays for itself ----------------
+    cap = n_cap(p) if max_q is None else int(max_q)
+    best_dq = None
+    qq = int(q)
+    while qq < cap:
+        qq += 1
+        r_new = reward_rate(rho, qq, S)
+        if float(A) + r_new * float(h) < float(target_usd) - 1e-12:
+            continue                                         # not there yet: bigger qq
+        dq = qq - int(q)
+        redeploy = (float(C_slot) + dq * float(p)) * float(r_star) * float(h)
+        fillcost = phi * d * float(qq) * float(h)
+        if float(A) + r_new * float(h) > redeploy + fillcost:
+            best_dq = dq
+            proj = float(A) + r_new * float(h)
+        break                                                # smallest clearing qq decides
+    if best_dq:
+        return RescueResult(TOP_UP, best_dq, proj, note="top_up_clears_target")
+
+    # -- three-way (§3.7).  P(recover) is 0 BY CONSTRUCTION when even the ρ/2 ceiling
+    #    cannot reach the target in the remaining window.
+    max_attainable = float(A) + (float(rho) / 2.0) * float(h)
+    p_rec = 0.0 if max_attainable < float(target_usd) else float(p_recover)
+    abandon_value = (float(r_star) * float(C_slot) * float(h)) if has_other_program else 0.0
+    hold_value = p_rec * float(target_usd) - phi * float(q) * d * float(h)
+    if abandon_value > hold_value:
+        return RescueResult(ABANDON, 0, proj, abandon_value, hold_value,
+                            note="abandon_value_exceeds_hold_value")
+    return RescueResult(HOLD, 0, proj, abandon_value, hold_value, note="hold")
+
+
+# =============================================================================================
 # ALLOCATE  (spec §1.3)
 # =============================================================================================
 def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.FLOOR_RATE_PER_H,
-             venue_caps=None, step_fraction=C.STEP_FRACTION):
+             venue_caps=None, step_fraction=C.STEP_FRACTION, held=None):
     """Marginal-rate water-filling under (★).  Returns (alloc, spent, marginal_at_stop).
 
     `venue_caps`: {venue: cap_usd} from the ratchet (spec §1.4).  MIRROR (ratchet raises venue
@@ -304,6 +398,13 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.FLOOR_RATE_PER_H
     """
     caps = caps or Caps()
     venue_caps = venue_caps or {}
+    held = held or {}
+    # SECOND AMENDMENT (a), replenish: `held` = net inventory attributed to each slot's leg.
+    # v1 §8.1's cap binds NET exposure — held PLUS resting — so after a fill the next target
+    # is `n_cap − held`, shrinking as inventory builds instead of doubling exposure (which
+    # the cluster cap would then refuse, silencing the requoter: the v4 tape's enter → fill
+    # → silence-to-settlement failure, arriving through a guard).  Held inventory also
+    # counts against the VENUE cap: a filled probe IS the venue's unverified exposure.
     budget_usd = max(0.0, float(budget_usd))                 # a negative budget funds NOTHING
 
     alloc = {}
@@ -340,6 +441,12 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.FLOOR_RATE_PER_H
             unit = R.unit_collateral(s.side, s.land_grab_price_c / 100.0)
             per_market[s.ticker] = per_market.get(s.ticker, 0.0) + q_alloc[s.key] * unit
             per_venue[s.venue] = per_venue.get(s.venue, 0.0) + q_alloc[s.key] * unit
+    seen_held = set()
+    for s in slots:
+        h_q = float(held.get(s.key, 0.0))
+        if h_q > 0 and s.key not in seen_held:
+            seen_held.add(s.key)
+            per_venue[s.venue] = per_venue.get(s.venue, 0.0) + h_q * s.p
 
     unaffordable = set()
     last_rate = 0.0
@@ -353,7 +460,8 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.FLOOR_RATE_PER_H
             if s.key in unaffordable:
                 continue
             q = alloc[s.key]
-            if q + 1 > n_cap(s.p, caps):                     # v1 §8.1 per-slot inventory cap
+            # v1 §8.1: the per-slot cap binds NET exposure — held inventory + resting.
+            if held.get(s.key, 0.0) + q + 1 > n_cap(s.p, caps):
                 continue
             if per_market.get(s.ticker, 0.0) + s.p > market_cap_usd(s, budget_usd, caps) + 1e-9:
                 continue
@@ -371,7 +479,8 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.FLOOR_RATE_PER_H
         if best is None:
             break
         step = max(1, int(round(step_fraction * budget_usd / best.p)))    # v1 §2.5
-        step = min(step, n_cap(best.p, caps) - alloc[best.key])
+        step = min(step, n_cap(best.p, caps) - int(held.get(best.key, 0.0))
+                   - alloc[best.key])
         room = market_cap_usd(best, budget_usd, caps) - per_market.get(best.ticker, 0.0)
         step = min(step, int(room / best.p + 1e-9))
         vcap = venue_caps.get(best.venue)
@@ -408,34 +517,104 @@ def projected_period_payout(program_slots, alloc):
     return accrued + total
 
 
+def _cliff_decision(ps, alloc, r_star, caps, venue_caps, held, budget_room, per_venue_spend):
+    """The SECOND AMENDMENT's decision for one below-entry-floor program WITH accrual at
+    stake.  Returns (RescueResult, best_slot).  `max_q` is the binding minimum of the
+    derived per-slot cap (amendment 1 composes here), the venue-cap room, and the budget —
+    so a top-up can never breach the bounds the water level honors."""
+    best = max(ps, key=lambda s: (alloc.get(s.key, 0), -s.p))
+    q = alloc.get(best.key, 0)
+    A = max([s.accrued for s in ps] or [0.0])
+    C_prog = sum(alloc.get(s.key, 0) * s.p for s in ps)
+    h = max(0.0, best.hours_left)
+    max_q = n_cap(best.p, caps) - int(held.get(best.key, 0.0))
+    vcap = (venue_caps or {}).get(best.venue)
+    if vcap is not None:
+        room = max(0.0, float(vcap) - per_venue_spend.get(best.venue, 0.0))
+        max_q = min(max_q, q + int(room / best.p))
+    max_q = min(max_q, q + int(max(0.0, budget_room) / best.p))
+    res = rescue(A, reward_rate(best.rho, q, best.S), h, best.rho, best.S, q, best.p,
+                 r_star, C_prog, phi=best.phi, d=best.d,
+                 has_other_program=True, max_q=max_q)
+    return res, best
+
+
 def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
                                floor_usd=C.ENTRY_FLOOR_USD, floor_rate=C.FLOOR_RATE_PER_H,
-                               venue_caps=None, max_passes=C.MAX_GATE_PASSES):
+                               venue_caps=None, max_passes=C.MAX_GATE_PASSES, held=None):
     """v1 §2.4 lines 12-15 — the forfeit gate is per PROGRAM-PERIOD, applied AFTER
     water-filling, and a dropped program's dollars are RE-WATER-FILLED.
 
-    MIRROR (ENTRY_FLOOR as an entry test ↔ the exit): the three-way KEEP/TOP_UP/HOLD/ABANDON
-    (v1 §3.5-3.7) is the exit end, kept verbatim there; this is the entry end.
+    SECOND CHARTER AMENDMENT — the gate now prices the CLIFF (v1 §3.5-3.7):
+      * A program below the entry floor with ZERO accrual is an ENTRY question: dropped, as
+        before (nothing is at stake).
+      * A program below the floor WITH accrued value is a RESCUE question: `rescue` decides.
+        ABANDON drops it (the cliff is genuinely unreachable — dead accrual gets no more
+        money); KEEP/TOP_UP/HOLD keep it, and a TOP_UP's Δq is APPLIED to the allocation
+        after the drop loop converges, so the requoter posts the size that reaches $1.10.
+    MIRROR (ENTRY_FLOOR as an entry test ↔ the exit): rescue IS the exit end, now wired.
     """
     caps = caps or Caps()
+    held = held or {}
     dropped = set()
     alloc, spent, marginal = {}, 0.0, 0.0
     for _ in range(int(max_passes)):
         live = [s for s in slots if s.program_id not in dropped]
         alloc, spent, marginal = allocate(live, budget_usd, r_star, caps, floor_rate,
-                                          venue_caps)
+                                          venue_caps, held=held)
         by_prog = {}
         for s in live:
             by_prog.setdefault(s.program_id, []).append(s)
+        pv_spend = {}
+        for s in live:
+            pv_spend[s.venue] = pv_spend.get(s.venue, 0.0) + \
+                alloc.get(s.key, 0) * s.p + float(held.get(s.key, 0.0)) * s.p
         newly = []
         for pid, ps in sorted(by_prog.items(), key=lambda kv: str(kv[0])):
             proj = projected_period_payout(ps, alloc)
-            if proj <= 0.0 or proj >= floor_usd:
+            if proj >= floor_usd:
                 continue
-            newly.append(pid)
+            A = max([s.accrued for s in ps] or [0.0])
+            if A <= 0.0:
+                if proj > 0.0:
+                    newly.append(pid)                        # pure entry: the floor decides
+                continue
+            res, _best = _cliff_decision(ps, alloc, r_star, caps, venue_caps, held,
+                                         budget_usd - spent, pv_spend)
+            if res.action == ABANDON:
+                newly.append(pid)
+                R.log("cliff_abandon", program_id=str(pid), accrued=A, proj=res.proj,
+                      abandon_value=res.abandon_value, hold_value=res.hold_value)
         if not newly:
             break
         dropped |= set(newly)
+    # Apply TOP_UPs on the CONVERGED allocation (one application, no oscillation with the
+    # drop loop): the Δq that reaches the cliff, bounded by every cap rescue already saw.
+    by_prog = {}
+    for s in slots:
+        if s.program_id not in dropped:
+            by_prog.setdefault(s.program_id, []).append(s)
+    pv_spend = {}
+    for s in slots:
+        if s.program_id in dropped:
+            continue
+        pv_spend[s.venue] = pv_spend.get(s.venue, 0.0) + \
+            alloc.get(s.key, 0) * s.p + float(held.get(s.key, 0.0)) * s.p
+    for pid, ps in sorted(by_prog.items(), key=lambda kv: str(kv[0])):
+        proj = projected_period_payout(ps, alloc)
+        if proj >= floor_usd:
+            continue
+        A = max([s.accrued for s in ps] or [0.0])
+        if A <= 0.0:
+            continue
+        res, best = _cliff_decision(ps, alloc, r_star, caps, venue_caps, held,
+                                    budget_usd - spent, pv_spend)
+        if res.action == TOP_UP and res.delta_q > 0:
+            alloc[best.key] = alloc.get(best.key, 0) + res.delta_q
+            spent += res.delta_q * best.p
+            pv_spend[best.venue] = pv_spend.get(best.venue, 0.0) + res.delta_q * best.p
+            R.log("cliff_top_up", program_id=str(pid), ticker=best.ticker, side=best.side,
+                  accrued=A, delta_q=res.delta_q, proj=res.proj)
     for s in slots:
         alloc.setdefault(s.key, 0)
         if s.program_id in dropped:
@@ -444,7 +623,7 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
 
 
 def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
-                        floor_rate=C.FLOOR_RATE_PER_H, venue_caps=None):
+                        floor_rate=C.FLOOR_RATE_PER_H, venue_caps=None, held=None):
     """The full cycle: solve spec §1.3's r* fixpoint around ALLOCATE — the FORFEIT-GATED
     ALLOCATE, because the allocation the requoter diffs against must be the post-gate one
     (finish-round charter A): quoting a program the gate would drop posts collateral into a
@@ -460,7 +639,8 @@ def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
 
     def run(r_star):
         a, sp, marg, dropped = allocate_with_forfeit_gate(
-            slots, budget_usd, r_star, caps, floor_rate=floor_rate, venue_caps=venue_caps)
+            slots, budget_usd, r_star, caps, floor_rate=floor_rate, venue_caps=venue_caps,
+            held=held)
         return (a, sp, dropped), (marg if marg > 0 else floor_rate)
 
     res = M.solve_rstar(lambda r: run(r), r0)

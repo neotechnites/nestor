@@ -175,6 +175,13 @@ class TestSlotTable(LipTestCase):
         self.assertFalse(scan.runway_ok(6.25, 0.1))
         self.assertTrue(scan.runway_ok(6.25, 0.01, accrued_usd=C.ENTRY_FLOOR_USD))
 
+    def test_runway_targets_the_CLIFF_when_accrual_is_at_stake(self):
+        """Second amendment (b): with 70¢ accrued the reachability target is $1.10 (the
+        forfeit cliff), not $2.00 — the runway guard must not confiscate the very accrual
+        the rescue exists to recover.  Same window, zero accrual: still excluded."""
+        self.assertTrue(scan.runway_ok(0.5, 4.0, accrued_usd=0.70))   # need $0.40 ≤ $0.50
+        self.assertFalse(scan.runway_ok(0.5, 4.0, accrued_usd=0.0))   # need $2.00 > $0.50
+
     def test_a_denied_series_never_becomes_a_slot(self):
         ex_kw = {"programs": program_body(series="KXRAIN", tickers=("KXRAIN-1",))}
         slots, _, _ = self._slots(**ex_kw)

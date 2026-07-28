@@ -94,6 +94,13 @@ class Maker(object):
         # Charter amendment: per-rung cap, derived per cycle from the day stop; the FLOOR
         # before the first cycle (conservative — no reward projection exists yet).
         self.slot_cap_usd = C.INV_CAP_USD
+        # --- SECOND AMENDMENT (b): accrued projected payout, per program.  The cliff
+        # decision is only as good as the A it remembers, so this persists via `accrual`
+        # money rows (≤60 s crash loss) and recovers with replay.
+        self.accrued = {}                    # program_id -> $ accrued (model, conditional)
+        self.last_accrual_ts = None
+        self.last_accrual_write = 0.0
+        self._accrual_written = {}           # program_id -> last persisted value
 
     # =========================================================================================
     # STARTUP
@@ -461,10 +468,18 @@ class Maker(object):
                 G.day_stop_usd(self.projected_day_reward))
             caps = alloc.Caps(inv_cap_usd=self.slot_cap_usd)
             venue_caps = self.admit_venues(now, slots)
-            # MBB's reserve is one copy of the LARGEST slot, which is now the derived cap.
-            budget = alloc.reserve_budget(self.ceiling_usd, self.slot_cap_usd)
+            # SECOND AMENDMENT (a): held inventory attributed per slot leg, so the cap binds
+            # NET exposure and the replenish target after a fill is n_cap − held — presence
+            # continues, correctly sized, instead of the v4 tape's silence-to-settlement.
+            held = self.held_by_slot(slots)
+            # MBB's reserve is one copy of the LARGEST slot (the derived cap), and the
+            # budget plans against what is GENUINELY available: held positions already
+            # consume the ceiling (v4 D5 — planning against the raw ceiling makes place()
+            # ration an infeasible plan first-come).
+            budget = alloc.reserve_budget(
+                self.ceiling_usd - self.cash.inventory_basis, self.slot_cap_usd)
             a, spent, res = alloc.allocate_with_rstar(slots, budget, caps=caps,
-                                                      venue_caps=venue_caps)
+                                                      venue_caps=venue_caps, held=held)
             out["allocate"] = {"spent": spent, "r_star": res.r_star,
                                "converged": res.converged, "slots": len(slots),
                                "slot_cap_usd": self.slot_cap_usd,
@@ -473,6 +488,7 @@ class Maker(object):
                                                           (res.dropped or ()))}
             out["alloc"] = a
             out["requote"] = self.requote_pass(now, slots, a, res.r_star)
+            out["accrued"] = self.integrate_accrual(now, slots, a)
 
         # --- cash feed cadence (30 s heartbeat; every wire call publishes anyway) ---
         if self.publisher.due(now):
@@ -932,6 +948,57 @@ class Maker(object):
         the floor rather than fabricating a number — the reconcile pass reads it within its
         first cadence."""
         return self.cash.last_balance
+
+    def held_by_slot(self, slots):
+        """Net inventory attributed to each slot's leg, for v1 §8.1's NET cap (second
+        amendment (a)): a bid slot carries a net-YES position, an ask slot a net-NO one."""
+        held = {}
+        for s in slots:
+            net = self.net_position(s.ticker)
+            if s.side == "bid" and net > 0:
+                held[s.key] = net
+            elif s.side == "ask" and net < 0:
+                held[s.key] = -net
+        return held
+
+    def integrate_accrual(self, now, slots, alloc_map,
+                          write_s=C.ACCRUAL_WRITE_S):
+        """SECOND AMENDMENT (b): integrate the MODEL accrual over the presence we actually
+        allocated — `share(q,S) × ρ/2 × dt` per funded slot, per program (v4's shape: never
+        rate × elapsed_window, which credits hours before we started).  Feeds the cliff
+        decision (`Slot.accrued` next cycle), widens the cash feed's positive side
+        (`rewards_accrued_unpaid` — over-stating is the safe direction, §5.2), and persists
+        as `accrual` money rows so a crash loses ≤ ACCRUAL_WRITE_S of memory.
+
+        dt is capped at 5 s: a stalled loop must not mint accrual for presence nobody held.
+        MIRROR (accrual over-counted ↔ under-counted): over-counting inflates only the
+        pending band and the KEEP bias — bounded by the [0.5,2.0] verification band, which
+        DISAGREES a venue whose credits undershoot the model; under-counting forfeits
+        rescues, today's tape.  The ratchet is the referee either way.
+        """
+        dt_h = 0.0
+        if self.last_accrual_ts is not None:
+            dt_h = min(max(0.0, float(now) - self.last_accrual_ts), 5.0) / 3600.0
+        self.last_accrual_ts = float(now)
+        delta_total = 0.0
+        for s in slots:
+            q = alloc_map.get(s.key, 0)
+            if q <= 0 or dt_h <= 0:
+                continue
+            d_acc = alloc.reward_rate(s.rho, q, s.S) * dt_h
+            if d_acc > 0:
+                self.accrued[s.program_id] = self.accrued.get(s.program_id, 0.0) + d_acc
+                delta_total += d_acc
+        if delta_total > 0:
+            self.cash.accrue_reward(delta_total)
+        if float(now) - self.last_accrual_write >= float(write_s):
+            self.last_accrual_write = float(now)
+            for pid in sorted(self.accrued, key=str):
+                val = round(self.accrued[pid], 6)
+                if self._accrual_written.get(pid) != val:
+                    self.ledger.write("accrual", program_id=str(pid), accrued=val)
+                    self._accrual_written[pid] = val
+        return round(sum(self.accrued.values()), 6)
 
     def flatten(self, now):
         """Cancel-all on the EXIT lane — never refused, never counted against the cancel share."""

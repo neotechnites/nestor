@@ -132,6 +132,111 @@ class TestOrdersAppear(EngineCase):
         self.assertEqual(len(r.m.ex.placed), 1)
 
 
+class TestReplenish(EngineCase):
+    """THE REPLENISH FIXTURE (second charter amendment, Ryan's complaint 2a).  The v4 tape:
+    enter a rung, accrue ~7¢, get filled, NEVER REQUOTE — capital rides to settlement
+    earning zero while the rung's accrual dies below the $1.00 cliff.  This fixture fails
+    on any requoter that goes silent after the first fill."""
+
+    def _runner(self):
+        ex = AliveExchange(program_body(tickers=(ALIVE_TICKER,)),
+                           {ALIVE_TICKER: cheap_book()})
+        m = self.maker(ex=ex)
+        return RUN.Runner(m, sleep=lambda _s: None)
+
+    def _filled(self, r):
+        """Enter, then the taker takes the WHOLE order."""
+        r.init(NOW, nestor_state=NESTOR)
+        r.iteration(NOW + 1)
+        self.assertEqual(len(r.m.ex.placed), 1)
+        oid = list(r.m.orders)[0]
+        n = r.m.orders[oid]["remaining"]
+        # a filled probe is verified evidence in this fixture's world: promote the venue so
+        # the replenish is not the (correct) unverified-probe refusal
+        st = r.m.venues["KXAAAGASD"]
+        st.verified = True
+        st.rung = 2
+        r.m.ex.resting.pop(oid, None)
+        r.m.book_fill(ALIVE_TICKER, "bid", n, 0.02, NOW + 2, fill_id="fill-1",
+                      order_id=oid)
+        return r, n
+
+    def test_the_requoter_does_NOT_go_silent_after_the_fill(self):
+        r, n = self._filled(self._runner())
+        for i in range(3):
+            r.iteration(NOW + 3 + i)
+        self.assertGreater(len(r.m.ex.placed), 1, "SILENT AFTER THE FIRST FILL — v4's tape")
+        self.assertTrue(r.m.orders, "nothing resting after the fill: presence died")
+        self.assertTrue(r.m.ex.resting, "the exchange book is empty: accrual is dying")
+
+    def test_the_replenish_is_sized_at_net_cap_minus_held(self):
+        """v1 §8.1 binds NET exposure: held + resting stays inside the venue cap — the
+        replenish shrinks as inventory builds instead of doubling exposure (which the
+        cluster cap would then refuse, silencing the requoter through a guard)."""
+        r, n = self._filled(self._runner())
+        r.iteration(NOW + 3)
+        st = r.m.venues["KXAAAGASD"]
+        vcap = st.cap_usd(0.25 * r.m.ceiling_usd, r.m.ceiling_usd)
+        resting = sum(o["remaining"] * 0.02 for o in r.m.orders.values())
+        held = abs(r.m.net_position(ALIVE_TICKER)) * 0.02
+        self.assertGreater(resting, 0.0)
+        self.assertLessEqual(held + resting, vcap + 0.03)   # one contract of rounding
+    def test_the_replenish_respects_the_turnover_bound(self):
+        """'Within refill-cap bounds': a slot churned past 4 turnovers of its cap is a FLOW
+        MAGNET (B9) — the requoter goes silent there BY DESIGN, with the refusal named."""
+        r, n = self._filled(self._runner())
+        r.m.refill.filled[(ALIVE_TICKER, "bid")] = 1e9      # turnovers exhausted
+        before = len(r.m.ex.placed)
+        r.iteration(NOW + 3)
+        self.assertEqual(len(r.m.ex.placed), before)
+        refused = [x for x in self.logs_of("place_refused")
+                   if x.get("refused_by") == "refill_cap"]
+        self.assertTrue(refused, "the silence must carry its reason")
+
+
+class TestAccrualIntegration(EngineCase):
+    """Second amendment (b) plumbing: accrual integrates over allocated presence, feeds the
+    cash feed's positive side, persists as money rows, and survives restart — the cliff
+    decision is only as good as the A it remembers."""
+
+    def _runner(self):
+        ex = AliveExchange(program_body(tickers=(ALIVE_TICKER,)),
+                           {ALIVE_TICKER: cheap_book()})
+        m = self.maker(ex=ex)
+        return RUN.Runner(m, sleep=lambda _s: None)
+
+    def test_accrual_integrates_and_widens_the_feeds_positive_side(self):
+        r = self._runner()
+        r.init(NOW, nestor_state=NESTOR)
+        r.iteration(NOW + 1)
+        r.iteration(NOW + 2)
+        self.assertGreater(r.m.accrued.get("prog-1", 0.0), 0.0)
+        self.assertGreater(r.m.cash.rewards_accrued_unpaid, 0.0)
+        self.assertAlmostEqual(r.m.cash.rewards_accrued_unpaid,
+                               sum(r.m.accrued.values()), places=9)
+
+    def test_accrued_value_survives_restart(self):
+        r = self._runner()
+        r.init(NOW, nestor_state=NESTOR)
+        r.iteration(NOW + 1)
+        r.iteration(NOW + 2)
+        r.iteration(NOW + 2 + C.ACCRUAL_WRITE_S + 1)      # the persistence cadence elapses
+        val = r.m.accrued["prog-1"]
+        self.assertTrue([x for x in r.m.ledger.read()
+                         if (x.get("k")) == "accrual"])
+        r2 = self._runner()
+        r2.init(NOW + 10, nestor_state=NESTOR)
+        self.assertAlmostEqual(r2.m.accrued["prog-1"], round(val, 6), places=6)
+
+    def test_slots_carry_the_accrued_memory(self):
+        r = self._runner()
+        r.init(NOW, nestor_state=NESTOR)
+        r.m.accrued["prog-1"] = 0.70
+        r.iteration(NOW + 1)
+        s = [s for s in r.slots if s.side == "bid"][0]
+        self.assertAlmostEqual(s.accrued, 0.70, places=6)
+
+
 GRAB_TICKER = "KXGRABALIVE-26JUL29-T4.12"
 
 

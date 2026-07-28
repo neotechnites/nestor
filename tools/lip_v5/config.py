@@ -153,6 +153,19 @@ HORIZON_EXEMPT_RUNG = 2                      # spec §1.2 "unless ratchet rung �
 ENTRY_FLOOR_USD = 2.00                       # v1 §3.1 = 2× the $1.00 payout cliff.
                                              # UNDERIVED §9.5 (recalibrate to
                                              # $1.00/q05(actual/projected) after 5 periods)
+# SECOND CHARTER AMENDMENT (Ryan) — the forfeit CLIFF.  Payout is $0 below $1.00, so accrual
+# under the cliff is CONDITIONAL, not banked: at $0.70 accrued, the next $0.30 of accrual is
+# worth $1.00+ (it unlocks the stranded 70¢), never $0.30.  RESCUE_TARGET = $1.00 boundary
+# + 1c round-down + 9c buffer (v1 §3.3, prod-proven).  Today's tape: $4.82 estimated across
+# 16 programs, only $2.38 above the cliffs; $0.87 and $0.83 forfeiting for want of this term.
+# MIRROR (rescuing dead accrual ↔ forfeiting live accrual): `alloc.rescue` prices BOTH ends —
+# top-up only when recovery beats redeploy + fill cost, abandon when the cliff is unreachable
+# under the (derived) rung cap.
+RESCUE_TARGET_USD = 1.10
+# Accrual persistence cadence: one `accrual` money row per program per minute, so a crash
+# loses ≤60 s of accrued-value memory — the same bound the presence rows carry, because the
+# cliff decision is only as good as the A it remembers.
+ACCRUAL_WRITE_S = 60.0
 RATCHET_UP = 1                               # spec §1.4 — a false up-step costs CAPITAL at a
 RATCHET_DOWN = 2                             # venue that does not pay; a false down-step
                                              # costs only RATE at a venue re-verifiable

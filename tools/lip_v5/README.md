@@ -360,8 +360,14 @@ orders appear, sheds appear, completions are measured.
   tested but not yet driven from the cycle** — the finish-round charter did not enumerate them;
   ALLOCATE's re-run each cycle (a falling T̂ moves the dollars) is the live mechanism meanwhile.
   Same for the `idle_capital` alert and dose-response perturbation.
-- **The v1 §3.5-3.7 KEEP/TOP_UP/HOLD/ABANDON checkpoints are not ported**; the forfeit gate
-  plus per-cycle reallocation carry the entry/exit floor logic this round.
+- **The v1 §3.5-3.7 KEEP/TOP_UP/HOLD/ABANDON decision IS ported** (second charter amendment):
+  `alloc.rescue` prices the forfeit cliff — at $0.70 accrued the next $0.30 is worth $1.00+
+  (it unlocks the stranded 70¢) — and the forfeit gate applies it: top-up posted when recovery
+  beats redeploy + fill cost, abandon when the cliff is unreachable, entry floor untouched at
+  zero accrual. Accrual integrates over allocated presence, persists as `accrual` money rows
+  (≤60 s crash loss), and survives restart. It runs per cycle from the gate rather than at v4's
+  window-fraction checkpoints — a deliberate simplification: the gate already re-runs every
+  cycle, so a separate checkpoint scheduler would be a second cadence for the same decision.
 - **`venue_reading` is a seam** — the ratchet climbs only when the credits ritual (or a later
   feed) calls it with popover/credit readings.
 - **`--shadow` without `--live` runs against a `FakeExchange`** and says so. It rehearses the
