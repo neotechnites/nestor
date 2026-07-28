@@ -341,6 +341,21 @@ DENY_SERIES = {
 }
 
 
+# DENY BY FAMILY, NOT BY THE TICKERS THAT HAPPENED TO BURN US.  PYPL and BA cost $16 and
+# went on the list by name; MLB and WNBA followed; then KXEARNINGSMENTIONF turned up in a live
+# book purely because nobody had lost money on Ford yet.  Every one of these shares ONE
+# mechanism (note 43 §4): a mention market resolves off a news event, so informed flow takes
+# the quote the instant the news moves, accrual is ~0, and the position outlives the reward
+# window.  A list that enumerates victims re-learns the same lesson at full price for every
+# new ticker; a list that names the MECHANISM refuses the whole family at once.
+DENY_SUBSTRINGS = ("MENTION",)
+
+
+def family_denied(ticker):
+    t = str(ticker or "").upper()
+    return any(sub in t for sub in DENY_SUBSTRINGS)
+
+
 def series_denied(ticker, deny=None):
     """A ticker belongs to a denied series iff the series IS the ticker or is its
     dash-delimited prefix.  Kalshi tickers are `SERIES-EVENT-STRIKE`, so `KXRAIN-...` is
@@ -351,6 +366,8 @@ def series_denied(ticker, deny=None):
     "too much" fix; the deny list itself remains the "too little" guard."""
     deny = DENY_SERIES if deny is None else deny
     t = str(ticker or "").upper()
+    if family_denied(t):
+        return True
     return any(t == s or t.startswith(s + "-") for s in deny)
 
 
