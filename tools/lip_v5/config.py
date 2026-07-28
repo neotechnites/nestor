@@ -424,7 +424,63 @@ INV_CAP_USD = 0.5 * DAY_STOP_FLOOR_USD       # = $10 — the slot cap's FLOOR, n
 
 def slot_cap_usd(day_stop_threshold_usd, floor_usd=None):
     """The derived per-rung collateral cap: `max(floor, 0.5 × day_stop)`.  Same shape as
-    `cap_series_usd`/`cluster_cap_usd` at the same factor, one level finer."""
+    `cap_series_usd`/`cluster_cap_usd` at the same factor, one level finer.
+
+    ── NEW-1: `slot_cap_usd == cluster_cap_usd` IS DELIBERATE.  THE DERIVATION. ──────────
+    The re-verify established the identity exactly (day stops $20/$40/$100/$150/$300) and
+    asked whether the two caps should be broken apart at a different factor.  They should
+    not, and the reasoning is worth writing down because the identity LOOKS like a defect:
+
+    R1 NESTING.  A finer cap may never EXCEED the coarser one it sits inside, or the coarser
+       is the only one that can ever bind and the finer is decoration — `cap_series_usd`'s
+       own `max` names that inversion as the thing to avoid.  So `slot_cap ≤ cluster_cap`.
+       That is the binding formal requirement; everything below is about where inside it.
+
+    R2 ONLY ONE OF THE TWO HAS AN INDEPENDENT DERIVATION.  Both were derived from the same
+       sentence — "no single X may trip the global day stop on its own" ⇒ cap ≤ 0.5 × day
+       stop.  But that sentence is about the UNIT OF RISK, and clusters.py's whole thesis is
+       that the unit of risk is the CLUSTER, not the rung: fifteen rungs of a ladder are not
+       fifteen bets, they are one bet expressed fifteen times.  So the day stop binds the
+       cluster at 0.5×, and the rung inherits the bound TRANSITIVELY — a rung inside a capped
+       cluster already cannot trip the stop, because the whole cluster cannot.  The slot
+       cap's own clause (b) above is therefore SUBSUMED, not independent.
+
+    R3 NOTHING BINDS THE RUNG STRICTLY TIGHTER.  The candidate is intra-cluster
+       diversification ("don't put the cluster's whole budget in one rung").  It does not
+       yield a constant, for three reasons:
+         (i)  the rungs of a threshold ladder NET, and `clusters.worst_case_loss_usd`
+              computes that netting EXACTLY.  Four rungs at K/4 and one rung at K do not
+              carry the same worst case, and the measure already prices the difference; a
+              flat 1/R factor would substitute a guess for a measurement that is exact.
+         (ii) R (rungs per ladder) is a property of the VENUE, not of the risk.  Any constant
+              fraction is either an UNDERIVED default — a bug that has not fired — or it is
+              R-dependent and therefore not a constant at all.
+         (iii)the objective ALREADY spreads: marginal gross ∝ S/(q+S)², so a rung saturates
+              its own share and the next dollar prefers a different rung BY ARITHMETIC
+              (clause (a) above).  Spreading the objective produces needs no cap to enforce.
+
+    R4 THE DEADLOCK WAS NOT THE EQUALITY.  Under the identity a slot at its cap saturates its
+       cluster, which made make-before-break's transient double-count a CERTAIN refusal
+       rather than an occasional one — so the identity set the blast radius, but the defect
+       was measuring a REPLACEMENT as an ADDITION (fixed in `engine.place_context`).  A cap
+       whose correctness depends on a measurement error staying small is not a cap; fix the
+       measurement.  And note that the alternative instrument is degenerate here: reserving
+       one slot's collateral inside the cluster cap — the analogue of `reserve_budget` at the
+       ceiling — reserves the ENTIRE cap when slot_cap == cluster_cap, funding nothing.  That
+       degeneracy is itself the proof that the exemption is the right instrument.
+
+    CONCLUSION: keep the identity.  `slot_cap ≤ cluster_cap` is the requirement; equality is
+    the tightest legal choice given that only the cluster bound is independently derived.
+    `test_newround.TestTheGuardHierarchy` asserts the ordering so a future change to either
+    function cannot silently invert it.
+
+    WHAT IT COSTS, MEASURED, POST-FIX: a 4-rung single-cluster gas ladder at a $20 day stop
+    plans $10 across its rungs, not the $34.56 across four that place() then refused.  That
+    is the CLUSTER cap being right, not the slot cap being wrong — all four rungs are one bet
+    on gas, and $10 is what a $20 day stop permits one bet.  The charter amendment's "$50 per
+    rung becomes reachable at a day stop ≥ $100" still holds and now reads "$50 per CLUSTER",
+    which is what the risk statement always said.
+    """
     f = INV_CAP_USD if floor_usd is None else float(floor_usd)
     return max(f, 0.5 * float(day_stop_threshold_usd))
 

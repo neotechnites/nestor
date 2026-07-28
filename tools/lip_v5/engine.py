@@ -205,14 +205,35 @@ class Maker(object):
     # =========================================================================================
     # THE ONE PATH TO THE WIRE
     # =========================================================================================
-    def place_context(self, available_cash_usd=None):
+    def place_context(self, available_cash_usd=None, replacing_order_id=None):
+        """`replacing_order_id` — **NEW-1: a MAKE-BEFORE-BREAK REPLACEMENT IS NOT AN
+        ADDITION.**  MBB posts the new quote while the old one still rests, and the caps
+        measured both in one reading.  With `slot_cap_usd == cluster_cap_usd` (see the
+        derivation in `config.slot_cap_usd`) a slot at its own cap IS the whole cluster cap,
+        so the transient double-count made the refusal CERTAIN, not occasional: the
+        replacement was refused `cluster_worst_case_cap`, `_requote_slot` returned False, and
+        nothing armed the cancel-first degrade (it latches only on an exchange
+        `insufficient balance` reject).  The slot re-offered the same refused order every
+        cycle, forever, at its stale price.  Exempting exactly the order under replacement
+        measures the book AS IT WILL BE one call later, which is the true statement.
+
+        MIRROR (exempting too much ↔ counting a replacement twice): the exemption is scoped
+        to ONE order id, named by the caller, and only on the requote path — an ADD never
+        passes it, so no path can grow exposure through it.  If the follow-on cancel fails,
+        the overlap is real; it is bounded by one slot's collateral and by one cycle, because
+        the next cycle's context carries no exemption for it and the requoter's own
+        multiple-live-order self-heal cancels the older copy.  Counting it twice is the
+        permanent-deadlock end, which is strictly worse than a one-cycle understatement.
+        """
         open_pos, resting = [], []
         for t, p in self.positions.items():
             for leg in ("yes", "no"):
                 if abs(p.get(leg, 0.0)) > 0:
                     open_pos.append({"ticker": t, "side": leg, "n": abs(p[leg]),
                                      "basis": self.entry_basis.get((t, leg), 0.0)})
-        for o in self.orders.values():
+        for oid, o in self.orders.items():
+            if replacing_order_id is not None and str(oid) == str(replacing_order_id):
+                continue                                      # NEW-1: replacement, not add
             if o.get("remaining", 0) > 0:
                 resting.append({"ticker": o["ticker"],
                                 "side": "yes" if o["side"] == "bid" else "no",
@@ -230,7 +251,8 @@ class Maker(object):
             day_stopped=self.day_stopped, skew_ok=self.skew_ok)
 
     def place(self, ticker, side, price, count, expiration_ts, now,
-              fully_closing=False, available_cash_usd=None, lane="place"):
+              fully_closing=False, available_cash_usd=None, lane="place",
+              replacing_order_id=None):
         """The ONLY way an order reaches the exchange.  Returns (ok, reason, resp).
 
         Order of operations is load-bearing:
@@ -243,7 +265,8 @@ class Maker(object):
         """
         order = {"ticker": ticker, "side": "yes" if side == "bid" else "no",
                  "n": float(count), "basis": float(price), "fully_closing": fully_closing}
-        ctx = self.place_context(available_cash_usd)
+        ctx = self.place_context(available_cash_usd,
+                                 replacing_order_id=replacing_order_id)
         ok, reason, detail = G.place_allowed(ctx, order)
         if not ok:
             R.log("place_refused", ticker=ticker, side=side, refused_by=reason,
@@ -694,12 +717,18 @@ class Maker(object):
                                            s.program_end_ts - s.window_h * 3600.0)
                 if s.close_ts is not None:
                     self.close_cache[s.ticker] = s.close_ts   # halted closing pass (SF-3)
+            # NEW-1b: the SAME cluster cap the rails read, brought inside the plan — an
+            # allocator that plans what `place()` must refuse is not a plan (264 refusals in
+            # 90 cycles on a 4-rung ladder, every cycle, forever).
+            cluster_cap = CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward))
             a, spent, res = alloc.allocate_with_rstar(slots, budget, caps=caps,
-                                                      venue_caps=venue_caps, held=held)
+                                                      venue_caps=venue_caps, held=held,
+                                                      cluster_cap_usd=cluster_cap)
             self.last_alloc = dict(a)
             out["allocate"] = {"spent": spent, "r_star": res.r_star,
                                "converged": res.converged, "slots": len(slots),
                                "slot_cap_usd": self.slot_cap_usd,
+                               "cluster_cap_usd": cluster_cap,
                                "venues_admitted": len(self.venues),
                                "dropped_programs": sorted(str(d) for d in
                                                           (res.dropped or ()))}
@@ -1120,7 +1149,33 @@ class Maker(object):
             if o.get("remaining", 0) > 0 and not o.get("gone_404"):
                 live_by_slot.setdefault((o["ticker"], o["side"]), []).append(o)
 
-        for s in sorted(slots, key=lambda x: (x.ticker, x.side)):
+        def target_q(s):
+            """The size this pass intends for `s` — the same `max(alloc, shed)` the loop
+            computes, hoisted so the ORDER of application can be derived from it."""
+            shed = Q.shed_qty(self.net_position(s.ticker), self.shed_target.get(s.key)) \
+                if s.key in self.shed_target else 0
+            return max(int(alloc_map.get(s.key, 0)), shed)
+
+        def release_first(s):
+            """NEW-1's residual: **RELEASES PRECEDE CLAIMS.**  An allocation is a
+            SIMULTANEOUS statement, but the pass applies it one slot at a time, and the caps
+            at `place()` see whatever has not been released yet.  Walking slots by ticker
+            therefore let a plan whose TOTAL fits its cluster be refused for an accident of
+            alphabet — the earlier rung's claim measured against the later rung's dead
+            collateral — costing the whole cluster its presence for a cycle at exactly the
+            moment the water level decided to move.  Shrinking first is FREE: a cancel is a
+            reduction and no cap can refuse it, so this ordering can only admit strictly more
+            of a plan the rails already approved in aggregate.
+            MIRROR (release-first ↔ claim-first): claim-first would hold presence while the
+            replacement is proven — which is exactly what make-before-break already does
+            WITHIN a slot, and it is per-slot that presence is worth protecting.  ACROSS
+            slots there is no presence to protect: the dollars are leaving that rung by the
+            water level's own decision."""
+            cur_total = sum(o.get("remaining", 0.0)
+                            for o in (live_by_slot.get(s.key) or []))
+            return (0 if target_q(s) < cur_total else 1, s.ticker, s.side)
+
+        for s in sorted(slots, key=release_first):
             key = s.key
             if s.close_ts is None:
                 continue                      # no close ⇒ no expiration backstop ⇒ no quote
@@ -1255,7 +1310,12 @@ class Maker(object):
         an `mbb_degraded` money row.  Under cancel-first, voluntary requotes are paced at
         T* = 46 s (v1 §4.2's optimum) and never inside the placement's own second (§4.2
         whole-second policy).
+
+        NEW-1: the make leg names the order it REPLACES, so the caps measure the book as it
+        will be one call later instead of double-counting one slot (see `place_context`).
+        Under cancel-first there is nothing to exempt — the old order is already gone.
         """
+        replacing = cur.get("order_id") if cur is not None else None
         degraded_ts = self.mbb_degraded.get(key)
         if degraded_ts is not None and now - degraded_ts >= C.SAFETY_RESYNC_S:
             self.mbb_degraded.pop(key, None)              # retry MBB after one resync period
@@ -1264,7 +1324,8 @@ class Maker(object):
         if C.MAKE_BEFORE_BREAK and degraded_ts is None:
             ok, reason, resp = self.place(ticker, side, price, q, exp, now,
                                           fully_closing=fully_closing,
-                                          available_cash_usd=self._available_cash())
+                                          available_cash_usd=self._available_cash(),
+                                          replacing_order_id=replacing)
             if ok:
                 if cur is not None:
                     self.cancel(cur["order_id"], now, lane="requote_cancel")
@@ -1284,7 +1345,8 @@ class Maker(object):
                       combined=q, shed_only=shed_q, refused_by=reason)
                 ok2, _, _ = self.place(ticker, side, price, shed_q, exp, now,
                                        fully_closing=True,
-                                       available_cash_usd=self._available_cash())
+                                       available_cash_usd=self._available_cash(),
+                                       replacing_order_id=replacing)
                 if ok2 and cur is not None:
                     self.cancel(cur["order_id"], now, lane="requote_cancel")
                 return ok2

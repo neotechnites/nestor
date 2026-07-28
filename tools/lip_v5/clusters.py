@@ -224,6 +224,12 @@ def cluster_cap_usd(day_stop_threshold_usd, inv_cap_usd=C.INV_CAP_USD):
     have afforded — a RATE loss, and the water level simply reallocates to another cluster,
     which is the diversification we wanted anyway.  Too loose is this morning.  The asymmetry
     is why the factor matches the day-stop-derived series cap rather than being tuned up.
+
+    NEW-1: this is the ONE of the three caps with an INDEPENDENT derivation, because the
+    cluster is the unit of risk — `config.slot_cap_usd`'s docstring carries the full argument
+    for why `slot_cap == cluster_cap` is deliberate rather than an accident, and
+    `alloc.allocate` now carries this same cap so the plan can never exceed what `place()`
+    will fund.
     """
     return max(float(inv_cap_usd), 0.5 * float(day_stop_threshold_usd))
 
