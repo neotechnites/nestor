@@ -950,7 +950,15 @@ class Maker(object):
                 net0 = max(s.net_at(0, C.FLOOR_RATE_PER_H) for s in ss)
                 candidates.append((venue, floor_usd, net0))
             elif st.rung == 0 and not st.verified and not st.stood_down:
-                cap, status = RT.rung0_cap(floor_usd, self.slot_cap_usd, per_market)
+                # RUNG-0 IS SIZED TO MEASURE SHARE, NOT TO ASK WHETHER REWARDS EXIST.  The
+                # mechanism is verified by receipt ($7.482 credited, per-rung line items), so
+                # the opening size no longer needs to be the bare floor-clearing probe §1.4
+                # specifies for an unknown mechanism — a probe that can only just clear the
+                # $1 cliff cannot distinguish "this venue pays" from "we barely qualified".
+                # Still bounded by the per-rung cap and the per-market cap inside rung0_cap,
+                # and by the cluster cap, day stop and drawdown halt outside it.
+                cap, status = RT.rung0_cap(floor_usd * C.RUNG0_FLOOR_MULT,
+                                           self.slot_cap_usd, per_market)
                 st.rung0_cap_usd = cap        # tracks floor_q up; 0.0 when UNPROBEABLE
                 if status == RT.UNPROBEABLE:
                     self.venue_status[venue] = RT.UNPROBEABLE

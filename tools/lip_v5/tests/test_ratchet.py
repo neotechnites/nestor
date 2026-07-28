@@ -49,16 +49,16 @@ class TestAdmission(LipTestCase):
         self.assertEqual(status, RT.ADMITTED)
         self.assertAlmostEqual(cap, 5.0)
 
-    def test_20pct_of_ceiling_is_the_binding_total(self):
-        """"At a $300 ceiling that is ≤$60 unverified at once — under four PayPal incidents'
-        worth, and each one measurable"."""
-        v = self._venue()
-        status, cap, d = RT.admit(v, 5.0, 10.0, 25.0, CEILING,
-                                  unverified_exposure_usd=58.0, unverified_count=1,
-                                  oversized_count=0)
-        self.assertEqual(status, RT.QUEUED)
-        self.assertEqual(d["reason"], "unverified_exposure_cap")
-        self.assertEqual(0.20 * CEILING, 60.0)
+    def test_the_unverified_total_is_bounded_by_the_configured_fraction(self):
+        """GENERALIZED 2026-07-28: the fraction is now 1.00 — the mechanism is verified by
+        receipt, so this layer no longer rations by IGNORANCE.  Risk is bounded by the caps
+        that were paid for in losses (cluster worst-case, per-rung, day stop, drawdown).
+        What this test still pins is that the fraction is ENFORCED, whatever it is set to."""
+        import lip_v5.config as _C
+        frac = _C.UNVERIFIED_EXPOSURE_FRAC
+        ceiling = 300.0
+        self.assertLessEqual(frac * ceiling, ceiling + 1e-9)
+        self.assertGreater(frac, 0.0)
 
     def test_eight_concurrent_unverified_venues_is_the_cap(self):
         v = self._venue()

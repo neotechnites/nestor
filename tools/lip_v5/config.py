@@ -208,8 +208,28 @@ VERIFY_BAND = (0.5, 2.0)                     # spec §1.4 — the system's own d
 RATCHET_BREAKEVEN_ACCURACY = 2.0 / 3.0       # spec §1.4: drift per reading is 3a − 2, so
                                              # a = 2/3 is the ladder's characteristic number.
                                              # This is the SENSOR-QUALITY REQUIREMENT.
-UNVERIFIED_EXPOSURE_FRAC = 0.20              # spec §1.4 / §9.3 — ≤$60 at a $300 ceiling
-N_UNVERIFIED_MAX = 8                         # spec §1.4 concurrent unverified venues
+# GENERALIZED 2026-07-28 (Ryan's call, with the evidence).  §1.4 sized these for an
+# UNVERIFIED MECHANISM: probe one venue, wait a settlement, believe the credit, scale.  That
+# is the right shape when you do not know whether presence pays at all.  It is the wrong shape
+# now: the mechanism is VERIFIED BY RECEIPT — $7.482 credited with per-rung line items, and
+# Kalshi's own documentation describes snapshot scoring on resting size with no trade
+# condition.  What remains unverified per venue is only whether OUR share holds there, which
+# the accrual meter measures continuously and which the forfeit gate prices every cycle.
+# Measured cost of the old sizing: 8 venues admitted at $1.33-$2.17 each = ~$16 deployable of
+# a $300 ceiling, and a 34-day program window that cannot absorb one-venue-per-settlement
+# sequencing.
+# WHAT STILL BOUNDS THE RISK, unchanged: the per-cluster worst-case cap (1/6 of ceiling per
+# settle source), the per-rung cap, the day stop, the 35% drawdown halt, the turnover cap and
+# the §2.5 toxicity kill.  This layer was the one that rationed by IGNORANCE; the others
+# ration by RISK, and they are the ones that were paid for in losses.
+UNVERIFIED_EXPOSURE_FRAC = 1.00              # the ceiling itself; risk is bounded by the caps
+N_UNVERIFIED_MAX = 40                        # breadth is the strategy (note 43 §7)
+# The opening size measures SHARE rather than asking whether rewards exist at all, so rung 0
+# is seeded at a MULTIPLE of the floor-clearing size instead of at the bare floor.  4x keeps
+# an opening probe inside the per-rung cap while making it large enough that its accrual is
+# distinguishable from the $1 forfeit cliff — a probe that can only just clear the floor
+# cannot tell "this venue pays" from "we barely qualified".
+RUNG0_FLOOR_MULT = 4.0
 OVERSIZED_PROBE_FRAC = 0.02                  # spec §9.3: now a CLASSIFICATION threshold, not
                                              # a cap
 OVERSIZED_PROBE_MAX = 2                      # spec §1.4 concurrent oversized-probe slots
