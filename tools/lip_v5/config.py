@@ -553,6 +553,21 @@ P3_TWO_SIDED_COLLATERAL_MIN = 0.40           # UNDERIVED §9.5
 P3_TWO_SIDED_MARKET_MIN = 1.0 / 3.0          # UNDERIVED §9.5
 P4_FILL_HONOR_TARGET = 0.95
 P4_FILL_HONOR_FLOOR = 0.90
+# P6 IS ADVISORY, NOT A REFUSAL — VERIFIED AGAINST KALSHI'S OWN DOCUMENTATION (2026-07-28).
+# The help centre states the liquidity program pays "for maintaining orders on the books that
+# help other traders get better prices, EVEN IF YOUR ORDERS DON'T GET FILLED", and scoring is
+# snapshot-based on resting size and share of qualifying liquidity with two-sided depth rules.
+# There is NO trade or volume condition (that is the separate VOLUME incentive program).  So
+# "nobody trades here" is not evidence that presence buys nothing — it is evidence of an
+# UNCONTESTED venue, which is the cheapest presence on the board (note 43 §6).
+# Measured at G2: with P6 refusing, 200 classified markets produced ZERO slots — v5 would have
+# quoted nothing at all, because every empty book is by construction untraded.
+# MIRROR (admitting a dead venue ↔ refusing a quiet good one): the refusal end was costing us
+# the entire long tail; the admission end is bounded by the forfeit gate (a venue that pays
+# nothing cannot clear the $1 cliff and is dropped) and by the verified-accrual ratchet, which
+# needs a CREDITED reward before it raises any cap.  Both are evidence-driven, so a venue that
+# genuinely pays nothing is refused by measurement rather than by assumption.
+P6_ADVISORY = True
 P6_LOOKBACK_DAYS = 5                         # MIRROR (kill for too MANY fills — we are the
                                              # fish ↔ kill for ZERO fills ever — a decorative
                                              # book): §2.5 is the first end, P6 the second.

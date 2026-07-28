@@ -224,9 +224,18 @@ class TestSlotTable(LipTestCase):
         scan._P6_WARNED = False
         slots, progs, c = self._slots()
         self.assertTrue(self.logs_of("p6_pre_entry_filter_UNWIRED"))
-        # ...and when it IS supplied, it excludes
+        # ...and when it IS supplied it OBSERVES rather than excludes (config.P6_ADVISORY):
+        # Kalshi's own docs pay for resting "even if your orders don't get filled", so an
+        # untraded market is an UNCONTESTED one, not a worthless one.
         none_traded = scan.build_slots(progs, c, NOW, p6=lambda t: False)
-        self.assertEqual(none_traded, [])
+        self.assertTrue(none_traded, "advisory P6 must not delete the quiet long tail")
+        self.assertTrue(self.logs_of("p6_would_refuse"))
+        # ...and the refusal end still works when the flag is turned off.
+        try:
+            C.P6_ADVISORY = False
+            self.assertEqual(scan.build_slots(progs, c, NOW, p6=lambda t: False), [])
+        finally:
+            C.P6_ADVISORY = True
         all_traded = scan.build_slots(progs, c, NOW, p6=lambda t: True)
         self.assertTrue(all_traded)
 
@@ -653,14 +662,20 @@ class TestPlumbingWakes(RunnerCase):
         for key, q in out["alloc"].items():
             self.assertEqual(q, 0, key)
 
-    def test_P6_a_market_nobody_trades_never_becomes_a_slot(self):
+    def test_P6_a_market_nobody_trades_IS_a_slot_and_is_recorded(self):
+        """VERIFIED against Kalshi's documentation 2026-07-28: liquidity rewards are paid for
+        maintaining resting orders "even if your orders don't get filled" — scoring samples the
+        BOOK, never the tape.  So silence is not evidence of a worthless venue; it is evidence
+        of an uncontested one.  Measured at G2: with P6 refusing, 200 classified markets made
+        ZERO slots and v5 quoted nothing.  The observation is still recorded so the first
+        payout settles it with evidence."""
         ex = ScanExchange(balance_cents=1_000_000)
         ex.trades_rows = []                               # 5 days of public tape: silence
         r = self.runner(ex=ex)
         r.init(NOW, nestor_state=self.NESTOR)
         out = r.iteration(NOW + 1)
-        self.assertEqual(out["slots"], 0)
-        self.assertTrue(self.logs_of("p6_refused"))
+        self.assertTrue(out["slots"], "the quiet long tail must remain quotable")
+        self.assertTrue(self.logs_of("p6_would_refuse"))
 
     def test_P6_a_traded_market_is_admitted(self):
         r = self.runner()                                 # default fake: one recent trade

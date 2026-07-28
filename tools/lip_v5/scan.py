@@ -411,7 +411,14 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             continue
 
         if p6 is not None and not p6(ticker):
-            continue                          # P6: nobody trades here; presence buys nothing
+            # ADVISORY by default (config.P6_ADVISORY, derivation there): rewards are paid for
+            # RESTING, not for trading, so an untraded market is an uncontested one.  The
+            # observation is still recorded per ticker so the first payout settles the question
+            # with evidence — if quiet venues turn out not to credit, the forfeit gate and the
+            # ratchet refuse them on measurement.
+            R.log("p6_would_refuse", ticker=ticker, advisory=bool(C.P6_ADVISORY))
+            if not C.P6_ADVISORY:
+                continue
         # Charter B: `close_ts` is the MARKET's settlement close; `program_end_ts` is the
         # reward window's end.  They differ on exactly the markets the horizon exclusion and
         # the carry term exist for (PYPL settles months after its window).  Fallback to the
