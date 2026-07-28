@@ -208,7 +208,31 @@ def by_cluster(positions):
 # =============================================================================================
 # THE CAP
 # =============================================================================================
-MAX_CLUSTER_FRAC = 1.0 / 6.0      # see cluster_cap_usd
+# DERIVED, not chosen (2026-07-28, replacing an eyeballed 1/6).
+#
+# Expected daily P&L = r·H·(N·K) − p·L·K : rewards are LINEAR in deployed capital and losses
+# are linear in the per-cluster cap K, so expected value rises with K without bound.  The cap
+# is therefore NOT a profit optimum — it is a RUIN constraint, and the right question is the
+# largest K that survives a bad day:
+#
+#     M · L · K  ≤  D
+#
+#   L = 0.4   worst observed one-day fractional loss on one cluster (2026-07-28 treasury
+#             run-over: ~$60 lost on ~$150 of one-direction exposure)
+#   M = 2     clusters that can go bad on the SAME day.  Distinct settle sources are largely
+#             independent (rates vs a commodity vs weather), so two is a stress, not a mean.
+#   D = 0.2·ceiling   the day stop — the loss we have already decided to accept in one day
+#
+#   ⇒ K ≤ 0.2·ceiling / (2 × 0.4) = ceiling / 4
+#
+# $75 at a $300 ceiling, $250 at $1,000.  MIRROR (too high ↔ too low): too high concentrates
+# and is bounded by the day stop and the 35% drawdown halt; too low is what we measured — a
+# book refusing 67 placements a minute while deploying a fraction of its capital, which loses
+# the rewards that are the entire product.  Both L and M are EMPIRICAL and should be
+# re-measured: L from our own worst cluster-day, M from how often two clusters draw down
+# together.  Until then this is one observation and a stress assumption, and it is written
+# here so the next revision argues with the numbers rather than the feel.
+MAX_CLUSTER_FRAC = 1.0 / 4.0
 
 
 def cluster_cap_usd(day_stop_threshold_usd, inv_cap_usd=C.INV_CAP_USD,
