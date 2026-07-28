@@ -1287,9 +1287,16 @@ class S4_TakerExitIsSuppressedAtThisRung(unittest.TestCase):
         self.assertEqual(action, M.TAKER_EXIT)
         self.assertGreater(info["rhs"] - info["lhs"], 0.0)
 
-    def test_the_gate_is_off_at_the_first_run_ceiling_and_is_a_ladder_decision(self):
-        self.assertFalse(M.TAKER_EXIT_ENABLED)
-        self.assertLess(M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_REQUIRED_ABOVE_USD)
+    def test_the_gate_is_a_ladder_decision_and_the_config_is_coherent(self):
+        """Ceiling-RELATIVE, not ceiling-pinned: $300 is now a live rung, and a test that
+        breaks on a legitimate config change is a test that gets deleted under time
+        pressure.  What must hold is the INVARIANT — the flag and the recorded decision
+        agree, and an armed exit always has a decision behind it (N1)."""
+        decision = str(M.TAKER_EXIT_DECISION).lower()
+        self.assertIn(decision, ("undecided", "on", "off_accepted"))
+        self.assertEqual(M.TAKER_EXIT_ENABLED, decision == "on")
+        if M.MAX_TOTAL_COLLATERAL_USD >= M.TAKER_EXIT_REQUIRED_ABOVE_USD:
+            self.assertNotEqual(decision, "undecided")
         # the bound the derivation rests on: stranded inventory is capped per slot at $10
         self.assertAlmostEqual(M.n_cap(0.40) * 0.40, 10.0, places=9)
         self.assertLessEqual(M.n_cap(0.02) * 0.02, 10.0 + 1e-9)
@@ -1530,9 +1537,9 @@ class NEW5_TakerExitIsCoupledToTheCeiling(unittest.TestCase):
         ok, _ = self._assert_with(65.0, False, self.GOOD_PROGS, decision="undecided")
         self.assertTrue(ok)
 
-    def test_the_threshold_is_the_next_ladder_rung(self):
+    def test_the_threshold_is_the_ladder_rung_it_was_derived_for(self):
         self.assertEqual(M.TAKER_EXIT_REQUIRED_ABOVE_USD, 300.0)
-        self.assertLess(M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_REQUIRED_ABOVE_USD)
+        self.assertGreater(M.MAX_TOTAL_COLLATERAL_USD, 0.0)
 
 
 # =============================================================================================
@@ -2968,11 +2975,13 @@ class Phase1_TakerExitPathIsReadyForEitherAnswer(_RunnerCase):
         self.assertGreaterEqual(float(self.posted[0]["price"]) * 100,
                                 M.MIN_LEGAL_PRICE_C)
 
-    def test_the_300_flip_is_one_coordinated_change(self):
-        """The morning commit flips ceiling AND flag together; the startup assertion is what
-        makes forgetting either one impossible."""
-        self.assertFalse(M.TAKER_EXIT_ENABLED)
-        self.assertLess(M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_REQUIRED_ABOVE_USD)
+    def test_the_shipped_config_would_actually_start(self):
+        """The morning commit moves ceiling AND decision together; this asserts the CURRENT
+        config passes its own startup gate, whatever rung it is on."""
+        decision = str(M.TAKER_EXIT_DECISION).lower()
+        self.assertEqual(M.TAKER_EXIT_ENABLED, decision == "on")
+        needs = M.MAX_TOTAL_COLLATERAL_USD >= M.TAKER_EXIT_REQUIRED_ABOVE_USD
+        self.assertTrue((not needs) or decision in ("on", "off_accepted"))
         ok, _ = M.unit_assertion_check(unit_progs(40))
         self.assertTrue(ok)
 
@@ -4179,6 +4188,97 @@ class Addendum_N1_N2(_RunnerCase):
                               if e["event"] == "ws_trust_reset"], [])
         finally:
             M.WS_ENABLED, M._WS_FEED, M._WS_IMPORT_TRIED = old_en, old_mod, old_tried
+
+
+class RefillCapDoesNotBlockExits(_RunnerCase):
+    """LIVE DEFECT (Ryan's find, via "there are no orders out").  §8.7's refill cap bounds
+    how much NEW inventory a window may ACCUMULATE — "beyond that the slot is a flow magnet,
+    not a maker".  It was counting CLOSING orders too, which is backwards by derivation: an
+    exit is the opposite flow.  Measured overnight: 589 refill_cap skips against 236
+    shed_preferred decisions with ZERO sheds resting.  Ordinary quoting exhausted every
+    slot's cap, and then the exits were blocked by the counter that exists to bound
+    accumulation.  The book went exit-less."""
+
+    def _maker(self, net_yes=20.0, price=0.40):
+        st = M.LedgerState()
+        st.positions = {"T": {"yes": max(0.0, net_yes), "no": max(0.0, -net_yes)}}
+        st.position_cost = {"T": abs(net_yes) * price}
+        st.position_cost_leg = {"T": {"yes": max(0.0, net_yes) * price,
+                                      "no": max(0.0, -net_yes) * price}}
+        m = M.Maker(None, st, [])
+        self.posted = []
+        m.do_post = lambda b: (self.posted.append(b),
+                               (201, {"order_id": "N%d" % (len(self.posted) + 1),
+                                      "fill_count": "0.00",
+                                      "remaining_count": b["count"]}))[1]
+        m.do_cancel = lambda oid: (200, {"reduced_by": "0.00"})
+        return m
+
+    def test_a_cap_exhausted_slot_STILL_POSTS_A_SHED(self):
+        """The defect in one assertion."""
+        m = self._maker(net_yes=20.0)
+        cap = M.refill_cap(M.unit_collateral("ask", 0.42))
+        m.refilled[("T", "ask")] = cap                 # exhausted by a night of quoting
+        o = m.place("T", "ask", 42, 20, 1785000000)    # fully closing
+        self.assertIsNotNone(o, "the exit was blocked by the accumulation counter")
+        self.assertEqual(len(self.posted), 1)
+        self.assertEqual(self.posted[0]["count"], "20.00")
+
+    def test_a_closing_order_does_not_consume_refill_capacity(self):
+        """A shed must not spend the budget that exists to limit ENTRIES — otherwise each
+        exit makes the next exit harder, which is the deadlock with extra steps."""
+        m = self._maker(net_yes=20.0)
+        before = m.refilled.get(("T", "ask"), 0)
+        m.place("T", "ask", 42, 20, 1785000000)
+        self.assertEqual(m.refilled.get(("T", "ask"), 0), before)
+
+    def test_an_OPENING_order_is_still_refused_at_the_cap(self):
+        """The cap must still do the job it was derived for."""
+        m = self._maker(net_yes=0.0)
+        cap = M.refill_cap(M.unit_collateral("bid", 0.40))
+        m.refilled[("T", "bid")] = cap
+        self.assertIsNone(m.place("T", "bid", 40, 10, 1785000000))
+        self.assertEqual(m.last_place_skip, "refill_cap")
+        self.assertEqual(self.posted, [])
+
+    def test_a_partial_closer_charges_only_its_opening_tail(self):
+        """20 held + a 30-lot ask = 20 closing + 10 opening; only the 10 counts."""
+        m = self._maker(net_yes=20.0)
+        m.refilled[("T", "ask")] = 0
+        o = m.place("T", "ask", 42, 30, 1785000000)
+        self.assertIsNotNone(o)
+        self.assertEqual(m.refilled.get(("T", "ask"), 0), 10)
+        # and at the cap, the same partial-closer is refused for its TAIL, not its whole size
+        m2 = self._maker(net_yes=20.0)
+        cap = M.refill_cap(M.unit_collateral("ask", 0.42))
+        m2.refilled[("T", "ask")] = cap
+        self.assertIsNone(m2.place("T", "ask", 42, 30, 1785000000))
+        self.assertEqual(m2.last_place_skip, "refill_cap")
+        # ... while the purely-closing 20 still goes through
+        self.assertIsNotNone(m2.place("T", "ask", 42, 20, 1785000000))
+
+    def test_it_uses_the_same_closing_room_source_as_the_collateral_check(self):
+        """One definition of "closing", shared with allocate_closing_room — the two can
+        never disagree about what an exit is."""
+        m = self._maker(net_yes=20.0)
+        resting = M.OrderState("R", "v4-c", "T", "ask", 0.42, 20, 0.0, 20.0)
+        m.st.orders["R"] = resting
+        self.assertEqual(m.st.closing_room("T", "ask"), 0.0)   # room already consumed
+        cap = M.refill_cap(M.unit_collateral("ask", 0.42))
+        m.refilled[("T", "ask")] = cap
+        # with no room left this order is entirely OPENING, so the cap correctly refuses it
+        self.assertIsNone(m.place("T", "ask", 42, 20, 1785000000))
+        self.assertEqual(m.last_place_skip, "refill_cap")
+
+    def test_the_flatten_path_survives_an_exhausted_cap(self):
+        """End to end: the day-stop flatten is the path that was silently doing nothing."""
+        m = self._maker(net_yes=20.0)
+        m.scores = {"T": {"yes_bid_c": 40, "yes_ask_c": 42}}
+        for side in ("bid", "ask"):
+            m.refilled[("T", side)] = M.refill_cap(M.unit_collateral(side, 0.42))
+        posted, residual, usd = m.flatten(1000.0, "day_stop")
+        self.assertEqual(posted, 1)
+        self.assertEqual(residual, 0.0)
 
 
 class StartupAssertions(unittest.TestCase):

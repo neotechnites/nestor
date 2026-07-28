@@ -2917,10 +2917,22 @@ class Maker(object):
                 gross=round(size * unit_collateral(side, price), 4),
                 ceiling=MAX_TOTAL_COLLATERAL_USD)
             return None
-        cap = refill_cap(unit_collateral(side, price))                 # §8.7
-        if self.refilled.get((ticker, side), 0) + size > cap:
+        # §8.7 — the refill cap bounds how much NEW inventory a window may ACCUMULATE
+        # ("beyond that the slot is a flow magnet, not a maker").  A CLOSING order is the
+        # opposite flow: it reduces inventory.  Counting it was backwards by derivation, and
+        # it deadlocked the book — measured overnight, 589 refill_cap skips against 236
+        # shed_preferred decisions with ZERO sheds resting, i.e. every slot's cap exhausted
+        # by ordinary quoting and then the exits blocked by the very counter that exists to
+        # bound accumulation.  Only the OPENING portion is charged, netted through the same
+        # allocate_closing_room source of truth the collateral check uses (`room`/`closing`
+        # above), so the two can never disagree about what "closing" means.
+        opening_size = max(0, size - int(closing))
+        cap = refill_cap(unit_collateral(side, price))
+        if opening_size and self.refilled.get((ticker, side), 0) + opening_size > cap:
             self.last_place_skip = "refill_cap"
-            log("skip_post", ticker=ticker, side=side, why="refill_cap", cap=cap)
+            log("skip_post", ticker=ticker, side=side, why="refill_cap", cap=cap,
+                size=size, closing=round(closing, 4), opening=opening_size,
+                refilled=self.refilled.get((ticker, side), 0))
             return None
         # §8.1/§5.5 — the inventory cap is on NET, and it binds on the WORST CASE of this
         # order filling in full.  A shed order is exempt: it reduces |net| by construction.
@@ -2989,7 +3001,11 @@ class Maker(object):
         self.st.orders[o.order_id] = o
         if fc > 0:
             self.st._credit_fill(o, fc)
-        self.refilled[(ticker, side)] = self.refilled.get((ticker, side), 0) + size
+        # §8.7: only the opening tail consumes refill capacity — an exit must never spend
+        # the budget that exists to limit entries.
+        if opening_size:
+            self.refilled[(ticker, side)] = self.refilled.get((ticker, side), 0) \
+                + opening_size
         log("place_resp", k="place_resp", order_id=o.order_id, coid=coid, ticker=ticker,
             side=side, price=price, size=size, fill_count=fc,
             remaining_count=o.remaining_count, seq=seq)
