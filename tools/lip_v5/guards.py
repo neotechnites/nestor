@@ -22,10 +22,21 @@ from . import runtime as R
 # already carries.
 # =============================================================================================
 def day_stop_usd(projected_day_reward_usd,
-                 frac=C.DAY_STOP_FRAC, floor=C.DAY_STOP_FLOOR_USD, cap=C.DAY_STOP_CAP_USD):
+                 frac=C.DAY_STOP_FRAC, floor=C.DAY_STOP_FLOOR_USD, cap=C.DAY_STOP_CAP_USD,
+                 ceiling_usd=None):
     """`min($150, max($20, 0.35 × projected_day_reward))` — returned POSITIVE, as a loss
     magnitude.  The largest drag that still leaves the day net-positive."""
-    return min(float(cap), max(float(floor), float(frac) * float(projected_day_reward_usd)))
+    # THE FLOOR SCALES WITH CAPITAL.  $20 dates from the $45-capital era; at a $300 ceiling
+    # it pins day_stop at $20, hence the rung cap at $10, and the book deployed $5.42 of
+    # $300 — the guard sized for a toy account throttling a real one.  20% of the ceiling is
+    # the same statement the original $20 made about $45-$100 of capital, and it stays well
+    # inside the 35% drawdown halt that bounds the day regardless.
+    # MIRROR (floor too HIGH ↔ too low): too high lets a bad day run further before the stop
+    # (bounded by the drawdown halt and the per-cluster cap); too low is what we measured —
+    # a book that cannot deploy, earns nothing, and therefore never raises the reward-derived
+    # term that would have unpinned it.
+    eff_floor = max(float(floor), 0.20 * float(ceiling_usd)) if ceiling_usd else float(floor)
+    return min(float(cap), max(eff_floor, float(frac) * float(projected_day_reward_usd)))
 
 
 def unpriced_positions(positions, yes_mids):

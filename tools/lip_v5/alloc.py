@@ -474,7 +474,16 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.FLOOR_RATE_PER_H
 
     elig = []
     for s in slots:
-        alloc[s.key] = q_alloc.get(s.key, 0)
+        # A RESTING ORDER IS ALREADY THIS SLOT'S ALLOCATION, not a rival for it.  Seeding the
+        # cluster tally from resting orders (so the plan stops over-planning) without ALSO
+        # crediting the slot that owns them makes the plan oscillate: cycle 1 plans and
+        # places, cycle 2 sees the cluster full and plans 0 so the requoter CANCELS, cycle 3
+        # plans again — a cancel/replace loop that also reads as a bookkeeping failure to the
+        # burst breaker (it halted the four-rung ladder at iteration 33).  Starting the slot
+        # at what it already rests makes "keep it" the plan's default and leaves the water
+        # level to decide only about the MARGIN.
+        alloc[s.key] = max(int(q_alloc.get(s.key, 0)),
+                           int(float((resting or {}).get(s.key, 0.0))))
         if s.pinned or s.denied or not s.legal_price_exists:
             continue
         if not s.p6_ok or s.assume_filled:

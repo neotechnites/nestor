@@ -257,7 +257,7 @@ class Maker(object):
             halt_state=self.halt, positions=open_pos, resting_basis=resting,
             nestor_orders=self.nestor_orders, nestor_positions=self.nestor_positions,
             available_cash_usd=available_cash_usd,
-            cluster_cap_usd=CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward),
+            cluster_cap_usd=CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd),
                                               ceiling_usd=self.ceiling_usd),
             frozen=self.frozen, refill=self.refill,
             n_cap_fn=lambda p: alloc.n_cap(p, caps),
@@ -294,8 +294,19 @@ class Maker(object):
         # hide behind a throttle, and keyed per (ticker, side) because that is the unit a
         # requote trigger acts on.
         bkey = (ticker, side)
+        # ONLY "BLIND" PLACEMENTS COUNT.  The condition this breaker exists to catch is our
+        # books not seeing our own orders — in the 130-order loop every placement happened
+        # with ZERO live orders recorded for the slot, because each success parsed as a
+        # rejection.  A make-before-break replacement, by contrast, always has the outgoing
+        # order still live in our books, and a slot legitimately follows a moving book more
+        # than three times a minute — which is what tripped this on the ladder fixture at
+        # iteration 33.  Counting only blind placements keeps the breaker aimed at the
+        # bookkeeping failure instead of at ordinary requoting.
+        blind = not any(o.get("remaining", 0) > 0 and not o.get("gone_404")
+                        and (o["ticker"], o["side"]) == bkey
+                        for o in self.orders.values())
         hist = [t for t in self.place_hist.get(bkey, []) if now - t < C.PLACE_BURST_WINDOW_S]
-        if len(hist) >= C.PLACE_BURST_MAX and not fully_closing:
+        if blind and len(hist) >= C.PLACE_BURST_MAX and not fully_closing:
             self.place_hist[bkey] = hist
             R.log("place_burst", ticker=ticker, side=side, n=len(hist),
                   window_s=C.PLACE_BURST_WINDOW_S)
@@ -320,7 +331,8 @@ class Maker(object):
         body = R.order_body(ticker, side, price, expiration_ts, coid, count)
         collateral = float(count) * R.unit_collateral(side, price)
 
-        self.place_hist.setdefault(bkey, []).append(now)
+        if blind:
+            self.place_hist.setdefault(bkey, []).append(now)
         self.ledger.write("place_req", ticker=ticker, side=side, price=price,
                           size=count, coid=coid, seq=self.coid_seq)
         # §5.3 — write (and fsync) the feed with this collateral ALREADY INCLUDED, then POST.
@@ -741,7 +753,7 @@ class Maker(object):
             # Charter amendment: the per-rung cap DERIVES from the day stop each cycle
             # (0.5×, floored at $10); the reward side of sizing is (★)'s own saturation.
             self.slot_cap_usd = C.slot_cap_usd(
-                G.day_stop_usd(self.projected_day_reward))
+                G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd))
             caps = alloc.Caps(inv_cap_usd=self.slot_cap_usd)
             venue_caps = self.admit_venues(now, slots)
             # SECOND AMENDMENT (a): held inventory attributed per slot leg, so the cap binds
@@ -765,7 +777,7 @@ class Maker(object):
             # NEW-1b: the SAME cluster cap the rails read, brought inside the plan — an
             # allocator that plans what `place()` must refuse is not a plan (264 refusals in
             # 90 cycles on a 4-rung ladder, every cycle, forever).
-            cluster_cap = CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward),
+            cluster_cap = CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd),
                                              ceiling_usd=self.ceiling_usd)
             # The plan must measure the same book the rails do: OPEN positions (`held`) PLUS
             # RESTING orders.  Omitting the second made every cycle plan an order `place()`
@@ -829,7 +841,7 @@ class Maker(object):
             [{"ticker": t, "side": leg, "n": abs(p[leg]),
               "basis": self.entry_basis.get((t, leg), 0.0)}
              for t, p in self.positions.items() for leg in ("yes", "no") if abs(p[leg]) > 0],
-            CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward),
+            CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd),
                                ceiling_usd=self.ceiling_usd))
         out["bucket_hz"] = self.bucket.b
         out["halted"] = self.halt.halted
