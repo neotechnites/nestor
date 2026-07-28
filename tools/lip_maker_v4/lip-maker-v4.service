@@ -1,0 +1,22 @@
+[Unit]
+Description=LIP maker v4 (Kalshi liquidity-incentive-program maker, spec-lip-maker-v1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nestor
+ExecStart=/usr/bin/python3 /home/ubuntu/kalshi_data/scripts/lip_maker_v4.py --live
+Restart=on-failure
+RestartSec=30
+# SIGTERM triggers the §9.6 cancel-all-on-every-exit-path handler; give it room to finish
+# the DELETEs before SIGKILL.  expiration_ts (= window_close - 4 min) is the backstop.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lip-maker-v4
+
+[Install]
+WantedBy=multi-user.target
