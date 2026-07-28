@@ -458,7 +458,7 @@ UNKNOWN_MAX_RETRIES = 3
 # ---- scanner (§7) -----------------------------------------------------------------------
 SCAN_PAGE_LIMIT = 1000                  # §7.1 cursor-paged, ~120 pages at limit=1000
 SCAN_MAX_PAGES = 200                    # bound the pull; 119,615 programs / 1000 = ~120
-DENY_SERIES = {"KXRAIN", "KXINXHUD", "KXNDQHUD", "KXMLBMENTION", "KXEARNINGSMENTIONBA", "KXEARNINGSMENTIONPYPL", "KXWNBAMENTION", "KXDXYDUD"}                # §7.4 seed deny: measured toxic, 40 markets wide
+DENY_SERIES = {"KXRAIN", "KXINXHUD", "KXNDQHUD", "KXMLBMENTION", "KXEARNINGSMENTIONBA", "KXEARNINGSMENTIONPYPL", "KXWNBAMENTION", "KXDXYDUD", "KXUST2AD", "KXUST5AD", "KXUST7AD", "KXUST10AD", "KXUST30AD"}                # §7.4 seed deny: measured toxic, 40 markets wide
 EVENT_ALLOWLIST = []                    # FIRST-RUN: EMPTY == OFF.  The scanner ranks
                                         # everything (§7.4).  Populate to restrict the
                                         # shakeout to one event, e.g. ["KXAAAGASD-26JUL29"].
