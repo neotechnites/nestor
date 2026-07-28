@@ -89,6 +89,24 @@ class V4Positions(object):
         legs[leg] = max(0.0, legs[leg] + sign * n * unit)
 
     def replay(self, records):
+        """Mirror v4's `ledger_replay` ARITHMETIC EXACTLY (SF-D).
+
+        v4's per-order filled invariant (v1 §9.2) is
+
+            filled = fill_count + max(0, remaining_count − reduced_by) + extra_fills
+
+        and the load-bearing property is that **`remaining_count` is the ORIGINAL remaining at
+        placement and is NEVER DECREMENTED.**  `extra_fills` accumulates fills learned from the
+        fills API; the cancel response's `reduced_by` is subtracted from the ORIGINAL remaining.
+
+        The first implementation here decremented `remaining` on every `fill_obs` and then
+        computed `learned = remaining − reduced_by` from the already-reduced value, subtracting
+        the same fills twice.  On any ticker carrying 404-disambiguation or crash-gap
+        `fill_obs` rows the adopted count came out LOW — and a low count is a `net`
+        disagreement at the W2 gate, which EXCLUDES and FREEZES the market.  So the bug froze
+        precisely the positions v4's recovery paths had just rescued: the markets with the most
+        eventful history, adopted least.
+        """
         for rec in records or []:
             kind = rec.get("k") or rec.get("kind") or rec.get("t")
             if kind == "place_resp":
@@ -97,17 +115,19 @@ class V4Positions(object):
                 oid = rec.get("order_id")
                 if not oid or str(oid) in self.orders:
                     continue                 # N2: a duplicated place_resp must not double-book
+                size = float(rec.get("size") or 0.0)
+                fc = float(rec.get("fill_count") or 0.0)
+                rc = rec.get("remaining_count")
                 o = {"ticker": rec.get("ticker"), "side": rec.get("side"),
                      "price": float(rec.get("price") or 0.0),
-                     "size": float(rec.get("size") or 0.0),
-                     "remaining": float(rec.get("remaining_count")
-                                        if rec.get("remaining_count") is not None
-                                        else rec.get("size") or 0.0)}
+                     "size": size,
+                     # IMMUTABLE from here on — this is the invariant's anchor.
+                     "remaining_count": float(size - fc if rc is None else rc),
+                     "reduced_by": None,
+                     "extra_fills": 0.0}
                 self.orders[str(oid)] = o
-                fc = float(rec.get("fill_count") or 0.0)
                 if fc > 0:
                     self._apply(o["ticker"], o["side"], fc, o["price"])
-                    o["remaining"] = max(0.0, o["remaining"] - fc)
             elif kind == "cancel_resp":
                 o = self.orders.get(str(rec.get("order_id")))
                 if o is None or int(rec.get("http", 0) or 0) != 200:
@@ -115,10 +135,10 @@ class V4Positions(object):
                 rb = rec.get("reduced_by")
                 if rb is None:
                     continue                 # a 200 we cannot read is not a cancel we trust
-                learned = max(0.0, o["remaining"] - float(rb))
+                o["reduced_by"] = max(0.0, min(o["remaining_count"], float(rb)))
+                learned = max(0.0, o["remaining_count"] - o["reduced_by"])
                 if learned:
                     self._apply(o["ticker"], o["side"], learned, o["price"])
-                o["remaining"] = 0.0
             elif kind == "fill_obs":
                 fid = rec.get("fill_id")
                 if fid is not None:
@@ -129,8 +149,12 @@ class V4Positions(object):
                 o = self.orders.get(str(oid)) if oid else None
                 n = float(rec.get("count") or 0.0)
                 if o is not None:
+                    o["extra_fills"] += n
+                    # v4 does exactly this: an order the fills API has spoken about is no
+                    # longer resting, so a later cancel cannot also claim its remainder.
+                    if o["reduced_by"] is None:
+                        o["reduced_by"] = 0.0
                     self._apply(o["ticker"], o["side"], n, o["price"])
-                    o["remaining"] = max(0.0, o["remaining"] - n)
                 else:
                     leg, sign = normalize_fill(rec.get("side"), rec.get("action", "buy"))
                     self._apply(rec.get("ticker"), leg, n,
@@ -138,13 +162,15 @@ class V4Positions(object):
                                 float(rec.get("sign", sign)))
             elif kind == "assume_filled":
                 o = self.orders.get(str(rec.get("order_id"))) if rec.get("order_id") else None
-                if o is not None and o["remaining"] > 0:
-                    self._apply(o["ticker"], o["side"], o["remaining"], o["price"])
-                    o["remaining"] = 0.0
+                if o is not None:
+                    n = max(0.0, o["remaining_count"])
+                    o["reduced_by"] = 0.0
+                    if n:
+                        self._apply(o["ticker"], o["side"], n, o["price"])
             elif kind == "expired":
                 o = self.orders.get(str(rec.get("order_id")))
                 if o is not None:
-                    o["remaining"] = 0.0
+                    o["reduced_by"] = o["remaining_count"]      # nothing filled
             elif kind == "settlement":
                 tk = rec.get("ticker")
                 self.positions[tk] = {"yes": 0.0, "no": 0.0}

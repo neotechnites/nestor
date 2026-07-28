@@ -291,27 +291,35 @@ def solve_rstar(allocate_fn, r0, max_iters=C.RSTAR_MAX_ITERS, damping=C.RSTAR_DA
 
     `allocate_fn(r_star)` → (alloc, marginal_rate_at_stop).
 
-    4 iterations because damped iteration on a monotone scalar map halves the residual per
-    step, so 4 covers a 16× seed error.  5% because ALLOCATE's own step resolution is 2% and
-    chasing below its own noise is theatre.
+    Damped iteration on a monotone scalar map halves the residual per step.  5% because
+    ALLOCATE's own step resolution is 2% and chasing below its own noise is theatre.
 
-    **SURFACED DIVERGENCE (D3), reported upward, NOT silently fixed.**  §1.3's two statements
-    are not the same claim.  "4 iterations covers a 16x seed error" is true of the RESIDUAL —
-    the damped map halves it per step, so 4 steps reduce it exactly 16x (verified in
-    T-N7).  But the STOP RULE is a 5% *relative step change*, and reaching that band from
-    initial relative error `e` needs `k ≥ log2(e/0.05)` steps: a 2x seed needs 5, a 16x seed
-    needs 9.  With `max_iters = 4` the stop rule therefore cannot trip for any meaningful seed
-    error, so this function ALWAYS falls back to `max(r*_0..r*_4)` and `rstar_no_converge`
-    fires every cycle.
-    The behavior is SAFE (the fallback errs high in both regimes — see below), so the spec's
-    constants ship UNCHANGED and the decision is Ryan's.  The two candidate fixes, both
-    one-line: `RSTAR_MAX_ITERS = 9`, or make the stop rule a residual-reduction test rather
-    than a step-to-step test.  Do not adopt either without the decision.
+    **D3, RESOLVED (was: surfaced upward).**  §1.3 made two statements that are not the same
+    claim.  "4 iterations covers a 16x seed error" is true of the RESIDUAL — the damped map
+    halves it per step, so 4 steps reduce it exactly 16x (still asserted in T-N7).  But the
+    STOP RULE is a 5% *relative step change*, and reaching that band from initial relative
+    error `e` needs `k >= log2(e/0.05)` steps: a 2x seed needs 5, a 16x seed needs 9.  At
+    `max_iters = 4` the rule could never trip, so the fixpoint always fell back to the
+    non-convergence branch and `rstar_no_converge` fired every cycle — alarm fatigue on a
+    control that was inert.  `RSTAR_MAX_ITERS = 9` is the smallest value that makes both of
+    §1.3's own statements true at once.
 
-    NON-CONVERGENCE: use `max(r*_0..r*_4)` and report it.  Derivation of that tie-break — a
+    NON-CONVERGENCE: use `max(r*_0..r*_k)` and report it.  Derivation of that tie-break — a
     HIGHER r* prices carry higher, admits fewer venues and allocates LESS: the conservative
     direction, and the one that fails toward the PayPal lesson rather than away from it.
-    T-N7 asserts the non-converged run allocates ≤ the converged run.
+    T-N7 asserts the non-converged run allocates <= the converged run.
+
+    **The honest limit of that tie-break (corrected).**  An earlier draft of this docstring
+    claimed `max(trace)` "errs high in both regimes".  IT DOES NOT.  It errs high relative to
+    the SEED, which is not the same as erring high relative to the TRUTH:
+      * seed too HIGH — the trace DESCENDS toward r*, `max` returns the seed, which is indeed
+        above the true fixed point.  Conservative, as claimed.
+      * seed too LOW  — the trace ASCENDS toward r*, `max` returns the LAST value, which is
+        still BELOW the true fixed point.  Carry is then priced too CHEAPLY: the PayPal
+        direction, not the safe one.
+    The low-seed case is reachable at cold start, where `r*_0 = lambda_min/16` by construction.
+    What bounds the damage there is not this function — it is §1.4's unverified-exposure cap,
+    which is exactly why that cap, and not this tie-break, is the cold-start guard.
     """
     r_prev = float(r0)
     trace = [r_prev]

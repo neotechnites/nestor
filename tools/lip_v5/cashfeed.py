@@ -103,13 +103,26 @@ class CashState(object):
 
     # -- the two published numbers ------------------------------------------------------
     @property
-    def delta_dollars(self):
+    def raw_delta(self):
         """`−(resting_collateral + inventory_basis + settled_awaiting_payout) + realized_pnl
-        − fees_paid`  — ADD to nestor's expected_cash."""
-        if self.mode == C.CASH_MODE_SUBACCOUNT:
-            return 0.0                      # §5.5 — the wall replaces the feed
+        − fees_paid` — v5's ACTUAL cash position, always computed, never zeroed.
+
+        Kept separate from `delta_dollars` because §5.5's subaccount zeroing is a PUBLICATION
+        rule, not an accounting one.  Zeroing the internal number too would silently break
+        every calculation that reasons about our own cash movements — the settlement-
+        confirmation arithmetic in `observe_balance` most of all, which would then read our own
+        spending as unexplained cash and confirm credits that had not landed.  Publication
+        zeroes; accounting never does.
+        """
         return (-(self.resting_collateral + self.inventory_basis +
                   self.settled_awaiting_payout) + self.realized_pnl - self.fees_paid)
+
+    @property
+    def delta_dollars(self):
+        """What we PUBLISH — ADD to nestor's expected_cash."""
+        if self.mode == C.CASH_MODE_SUBACCOUNT:
+            return 0.0                      # §5.5 — the wall replaces the feed
+        return self.raw_delta
 
     @property
     def pending_payout_dollars(self):
@@ -132,7 +145,7 @@ class CashState(object):
         confirming a credit that has not landed.  So confirmation arithmetic adds the in-flight
         amount back.
         """
-        return self.delta_dollars + self.max_inflight_usd
+        return self.raw_delta + self.max_inflight_usd
 
     # -- wire events --------------------------------------------------------------------
     def reserve_order(self, oid, collateral_usd):
@@ -160,20 +173,72 @@ class CashState(object):
         else:
             self.resting_by_order[oid] = cur - float(released_usd)
 
-    def fill(self, ticker, oid, contracts, unit_collateral_usd, side_sign=1.0):
-        """A fill converts RESTING COLLATERAL into INVENTORY BASIS.  `delta_dollars` is
-        unchanged by construction (both terms are inside the same negative sum), which is
-        exactly right: the exchange took the cash at placement, not at fill."""
+    def fill(self, ticker, oid, contracts, unit_collateral_usd, side_sign=1.0,
+             proceeds_per_contract=None):
+        """A fill.  TWO CASES, and conflating them was BLOCKER-A.
+
+        **OPENING** (`side_sign > 0`): resting collateral becomes inventory basis.
+        `delta_dollars` is UNCHANGED by construction — both terms sit inside the same negative
+        sum — which is exactly right, because the exchange took the cash at PLACEMENT, not at
+        fill.
+
+        **CLOSING** (`side_sign < 0`, i.e. a shed or any disposal): `n` contracts leave
+        inventory at basis `b` and the exchange returns `n × proceeds` in cash.  The basis
+        leaving raises `delta_dollars` by `n·b`, but the cash that actually arrived is
+        `n·proceeds` — so WITHOUT realizing the P&L the published number rises by the basis
+        instead of by the proceeds, and on any shed at a LOSS that is a rise ABOVE THE TRUTH.
+
+        Worked, from the review: shed 10 @ $0.20 against a $0.40 basis.  Basis leaving is
+        $4.00; cash arriving is $2.00.  Booking only the basis publishes +$4.00 against a true
+        +$2.00 — $2.00 above truth, on the FIRST TRIAGE EXIT.  Realizing
+        `n·(proceeds − basis) = −$2.00` makes the net movement `+4.00 − 2.00 = +2.00`, exactly
+        the cash received.
+
+        MIRROR (a close booked too RICH ↔ too POOR): too rich is the above and is forbidden;
+        too poor only understates us, so `proceeds_per_contract=None` falls back to
+        `unit_collateral_usd` — the price we transacted at — rather than to anything optimistic.
+        """
         n = float(contracts)
-        cost = n * float(unit_collateral_usd)
-        cur = self.resting_by_order.get(oid, 0.0)
-        self.resting_by_order[oid] = max(0.0, cur - cost)
-        if self.resting_by_order[oid] <= 1e-12:
-            self.resting_by_order.pop(oid, None)
-        inv = self.inventory.setdefault(ticker, {"n": 0.0, "basis": 0.0})
-        prev_total = inv["n"] * inv["basis"]
-        inv["n"] += n * float(side_sign)
-        inv["basis"] = ((prev_total + cost) / abs(inv["n"])) if abs(inv["n"]) > 1e-12 else 0.0
+        sign = float(side_sign)
+        unit = float(unit_collateral_usd)
+
+        if sign >= 0:
+            cost = n * unit
+            cur = self.resting_by_order.get(oid, 0.0)
+            self.resting_by_order[oid] = max(0.0, cur - cost)
+            if self.resting_by_order[oid] <= 1e-12:
+                self.resting_by_order.pop(oid, None)
+            inv = self.inventory.setdefault(ticker, {"n": 0.0, "basis": 0.0})
+            prev_total = inv["n"] * inv["basis"]
+            inv["n"] += n
+            inv["basis"] = ((prev_total + cost) / abs(inv["n"])) if abs(inv["n"]) > 1e-12 \
+                else 0.0
+            return 0.0
+
+        proceeds = unit if proceeds_per_contract is None else float(proceeds_per_contract)
+        inv = self.inventory.get(ticker)
+        held = abs(inv["n"]) if inv else 0.0
+        closing = min(n, held)
+        realized = 0.0
+        if closing > 0:
+            basis = inv["basis"]
+            inv["n"] -= closing * (1.0 if inv["n"] > 0 else -1.0)
+            realized = closing * (proceeds - basis)
+            self.realized_pnl += realized
+            if abs(inv["n"]) <= 1e-12:
+                self.inventory.pop(ticker, None)
+        excess = n - closing
+        if excess > 0:
+            # Closing more than we hold FLIPS the position: the tail is an OPENING fill on the
+            # other leg.  Booking it as opening adds basis, i.e. MORE consumption — the safe
+            # direction — rather than manufacturing proceeds we did not receive.
+            inv2 = self.inventory.setdefault(ticker, {"n": 0.0, "basis": 0.0})
+            prev_total = inv2["n"] * inv2["basis"]
+            cost = excess * unit
+            inv2["n"] -= excess
+            inv2["basis"] = ((prev_total + cost) / abs(inv2["n"])) if abs(inv2["n"]) > 1e-12 \
+                else 0.0
+        return realized
 
     def accrue_reward(self, usd):
         self.rewards_accrued_unpaid += float(usd)
@@ -244,12 +309,39 @@ class CashState(object):
         A raises `delta`, and reusing a pre-release `delta` for item B would understate B's
         `expected_without_credit` and make B EASIER to release — the unsafe direction.
 
+        **BLOCKER-B — this path is DISABLED IN SHARED MODE.**  The arithmetic above nets out
+        v5's OWN cash movements, and that is all it can net out.  In the shared account nestor
+        is trading the same balance, and ITS settlement credits are exogenous to v5's
+        `delta_dollars` in exactly the way a real credit is — so nestor being paid confirms v5's
+        pending settlement.  There is no correction available from inside v5: the whole method
+        is "cash we cannot explain", and in a shared account there is a second explanation v5
+        cannot see.
+
+        So while `mode == "shared"` the `/portfolio/settlements` row is the ONLY release path.
+        It is exact (it carries the paid amount for OUR ticker) and it needs no inference.  The
+        balance path is reserved for `mode == "subaccount"`, where the account holds nothing
+        but v5's own activity and "unexplained" genuinely means unexplained.
+
+        Cost of the restriction: releases wait for the settlements row instead of the next
+        balance read.  That direction only makes v5 look POORER than it is, which is the safe
+        side and the same reason the 6 h timeout pages rather than releases.
+
         MIRROR (releasing too EARLY ↔ too LATE): early is the halt-nestor direction and is
-        structurally forbidden by the inequality above.  Late only makes v5 look poorer than it
-        is, which is why the 6 h timeout PAGES instead of releasing.
+        structurally forbidden — by the inequality above, and in shared mode by refusing the
+        inference entirely.  Late is bounded by `settlement_cash_unconfirmed`.
         """
         bal = float(balance_usd)
         released = []
+        if self.mode == C.CASH_MODE_SHARED:
+            # Record the balance for the components/telemetry, confirm NOTHING.
+            self.last_balance = bal
+            self.last_exchange_delta = self.exchange_delta
+            for ticker in sorted(self.pending):
+                p = self.pending[ticker]
+                if p.baseline_balance is None:
+                    p.baseline_balance = bal
+                    p.baseline_delta = self.exchange_delta
+            return released
         for ticker in sorted(self.pending):
             p = self.pending.get(ticker)
             if p is None:

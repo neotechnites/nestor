@@ -70,6 +70,73 @@ class TestGenAdopt(LipTestCase):
         self.assertEqual(CU.normalize_fill("no", "buy"), ("ask", 1.0))
         self.assertEqual(CU.normalize_fill("yes", "sell"), ("bid", -1.0))
 
+    def test_SFD_fill_obs_then_cancel_matches_v4s_invariant(self):
+        """SF-D — v4's per-order invariant is
+
+            filled = fill_count + max(0, remaining_count − reduced_by) + extra_fills
+
+        with `remaining_count` the ORIGINAL remaining, NEVER decremented.  Decrementing it on
+        `fill_obs` and then computing `learned` from the reduced value subtracts the same fills
+        twice and the count comes out LOW — which is a `net` disagreement at the W2 gate, so
+        the market is EXCLUDED and FROZEN.  The bug therefore froze exactly the tickers v4's
+        404/crash-gap recovery had just rescued.
+        """
+        recs = [
+            place("1", "T", "bid", 0.40, 100),                  # 100 resting
+            {"k": "fill_obs", "order_id": "1", "count": 8, "fill_id": "f1"},
+            {"k": "cancel_resp", "order_id": "1", "http": 200, "reduced_by": 70.0},
+        ]
+        rows = CU.gen_adopt(recs, 0.0)["positions"]
+        # v4: extra_fills 8 + max(0, 100 − 70) = 8 + 30 = 38
+        self.assertAlmostEqual(rows[0]["net"], 38.0,
+                               msg="must match v4's replay arithmetic exactly")
+
+    def test_SFD_the_pre_fix_arithmetic_ran_low_by_the_fill_obs_count(self):
+        """The defect's signature: exactly the `fill_obs` count low — the reviewer's 8."""
+        recs = [
+            place("1", "T", "bid", 0.40, 100),
+            {"k": "fill_obs", "order_id": "1", "count": 8, "fill_id": "f1"},
+            {"k": "cancel_resp", "order_id": "1", "http": 200, "reduced_by": 70.0},
+        ]
+        correct = CU.gen_adopt(recs, 0.0)["positions"][0]["net"]
+        buggy = 8 + max(0.0, (100 - 8) - 70)                    # decrement-then-subtract
+        self.assertEqual(correct - buggy, 8.0)
+
+    def test_SFD_multiple_fill_obs_rows_accumulate_in_extra_fills(self):
+        recs = [
+            place("1", "T", "bid", 0.40, 100),
+            {"k": "fill_obs", "order_id": "1", "count": 5, "fill_id": "f1"},
+            {"k": "fill_obs", "order_id": "1", "count": 3, "fill_id": "f2"},
+            {"k": "cancel_resp", "order_id": "1", "http": 200, "reduced_by": 90.0},
+        ]
+        rows = CU.gen_adopt(recs, 0.0)["positions"]
+        self.assertAlmostEqual(rows[0]["net"], 5 + 3 + (100 - 90))
+
+    def test_SFD_partial_fill_at_placement_anchors_remaining_count(self):
+        """`remaining_count = size − fill_count` at placement, then immutable."""
+        recs = [
+            place("1", "T", "bid", 0.40, 100, fill_count=20),   # remaining_count = 80
+            {"k": "cancel_resp", "order_id": "1", "http": 200, "reduced_by": 50.0},
+        ]
+        rows = CU.gen_adopt(recs, 0.0)["positions"]
+        self.assertAlmostEqual(rows[0]["net"], 20 + (80 - 50))
+
+    def test_SFD_expired_credits_nothing(self):
+        recs = [place("1", "T", "bid", 0.40, 100),
+                {"k": "expired", "order_id": "1"}]
+        self.assertEqual(CU.gen_adopt(recs, 0.0)["positions"], [])
+
+    def test_SFD_assume_filled_credits_the_ORIGINAL_remaining(self):
+        recs = [place("1", "T", "bid", 0.40, 100),
+                {"k": "assume_filled", "order_id": "1", "ticker": "T"}]
+        rows = CU.gen_adopt(recs, 0.0)["positions"]
+        self.assertAlmostEqual(rows[0]["net"], 100.0)
+
+    def test_SFD_a_reduced_by_over_remaining_is_clamped(self):
+        recs = [place("1", "T", "bid", 0.40, 100),
+                {"k": "cancel_resp", "order_id": "1", "http": 200, "reduced_by": 500.0}]
+        self.assertEqual(CU.gen_adopt(recs, 0.0)["positions"], [])
+
     def test_gen_adopt_is_rerunnable(self):
         """A pure function of v4's ledger, so running it twice cannot drift."""
         recs = [place("1", "T", "bid", 0.40, 50, fill_count=50)]

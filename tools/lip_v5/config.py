@@ -106,8 +106,14 @@ MAX_GATE_PASSES = 8                          # v1 §2.4 re-water-fill loop, boun
 # less — the conservative direction, which is why non-convergence takes the MAX.  Too LOW
 # makes carry look cheap, which is the PayPal direction; the §1.4 unverified cap is the guard
 # on that end, and it is the only guard on it, which is why cold start is capped not tuned.
-RSTAR_MAX_ITERS = 4                          # damped iteration halves residual per step ⇒
-                                             # 4 covers a 16× seed error (spec §1.3)
+# Spec §1.3 wrote 4, deriving it from RESIDUAL reduction (4 damped steps cut the residual 16×,
+# which is exactly true).  But the STOP RULE is a 5% relative step change, and reaching that
+# band from initial relative error `e` needs `k ≥ log2(e/0.05)`: 5 steps for a 2× seed, 9 for a
+# 16× one.  At 4 the rule could never trip, so the fixpoint always fell back to
+# `max(r*_0..r*_4)` and `rstar_no_converge` fired every cycle — alarm fatigue on a control that
+# was doing nothing.  9 is the smallest value that makes the spec's OWN two statements
+# consistent: it covers the 16× seed error §1.3 names, at the 5% tolerance §1.3 sets.
+RSTAR_MAX_ITERS = 9                          # spec §1.3, reconciled (see money.solve_rstar)
 RSTAR_DAMPING = 0.5                          # prevents 2-cycles (spec §1.3)
 RSTAR_CONVERGE_FRAC = 0.05                   # ALLOCATE's own step resolution is 2%; chasing
                                              # below its own noise is theatre (spec §1.3)
@@ -240,6 +246,37 @@ CANCEL_SHARE_MAX = 0.25                      # spec §3.3 — one cancel per req
 CANCEL_SHARE_WINDOW_S = 60.0                 # spec §3.3 rolling window
 CANCEL_SHARE_POISON_BREACHES = 3             # spec §3.3 "3 in 10 min ⇒ poison it"
 CANCEL_SHARE_POISON_WINDOW_S = 600.0         # spec §3.3
+
+# =============================================================================================
+# VENUE DENY LIST — MEASURED, not assumed (charter: "v3/v4's lessons as MEASURED INPUTS").
+# =============================================================================================
+# These eight are v4's measured-toxic venues, carried forward as evidence rather than
+# re-discovered at v5's expense.  Two families, one mechanism each:
+#   * MENTION / event markets (BA, MLB, PYPL, WNBA) — the PayPal geometry itself: fills on
+#     contact, accrual ≈ 0, and a close months out so carry runs to the horizon.  (★) refuses
+#     these on the numbers; the deny list means we do not pay $16 again to re-derive it.
+#   * INDEX HOURLIES (KXINXHUD, KXNDQHUD, KXDXYDUD) and KXRAIN — heavy informed taker flow
+#     against a maker who cannot reprice fast enough: we are the fish (P6 inverted).
+# MIRROR (denying too MUCH ↔ too little): the deny list is the "too little" guard.  Its own
+# mirror — a venue denied that has since become good — is §1.4's REVIVE predicate: a new
+# program period AND a 95% T̂-posterior clearing the hurdle.  So this is a prior, not a
+# sentence, and nothing here revives on a timer.
+DENY_SERIES = {
+    "KXRAIN",                      # v4 §7.4 seed deny: measured toxic, 40 markets wide
+    "KXINXHUD", "KXNDQHUD",        # index hourlies — informed flow
+    "KXDXYDUD",                    # index hourly (Ryan, 2026-07-28)
+    "KXMLBMENTION", "KXWNBAMENTION",
+    "KXEARNINGSMENTIONBA", "KXEARNINGSMENTIONPYPL",   # the $16 lesson, by name
+}
+
+
+def series_denied(ticker, deny=None):
+    """A ticker belongs to a denied series iff the series is its prefix.  Prefix, not equality:
+    Kalshi tickers are `SERIES-EVENT-STRIKE`, so the series is what the deny list can name."""
+    deny = DENY_SERIES if deny is None else deny
+    t = str(ticker or "").upper()
+    return any(t == s or t.startswith(s + "-") or t.startswith(s) for s in deny)
+
 
 LANES = ("exit_cancel", "requote_cancel", "place", "verify", "book_poll", "classify_sweep")
 LANE_PRIORITY = {name: i for i, name in enumerate(LANES)}          # spec §3.3, strict order

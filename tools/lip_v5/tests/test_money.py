@@ -191,43 +191,44 @@ class TestRStarFixpoint(LipTestCase):
         residuals = [abs(x - true_r) for x in res.trace]
         for a, b in zip(residuals, residuals[1:]):
             self.assertAlmostEqual(b, 0.5 * a, places=12)      # halves per step, exactly
-        self.assertAlmostEqual(residuals[0] / residuals[-1], 16.0, places=6)
+        # §1.3's claim, isolated to the four steps it was made about
+        self.assertAlmostEqual(residuals[0] / residuals[4], 16.0, places=6)
         self.assertLessEqual(res.iters, C.RSTAR_MAX_ITERS)
 
-    def test_TN7_FINDING_the_5pct_stop_rule_cannot_trip_within_4_iterations(self):
-        """SURFACED DIVERGENCE (spec §1.3, reported upward — NOT silently fixed).
+    def test_TN7_nine_iterations_DO_converge_at_the_5pct_rule(self):
+        """D3, RESOLVED: `RSTAR_MAX_ITERS = 9` is the smallest value making §1.3's two
+        statements true at once — it covers the 16x seed error §1.3 names, at the 5% tolerance
+        §1.3 sets.  `k ≥ log2(e/0.05)`: 5 steps for a 2x seed, 9 for a 16x one."""
+        true_r = 0.10
+        self.assertEqual(C.RSTAR_MAX_ITERS, 9)
+        for seed_mult, expect_iters in ((2.0, 5), (16.0, 9)):
+            res = M.solve_rstar(lambda r: ("A", true_r), true_r * seed_mult)
+            self.assertTrue(res.converged, "seed x%g did not converge" % seed_mult)
+            self.assertEqual(res.iters, expect_iters, "seed x%g" % seed_mult)
+            self.assertLess(abs(res.r_star - true_r) / true_r, 0.05)
 
-        §1.3 states two things that are not the same claim:
-          (i)  4 iterations "covers a 16x seed error"  — true of the RESIDUAL (test above);
-          (ii) "stop when |r*_k − r*_{k−1}| / r*_k < 0.05".
-
-        The damped map reaches a 5% RELATIVE band from initial relative error `e` only after
-        `k ≥ log2(e/0.05)` steps: e = 1 (a 2x seed) needs 5, e = 15 (a 16x seed) needs 9.  So
-        with RSTAR_MAX_ITERS = 4 the stop rule cannot trip for ANY meaningful seed error, and
-        the fixpoint always falls back to `max(r*_0..r*_4)`.
-
-        This is asserted here because it is the ACTUAL shipped behavior and it must not change
-        unnoticed.  It is SAFE — see the next test — but it is not adaptive, and
-        `rstar_no_converge` will therefore fire every cycle.
-        """
+    def test_TN7_at_four_iterations_it_could_never_have_converged(self):
+        """The defect itself, pinned: at the spec's original 4 the stop rule cannot trip for
+        any meaningful seed error, so `rstar_no_converge` fired every cycle."""
         true_r = 0.10
         for seed_mult in (2.0, 16.0):
-            res = M.solve_rstar(lambda r: ("A", true_r), true_r * seed_mult)
-            self.assertFalse(res.converged, "seed x%g unexpectedly converged" % seed_mult)
-            self.assertEqual(res.r_star, max(res.trace))
+            res = M.solve_rstar(lambda r: ("A", true_r), true_r * seed_mult, max_iters=4)
+            self.assertFalse(res.converged)
 
-    def test_TN7_the_fallback_is_conservative_in_both_directions(self):
-        """Why the finding above is safe to ship: `max(trace)` errs HIGH in both regimes.
+    def test_TN7_the_fallback_errs_high_ONLY_when_the_seed_was_high(self):
+        """CORRECTED (the reviewer verified this): `max(trace)` does NOT err high in both
+        regimes.  It errs high relative to the SEED, which is not the same as relative to the
+        TRUTH — and the low-seed case lands BELOW the true fixed point, pricing carry too
+        cheaply, which is the PayPal direction.  §1.4's unverified-exposure cap, not this
+        tie-break, is the cold-start guard."""
+        true_r = 0.10
+        high = M.solve_rstar(lambda r: ("A", true_r), 1.60, max_iters=4)
+        self.assertEqual(high.r_star, max(high.trace))
+        self.assertGreater(high.r_star, true_r)             # above the truth: conservative
 
-        Seed too HIGH ⇒ the trace decreases ⇒ max = the seed ⇒ carry priced high ⇒ fewer
-        venues admitted.  Seed too LOW ⇒ the trace increases ⇒ max = the last value ⇒ again
-        the highest r* seen.  A higher r* always allocates LESS, which is the direction that
-        fails toward the PayPal lesson rather than away from it.
-        """
-        for true_r, seed in ((0.10, 1.60), (0.10, 0.00625)):
-            res = M.solve_rstar(lambda r: ("A", true_r), seed)
-            self.assertGreaterEqual(res.r_star, min(res.trace))
-            self.assertEqual(res.r_star, max(res.trace))
+        low = M.solve_rstar(lambda r: ("A", true_r), C.FLOOR_RATE_PER_H, max_iters=4)
+        self.assertEqual(low.r_star, max(low.trace))
+        self.assertLess(low.r_star, true_r)                 # BELOW the truth: NOT conservative
 
     def test_TN7_damping_prevents_a_two_cycle(self):
         """An oscillating map: without the 0.5 damping this is a permanent 2-cycle."""
