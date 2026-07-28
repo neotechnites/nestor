@@ -151,6 +151,21 @@ ENTRY_FLOOR_USD = 2.00                  # §3.1 = 2x the $1.00 payout cliff = th
                                         #       declared tolerable model error (charter §8)
 RESCUE_TARGET_USD = 1.10                # §3.3 = $1.00 boundary + 1c round-down + 9c buffer
 CHECKPOINT_FRACTIONS = (0.25, 0.50, 0.80, 0.94)   # §3.4 WINDOW FRACTIONS, never clock offsets
+# ---- runway guard (LIVE DEFECT: late entry at scale) ------------------------------------
+# Observed live: 735 lots posted on gas 4.120 and 50 on 4.110 with under 25 minutes left in
+# that program's window.  ALLOCATE optimises a RATE ($/h per collateral-$) and is blind to
+# how many hours remain to earn it, so a dying program looks identical to a fresh one — and
+# the §3.1 forfeit gate cannot save us either, because it grades the PERIOD projection,
+# which late in a window is dominated by accrual we will never make.
+# Derivation (never hardcoded): entering is only rational if the §3.1 ENTRY_FLOOR is still
+# REACHABLE in the time left.  A slot's reward rate is (rho/2)*share.  Use a CONSERVATIVE
+# share, not the sole-qualifier ideal of 1.0 — assuming we take the whole side is exactly
+# the optimism that produces late entries:
+#     ENTRY_SHARE_ASSUMPTION * (rho/2) * h  >=  ENTRY_FLOOR
+#     =>  h  >=  ENTRY_FLOOR / (ENTRY_SHARE_ASSUMPTION * rho / 2)
+# At rho = $6.25/h (a gas rung) and ENTRY_FLOOR = $2.00 this is 1.28h.  It scales with the
+# pool: a fat program needs less runway, a thin one more, which is the correct shape.
+ENTRY_SHARE_ASSUMPTION = 0.5
 
 # ---- requote / cadence (§4) -------------------------------------------------------------
 MAKE_BEFORE_BREAK = True                # §4.1 strictly dominant when the balance exists
@@ -413,14 +428,16 @@ def allocate_closing_room(orders, net_yes):
     """
     room = closing_rooms(net_yes)
     total = 0.0
+    per_order = {}
     for o in sorted(orders, key=lambda x: str(x.order_id)):
         r = o.resting
         if r <= 0:
             continue
         c = min(r, room.get(o.side, 0.0))
         room[o.side] = room.get(o.side, 0.0) - c
+        per_order[str(o.order_id)] = c
         total += (r - c) * unit_collateral(o.side, o.price)
-    return total, room
+    return total, room, per_order
 
 
 def closing_qty(side, size, net_yes=0.0, room=None):
@@ -617,12 +634,13 @@ class Slot(object):
     only so the §2.7 wall arithmetic can be exercised with a wall stated separately."""
     __slots__ = ("ticker", "side", "rho", "S", "p", "W", "pinned", "denied",
                  "legal_price_exists", "p6_ok", "phi", "d", "program_id", "window_h",
-                 "pool", "assume_filled", "target_size", "cum_size")
+                 "pool", "assume_filled", "target_size", "cum_size", "hours_left",
+                 "accrued")
 
     def __init__(self, ticker, side, rho, S, p, W=0.0, pinned=False, denied=False,
                  legal_price_exists=True, p6_ok=True, phi=None, d=None, program_id=None,
                  window_h=16.0, pool=None, assume_filled=False, target_size=1000,
-                 cum_size=0.0):
+                 cum_size=0.0, hours_left=None, accrued=0.0):
         self.ticker = ticker
         self.side = side                    # "bid" | "ask"
         self.rho = float(rho)               # $/h over the program's OWN window (§0.4/§0.5)
@@ -642,6 +660,9 @@ class Slot(object):
         self.assume_filled = assume_filled
         self.target_size = target_size
         self.cum_size = cum_size
+        # hours of the program's OWN window still to run, and what we have accrued in it
+        self.hours_left = float(window_h) if hours_left is None else float(hours_left)
+        self.accrued = float(accrued)
 
     @property
     def key(self):
@@ -820,6 +841,25 @@ def day_stop_breached(pnl_usd, projected_day_reward_usd):
     return -float(pnl_usd) >= day_stop_usd(projected_day_reward_usd) - 1e-12
 
 
+def min_runway_h(rho, floor_usd=ENTRY_FLOOR_USD, share=ENTRY_SHARE_ASSUMPTION):
+    """Hours of window a slot needs for the §3.1 ENTRY_FLOOR to be REACHABLE at a
+    conservative share.  See the ENTRY_SHARE_ASSUMPTION derivation."""
+    if rho <= 0 or share <= 0:
+        return float("inf")
+    return float(floor_usd) / (float(share) * float(rho) / 2.0)
+
+
+def runway_ok(rho, hours_left, accrued_usd=0.0, floor_usd=ENTRY_FLOOR_USD,
+              share=ENTRY_SHARE_ASSUMPTION, rescue_target=RESCUE_TARGET_USD):
+    """Runway guard.  Refuse to ENTER or TOP UP a slot whose program cannot still reach the
+    entry floor — UNLESS we have already accrued past RESCUE_TARGET there, in which case
+    this is a rescue and §3.5 owns the decision (topping up a nearly-paid program late is
+    exactly what §3.6 says beats redeploy)."""
+    if float(accrued_usd) >= float(rescue_target) - 1e-12:
+        return True
+    return float(hours_left) >= min_runway_h(rho, floor_usd, share)
+
+
 def n_cap(p, caps=None):
     """§8.1 — floor($10/p) on NET.  Scales as 1/p: 25 at 40c, 500 at 2c."""
     caps = caps or Caps()
@@ -871,6 +911,8 @@ def allocate(slots, budget_usd, caps=None, lambda_min=LAMBDA_MIN, r_star_wall=No
         if not s.p6_ok:                                     # §10.3-P6 pre-entry filter
             continue
         if s.assume_filled:                                 # §9.4b freeze, T32b
+            continue
+        if not runway_ok(s.rho, s.hours_left, s.accrued):   # runway guard
             continue
         if s.p <= 0 or s.rho <= 0 or (s.S + s.W) <= 0:
             continue
@@ -1905,7 +1947,7 @@ def scan_programs(now=None, cache=True):
 
 
 def slots_from_market(prog, book_body, now, denied=False, p6_yes=True, p6_no=True,
-                      assume_filled=False):
+                      assume_filled=False, accrued=0.0):
     """§1.2 — build the two slots for one market from the live book."""
     yes_lv, no_lv = book_levels(book_body)
     yb, ya = best_from_book(book_body)
@@ -1931,7 +1973,9 @@ def slots_from_market(prog, book_body, now, denied=False, p6_yes=True, p6_no=Tru
                         pinned=pinned, denied=denied, legal_price_exists=legal, p6_ok=p6,
                         program_id=prog["program_id"], window_h=H, pool=pool,
                         assume_filled=assume_filled, target_size=tgt,
-                        cum_size=sc.cum_size))
+                        cum_size=sc.cum_size,
+                        hours_left=max(0.0, (prog["end_ts"] - now) / 3600.0),
+                        accrued=accrued))
     return out, {"yes_entry": y_entry, "no_entry": n_entry,
                  "yes_recon": y_recon, "no_recon": n_recon,
                  "yes_bid_c": yb, "yes_ask_c": ya, "pinned": pinned}
@@ -2060,6 +2104,7 @@ class Maker(object):
         self.last_classify = 0.0
         self.halted = False             # §8.4 day stop / §8.5 budget trip
         self.last_place_skip = None     # FIX-B: why the last place() declined, if it did
+        self.released = set()           # program_ids whose window-end release already ran
         self.fees_paid = 0.0            # taker fees, for the §8.4 mark
         self.last_resync = 0.0
         self.last_snapshot = 0.0
@@ -2427,8 +2472,9 @@ class Maker(object):
         sees the fresh book and funds nothing) but it is B1 again in the time dimension.
         """
         tk = prog["market_ticker"]
-        slots, info = slots_from_market(prog, body, now, denied=denied,
-                                        assume_filled=assume_filled)
+        slots, info = slots_from_market(
+            prog, body, now, denied=denied, assume_filled=assume_filled,
+            accrued=self.accrued.get(prog["program_id"], 0.0))
         H = window_hours(prog["start_ts"], prog["end_ts"])
         rho = pool_rate(prog["period_reward"], H)
         yb, ya = info["yes_bid_c"], info["yes_ask_c"]
@@ -2478,6 +2524,52 @@ class Maker(object):
             chosen_values=[round(market_rank_value(self.classified[t]), 6)
                            for t in ranked])
 
+    def release_ended_programs(self, now):
+        """PROGRAM-END RELEASE — when a program's window ends, stop quoting its pool and
+        pull the orders that were only there to earn it.
+
+        The allocator already drops an ended program on the next cycle (cycle() filters on
+        `end_ts > now`, so no slots are built for it and nothing is allocated), but DROPPING
+        A SLOT DOES NOT CANCEL WHAT IS ALREADY RESTING.  Those orders would sit on a dead
+        pool earning nothing, holding collateral against the §8.3 ceiling and carrying live
+        fill risk for no reward — strictly dominated.
+
+        EXCEPT closing orders.  Inventory OUTLIVES the program that produced it (§5: the
+        position settles on the market's own schedule, not the pool's), so a shed that is
+        unwinding a position must persist past the window end.  Cancelling it would strand
+        the inventory until settlement, which is the §5.3 failure the recycler exists to
+        prevent — and, in the exact shape FIX-A fixed, would do so at the one moment the
+        position can still be worked.
+        """
+        for p in list(self.programs.values()):
+            pid = p["program_id"]
+            if pid in self.released or p["end_ts"] > now:
+                continue
+            tk = p["market_ticker"]
+            # another live program on the same market still wants these quotes
+            if any(q["market_ticker"] == tk and q["end_ts"] > now
+                   for q in self.programs.values()):
+                self.released.add(pid)
+                log("program_end_release", program_id=pid, ticker=tk,
+                    kept="another live program on this market")
+                continue
+            orders = [o for o in self.st.orders.values()
+                      if o.ticker == tk and o.resting > 0]
+            _, _, closing = allocate_closing_room(orders, self.st.net_position(tk))
+            cancelled, kept = [], []
+            for o in sorted(orders, key=lambda x: str(x.order_id)):
+                if closing.get(str(o.order_id), 0.0) > 0:
+                    kept.append(o.order_id)          # inventory outlives the program
+                    continue
+                self.cancel(o)
+                self.live_by_slot.pop((tk, o.side), None)
+                cancelled.append(o.order_id)
+            self.released.add(pid)
+            self.classified.pop(tk, None)            # and it leaves the §4.6 poll ranking
+            log("program_end_release", program_id=pid, ticker=tk,
+                cancelled=cancelled, kept_closing=kept,
+                net_position=self.st.net_position(tk))
+
     def check_day_stop(self, slots, alloc, now):
         """§8.4 global day stop.  Reads the ledger-reconstructed positions and cost (§9.3)
         marked against the current books — never an exchange index (§8.6)."""
@@ -2521,6 +2613,7 @@ class Maker(object):
 
     def cycle(self, now=None):
         now = _now() if now is None else now
+        self.release_ended_programs(now)
         progs = [p for p in self.programs.values() if p["end_ts"] > now
                  and p["market_ticker"] not in self.st.assume_filled
                  and p["market_ticker"] not in self.st.poisoned]

@@ -161,8 +161,11 @@ class T14_1_Allocate(unittest.TestCase):
         """D-IMPL-1 — the spec pseudocode's line-10 `break` would abandon the remaining
         budget when the CURRENT best slot cannot afford one more contract, even though a
         cheaper slot still can.  That contradicts T5."""
-        rich = slot("RICH-MKT", "bid", 100.0, 5.0, 0.99, phi=0.0, d=0.0)
-        cheap = slot("CHEAP-MKT", "bid", 0.10, 5.0, 0.01, phi=0.0, d=0.0)
+        # hours_left is pinned large so this isolates the BUDGET mechanic: the runway guard
+        # would otherwise (correctly) refuse the $0.10/h pool, whose whole 16h window cannot
+        # reach the $2 entry floor at a conservative share.
+        rich = slot("RICH-MKT", "bid", 100.0, 5.0, 0.99, phi=0.0, d=0.0, hours_left=999.0)
+        cheap = slot("CHEAP-MKT", "bid", 0.10, 5.0, 0.01, phi=0.0, d=0.0, hours_left=999.0)
         al, spent = M.allocate([rich, cheap], 1.00, BIG, lambda_min=0.0)
         self.assertGreater(al[cheap.key], 0)
         self.assertGreater(spent, 1.00 - 0.99)
@@ -1802,6 +1805,154 @@ class FIXA1_ClosingRoomIsConsumedByRestingOrders(unittest.TestCase):
         orders = list(st.orders.values())
         self.assertEqual(M.allocate_closing_room(orders, 20.0),
                          M.allocate_closing_room(list(reversed(orders)), 20.0))
+
+
+class RunwayGuardAndProgramEndRelease(unittest.TestCase):
+    """LIVE DEFECT: v4 allocated 735 lots on gas 4.120 and 50 on 4.110 with under 25 minutes
+    left in that program's window.  ALLOCATE optimises a RATE and is blind to how long that
+    rate can be earned."""
+
+    def test_min_runway_is_derived_from_the_entry_floor_not_hardcoded(self):
+        # h >= ENTRY_FLOOR / (share * rho/2);  at rho=6.25, floor=$2, share=0.5 -> 1.28h
+        self.assertAlmostEqual(M.min_runway_h(6.25), 1.28, places=6)
+        self.assertAlmostEqual(
+            M.min_runway_h(6.25),
+            M.ENTRY_FLOOR_USD / (M.ENTRY_SHARE_ASSUMPTION * 6.25 / 2.0), places=12)
+        self.assertEqual(M.ENTRY_SHARE_ASSUMPTION, 0.5)      # conservative, NOT 1.0
+        # it scales with the pool: a fatter program needs less runway, a thinner one more
+        self.assertLess(M.min_runway_h(62.5), M.min_runway_h(6.25))
+        self.assertGreater(M.min_runway_h(0.625), M.min_runway_h(6.25))
+        self.assertEqual(M.min_runway_h(0.0), float("inf"))
+        # assuming the sole-qualifier share of 1.0 is exactly the optimism that produced the
+        # live late entries -- it would have halved the required runway
+        self.assertAlmostEqual(M.min_runway_h(6.25, share=1.0), 0.64, places=6)
+
+    def test_entry_is_refused_under_min_runway(self):
+        """The live shape: 25 minutes left on a gas rung, nothing accrued."""
+        self.assertFalse(M.runway_ok(6.25, 25.0 / 60.0, 0.0))
+        s = M.Slot("KXAAAGASD-26JUL28-4.120", "bid", 6.25, 50.0, 0.02,
+                   hours_left=25.0 / 60.0)
+        al, spent = M.allocate([s], 45.0, BIG)
+        self.assertEqual(al[s.key], 0)                        # was 735 lots live
+        self.assertEqual(spent, 0.0)
+        # and the budget is genuinely released, not merely withheld from this slot
+        good = M.Slot("GOOD", "bid", 6.25, 50.0, 0.02, hours_left=8.0)
+        al2, spent2 = M.allocate([s, good], 45.0, BIG)
+        self.assertEqual(al2[s.key], 0)
+        self.assertGreater(al2[good.key], 0)
+        self.assertGreater(spent2, 0.0)
+
+    def test_entry_is_allowed_with_runway(self):
+        self.assertTrue(M.runway_ok(6.25, 1.28, 0.0))
+        self.assertTrue(M.runway_ok(6.25, 8.0, 0.0))
+        s = M.Slot("T", "bid", 6.25, 50.0, 0.02, hours_left=2.0)
+        self.assertGreater(M.allocate([s], 45.0, BIG)[0][s.key], 0)
+
+    def test_rescue_top_up_is_still_allowed_above_the_accrued_threshold(self):
+        """§3.6 -- accrued score is not sunk, it is CONDITIONAL on clearing $1.00, which is
+        why topping up a nearly-paid program late beats redeploy.  The guard must not
+        override the rescue path."""
+        self.assertFalse(M.runway_ok(6.25, 0.3, 0.0))
+        self.assertTrue(M.runway_ok(6.25, 0.3, M.RESCUE_TARGET_USD))
+        self.assertTrue(M.runway_ok(6.25, 0.01, 5.00))
+        self.assertFalse(M.runway_ok(6.25, 0.3, M.RESCUE_TARGET_USD - 0.01))
+        late = M.Slot("T", "bid", 6.25, 50.0, 0.02, hours_left=0.3,
+                      accrued=M.RESCUE_TARGET_USD)
+        self.assertGreater(M.allocate([late], 45.0, BIG)[0][late.key], 0)
+        cold = M.Slot("T", "bid", 6.25, 50.0, 0.02, hours_left=0.3, accrued=0.0)
+        self.assertEqual(M.allocate([cold], 45.0, BIG)[0][cold.key], 0)
+
+    def test_slots_from_market_carries_the_real_remaining_window(self):
+        prog = {"program_id": "P1", "market_ticker": "T", "series": "KX",
+                "period_reward": 1000000.0, "target_size_fp": 10.0,
+                "discount_factor_bps": 5000.0, "start_ts": 0.0, "end_ts": 16 * 3600.0,
+                "paid_out": False}
+        # thin enough that the §2.2 hurdle is cleared, so the only thing under test here is
+        # the runway
+        book = {"orderbook": {"orderbook_fp": {
+            "yes_dollars": [["0.4000", "100"], ["0.3900", "100"]],
+            "no_dollars": [["0.5900", "100"], ["0.5800", "100"]]}}}
+        late, _ = M.slots_from_market(prog, book, 16 * 3600.0 - 1500.0)   # 25 min left
+        for s in late:
+            self.assertAlmostEqual(s.hours_left, 1500.0 / 3600.0, places=6)
+        self.assertEqual(sum(M.allocate(late, 45.0, BIG)[0].values()), 0)
+        early, _ = M.slots_from_market(prog, book, 0.0)
+        self.assertAlmostEqual(early[0].hours_left, 16.0, places=6)
+        self.assertGreater(sum(M.allocate(early, 45.0, BIG)[0].values()), 0)
+
+    # ---- program-end release ---------------------------------------------------------
+    def _prog(self, pid="P1", ticker="T", end=1000.0):
+        return {"program_id": pid, "market_ticker": ticker, "series": "KX",
+                "period_reward": 1000000.0, "target_size_fp": 1000.0,
+                "discount_factor_bps": 5000.0, "start_ts": 0.0, "end_ts": end,
+                "paid_out": False}
+
+    def test_ended_programs_leave_the_allocation(self):
+        """Confirming the allocator already drops them: cycle() filters on end_ts > now, so
+        no slots are built and nothing is allocated."""
+        prog = self._prog(end=1000.0)
+        m = M.Maker(None, M.LedgerState(), [prog])
+        live = [p for p in m.programs.values() if p["end_ts"] > 1001.0]
+        self.assertEqual(live, [])
+
+    def test_window_end_cancels_non_closing_orders_but_keeps_closing_ones(self):
+        """Inventory OUTLIVES the program that produced it -- a shed unwinding a position
+        must survive the window end, or the inventory strands until settlement."""
+        tmp = tempfile.mkdtemp()
+        old = (M.DATA_DIR, M.LEDGER_PATH, M.DRY)
+        try:
+            M.DATA_DIR = os.path.join(tmp, "lip")
+            M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+            M.DRY = False
+            st = M.LedgerState()
+            st.positions = {"T": {"yes": 20.0, "no": 0.0}}       # long YES
+            st.position_cost = {"T": 8.0}
+            quote = M.OrderState("A_QUOTE", "v4-c", "T", "bid", 0.40, 10, 0.0, 10.0)
+            shed = M.OrderState("B_SHED", "v4-c", "T", "ask", 0.42, 20, 0.0, 20.0)
+            st.orders["A_QUOTE"] = quote
+            st.orders["B_SHED"] = shed
+            m = M.Maker(None, st, [self._prog(end=1000.0)])
+            m.live_by_slot[("T", "bid")] = quote
+            m.live_by_slot[("T", "ask")] = shed
+            m.classified["T"] = {"rho": 6.25, "pinned": False, "denied": False,
+                                 "sides": [{"S": 50.0, "p": 0.40, "qualifies": True}]}
+            cancelled = []
+            m.do_cancel = lambda oid: (cancelled.append(oid),
+                                       (200, {"reduced_by": "10.00"}))[1]
+            m.release_ended_programs(1001.0)
+            self.assertEqual(cancelled, ["A_QUOTE"])            # the earning quote goes
+            self.assertEqual(shed.state, M.ST_LIVE)             # the shed stays
+            self.assertNotIn(("T", "bid"), m.live_by_slot)
+            self.assertIn(("T", "ask"), m.live_by_slot)
+            self.assertNotIn("T", m.classified)                 # leaves the poll ranking
+            # idempotent: a second pass does nothing
+            m.release_ended_programs(1002.0)
+            self.assertEqual(cancelled, ["A_QUOTE"])
+        finally:
+            M.DATA_DIR, M.LEDGER_PATH, M.DRY = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_release_does_not_fire_while_another_program_on_that_market_is_live(self):
+        tmp = tempfile.mkdtemp()
+        old = (M.DATA_DIR, M.LEDGER_PATH, M.DRY)
+        try:
+            M.DATA_DIR = os.path.join(tmp, "lip")
+            M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+            M.DRY = False
+            st = M.LedgerState()
+            quote = M.OrderState("A", "v4-c", "T", "bid", 0.40, 10, 0.0, 10.0)
+            st.orders["A"] = quote
+            m = M.Maker(None, st, [self._prog("P1", "T", 1000.0),
+                                   self._prog("P2", "T", 9e9)])
+            m.live_by_slot[("T", "bid")] = quote
+            cancelled = []
+            m.do_cancel = lambda oid: (cancelled.append(oid), (200, {"reduced_by": "0"}))[1]
+            m.release_ended_programs(1001.0)
+            self.assertEqual(cancelled, [])
+            self.assertIn(("T", "bid"), m.live_by_slot)
+        finally:
+            M.DATA_DIR, M.LEDGER_PATH, M.DRY = old
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class StartupAssertions(unittest.TestCase):
