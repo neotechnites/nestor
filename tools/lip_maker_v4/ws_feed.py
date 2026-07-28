@@ -529,6 +529,7 @@ class WsFeed(object):
         self._sid_tickers = {}          # sid -> tuple of tickers that subscription covers
         self._cmd_id = 0
         self._reproof_epoch = 0
+        self._clamp_logged = None
         self._connected = False
         self._liveness_ts = 0.0         # last time the reader confirmed the socket open
         self._last_msg_ts = 0.0
@@ -561,8 +562,19 @@ class WsFeed(object):
                 seen.add(t)
                 clean.append(t)
         if len(clean) > self._max_markets:
-            self._log("ws_ticker_clamp", asked=len(clean), cap=self._max_markets)
+            # Log the CONDITION once, not once per call.  `attach()` runs every 1 Hz cycle,
+            # so a steady state of "more candidates than the cap" was writing a row every
+            # cycle — 154 rows in 3 minutes, drowning the connect/subscribe/data events that
+            # are the actual diagnostic.  A clamp that never changes is not news; a clamp
+            # whose SIZE changes is.
+            if self._clamp_logged != len(clean):
+                self._clamp_logged = len(clean)
+                self._log("ws_ticker_clamp", asked=len(clean), cap=self._max_markets,
+                          dropped=len(clean) - self._max_markets,
+                          why="steady-state condition, logged on change only")
             clean = clean[:self._max_markets]
+        elif self._clamp_logged is not None:
+            self._clamp_logged = None
         new = tuple(clean)
         with self._lock:
             changed = new != self._tickers

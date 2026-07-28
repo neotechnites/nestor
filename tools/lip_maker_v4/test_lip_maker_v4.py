@@ -3767,10 +3767,16 @@ class FinalGate_W2_DivergenceGate(_RunnerCase):
             M.WS_ENABLED = old
 
     def test_the_gate_is_inert_while_the_flag_is_off(self):
+        """Asserts the OFF BEHAVIOUR, not the current config — WS_ENABLED is a live deploy
+        decision that flips between sessions."""
         m = M.Maker(None, M.LedgerState(), [])
         m.ws_agreements["T"] = 99
-        self.assertFalse(M.WS_ENABLED)
-        self.assertFalse(m.ws_trusted("T", 1000.0))
+        old = M.WS_ENABLED
+        try:
+            M.WS_ENABLED = False
+            self.assertFalse(m.ws_trusted("T", 1000.0))
+        finally:
+            M.WS_ENABLED = old
 
 
 class FinalGate_R1_CreditsRitual(_RunnerCase):

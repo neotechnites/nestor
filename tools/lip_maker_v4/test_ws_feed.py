@@ -452,10 +452,22 @@ class ConsumerSeam(unittest.TestCase):
         self.assertIs(mod, W)
         self.assertIs(M.ws_module(), mod)                    # cached
 
-    def test_it_is_off_by_default_and_the_maker_is_pure_REST(self):
-        self.assertFalse(M.WS_ENABLED)
+    def test_with_the_flag_OFF_the_maker_is_pure_REST(self):
+        """Asserts the OFF BEHAVIOUR, not the current config — WS_ENABLED is a live deploy
+        decision that flips between sessions."""
+        old = M.WS_ENABLED
+        try:
+            M.WS_ENABLED = False
+            m = M.Maker(None, M.LedgerState(), [])
+            self.assertIsNone(m.attach_ws([]))
+            self.assertIsNone(m.ws_book(T))
+            self.assertEqual(m.poll_cap(), M.MAX_REST_MARKETS)
+        finally:
+            M.WS_ENABLED = old
+
+    def test_with_no_feed_attached_the_maker_is_pure_REST_whatever_the_flag(self):
         m = M.Maker(None, M.LedgerState(), [])
-        self.assertIsNone(m.attach_ws([]))
+        self.assertIsNone(m.ws)
         self.assertIsNone(m.ws_book(T))
         self.assertEqual(m.poll_cap(), M.MAX_REST_MARKETS)
 
@@ -542,6 +554,39 @@ class N2_ReconnectCostsTrust(unittest.TestCase):
             self.assertEqual(m.ws_agreements.get(T, 0), 0)
         finally:
             M.WS_ENABLED = old
+
+class ClampLoggingIsNotSpam(unittest.TestCase):
+
+    def test_the_clamp_logs_on_CHANGE_not_on_every_call(self):
+        """attach() runs every 1 Hz cycle, so a steady "more candidates than the cap" state
+        wrote a row per cycle — 154 rows in 3 minutes, drowning the connect/subscribe/data
+        events that are the actual diagnostic.  A clamp that never changes is not news."""
+        rows = []
+        f = W.WsFeed(auth=None, tickers=[])
+        f._log = lambda ev, **kw: rows.append((ev, kw))
+        many = ["M%03d" % i for i in range(W.MAX_WS_MARKETS + 10)]
+        for _ in range(20):
+            f.set_tickers(many)
+        clamps = [r for r in rows if r[0] == "ws_ticker_clamp"]
+        self.assertEqual(len(clamps), 1)
+        self.assertEqual(clamps[0][1]["dropped"], 10)
+        # a DIFFERENT overage is news again
+        f.set_tickers(many + ["EXTRA"])
+        self.assertEqual(len([r for r in rows if r[0] == "ws_ticker_clamp"]), 2)
+        # dropping under the cap and back over reports again
+        f.set_tickers(["M001"])
+        f.set_tickers(many)
+        self.assertEqual(len([r for r in rows if r[0] == "ws_ticker_clamp"]), 3)
+
+    def test_no_clamp_row_when_under_the_cap(self):
+        rows = []
+        f = W.WsFeed(auth=None, tickers=[])
+        f._log = lambda ev, **kw: rows.append((ev, kw))
+        for _ in range(5):
+            f.set_tickers(["A", "B", "C"])
+        self.assertEqual([r for r in rows if r[0] == "ws_ticker_clamp"], [])
+        self.assertLessEqual(len(f.tickers), W.MAX_WS_MARKETS)
+
 
 class AuthSigning(unittest.TestCase):
 
