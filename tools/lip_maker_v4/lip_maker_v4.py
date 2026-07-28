@@ -114,10 +114,20 @@ NTFY_TOPIC = "senate-nestor-2732e947"                            # §13.6
 # filing's $10-$1,000/day cap.  A wrong unit is a 10x or 10,000x sizing error, so it is
 # additionally enforced by a STARTUP ASSERTION against a live program.
 PERIOD_REWARD_UNIT_USD = 1e-4
-UNIT_ASSERT_SERIES = "KXAAAGASD"        # §0.3: a known gas daily rung must read $100.00
+UNIT_ASSERT_SERIES = "KXAAAGASD"        # §0.3's original anchor: a live gas daily rung
 UNIT_ASSERT_EXPECT_USD = 100.00
 UNIT_ASSERT_TOL_USD = 0.01
 REFUSE_ON_UNIT_MISMATCH = True          # §0.3 "or REFUSE TO RUN"
+# The assertion's PURPOSE is verifying PERIOD_REWARD_UNIT_USD against known truth — not
+# verifying gas.  Pinning it to one series made the process unstartable in the gap between a
+# gas window closing (03:59Z) and the next day's rungs listing, which is a self-inflicted
+# outage on a $1e-4 constant that 585 of 771 live programs attest to simultaneously.
+# New form: at least UNIT_ASSERT_MIN_MATCHES live programs must read exactly $100.00 (the
+# MODAL pool).  30 gives ~20x margin against program-mix drift while still failing loudly,
+# because a unit error is not subtle — at 1e-3 every one of them reads $1,000 and at 1e-5
+# every one reads $10.00, so the matching count collapses to zero rather than degrading.
+# Gas, when live, is kept as a non-blocking belt on the original anchor.
+UNIT_ASSERT_MIN_MATCHES = 30
 
 # ---- scoring (§0.2 / §11.5) -------------------------------------------------------------
 DISCOUNT_FACTOR_DEFAULT = 0.50          # discount_factor_bps 5000 on 100% of live programs
@@ -351,6 +361,34 @@ def unit_assertion_ok(period_reward, expect_usd=UNIT_ASSERT_EXPECT_USD,
                       tol=UNIT_ASSERT_TOL_USD):
     """§0.3 startup assertion, as a pure predicate so it is testable without network."""
     return abs(pool_usd(period_reward) - expect_usd) <= tol
+
+
+def unit_assertion_check(programs, expect_usd=UNIT_ASSERT_EXPECT_USD,
+                        tol=UNIT_ASSERT_TOL_USD, min_matches=UNIT_ASSERT_MIN_MATCHES,
+                        series=UNIT_ASSERT_SERIES):
+    """§0.3 startup assertion, as a pure function.  Returns (ok, detail_dict).
+
+    PASS iff at least `min_matches` live liquidity programs convert to exactly `expect_usd`.
+    If any program of `series` is live, one of them must ALSO read `expect_usd` — a belt on
+    the original anchor that is skipped, not failed, when the series is between windows.
+    """
+    matches = [p for p in (programs or [])
+               if abs(pool_usd(p.get("period_reward")) - expect_usd) <= tol]
+    in_series = [p for p in (programs or []) if p.get("series") == series]
+    series_ok = None                                  # None == not live, nothing to assert
+    if in_series:
+        series_ok = any(abs(pool_usd(p.get("period_reward")) - expect_usd) <= tol
+                        for p in in_series)
+    ok = len(matches) >= min_matches and series_ok is not False
+    return ok, {
+        "n_programs": len(programs or []),
+        "n_at_expect": len(matches),
+        "min_required": min_matches,
+        "samples": [str(p.get("market_ticker")) for p in matches[:3]],
+        "series": series,
+        "series_live": len(in_series),
+        "series_ok": series_ok,
+    }
 
 
 def pool_rate(period_reward, window_hours):
@@ -2179,21 +2217,19 @@ def startup_assertions(auth, auth_note, programs=None):
     detail = "skipped"
     try:
         progs = programs if programs is not None else scan_programs(cache=False)
-        rungs = [p for p in progs if p["series"] == UNIT_ASSERT_SERIES]
-        if not rungs:
-            ok_unit = not REFUSE_ON_UNIT_MISMATCH
-            detail = "no live %s program found - CANNOT VERIFY THE UNIT" % UNIT_ASSERT_SERIES
-        else:
-            vals = sorted({round(pool_usd(p["period_reward"]), 4) for p in rungs})
-            ok_unit = any(unit_assertion_ok(p["period_reward"]) for p in rungs)
-            detail = "n=%d pool_usd values=%s expect %.2f+-%.2f" % (
-                len(rungs), vals[:6], UNIT_ASSERT_EXPECT_USD, UNIT_ASSERT_TOL_USD)
+        ok_unit, d = unit_assertion_check(progs)
+        if not REFUSE_ON_UNIT_MISMATCH:
+            ok_unit = True
+        detail = ("%d/%d live programs read $%.2f+-%.2f (need >=%d) samples=%s; "
+                  "%s live=%d belt=%s" % (
+                      d["n_at_expect"], d["n_programs"], UNIT_ASSERT_EXPECT_USD,
+                      UNIT_ASSERT_TOL_USD, d["min_required"], d["samples"],
+                      d["series"], d["series_live"],
+                      "n/a" if d["series_ok"] is None else d["series_ok"]))
     except Exception as exc:
         ok_unit = False
         detail = "%s: %s" % (type(exc).__name__, exc)
-    results.append(("unit_assertion_%s_eq_%.2f" % (UNIT_ASSERT_SERIES,
-                                                   UNIT_ASSERT_EXPECT_USD),
-                    ok_unit, detail))
+    results.append(("unit_assertion_eq_%.2f" % UNIT_ASSERT_EXPECT_USD, ok_unit, detail))
 
     # 5. NEW-5 — the ladder gate.  TAKER_EXIT_ENABLED is False because at a $45 ceiling
     #    the §8.1 net cap bounds what a taker exit could recover at single dollars (see the

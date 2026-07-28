@@ -29,6 +29,15 @@ def slot(ticker, side="bid", rho=6.25, S=50.0, p=0.40, **kw):
     return M.Slot(ticker, side, rho, S, p, **kw)
 
 
+def unit_progs(n=40, reward=1_000_000.0, series="KXOTHER", gas=0, gas_reward=1_000_000.0):
+    """Live-program fixtures for the §0.3 unit assertion."""
+    out = [{"series": series, "market_ticker": "%s-%03d" % (series, i),
+            "period_reward": reward} for i in range(n)]
+    out += [{"series": "KXAAAGASD", "market_ticker": "KXAAAGASD-4.%03d" % i,
+             "period_reward": gas_reward} for i in range(gas)]
+    return out
+
+
 # =============================================================================================
 # §14.1  ALLOCATE
 # =============================================================================================
@@ -1466,7 +1475,7 @@ class NEW5_TakerExitIsCoupledToTheCeiling(unittest.TestCase):
              M.TAKER_EXIT_ENABLED) = old
             shutil.rmtree(tmp, ignore_errors=True)
 
-    GOOD_PROGS = [{"series": "KXAAAGASD", "period_reward": 1_000_000.0}]
+    GOOD_PROGS = unit_progs(40, gas=17)
 
     def test_first_run_ceiling_passes_with_the_taker_exit_off(self):
         ok, r = self._assert_with(45.0, False, self.GOOD_PROGS)
@@ -2532,15 +2541,85 @@ class C4_ShedRetriesAloneWhenTheCombinedOrderIsRejected(_RunnerCase):
         self.assertIn("if placed is None and shed_q > 0 and q > shed_q:", src)
 
 
+class UnitAssertionIsAboutTheUnitNotAboutGas(unittest.TestCase):
+    """§0.3 -- the assertion verifies PERIOD_REWARD_UNIT_USD against known truth.  Pinning it
+    to one series made the process unstartable between that series' windows: measured
+    04:04Z, 771 programs live, 585 reading exactly $100.00, and v4 refused to start because
+    the gas daily had closed at 03:59Z and the next day had not listed."""
+
+    def test_the_modal_pool_carries_the_assertion_without_gas(self):
+        ok, d = M.unit_assertion_check(unit_progs(40, gas=0))
+        self.assertTrue(ok)
+        self.assertEqual(d["n_at_expect"], 40)
+        self.assertEqual(d["series_live"], 0)
+        self.assertIsNone(d["series_ok"])              # skipped, not failed
+        self.assertEqual(len(d["samples"]), 3)
+        self.assertEqual(d["min_required"], 30)
+        self.assertEqual(M.UNIT_ASSERT_MIN_MATCHES, 30)
+
+    def test_gas_when_live_is_an_additional_belt(self):
+        ok, d = M.unit_assertion_check(unit_progs(40, gas=17))
+        self.assertTrue(ok)
+        self.assertTrue(d["series_ok"])
+        self.assertEqual(d["series_live"], 17)
+        self.assertEqual(d["n_at_expect"], 57)
+
+    def test_gas_live_but_reading_wrong_fails_even_with_the_modal_pool_intact(self):
+        """The belt has teeth: if the original anchor is live and disagrees, refuse."""
+        ok, d = M.unit_assertion_check(unit_progs(40, gas=17, gas_reward=100_000.0))
+        self.assertFalse(ok)
+        self.assertFalse(d["series_ok"])
+        self.assertEqual(d["n_at_expect"], 40)         # the modal pool alone would pass
+
+    def test_a_unit_error_collapses_the_count_to_zero_and_refuses(self):
+        """A unit error is not subtle: at 1e-3 every program reads $1,000 and at 1e-5 every
+        one reads $10.00, so the matching count goes to ZERO rather than degrading."""
+        for wrong in (100_000.0, 10_000_000.0, 1_000.0, 100_000_000.0):
+            ok, d = M.unit_assertion_check(unit_progs(500, reward=wrong))
+            self.assertFalse(ok, wrong)
+            self.assertEqual(d["n_at_expect"], 0, wrong)
+        # and the real 100x-off cases specifically
+        ok, _ = M.unit_assertion_check(unit_progs(771, reward=1_000_000.0 * 100))
+        self.assertFalse(ok)
+        ok, _ = M.unit_assertion_check(unit_progs(771, reward=1_000_000.0 / 100))
+        self.assertFalse(ok)
+
+    def test_too_few_matches_refuses(self):
+        self.assertFalse(M.unit_assertion_check(unit_progs(29))[0])
+        self.assertTrue(M.unit_assertion_check(unit_progs(30))[0])
+        self.assertFalse(M.unit_assertion_check([])[0])
+        # 20x margin against program-mix drift: today's 585 is far above the floor
+        self.assertGreaterEqual(585 / M.UNIT_ASSERT_MIN_MATCHES, 19.0)
+
+    def test_the_refusal_reaches_startup(self):
+        tmp = tempfile.mkdtemp()
+        old = (M.DATA_DIR, M.LEDGER_PATH)
+        try:
+            M.DATA_DIR = os.path.join(tmp, "lip")
+            M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+            ok, results = M.startup_assertions(None, "n/a",
+                                               programs=unit_progs(40, reward=100_000.0))
+            unit = [r for r in results if r[0].startswith("unit_")][0]
+            self.assertFalse(unit[1])
+            self.assertFalse(ok)
+            ok2, results2 = M.startup_assertions(None, "n/a", programs=unit_progs(40))
+            unit2 = [r for r in results2 if r[0].startswith("unit_")][0]
+            self.assertTrue(unit2[1])
+            self.assertIn("40/40", unit2[2])
+        finally:
+            M.DATA_DIR, M.LEDGER_PATH = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class StartupAssertions(unittest.TestCase):
 
     def test_unit_assertion_refuses_a_wrong_unit(self):
         """§0.3 — refuse to run.  Exercised through the pure predicate; the network leg is
         the same predicate applied to the scanner's output."""
-        good = [{"series": "KXAAAGASD", "period_reward": 1_000_000.0}]
-        bad = [{"series": "KXAAAGASD", "period_reward": 100_000.0}]
-        self.assertTrue(any(M.unit_assertion_ok(p["period_reward"]) for p in good))
-        self.assertFalse(any(M.unit_assertion_ok(p["period_reward"]) for p in bad))
+        self.assertTrue(M.unit_assertion_check(unit_progs(40))[0])
+        self.assertFalse(M.unit_assertion_check(unit_progs(40, reward=100_000.0))[0])
+        self.assertTrue(M.unit_assertion_ok(1_000_000))       # the per-program predicate
+        self.assertFalse(M.unit_assertion_ok(100_000))
         self.assertTrue(M.REFUSE_ON_UNIT_MISMATCH)
 
     def test_data_dir_and_ledger_assertions_run_without_network(self):
@@ -2550,8 +2629,7 @@ class StartupAssertions(unittest.TestCase):
             M.DATA_DIR = os.path.join(tmp, "lip")
             M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
             ok, results = M.startup_assertions(None, "no key (dry)",
-                                               programs=[{"series": "KXAAAGASD",
-                                                          "period_reward": 1_000_000.0}])
+                                               programs=unit_progs(40, gas=17))
             names = {n: (g, d) for n, g, d in results}
             self.assertTrue(names["data_dir_writable"][0])
             self.assertTrue(names["ledger_replay_clean"][0])

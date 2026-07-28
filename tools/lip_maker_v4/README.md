@@ -8,11 +8,12 @@ Python 3.12 + requests + cryptography. Tests: `python3 -m unittest discover tool
     ssh ubuntu@VPS 'mkdir -p ~/nestor/data/lip && python3 ~/kalshi_data/scripts/lip_maker_v4.py --check'
 
 ## First-run checklist (all must pass before --live)
-0. **`python3 -m unittest discover tools/lip_maker_v4/` — 100 tests, must print `OK`.** Run it on the
+0. **`python3 -m unittest discover tools/lip_maker_v4/` — 158 tests, must print `OK`.** Run it on the
    VPS against the file you just scp'd, not only on the Mac.
 1. `--check` prints `[OK ]` for all four startup assertions: `env_and_pem`, `data_dir_writable`,
-   `ledger_replay_clean`, `taker_exit_decision_matches_ceiling`, and **`unit_assertion_KXAAAGASD_eq_100.00`** — a live gas rung must read
-   `$100.00 ± $0.01`; the process REFUSES TO RUN on failure (§0.3).
+   `ledger_replay_clean`, `taker_exit_decision_matches_ceiling`, and **`unit_assertion_eq_100.00`** — at least 30
+   live programs must read `$100.00 ± $0.01` (the modal pool; ~585 of 771 do). Gas, when live, is an
+   extra belt. The process REFUSES TO RUN on failure (§0.3).
 2. `~/nestor/.env` has `KALSHI_API_KEY_ID`; `~/nestor/secrets/prod.pem` exists. Config read-back: `MAX_TOTAL_COLLATERAL_USD = 45.0`, `EVENT_ALLOWLIST = []` (OFF — scanner ranks
    everything; set to e.g. `["KXAAAGASD-26JUL29"]` to pen the shakeout to gas), `COID_PREFIX = "v4-"`.
 3. `lip_maker_v4.py --dry` — one cycle, zero POST/DELETE; inspect the `allocate` line.
