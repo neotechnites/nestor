@@ -291,8 +291,15 @@ class Maker(object):
           4. the wire
           5. correct the feed from the response
         """
+        # `basis` is WHAT ONE CONTRACT CAN LOSE — the collateral posted — and `price` is on the
+        # YES axis for BOTH sides.  The same defect as the resting-order basis, in the one
+        # place it was missed: an ask at a 0.97 yes-price costs 0.03 to post and was being
+        # scored at 0.97, so a routine land grab read as a $291 order against a $75 cluster
+        # cap and was refused every cycle, forever.  Plan and rail must measure in the same
+        # currency as the money.
         order = {"ticker": ticker, "side": "yes" if side == "bid" else "no",
-                 "n": float(count), "basis": float(price), "fully_closing": fully_closing}
+                 "n": float(count), "basis": R.unit_collateral(side, price),
+                 "fully_closing": fully_closing}
         ctx = self.place_context(available_cash_usd,
                                  replacing_order_id=replacing_order_id)
         ok, reason, detail = G.place_allowed(ctx, order)

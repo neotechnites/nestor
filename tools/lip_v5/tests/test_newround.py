@@ -480,3 +480,32 @@ class TestADeterminedMarketCarriesNoClusterRisk(__import__('unittest').TestCase)
         ctx = m.place_context(available_cash_usd=1000.0)
         self.assertEqual([p for p in ctx.positions if p["ticker"] == tk], [],
                          "a determined market cannot lose more; it must not hold risk budget")
+
+
+class TestTheProspectiveOrderIsMeasuredInCollateral(__import__('unittest').TestCase):
+    """The resting-order basis was fixed on 2026-07-28; the PROSPECTIVE order's was missed.
+    An ask at a 0.97 yes-price costs 0.03/contract to post and was scored at 0.97, so a
+    routine 300-lot land grab read as a $291 order against a $75 cluster cap and was refused
+    every cycle, forever."""
+
+    def test_a_sell_side_order_is_scored_at_what_it_costs(self):
+        from lip_v5 import engine, exchange as X, guards as G
+        ex = X.FakeExchange(balance_cents=1_000_000)
+        m = engine.Maker(ex, 1785268000.0, live=False)
+        m.nestor_orders, m.nestor_positions = set(), set()
+        seen = {}
+        orig = G.place_allowed
+
+        def spy(ctx, order):
+            seen.update(order)
+            return orig(ctx, order)
+
+        G.place_allowed = spy
+        try:
+            m.place("KXTRUMPACT-26JUL26-T1", "ask", 0.97, 300, 1785271600.0,
+                    1785268000.0, available_cash_usd=1000.0)
+        finally:
+            G.place_allowed = orig
+        self.assertAlmostEqual(seen["basis"], 0.03, places=6)
+        self.assertAlmostEqual(seen["n"] * seen["basis"], 9.0, places=4,
+                               msg="300 lots at 3c is $9 of risk, not $291")
