@@ -1488,6 +1488,223 @@ class NEW5_TakerExitIsCoupledToTheCeiling(unittest.TestCase):
         self.assertLess(M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_REQUIRED_ABOVE_USD)
 
 
+# =============================================================================================
+# LIVE-RUN REGRESSIONS (FIX-A, FIX-B) — observed in v4's first hour at a saturated $45 ceiling
+# =============================================================================================
+class FIXA_ClosingOrdersDoNotChargeCollateral(unittest.TestCase):
+
+    def test_the_live_deadlock_shed_can_post_at_a_saturated_ceiling(self):
+        """FIX-A — observed live: 19.95 NO held on KXDXYDUD, recycler logging
+        MakerShed/shed_preferred every second, and the shed order skipped on
+        `collateral_ceiling` every second.  The shed could never post, so the inventory
+        locked until settlement — the §5.3 "inventory BLOCKS THE SLOT" failure arriving
+        through our own risk control."""
+        st = M.LedgerState()
+        st.positions = {"D": {"yes": 0.0, "no": 19.95}}     # long NO
+        st.position_cost = {"D": 42.87}                     # ceiling saturated
+        m = M.Maker(None, st, [])
+        self.assertGreater(st.collateral, M.MAX_TOTAL_COLLATERAL_USD - 3.0)
+        # shedding a NO position means BUYING YES -> a bid, closing up to 19.95
+        self.assertEqual(M.shed_slot("ask"), "bid")
+        self.assertAlmostEqual(M.closing_qty("bid", 19, -19.95), 19.0, places=9)
+        self.assertAlmostEqual(M.order_collateral_usd("bid", 0.42, 19, -19.95), 0.0,
+                               places=9)
+        # ... so it is NOT skipped any more.  (do_post is stubbed; no network.)
+        posted = {}
+        m.do_post = lambda body: (posted.setdefault("body", body),
+                                  (201, {"order_id": "O1", "fill_count": "0.00",
+                                         "remaining_count": body["count"]}))[1]
+        old_dry = M.DRY
+        tmp = tempfile.mkdtemp()
+        old = (M.DATA_DIR, M.LEDGER_PATH)
+        try:
+            M.DRY = False
+            M.DATA_DIR = os.path.join(tmp, "lip")
+            M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+            o = m.place("D", "bid", 42, 19, 1785000000)
+            self.assertIsNotNone(o)                          # was None before FIX-A
+            self.assertIsNone(m.last_place_skip)
+        finally:
+            M.DRY = old_dry
+            M.DATA_DIR, M.LEDGER_PATH = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_the_partial_case_charges_only_the_opening_tail(self):
+        """FIX-A — the case that bites: a 25-lot ask against 19.95 held is 19.95 closing
+        plus 5.05 opening, and only the 5.05 tail may be charged."""
+        self.assertAlmostEqual(M.closing_qty("ask", 25, 19.95), 19.95, places=9)
+        charged = M.order_collateral_usd("ask", 0.42, 25, 19.95)
+        self.assertAlmostEqual(charged, 5.05 * M.unit_collateral("ask", 0.42), places=9)
+        self.assertAlmostEqual(charged, 5.05 * 0.58, places=9)
+        gross = 25 * M.unit_collateral("ask", 0.42)
+        self.assertLess(charged, gross)
+        self.assertAlmostEqual(gross - charged, 19.95 * 0.58, places=9)
+
+    def test_a_non_closing_order_still_charges_in_full(self):
+        """The netting must not become a hole in the §8.3 ceiling."""
+        self.assertAlmostEqual(M.order_collateral_usd("bid", 0.42, 25, 0.0),
+                               25 * 0.42, places=9)
+        # an order on the SAME side as the position OPENS more of it
+        self.assertEqual(M.closing_qty("bid", 25, 19.95), 0.0)
+        self.assertAlmostEqual(M.order_collateral_usd("bid", 0.42, 25, 19.95),
+                               25 * 0.42, places=9)
+        self.assertEqual(M.closing_qty("ask", 25, -19.95), 0.0)
+        self.assertAlmostEqual(M.order_collateral_usd("ask", 0.42, 25, -19.95),
+                               25 * 0.58, places=9)
+        # and a flat book charges everything, both sides
+        for side, px in (("bid", 0.40), ("ask", 0.40)):
+            self.assertAlmostEqual(M.order_collateral_usd(side, px, 10, 0.0),
+                                   10 * M.unit_collateral(side, px), places=9)
+
+    def test_a_new_post_at_a_saturated_ceiling_still_skips(self):
+        st = M.LedgerState()
+        st.positions = {"D": {"yes": 0.0, "no": 19.95}}
+        st.position_cost = {"D": 42.87}
+        m = M.Maker(None, st, [])
+        tmp = tempfile.mkdtemp()
+        old = (M.DATA_DIR, M.LEDGER_PATH)
+        try:
+            M.DATA_DIR = os.path.join(tmp, "lip")
+            M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+            self.assertIsNone(m.place("OTHER", "bid", 40, 25, 1785000000))
+            self.assertEqual(m.last_place_skip, "collateral_ceiling")
+        finally:
+            M.DATA_DIR, M.LEDGER_PATH = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_resting_collateral_nets_the_same_way_placement_does(self):
+        """If placement nets a closing order to $0 but the resting view then charges it in
+        full, the ceiling re-seals one tick later and the deadlock returns."""
+        recs = [rec_place("O1", T, "bid", 0.40, 20, fill=20, rem=0),      # 20 YES held
+                rec_place("O2", T, "ask", 0.42, 20)]                      # closing ask
+        st = M.ledger_replay(recs)
+        self.assertAlmostEqual(st.net_position(T), 20.0, places=9)
+        self.assertAlmostEqual(st.resting_collateral, 0.0, places=9)      # fully closing
+        self.assertAlmostEqual(st.position_collateral, 20 * 0.40, places=9)
+        # a partially-closing rest charges only its tail
+        recs2 = [rec_place("O1", T, "bid", 0.40, 20, fill=20, rem=0),
+                 rec_place("O2", T, "ask", 0.42, 25)]
+        st2 = M.ledger_replay(recs2)
+        self.assertAlmostEqual(st2.resting_collateral, 5 * 0.58, places=9)
+        # and a non-closing rest is untouched
+        recs3 = [rec_place("O1", T, "bid", 0.40, 20, fill=20, rem=0),
+                 rec_place("O2", T, "bid", 0.40, 10)]
+        self.assertAlmostEqual(M.ledger_replay(recs3).resting_collateral, 10 * 0.40,
+                               places=9)
+
+    def test_closing_capacity_is_shared_deterministically_across_resting_orders(self):
+        """Two closing asks against one position must not BOTH net to zero."""
+        recs = [rec_place("O1", T, "bid", 0.40, 20, fill=20, rem=0),
+                rec_place("O2", T, "ask", 0.42, 15),
+                rec_place("O3", T, "ask", 0.42, 15)]
+        st = M.ledger_replay(recs)
+        # 20 of the 30 resting asks close; the other 10 open at the NO price
+        self.assertAlmostEqual(st.resting_collateral, 10 * 0.58, places=9)
+        self.assertEqual(st.resting_collateral, M.ledger_replay(recs).resting_collateral)
+
+
+class FIXB_CeilingBlockedRequotesDegradeInsteadOfFreezing(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = (M.DATA_DIR, M.LEDGER_PATH, M.DRY)
+        M.DATA_DIR = os.path.join(self.tmp, "lip")
+        M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+        M.DRY = False
+
+    def tearDown(self):
+        M.DATA_DIR, M.LEDGER_PATH, M.DRY = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _saturated_maker(self, cost=40.70):
+        # `cost` is everything OTHER than this slot's own resting order.  At 40.70 plus a
+        # $4.00 resting bid the book is saturated at $44.70 of $45: the make-before-break
+        # OVERLAP (+$4.10) does not fit, but the cancel-first repost does — which is the
+        # whole point of FIX-B.
+        st = M.LedgerState()
+        st.positions = {"T": {"yes": 0.0, "no": 0.0}}
+        st.position_cost = {"T": cost}
+        m = M.Maker(None, st, [])
+        self.calls = []
+        m.do_cancel = lambda oid: (self.calls.append(("cancel", oid)),
+                                   (200, {"reduced_by": "10.00"}))[1]
+
+        def post(body):
+            self.calls.append(("post", body["price"], body["count"]))
+            return (201, {"order_id": "N%d" % len(self.calls),
+                          "fill_count": "0.00", "remaining_count": body["count"]})
+        m.do_post = post
+        return m
+
+    def test_a_moved_book_still_gets_a_recentred_quote_via_cancel_first(self):
+        """FIX-B — the live freeze: skip_post on collateral_ceiling treated a re-centre like
+        a new post, so the quote sat off-best and decayed at 0.5^ticks."""
+        m = self._saturated_maker()
+        resting = M.OrderState("OLD", "v4-c", "T", "bid", 0.40, 10, 0.0, 10.0)
+        m.st.orders["OLD"] = resting
+        m.live_by_slot[("T", "bid")] = resting
+        # the overlap does not fit: 10 more at 41c on top of a saturated ceiling
+        self.assertGreater(m.st.collateral + 10 * 0.41, M.MAX_TOTAL_COLLATERAL_USD)
+        new = m.requote("T", "bid", 41, 10, 1785000000)
+        self.assertIsNotNone(new)                       # was None before FIX-B
+        self.assertEqual(new.price, 0.41)               # and it is re-centred
+        # Cancel-first: the cancel precedes the post.  The make leg never reaches the wire
+        # at all -- the ceiling check declines it locally -- so no request is wasted.
+        self.assertEqual([c[0] for c in self.calls], ["cancel", "post"])
+        self.assertEqual(m.live_by_slot[("T", "bid")].order_id, new.order_id)
+        # a ceiling block must NOT latch the slot into cancel-first: it is transient
+        self.assertNotIn(("T", "bid"), m.mbb_degraded)
+
+    def test_the_ceiling_case_is_logged_distinctly_from_a_balance_reject(self):
+        m = self._saturated_maker()
+        resting = M.OrderState("OLD", "v4-c", "T", "bid", 0.40, 10, 0.0, 10.0)
+        m.st.orders["OLD"] = resting
+        m.live_by_slot[("T", "bid")] = resting
+        m.requote("T", "bid", 41, 10, 1785000000)
+        events = [json.loads(l)["event"]
+                  for l in open(M.LEDGER_PATH)] if os.path.exists(M.LEDGER_PATH) else []
+        self.assertIn("mbb_degraded_ceiling", events)
+        self.assertNotIn("mbb_degraded", events)
+
+    def test_an_upsized_requote_is_not_collateral_neutral_and_still_degrades(self):
+        """The neutrality argument only holds for equal-or-smaller size."""
+        m = self._saturated_maker()
+        resting = M.OrderState("OLD", "v4-c", "T", "bid", 0.40, 10, 0.0, 10.0)
+        m.st.orders["OLD"] = resting
+        m.live_by_slot[("T", "bid")] = resting
+        m.requote("T", "bid", 41, 40, 1785000000)
+        self.assertIn(("T", "bid"), m.mbb_degraded)
+        events = [json.loads(l)["event"] for l in open(M.LEDGER_PATH)]
+        self.assertIn("mbb_degraded", events)
+
+    def test_a_genuinely_new_post_at_saturation_still_skips(self):
+        """No resting order means no overlap, nothing to cancel and nothing to degrade —
+        the ceiling must simply hold."""
+        m = self._saturated_maker(cost=44.60)     # nothing resting, no headroom at all
+        self.assertIsNone(m.requote("T", "bid", 41, 10, 1785000000))
+        self.assertEqual(self.calls, [])
+        self.assertNotIn(("T", "bid"), m.mbb_degraded)
+        self.assertEqual(m.last_place_skip, "collateral_ceiling")
+
+    def test_make_before_break_is_still_the_default_when_headroom_exists(self):
+        """§4.1 must be untouched on an unsaturated book: post, confirm, THEN cancel."""
+        st = M.LedgerState()
+        m = M.Maker(None, st, [])
+        self.calls = []
+        m.do_cancel = lambda oid: (self.calls.append(("cancel", oid)),
+                                   (200, {"reduced_by": "10.00"}))[1]
+        m.do_post = lambda body: (self.calls.append(("post", body["count"])),
+                                  (201, {"order_id": "N1", "fill_count": "0.00",
+                                         "remaining_count": body["count"]}))[1]
+        resting = M.OrderState("OLD", "v4-c", "T", "bid", 0.40, 10, 0.0, 10.0)
+        m.st.orders["OLD"] = resting
+        m.live_by_slot[("T", "bid")] = resting
+        new = m.requote("T", "bid", 41, 10, 1785000000)
+        self.assertIsNotNone(new)
+        self.assertEqual([c[0] for c in self.calls], ["post", "cancel"])   # make, THEN break
+        self.assertNotIn(("T", "bid"), m.mbb_degraded)
+
+
 class StartupAssertions(unittest.TestCase):
 
     def test_unit_assertion_refuses_a_wrong_unit(self):

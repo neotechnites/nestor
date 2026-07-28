@@ -385,6 +385,40 @@ def unit_collateral(side, price_dollars):
     return float(price_dollars) if side == "bid" else (1.0 - float(price_dollars))
 
 
+def closing_qty(side, size, net_yes):
+    """FIX-A — how much of an order of `size` on `side` CLOSES inventory already held.
+
+    `net_yes` = yes contracts held minus no contracts held, on that market.
+      * we are long YES (net > 0): an ASK sells YES, closing up to `net_yes`.
+      * we are long NO  (net < 0): a BID buys YES, closing up to `-net_yes`.
+    A closing contract is delivered out of the position, so the exchange takes NO new
+    collateral for it.  Anything beyond the position is a fresh opening contract.
+    """
+    room = max(0.0, float(net_yes)) if side == "ask" else max(0.0, -float(net_yes))
+    return min(float(size), room)
+
+
+def order_collateral_usd(side, price_dollars, size, net_yes=0.0):
+    """FIX-A — collateral an order COMMITS, net of the part that closes held inventory.
+
+    The live deadlock this fixes: at a saturated ceiling the recycler decided MakerShed
+    every second, but the shed order was charged as if it were fresh exposure
+    (`would_add $2.88` against 19.95 held), so the ceiling check skipped it forever and the
+    inventory could not recycle — it locked until settlement, which is precisely the
+    "inventory is expensive because it BLOCKS THE SLOT" failure §5.3 exists to prevent.
+
+    A closing order cannot increase exposure: its worst case is that we end up FLAT.
+    Charging it is not conservatism, it is a model error, and it makes the ceiling
+    self-sealing exactly when the recycler is trying to unseal it.
+
+    Partial case (the one that bites): a 25-lot ask against 19.95 held is 19.95 closing
+    plus 5.05 opening — only the 5.05 tail is charged.
+    """
+    closing = closing_qty(side, size, net_yes)
+    opening = max(0.0, float(size) - closing)
+    return opening * unit_collateral(side, price_dollars)
+
+
 def order_body(ticker, side, price_dollars, expiration_ts, coid, count):
     """§4.7 — the exact v3-proven V2 resting-order body."""
     return {
@@ -1354,8 +1388,26 @@ class LedgerState(object):
 
     @property
     def resting_collateral(self):
-        return sum(o.resting * unit_collateral(o.side, o.price)
-                   for o in self.orders.values())
+        """FIX-A — resting orders are netted against held inventory exactly as placement is.
+
+        If placement nets a closing order to $0 but this view then charges it in full once
+        it rests, the ceiling re-seals on the next cycle and the deadlock returns one tick
+        later.  The two must agree.  Closing capacity is allocated per ticker, deterministic
+        in order_id, so the split is stable across replays.
+        """
+        by_ticker = {}
+        for o in self.orders.values():
+            if o.resting > 0:
+                by_ticker.setdefault(o.ticker, []).append(o)
+        total = 0.0
+        for ticker, orders in by_ticker.items():
+            net = self.net_position(ticker)
+            room = {"ask": max(0.0, net), "bid": max(0.0, -net)}
+            for o in sorted(orders, key=lambda x: str(x.order_id)):
+                c = min(o.resting, room.get(o.side, 0.0))
+                room[o.side] = room.get(o.side, 0.0) - c
+                total += (o.resting - c) * unit_collateral(o.side, o.price)
+        return total
 
     @property
     def position_collateral(self):
@@ -1969,6 +2021,7 @@ class Maker(object):
         self.classified = {}            # ticker -> §4.6 classification (B1)
         self.last_classify = 0.0
         self.halted = False             # §8.4 day stop / §8.5 budget trip
+        self.last_place_skip = None     # FIX-B: why the last place() declined, if it did
         self.fees_paid = 0.0            # taker fees, for the §8.4 mark
         self.last_resync = 0.0
         self.last_snapshot = 0.0
@@ -2050,28 +2103,36 @@ class Maker(object):
 
     # -- placement ------------------------------------------------------------------------
     def place(self, ticker, side, price_c, size, expiration_ts):
+        self.last_place_skip = None
         if self.halted:
+            self.last_place_skip = "halted"
             # §8.4/§8.5: a halted process posts NOTHING, on every path into placement.
             return None
         if ticker in self.st.poisoned or ticker in self.st.assume_filled:
             return None
         price = price_c / 100.0
-        add = size * unit_collateral(side, price)
+        net = self.st.net_position(ticker)
+        add = order_collateral_usd(side, price, size, net)          # FIX-A
+        closing = closing_qty(side, size, net)
         if self.st.collateral + add > MAX_TOTAL_COLLATERAL_USD + 1e-9:
+            self.last_place_skip = "collateral_ceiling"             # FIX-B needs the reason
             log("skip_post", ticker=ticker, side=side, why="collateral_ceiling",
                 committed=round(self.st.collateral, 4), would_add=round(add, 4),
+                closing_qty=round(closing, 4), gross=round(
+                    size * unit_collateral(side, price), 4),
                 ceiling=MAX_TOTAL_COLLATERAL_USD)
             return None
         cap = refill_cap(unit_collateral(side, price))                 # §8.7
         if self.refilled.get((ticker, side), 0) + size > cap:
+            self.last_place_skip = "refill_cap"
             log("skip_post", ticker=ticker, side=side, why="refill_cap", cap=cap)
             return None
         # §8.1/§5.5 — the inventory cap is on NET, and it binds on the WORST CASE of this
         # order filling in full.  A shed order is exempt: it reduces |net| by construction.
-        net = self.st.net_position(ticker)
         worst = net + size if side == "bid" else net - size
         ncap = n_cap(unit_collateral(side, price))
         if abs(worst) > ncap and abs(worst) > abs(net):
+            self.last_place_skip = "net_inventory_cap"
             log("skip_post", ticker=ticker, side=side, why="net_inventory_cap",
                 net=net, worst=worst, n_cap=ncap)
             return None
@@ -2240,8 +2301,26 @@ class Maker(object):
 
     # -- requote: MAKE BEFORE BREAK (§4.1/§4.2) -------------------------------------------
     def requote(self, ticker, side, price_c, size, expiration_ts):
-        old = self.live_by_slot.get((ticker, side))
+        """§4.1 make-before-break, with the §4.2 fallback and the FIX-B ceiling path.
+
+        FIX-B, from the live run: a re-CENTRE of an existing resting order was being costed
+        as a brand-new post.  Make-before-break needs headroom for the transient overlap
+        (§2.4 reserves it), but at a saturated ceiling that headroom is gone, so the make
+        leg was skipped on `collateral_ceiling`, the requote never happened, and the quote
+        froze off-best and decayed at 0.5^ticks — the exact coverage loss §4.1 exists to
+        prevent, arriving through the risk control rather than through the exchange.
+
+        A cancel-first requote of EQUAL OR SMALLER size is collateral-neutral to within one
+        tick: the cancel releases the old order's commitment before the repost takes its
+        own, and the two differ only by the price improvement being chased (at most a cent
+        per contract).  The repost is still ceiling-checked, so even that residual is
+        declined safely rather than breaching.  A ceiling block on the OVERLAP is therefore
+        not a reason to skip, it is a reason to take the path §4.2 already built.  It is logged as `mbb_degraded_ceiling` and, unlike a balance reject,
+        does NOT latch the slot into cancel-first — the ceiling is transient and the next
+        cycle should try the overlap again.
+        """
         key = (ticker, side)
+        old = self.live_by_slot.get(key)
         if MAKE_BEFORE_BREAK and key not in self.mbb_degraded:
             new = self.place(ticker, side, price_c, size, expiration_ts)
             if new is not None:
@@ -2252,12 +2331,28 @@ class Maker(object):
                 return new
             if DRY:
                 return None          # --dry never places, so there is nothing to degrade
-            # §4.2 AUTOMATIC degradation, not a config choice: any insufficient-balance /
-            # margin-reject on the make leg switches THIS SLOT to cancel-first immediately.
-            # It retries make-before-break at the next checkpoint.
-            self.mbb_degraded.add(key)
-            log("mbb_degraded", ticker=ticker, side=side,
-                why="make_leg_rejected", cancel_first_period_s=CANCEL_FIRST_PERIOD_S)
+            if old is None:
+                # No overlap was attempted: this is a plain new post that the ceiling, the
+                # refill cap or an inventory cap declined.  Nothing to degrade, and
+                # cancel-first has nothing to cancel.
+                return None
+            if self.last_place_skip == "collateral_ceiling" and \
+                    size <= old.resting + 1e-9:
+                # FIX-B: transient, and cancel-first is collateral-neutral here.  Do NOT
+                # latch mbb_degraded — that is reserved for the exchange telling us no.
+                log("mbb_degraded_ceiling", ticker=ticker, side=side,
+                    size=size, old_resting=old.resting,
+                    committed=round(self.st.collateral, 4),
+                    ceiling=MAX_TOTAL_COLLATERAL_USD,
+                    why="overlap_headroom_unavailable_requote_is_collateral_neutral")
+            else:
+                # §4.2 AUTOMATIC degradation: an insufficient-balance / margin-reject on the
+                # make leg latches THIS SLOT to cancel-first; it retries at the next
+                # checkpoint.
+                self.mbb_degraded.add(key)
+                log("mbb_degraded", ticker=ticker, side=side,
+                    why="make_leg_rejected", skip=self.last_place_skip,
+                    cancel_first_period_s=CANCEL_FIRST_PERIOD_S)
         if old is not None:
             self.cancel(old)
             self.live_by_slot.pop(key, None)
