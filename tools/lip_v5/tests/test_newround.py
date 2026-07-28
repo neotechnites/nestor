@@ -419,3 +419,34 @@ class TestThePlanMeasuresTheSameBookAsTheRails(__import__('unittest').TestCase):
         used = spent + 30.0
         self.assertLessEqual(used, 50.0 + 1e-9,
                              "the plan must not exceed the cluster the rails will measure")
+
+
+class TestTheRiskMeasureAgreesWithTheMoney(__import__('unittest').TestCase):
+    """Live 2026-07-28: four RATES orders holding ~$2 of real collateral were scored at
+    $64.48 against a $50 cluster cap, because a sell-side order's basis was taken as its
+    YES-axis price (0.84) rather than what it cost (0.16).  The cluster then refused
+    everything and the book deployed $5.76 of a $300 ceiling."""
+
+    def test_a_sell_side_order_is_valued_at_its_collateral(self):
+        from lip_v5 import engine, exchange as X
+        ex = X.FakeExchange(balance_cents=1_000_000)
+        m = engine.Maker(ex, 1785268000.0, live=False)
+        m.orders["o1"] = {"order_id": "o1", "coid": "c1", "ticker": "KXUST5AD-26JUL29-T4.31",
+                          "side": "ask", "price": 0.84, "size": 100.0, "remaining": 100.0,
+                          "placed_ts": 1785268000.0}
+        ctx = m.place_context(available_cash_usd=1000.0)
+        row = [r for r in ctx.resting_basis if r["ticker"] == "KXUST5AD-26JUL29-T4.31"][0]
+        self.assertAlmostEqual(row["basis"], 0.16, places=6,
+                               msg="an ask at 0.84 costs 0.16 per contract, not 0.84")
+        self.assertAlmostEqual(row["n"] * row["basis"], 16.0, places=4)
+
+    def test_a_buy_side_order_is_unchanged(self):
+        from lip_v5 import engine, exchange as X
+        ex = X.FakeExchange(balance_cents=1_000_000)
+        m = engine.Maker(ex, 1785268000.0, live=False)
+        m.orders["o2"] = {"order_id": "o2", "coid": "c2", "ticker": "KXUST5AD-26JUL29-T4.31",
+                          "side": "bid", "price": 0.16, "size": 100.0, "remaining": 100.0,
+                          "placed_ts": 1785268000.0}
+        ctx = m.place_context(available_cash_usd=1000.0)
+        row = [r for r in ctx.resting_basis if r["ticker"] == "KXUST5AD-26JUL29-T4.31"][0]
+        self.assertAlmostEqual(row["basis"], 0.16, places=6)

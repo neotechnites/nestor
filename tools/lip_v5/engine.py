@@ -237,9 +237,19 @@ class Maker(object):
             if replacing_order_id is not None and str(oid) == str(replacing_order_id):
                 continue                                      # NEW-1: replacement, not add
             if o.get("remaining", 0) > 0:
+                # `basis` is WHAT ONE CONTRACT CAN LOSE, i.e. the collateral we actually
+                # posted — and `o["price"]` is on the YES axis for BOTH sides.  A no-leg
+                # order at a yes-price of 0.84 costs 0.16, not 0.84.  Passing the yes price
+                # made every sell-side quote read as up to 6x its real risk: measured live,
+                # four small RATES orders holding ~$2 of collateral were scored at $64.48
+                # against a $50 cluster cap, so the whole cluster refused everything and the
+                # book deployed $5.76 of a $300 ceiling.  `unit_collateral` is the same
+                # function the cash feed and the caps already use, so this makes the risk
+                # measure agree with the money.
                 resting.append({"ticker": o["ticker"],
                                 "side": "yes" if o["side"] == "bid" else "no",
-                                "n": o["remaining"], "basis": o["price"]})
+                                "n": o["remaining"],
+                                "basis": R.unit_collateral(o["side"], o["price"])})
         # B9's turnover bound scales WITH the derived slot cap (charter amendment): a $50
         # rung gets 4 turnovers of $50, a $10 rung 4 of $10 — proportional blast radius.
         caps = alloc.Caps(inv_cap_usd=self.slot_cap_usd)
