@@ -518,7 +518,19 @@ MAX_DRAWDOWN_FRAC = 0.35
 DAILY_LOSS_LIMIT_USD = DAY_STOP_CAP_USD
 # --- B6: persist-failure fail-closed ---
 # 3 attempts: one covers a transient fsync hiccup, three distinguishes that from a full disk
-# without turning a stall into a long stall.  Matches MAX_CONSEC_CANCEL_ANOMALIES' shape.
+# without turning a stall into a long stall.  Matches # --- B14: PLACEMENT-RATE CIRCUIT BREAKER (the 130-order loop, 2026-07-28) ---
+# A slot may legitimately re-place only when a requote trigger fires, and MIN_RESTING_LIFE_S
+# (30 s) bounds that at 2 per minute; 3 allows one make-before-break transient on top.  Beyond
+# that the loop is not requoting, it is FAILING TO SEE ITS OWN ORDERS — which is what happened
+# when a successful placement parsed as a rejection: 130 identical orders in 130 seconds.
+# This is a HALT, not a refusal.  A refusal would leave the real defect (our books disagreeing
+# with the wire) running silently against every other slot; the disagreement itself is the
+# emergency, and a human must look.  MIRROR (breaker too tight ↔ too loose): too tight halts a
+# legitimately busy slot — bounded, visible, and resumable by operator record; too loose is an
+# unbounded order count on a live account, which is what this cost us.
+PLACE_BURST_MAX = 3
+PLACE_BURST_WINDOW_S = 60.0
+# ...matching MAX_CONSEC_CANCEL_ANOMALIES' shape.
 PERSIST_MAX_RETRIES = 3
 # --- B11: capital floor ---
 # v5 spending the last dollars is v5 deciding, unilaterally, that nestor does not get to

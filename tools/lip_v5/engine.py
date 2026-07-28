@@ -61,6 +61,8 @@ class Maker(object):
         self.position_cost = {}              # ticker -> $
         self.entry_basis = {}                # (ticker, leg) -> $/contract
         self.orders = {}                     # oid -> dict
+        self.place_hist = {}                 # (ticker, side) -> [ts]  (B14 breaker)
+        self._rate_refused = {}              # (ticker, side) -> last log ts
         self.frozen = set()
         self.venues = {}                     # venue -> RT.VenueState (ADMITTED only; a venue
                                              # absent here allocates ZERO — see admit_venues)
@@ -277,8 +279,28 @@ class Maker(object):
             R.log("shadow_place", ticker=ticker, side=side, price=price, count=count)
             return False, "shadow", None
 
+        # B14 — placement-rate circuit breaker.  Counted BEFORE the rate lane so a loop cannot
+        # hide behind a throttle, and keyed per (ticker, side) because that is the unit a
+        # requote trigger acts on.
+        bkey = (ticker, side)
+        hist = [t for t in self.place_hist.get(bkey, []) if now - t < C.PLACE_BURST_WINDOW_S]
+        if len(hist) >= C.PLACE_BURST_MAX and not fully_closing:
+            self.place_hist[bkey] = hist
+            R.log("place_burst", ticker=ticker, side=side, n=len(hist),
+                  window_s=C.PLACE_BURST_WINDOW_S)
+            self.halt.halt("place_burst", now,
+                           {"ticker": ticker, "side": side, "n": len(hist),
+                            "why": "placed %d times in %gs — our books are not seeing our own "
+                                   "orders" % (len(hist), C.PLACE_BURST_WINDOW_S)})
+            return False, "place_burst", None
+
         admitted, why = self.bucket.admit(lane, now, key=(ticker, side))
         if not admitted:
+            # A SILENT refusal is indistinguishable from an order never attempted (it cost an
+            # hour of live diagnosis).  Say it, at most once per slot per window.
+            if self._rate_refused.get(bkey, 0.0) + 30.0 <= now:
+                self._rate_refused[bkey] = now
+                R.log("place_rate_refused", ticker=ticker, side=side, lane=lane, why=why)
             return False, why, None
 
         self.coid_seq += 1
@@ -287,6 +309,7 @@ class Maker(object):
         body = R.order_body(ticker, side, price, expiration_ts, coid, count)
         collateral = float(count) * R.unit_collateral(side, price)
 
+        self.place_hist.setdefault(bkey, []).append(now)
         self.ledger.write("place_req", ticker=ticker, side=side, price=price,
                           size=count, coid=coid, seq=self.coid_seq)
         # §5.3 — write (and fsync) the feed with this collateral ALREADY INCLUDED, then POST.
