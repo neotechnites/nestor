@@ -982,7 +982,21 @@ class Maker(object):
                 # $1 cliff cannot distinguish "this venue pays" from "we barely qualified".
                 # Still bounded by the per-rung cap and the per-market cap inside rung0_cap,
                 # and by the cluster cap, day stop and drawdown halt outside it.
-                cap, status = RT.rung0_cap(floor_usd * C.RUNG0_FLOOR_MULT,
+                # A VENUE CAP THAT CANNOT FUND ONE CLIFF-SIZED RUNG CAN NEVER EARN.
+                # `venue_floor_usd` takes the MIN across the venue's slots — the cheapest
+                # probe — which is right for "does this venue exist" and wrong for "hold
+                # enough share to clear $2".  Measured live: venue caps landed at $5-8 while
+                # the cliff needed ~$21 at mid prices, so every rung was zeroed for being
+                # unable to reach the cliff inside its own venue budget, and the book sat at
+                # $5.44 of a $300 ceiling with NOTHING refused and NOTHING dropped.
+                # The two numbers were computed from different assumptions (whole-side share
+                # vs the real rival score); this makes them agree.
+                need = 0.0
+                for sl in ss:
+                    q_c = alloc.cliff_clearing_q(sl)
+                    if q_c:
+                        need = max(need, q_c * sl.p)
+                cap, status = RT.rung0_cap(max(floor_usd * C.RUNG0_FLOOR_MULT, need),
                                            self.slot_cap_usd, per_market)
                 st.rung0_cap_usd = cap        # tracks floor_q up; 0.0 when UNPROBEABLE
                 if status == RT.UNPROBEABLE:
