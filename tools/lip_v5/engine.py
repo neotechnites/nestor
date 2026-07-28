@@ -996,20 +996,7 @@ class Maker(object):
                     q_c = alloc.cliff_clearing_q(sl)
                     if q_c:
                         need = max(need, q_c * sl.p)
-                # RUNG 0 IS THE PER-RUNG CAP, NOT A PROBE SIZE.  Everything above still
-                # derived the venue's opening cap from floor_q — the smallest size that can
-                # measure whether rewards exist — and that is probe logic for an UNVERIFIED
-                # MECHANISM.  Ours is verified by receipt; what is unverified per venue is
-                # only our SHARE, and share is measured by holding a real position, not a
-                # token one.  Measured live with the allocator instrumented: `venue_cap` was
-                # the single largest reason slots were passed over (26 of ~45 per cycle),
-                # with $5.01 deployed of a $300 ceiling.
-                # The venue therefore opens at the same cap any single rung may hold, and the
-                # bounds that matter are unchanged: the per-rung cap, the per-market cap, the
-                # per-cluster worst-case cap, the day stop and the drawdown halt.  The ratchet
-                # still climbs and still stands venues down on DISAGREE — it just no longer
-                # rations by ignorance the mechanism has already dispelled.
-                cap, status = RT.rung0_cap(max(floor_usd, need, self.slot_cap_usd),
+                cap, status = RT.rung0_cap(max(floor_usd * C.RUNG0_FLOOR_MULT, need),
                                            self.slot_cap_usd, per_market)
                 st.rung0_cap_usd = cap        # tracks floor_q up; 0.0 when UNPROBEABLE
                 if status == RT.UNPROBEABLE:
