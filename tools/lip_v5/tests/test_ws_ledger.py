@@ -356,8 +356,56 @@ class TestBinaryWiring(LipTestCase):
             C.LEDGER_PATH, C.ADOPT_PATH, C.HANDBACK_PATH = saved
 
     def test_bare_live_is_refused(self):
-        """G3 is a human gate; the binary refuses to be the one that opens it."""
-        self.assertEqual(BIN.main(["--live"]), 2)
+        """G3 is a human gate: `--live` without the operator-created artifact refuses, exits
+        2 (which the unit file's RestartPreventExitStatus honors), and NEVER arms the
+        runtime — a refused start can neither page nor reach the wire."""
+        self.assertEqual(BIN.main(["--live", "--data-dir", self.tmp]), 2)
+        self.assertFalse(R.is_live())
+
+    def test_a_wrong_gate_artifact_still_refuses(self):
+        R.set_write_roots([self.tmp])
+        R.atomic_write_json(self.path(C.GO_ARTIFACT_NAME),
+                            {"gate": "G7", "operator": "ryan"})
+        self.assertEqual(BIN.main(["--live", "--data-dir", self.tmp]), 2)
+        self.assertFalse(R.is_live())
+
+
+class TestGoArtifact(LipTestCase):
+    """Charter D: no code path may start quoting live without --live AND the operator gate
+    artifact.  The artifact check is the FIRST thing `run_live` does, before auth, before
+    `set_live`."""
+
+    def _write(self, obj):
+        p = self.path("v5_go.json")
+        R.atomic_write_json(p, obj)
+        return p
+
+    def test_missing_or_unparseable_refuses(self):
+        ok, why = BIN.go_artifact_ok(self.path("nope.json"))
+        self.assertFalse(ok)
+        self.assertIn("missing", why)
+
+    def test_a_touch_is_not_a_decision(self):
+        p = self.path("v5_go.json")
+        with open(p, "w") as fh:
+            fh.write("")
+        ok, _ = BIN.go_artifact_ok(p)
+        self.assertFalse(ok)
+
+    def test_the_decision_needs_an_author(self):
+        ok, why = BIN.go_artifact_ok(self._write({"gate": "G3", "operator": "  "}))
+        self.assertFalse(ok)
+        self.assertIn("operator", why)
+
+    def test_a_leftover_artifact_from_another_gate_cannot_arm_this_one(self):
+        ok, why = BIN.go_artifact_ok(self._write({"gate": "G7", "operator": "ryan"}))
+        self.assertFalse(ok)
+        self.assertIn("G3", why)
+
+    def test_the_hand_written_recipe_passes(self):
+        ok, why = BIN.go_artifact_ok(self._write(
+            {"gate": "G3", "operator": "ryan", "note": "probe capital approved"}))
+        self.assertTrue(ok, why)
 
 
 class TestNoExternalEffects(LipTestCase):

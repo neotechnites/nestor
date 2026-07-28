@@ -64,11 +64,12 @@ hours — no settlement, no credit, no waiting.
 | `ledger.py` | 131 | the money record, and the separate presence file + compaction |
 | `wsgate.py` | 156 | the W2 3-agreement gate over the vendored feed |
 | `ws_feed.py` | 1221 | **vendored verbatim from v4** — see below |
-| `scan.py` | 378 | **programs feed → classify sweep → slot table** — window guards, runway, deny list, P6 seam |
+| `scan.py` | 450 | **programs feed → classify sweep → slot table** — window guards, runway, deny list, REAL market close, the P6 public-tape check |
+| `quote.py` | 130 | **the pure half of the REQUOTER** — §4.3 triggers, shed geometry (never crossing), whole-second policy |
 | `runner.py` | 171 | **the outer loop** — init/recovery, the systemd cycle, always-shutdown |
 | `runtime.py` | 363 | the only clock, the only logger, every external effect behind a stubbable seam |
 | `lip_v5.py` | 386 | the binary; note 23 §III's five answered in its header |
-| `tests/` | 3300 | **429 tests**, `python3 -m unittest` green |
+| `tests/` | 4200 | **491 tests**, `python3 -m unittest` green — including the ALIVENESS suite (`test_aliveness.py`): FakeExchange + one good venue ⇒ orders APPEAR; a failing adopted position ⇒ a shed APPEARS |
 
 ### The rails (`guards.py`) — B1..B13
 
@@ -106,7 +107,7 @@ changing v5, and a v5 deploy needing v4's tree on the box.
 cd tools && python3 -m unittest discover -s lip_v5/tests -t .
 ```
 
-429 tests, ~0.1 s, no network, no filesystem outside the tmpdir, no possibility of paging.
+491 tests, ~0.2 s, no network, no filesystem outside the tmpdir, no possibility of paging.
 
 **The suite cannot page and cannot write outside tmp**, structurally, not by convention — two
 real incidents this week were a unit suite firing a push to a phone and a unit suite writing
@@ -298,7 +299,8 @@ incompleteness, everything else consistent.
 3. **Consistent, checked:** §1 (YES+NO=$1, netting, collateral = price of what you bought);
    §3 (settle-source clusters, and a box nets to riskless — asserted); §4 (maker fees ≡ 0, taker
    only on the crossing exit; adverse selection measured per (m,s) so a trending day's
-   one-sided flow shows up); §5 (PSDH, and its zero-fills mirror — see the P6 gap above);
+   one-sided flow shows up); §5 (PSDH, and its zero-fills mirror — P6, now wired through the
+   classify sweep's public-tape check);
    §6 (horizon as cost, and the value of paying to exit decaying as settlement nears — the
    triage's `H_wait` produces exactly that); §7 (per-pool saturation: marginal rate → 0 as share
    → 1, so ALLOCATE moves to breadth by itself); §8 (one writer per file, attribution by our own
@@ -328,21 +330,32 @@ Full derivations are in the build report and in the code beside each item.
 
 ## What is and is not built
 
-**The build is complete.** Every money rule, all thirteen rails, the scan/classify sweep, the
-slot table, the run cycle, the outer systemd loop with recovery and always-shutdown, the one
-path to the wire, `--gen-adopt`, `--shadow`, `--handback`, and the unit file.
+**The build is complete, and ALIVE.** Every money rule, all thirteen rails, the scan/classify
+sweep, the slot table, the run cycle, **the requoting stage** (the finish-round charter's
+finding: v5 previously computed allocations and DROPPED them — `Maker.place()` had zero call
+sites), the shed path (triage verdicts + ongoing (★) failure, never crossing, feeding
+`l_shed`), venue admission (§1.4 caps bind: unadmitted venues allocate ZERO), restart recovery
+of resting orders with the §9.4 prefix sweep, idempotent adoption via `adopt` ledger rows, the
+outer systemd loop with always-shutdown and the SF-3 halted-idle, the one path to the wire,
+`--gen-adopt`, `--shadow`, `--handback`, `--live` behind the G3 artifact, and the unit file.
 
 **The property to attack:** there is exactly ONE path to the wire (`Maker.place`), it consults
 `guards.place_allowed` before spending anything, and it publishes the cash feed before the POST.
 `test_engine.py` asserts it on `place()` and `test_runner.py` asserts it on the **assembled
-loop** — by driving whole iterations and comparing what the exchange saw against what
-`Maker.place` sent. A second path added later fails the suite rather than passing review.
+loop** — by driving whole iterations against a venue the allocator ADMITS, asserting the
+exchange saw REAL orders (`placed > 0`; the earlier 0 == 0 form is how the missing requoter
+passed review), all of them via `Maker.place`. `test_aliveness.py` is the affirmative proof:
+orders appear, sheds appear, completions are measured.
 
 **Known gaps, stated rather than hidden:**
-- **P6's pre-entry filter is a seam, not a source.** It needs the public trade tape, which this
-  build does not pull. `scan.build_slots(p6=...)` takes it; with nothing supplied the absence is
-  logged once per process (`p6_pre_entry_filter_UNWIRED`). Wire it before G3 — note 43 §5's
-  mirror is exactly this check.
+- **The §2.5 kill loop (`presence.evaluate_slot`) and the §8.7 collapse predicate are pure and
+  tested but not yet driven from the cycle** — the finish-round charter did not enumerate them;
+  ALLOCATE's re-run each cycle (a falling T̂ moves the dollars) is the live mechanism meanwhile.
+  Same for the `idle_capital` alert and dose-response perturbation.
+- **The v1 §3.5-3.7 KEEP/TOP_UP/HOLD/ABANDON checkpoints are not ported**; the forfeit gate
+  plus per-cycle reallocation carry the entry/exit floor logic this round.
+- **`venue_reading` is a seam** — the ratchet climbs only when the credits ritual (or a later
+  feed) calls it with popover/credit readings.
 - **`--shadow` without `--live` runs against a `FakeExchange`** and says so. It rehearses the
   loop's shape; it is not a venue ranking. G2's real read-out needs `--shadow --live`.
 - **Note 43 §7's "the exit consumes room"** is modelled qualitatively (inventory blocks the

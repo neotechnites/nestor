@@ -367,13 +367,25 @@ class TestRunnerLoop(RunnerCase):
         self.assertTrue(self.logs_of("cycle_overrun"))
 
 
+class CheapScanExchange(ScanExchange):
+    """A GOOD venue (the gas geometry): (★) admits it, so the assembled loop actually
+    quotes — which is what makes the one-path test non-vacuous."""
+
+    def book(self, ticker):
+        self.book_calls += 1
+        return 200, book(yes=(("0.02", "1200"),), no=(("0.97", "1200"),))
+
+
 class TestOnePathToTheWireAssembled(RunnerCase):
     """The property extended to the ASSEMBLED loop, not just `place()` in isolation."""
 
     NESTOR = {"open_order_tickers": [], "position_tickers": []}
 
     def test_no_write_reaches_the_exchange_except_through_place(self):
-        r = self.runner()
+        """Charter D: the vacuous form of this test (0 == 0 on a book nobody quoted) is
+        exactly how the missing requoter passed review.  It now runs against a venue the
+        allocator ADMITS and asserts the exchange saw REAL orders — all of them via place."""
+        r = self.runner(ex=CheapScanExchange(balance_cents=1_000_000))
         r.init(NOW, nestor_state=self.NESTOR)
         placed_via_place = []
         orig = r.m.place
@@ -386,8 +398,10 @@ class TestOnePathToTheWireAssembled(RunnerCase):
 
         r.m.place = spy
         for i in range(5):
-            r.iteration(NOW + i)
-        # everything the exchange saw was placed by Maker.place
+            r.iteration(NOW + 1 + i)
+        # the system is ALIVE...
+        self.assertGreater(len(r.m.ex.placed), 0, "the assembled loop placed NOTHING")
+        # ...and everything the exchange saw was placed by Maker.place
         self.assertEqual(len(r.m.ex.placed), len(placed_via_place))
 
     def test_a_halted_loop_places_NOTHING(self):
@@ -416,6 +430,248 @@ class TestOnePathToTheWireAssembled(RunnerCase):
             out = r.iteration(NOW + i)
         self.assertGreaterEqual(out["slots"], 1)              # it DID the work
         self.assertEqual(r.m.ex.placed, [])                   # and quoted nothing
+
+
+class TestRecoveryOrders(RunnerCase):
+    """BLOCKER-1 — resting orders survive a restart: replay rebuilds them, the cash feed
+    counts their collateral, and the §9.4 step-4 prefix sweep reconciles both directions."""
+
+    NESTOR = {"open_order_tickers": [], "position_tickers": []}
+
+    def test_replay_rebuilds_a_live_order_and_counts_its_collateral(self):
+        r = self.runner()
+        r.m.ledger.write("place_resp", order_id="o1", coid="v5-lipm-T-y-1", ticker="T",
+                         side="bid", price=0.40, size=10, fill_count=0, remaining_count=10,
+                         expiration_ts=int(NOW + 3600), fully_closing=False)
+        r.init(NOW, nestor_state=self.NESTOR)
+        self.assertIn("o1", r.m.orders)
+        self.assertAlmostEqual(r.m.orders["o1"]["remaining"], 10.0, places=9)
+        # THE INVARIANT: the exchange still holds these dollars, so the feed counts them.
+        self.assertAlmostEqual(r.m.cash.resting_collateral, 4.0, places=9)
+
+    def test_a_cancelled_or_expired_order_is_not_rebuilt(self):
+        r = self.runner()
+        for oid, terminal in (("o1", ("cancel_resp", {"http": 200, "reduced_by": 10})),
+                              ("o2", ("expired", {}))):
+            r.m.ledger.write("place_resp", order_id=oid, coid="v5-lipm-T-y-9", ticker="T",
+                             side="bid", price=0.40, size=10, remaining_count=10,
+                             expiration_ts=int(NOW + 3600))
+            r.m.ledger.write(terminal[0], order_id=oid, ticker="T", **terminal[1])
+        r.init(NOW, nestor_state=self.NESTOR)
+        self.assertEqual(r.m.orders, {})
+        self.assertEqual(r.m.cash.resting_collateral, 0.0)
+
+    def test_fill_obs_rows_shrink_the_rebuilt_remaining(self):
+        r = self.runner()
+        r.m.ledger.write("place_resp", order_id="o1", coid="v5-lipm-T-y-1", ticker="T",
+                         side="bid", price=0.40, size=10, remaining_count=10,
+                         expiration_ts=int(NOW + 3600))
+        r.m.ledger.write("fill_obs", order_id="o1", ticker="T", side="bid", count=6,
+                         price_c=40)
+        r.init(NOW, nestor_state=self.NESTOR)
+        self.assertAlmostEqual(r.m.orders["o1"]["remaining"], 4.0, places=9)
+        self.assertAlmostEqual(r.m.cash.resting_collateral, 1.6, places=9)
+
+    def test_an_order_past_its_expiration_backstop_is_not_rebuilt(self):
+        r = self.runner()
+        r.m.ledger.write("place_resp", order_id="o1", coid="v5-lipm-T-y-1", ticker="T",
+                         side="bid", price=0.40, size=10, remaining_count=10,
+                         expiration_ts=int(NOW - 10))
+        r.init(NOW, nestor_state=self.NESTOR)
+        self.assertNotIn("o1", r.m.orders)
+
+    def test_the_prefix_sweep_finds_exchange_orders_replay_never_saw(self):
+        """An exchange order wearing OUR prefix that replay does not know holds collateral
+        and may fill: it enters `self.orders` (so it can be cancelled), the feed counts it,
+        and B10's UNKNOWN machinery owns its resolution."""
+        r = self.runner()
+        r.m.ex.resting["x9"] = {"ticker": "T", "side": "bid", "count": 7,
+                                "price": "0.5000", "client_order_id": "v5-lipm-T-y-99"}
+        r.m.ex.resting["theirs"] = {"ticker": "T", "side": "bid", "count": 3,
+                                    "price": "0.5000", "client_order_id": "v4-lipm-T-y-1"}
+        r.init(NOW, nestor_state=self.NESTOR)
+        self.assertIn("x9", r.m.orders)
+        self.assertIn("x9", r.m.unknown.pending)
+        self.assertNotIn("theirs", r.m.orders)            # never touch another's orders
+        self.assertAlmostEqual(r.m.cash.resting_collateral, 3.5, places=9)
+        self.assertTrue(self.logs_of("recovery_unknown_order"))
+
+    def test_a_replay_live_order_the_exchange_no_longer_shows_goes_to_UNKNOWN(self):
+        r = self.runner()
+        r.m.ledger.write("place_resp", order_id="gone", coid="v5-lipm-T-y-1", ticker="T",
+                         side="bid", price=0.40, size=10, remaining_count=10,
+                         expiration_ts=int(NOW + 3600))
+        r.init(NOW, nestor_state=self.NESTOR)
+        self.assertIn("gone", r.m.unknown.pending)
+        self.assertTrue(self.logs_of("recovery_order_gone"))
+
+
+class TestAdoptionIdempotent(RunnerCase):
+    """BLOCKER-2 — adoption is a money event: it writes `adopt` rows, replay rebuilds them,
+    and a re-supplied adopt file is SKIPPED, so `position_cost` can never double."""
+
+    NESTOR = {"open_order_tickers": [], "position_tickers": []}
+    TK = "KXUST10AD-1"
+    ADOPT = {"positions": [{"ticker": TK, "side": "yes", "net": 20.0, "basis": 0.50}]}
+    EXPO = {(TK, "yes"): 20.0}
+
+    def test_restart_with_the_same_adopt_file_does_not_double(self):
+        r = self.runner()
+        ok, refusals = r.init(NOW, allow_fresh=True, adopt_obj=self.ADOPT,
+                              exchange_positions=self.EXPO,
+                              marks={(self.TK, "yes"): 0.52}, nestor_state=self.NESTOR)
+        self.assertTrue(ok, refusals)
+        cost1 = r.m.position_cost[self.TK]
+        self.assertAlmostEqual(cost1, 10.0, places=9)
+        # restart, SAME adopt file supplied again (the crash-loop case)
+        r2 = self.runner()
+        ok, refusals = r2.init(NOW + 60, adopt_obj=self.ADOPT,
+                               exchange_positions=self.EXPO,
+                               marks={(self.TK, "yes"): 0.52}, nestor_state=self.NESTOR)
+        self.assertTrue(ok, refusals)
+        self.assertTrue(self.logs_of("adopt_skipped_already_adopted"))
+        self.assertAlmostEqual(r2.m.position_cost[self.TK], cost1, places=9)
+        self.assertAlmostEqual(r2.m.positions[self.TK]["yes"], 20.0, places=9)
+
+    def test_restart_WITHOUT_the_adopt_file_keeps_the_position(self):
+        """The other half of writing adopt rows: the position survives on replay alone."""
+        r = self.runner()
+        r.init(NOW, allow_fresh=True, adopt_obj=self.ADOPT, exchange_positions=self.EXPO,
+               marks={(self.TK, "yes"): 0.52}, nestor_state=self.NESTOR)
+        r2 = self.runner()
+        r2.init(NOW + 60, nestor_state=self.NESTOR)
+        self.assertAlmostEqual(r2.m.positions[self.TK]["yes"], 20.0, places=9)
+        self.assertAlmostEqual(r2.m.entry_basis[(self.TK, "yes")], 0.50, places=9)
+        self.assertAlmostEqual(r2.m.cash.inventory_basis, 10.0, places=9)
+
+    def test_an_adoption_freeze_survives_restart(self):
+        r = self.runner()
+        r.init(NOW, allow_fresh=True,
+               adopt_obj={"positions": [{"ticker": self.TK, "side": "yes", "net": 20.0,
+                                         "basis": 0.50}]},
+               exchange_positions={(self.TK, "yes"): 7.0},     # net DISAGREES ⇒ frozen
+               marks={}, nestor_state=self.NESTOR)
+        self.assertIn(self.TK, r.m.frozen)
+        r2 = self.runner()
+        r2.init(NOW + 60, nestor_state=self.NESTOR)
+        self.assertIn(self.TK, r2.m.frozen)
+
+
+class TestHaltedIdle(RunnerCase):
+    """SF-3 — every halt path flattens once; the halted loop idles slow, keeps the
+    heartbeat, and never spins or crash-loops."""
+
+    NESTOR = {"open_order_tickers": [], "position_tickers": []}
+
+    def test_a_halt_flattens_ONCE_and_only_once(self):
+        r = self.runner()
+        r.init(NOW, nestor_state=self.NESTOR)
+        r.m.place("KXAAAGASD-1", "bid", 0.50, 10, NOW + 3600, NOW,
+                  available_cash_usd=1000.0)
+        r.m.halt.halt("iteration_error", NOW)
+        out = r.iteration(NOW + 1)
+        self.assertTrue(out["halted"])
+        self.assertEqual(r.m.orders, {})                  # flattened
+        cancels = len(r.m.ex.cancelled)
+        r.iteration(NOW + 2)
+        self.assertEqual(len(r.m.ex.cancelled), cancels)  # once, not per iteration
+
+    def test_the_halted_loop_keeps_the_cash_feed_heartbeat(self):
+        """A halted-but-alive v5 still holds inventory; a stale feed would page nestor's
+        operator about a process that is fine."""
+        r = self.runner()
+        r.init(NOW, nestor_state=self.NESTOR)
+        r.m.halt.halt("day_stop", NOW)
+        r.m.publisher.publish(NOW)
+        r.iteration(NOW + C.CASH_FEED_HEARTBEAT_S + 1)
+        self.assertGreater(r.m.publisher.last_publish_ts, NOW)
+
+    def test_the_halted_loop_sleeps_the_idle_cadence(self):
+        naps = []
+        r = self.runner()
+        r._sleep = naps.append
+        r.init(NOW, nestor_state=self.NESTOR)
+        r.m.halt.halt("day_stop", NOW)
+        r.run(max_iterations=2)
+        self.assertEqual(len(naps), 2)
+        for n in naps:
+            self.assertGreater(n, C.HALTED_IDLE_S - 5.0)  # ~30 s, not the 1 s live cadence
+
+    def test_an_exception_inside_the_halted_branch_does_not_crash_the_loop(self):
+        r = self.runner()
+        r.init(NOW, nestor_state=self.NESTOR)
+        r.m.halt.halt("day_stop", NOW)
+        r.m.flatten = lambda now: (_ for _ in ()).throw(RuntimeError("boom"))
+        out = r.iteration(NOW + 1)                        # must not raise
+        self.assertTrue(out["halted"])
+        self.assertTrue(self.logs_of("halted_idle_error"))
+
+
+class TestPlumbingWakes(RunnerCase):
+    """Charter B: the wiring that wakes dormant guards, proven through the ASSEMBLED loop."""
+
+    NESTOR = {"open_order_tickers": [], "position_tickers": []}
+    TICKER = "KXAAAGASD-26JUL29-T4.12"
+
+    def test_B2_the_day_stop_sees_mids_from_the_classifier(self):
+        """The day stop was dormant because nothing fed it `yes_mids`.  Now a marked loss on
+        classified books trips it through the loop, with no caller-supplied prices."""
+        r = self.runner()
+        r.init(NOW, nestor_state=self.NESTOR)
+        r.m.positions[self.TICKER] = {"yes": 100.0, "no": 0.0}
+        r.m.position_cost[self.TICKER] = 90.0             # marked ~0.41 ⇒ ~$49 of loss
+        out = r.iteration(NOW + 1)
+        self.assertTrue(out.get("day_stop"))
+        self.assertTrue(r.m.halt.halted)
+
+    def test_the_slot_carries_the_MARKET_close_not_the_program_end(self):
+        ex = ScanExchange(balance_cents=1_000_000)
+        ex.market_closes[self.TICKER] = NOW + 90 * 86400  # settles MONTHS later (PYPL shape)
+        r = self.runner(ex=ex)
+        r.init(NOW, nestor_state=self.NESTOR)
+        r.iteration(NOW + 1)
+        s = [s for s in r.slots if s.side == "bid"][0]
+        self.assertAlmostEqual(s.close_ts, NOW + 90 * 86400, places=3)
+        self.assertAlmostEqual(s.program_end_ts, NOW + 16 * 3600, places=3)
+        self.assertGreater(s.l_eff, 2000.0)               # carry runs to the REAL horizon
+
+    def test_the_horizon_exclusion_wakes_on_the_real_close(self):
+        """T_settle ≫ H_prog + 24 h: the exact PYPL geometry, now visible to ALLOCATE."""
+        from .. import alloc
+        ex = ScanExchange(balance_cents=1_000_000)
+        ex.market_closes[self.TICKER] = NOW + 90 * 86400
+        r = self.runner(ex=ex)
+        r.init(NOW, nestor_state=self.NESTOR)
+        out = r.iteration(NOW + 1)
+        for key, q in out["alloc"].items():
+            self.assertEqual(q, 0, key)
+
+    def test_P6_a_market_nobody_trades_never_becomes_a_slot(self):
+        ex = ScanExchange(balance_cents=1_000_000)
+        ex.trades_rows = []                               # 5 days of public tape: silence
+        r = self.runner(ex=ex)
+        r.init(NOW, nestor_state=self.NESTOR)
+        out = r.iteration(NOW + 1)
+        self.assertEqual(out["slots"], 0)
+        self.assertTrue(self.logs_of("p6_refused"))
+
+    def test_P6_a_traded_market_is_admitted(self):
+        r = self.runner()                                 # default fake: one recent trade
+        r.init(NOW, nestor_state=self.NESTOR)
+        out = r.iteration(NOW + 1)
+        self.assertGreater(out["slots"], 0)
+
+    def test_venue_caps_bind_in_the_assembled_loop(self):
+        """§1.4 was dormant because `self.venues` was never populated.  Now every venue in
+        the slot table is capped: admitted at rung-0, or zero."""
+        r = self.runner(ex=CheapScanExchange(balance_cents=1_000_000))
+        r.init(NOW, nestor_state=self.NESTOR)
+        out = r.iteration(NOW + 1)
+        self.assertIn("KXAAAGASD", r.m.venues)
+        st = r.m.venues["KXAAAGASD"]
+        spent = out["allocate"]["spent"]
+        self.assertGreater(spent, 0.0)
+        self.assertLessEqual(spent, st.rung0_cap_usd + 1e-6)
 
 
 if __name__ == "__main__":

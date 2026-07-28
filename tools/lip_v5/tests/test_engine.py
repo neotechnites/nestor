@@ -393,6 +393,107 @@ class TestCycle(EngineCase):
         self.assertEqual(m.cash.settled_awaiting_payout, 0.0)
 
 
+class TestDrawdownEquity(EngineCase):
+    """Charter B3 fix: drawdown measures LOSS, never deployment."""
+
+    def test_full_deployment_at_zero_loss_is_drawdown_zero(self):
+        """The charter's own required test.  The defect: equity summed `raw_delta`, which
+        counts every deployed dollar as gone — deploying the ceiling read as a 100% drawdown
+        and halted a healthy book at its first allocation."""
+        m = self.maker()
+        m.cycle(NOW, yes_mids={})                        # peak established flat
+        m.cash.confirm_order("c1", m.ceiling_usd)        # fully deployed, zero loss
+        out = m.cycle(NOW + 1, yes_mids={})
+        self.assertEqual(out["drawdown"], 0.0)
+        self.assertFalse(m.halt.halted)
+
+    def test_inventory_at_mark_is_an_asset_not_a_loss(self):
+        m = self.maker()
+        m.cycle(NOW, yes_mids={})
+        m.positions["T"] = {"yes": 100.0, "no": 0.0}
+        m.position_cost["T"] = 40.0
+        out = m.cycle(NOW + 1, yes_mids={"T": 0.40})     # marked exactly at cost
+        self.assertAlmostEqual(out["drawdown"], 0.0, places=9)
+        self.assertFalse(m.halt.halted)
+
+    def test_a_real_loss_still_breaches(self):
+        m = self.maker()
+        m.cycle(NOW, yes_mids={})
+        m.cash.realized_pnl = -0.36 * m.ceiling_usd      # > MAX_DRAWDOWN_FRAC of peak
+        m.cycle(NOW + 1, yes_mids={})
+        self.assertTrue(m.halt.halted)
+        self.assertEqual(m.halt.reason, "max_drawdown")
+
+
+class TestFeesWired(EngineCase):
+    """Charter B: `fees_paid` (cash.pay_fee) on any fee-bearing event."""
+
+    def test_a_taker_fill_books_its_fee(self):
+        m = self.maker()
+        m.ex.fills_rows = [{"ticker": "T", "side": "yes", "action": "buy", "count": 5,
+                            "price": 0.4, "fill_id": "f", "is_taker": True,
+                            "client_order_id": "v5-lipm-T-y-1"}]
+        m.poll_fills(NOW)
+        # F = ceil(0.07 · 5 · 0.4 · 0.6 · 100)/100 = $0.09, in the feed AND the P&L mirror
+        self.assertAlmostEqual(m.cash.fees_paid, 0.09, places=9)
+        self.assertEqual(m.fees_paid, m.cash.fees_paid)
+
+    def test_a_maker_fill_is_free(self):
+        m = self.maker()
+        m.ex.fills_rows = [{"ticker": "T", "side": "yes", "action": "buy", "count": 5,
+                            "price": 0.4, "fill_id": "f", "client_order_id":
+                            "v5-lipm-T-y-1"}]
+        m.poll_fills(NOW)
+        self.assertEqual(m.cash.fees_paid, 0.0)
+
+
+class TestClosingAxis(EngineCase):
+    """The defect the aliveness suite exposed: a closing fill must reduce the leg it SOLD."""
+
+    def _held(self):
+        m = self.maker()
+        m.positions["T"] = {"yes": 10.0, "no": 0.0}
+        m.entry_basis[("T", "yes")] = 0.40
+        m.position_cost["T"] = 4.0
+        m.cash.inventory["T"] = {"n": 10.0, "basis": 0.40}
+        return m
+
+    def test_a_closing_ASK_reduces_the_held_YES_leg(self):
+        m = self._held()
+        m.book_fill("T", "ask", 10, 0.42, NOW, fill_id="f", closing=True, proceeds=0.42)
+        self.assertAlmostEqual(m.positions["T"]["yes"], 0.0, places=9)
+        self.assertAlmostEqual(m.position_cost["T"], 0.0, places=9)
+        self.assertAlmostEqual(m.cash.realized_pnl, 0.2, places=9)   # 10 × (0.42 − 0.40)
+
+    def test_a_fills_api_sell_of_yes_closes_yes(self):
+        m = self._held()
+        m.ex.fills_rows = [{"ticker": "T", "side": "yes", "action": "sell", "count": 10,
+                            "price": 0.42, "fill_id": "f",
+                            "client_order_id": "v5-lipm-T-y-1"}]
+        m.poll_fills(NOW)
+        self.assertAlmostEqual(m.positions["T"]["yes"], 0.0, places=9)
+        self.assertAlmostEqual(m.positions["T"]["no"], 0.0, places=9)
+
+
+class TestMeterAskAxis(EngineCase):
+    def test_an_ask_above_best_is_graded_BEHIND_not_at_best(self):
+        """'Behind' points opposite ways per side; one sign for both graded every off-best
+        ask as at-best (found while wiring books — the meter had never seen a real book)."""
+        m = self.maker()
+        m.place("KXAAAGASD-1", "ask", 0.60, 10, NOW + 3600, NOW, available_cash_usd=1000.0)
+        m.meter_tick(NOW, {"KXAAAGASD-1": {"ask": 0.58}})    # best ask 58c, ours 60c: 2 back
+        acc = m.meter.acc[("KXAAAGASD-1", "ask")]
+        self.assertAlmostEqual(acc["prox_dollar_s"], 0.25 * acc["rest_dollar_s"], places=9)
+
+    def test_an_ask_at_best_is_at_best(self):
+        m = self.maker()
+        m.place("KXAAAGASD-1", "ask", 0.58, 10, NOW + 3600, NOW, available_cash_usd=1000.0)
+        m.meter_tick(NOW, {"KXAAAGASD-1": {"ask": 0.58}})
+        acc = m.meter.acc[("KXAAAGASD-1", "ask")]
+        self.assertAlmostEqual(acc["prox_dollar_s"], acc["rest_dollar_s"], places=9)
+        self.assertEqual(acc["at_best_s"], 1.0)
+
+
 class TestShutdown(EngineCase):
     def test_shutdown_cancels_then_writes_handback_then_zeroes_the_feed(self):
         m = self.maker()
@@ -438,6 +539,41 @@ class TestShutdown(EngineCase):
             order_at_zero.setdefault("orders", len(m.orders)), orig(now))[1]
         m.shutdown(NOW + 1)
         self.assertEqual(order_at_zero["orders"], 0)
+
+    def test_SF4_shutdown_survives_an_order_without_a_coid(self):
+        """A recovery-swept or replay-rebuilt order may carry no coid; shutdown's cancel-all
+        must survive it (`o.get`, never `o[...]`)."""
+        m = self.maker()
+        m.orders["x"] = {"order_id": "x", "ticker": "T", "side": "bid", "price": 0.5,
+                         "size": 5.0, "remaining": 5.0, "placed_ts": NOW}
+        res = m.shutdown(NOW + 1)
+        self.assertTrue(res["handback"] is not False)
+        self.assertNotIn("x", m.orders)
+
+    def test_SF4_a_flatten_explosion_does_not_cost_the_handback(self):
+        m = self.maker()
+        m.positions["T"] = {"yes": 5.0, "no": 0.0}
+        m.entry_basis[("T", "yes")] = 0.4
+        m.flatten = lambda now: (_ for _ in ()).throw(RuntimeError("boom"))
+        res = m.shutdown(NOW + 1)
+        self.assertTrue(res["handback"])
+        self.assertTrue(self.logs_of("shutdown_flatten_error"))
+        obj = R.read_json(C.HANDBACK_PATH)
+        self.assertEqual(obj["positions"][0]["ticker"], "T")
+
+    def test_SF4_the_zeroed_feed_is_REFUSED_while_orders_remain(self):
+        """A zeroed feed with orders still resting publishes expected-cash ABOVE the truth —
+        the one forbidden direction.  The last live (conservative) feed stands, and a human
+        is paged."""
+        m = self.maker()
+        m.place("KXAAAGASD-1", "bid", 0.50, 10, NOW + 3600, NOW, available_cash_usd=1000.0)
+        m.ex.cancel_status = 500                          # the cancel-all fails
+        m.shutdown(NOW + 1)
+        feed = R.read_json(C.CASH_FEED_PATH)
+        self.assertNotIn("zeroed", feed)
+        self.assertLess(feed["delta_dollars"], 0.0)       # still counting the collateral
+        self.assertTrue(self.logs_of("shutdown_feed_not_zeroed"))
+        self.assertTrue(any(a[0] == "halt" for a in self.alerts))
 
 
 class TestShadowReadout(EngineCase):

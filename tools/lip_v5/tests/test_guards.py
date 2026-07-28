@@ -373,6 +373,15 @@ class TestDenyList(LipTestCase):
     def test_a_good_venue_is_not_denied(self):
         self.assertFalse(C.series_denied("KXAAAGASD-26JUL29-B4.120"))
 
+    def test_a_series_that_merely_shares_a_spelling_is_NOT_denied(self):
+        """Finish-round charter D: the bare-`startswith` clause denied every series whose
+        name merely EXTENDED a toxic one — evidence about KXRAIN is not evidence about
+        KXRAINBOW.  The match is exact-or-dash-anchored."""
+        self.assertTrue(C.series_denied("KXRAIN"))
+        self.assertTrue(C.series_denied("KXRAIN-26JUL29-T1"))
+        self.assertFalse(C.series_denied("KXRAINBOW-26JUL29-T1"))
+        self.assertFalse(C.series_denied("KXINXHUDX-1"))
+
 
 class TestOrderedGate(LipTestCase):
     """The ORDER of the rails is derived, and asserted, because a reordering that still passes
