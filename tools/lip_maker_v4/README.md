@@ -8,7 +8,7 @@ Python 3.12 + requests + cryptography. Tests: `python3 -m unittest discover tool
     ssh ubuntu@VPS 'mkdir -p ~/nestor/data/lip && python3 ~/kalshi_data/scripts/lip_maker_v4.py --check'
 
 ## First-run checklist (all must pass before --live)
-0. **`python3 -m unittest discover tools/lip_maker_v4/` — 191 tests, must print `OK`.** Run it on the
+0. **`python3 -m unittest discover tools/lip_maker_v4/` — 256 tests, must print `OK`.** Run it on the
    VPS against the file you just scp'd, not only on the Mac.
 1. `--check` prints `[OK ]` for all four startup assertions: `env_and_pem`, `data_dir_writable`,
    `ledger_replay_clean`, `taker_exit_decision_matches_ceiling`, and **`unit_assertion_eq_100.00`** — at least 30
@@ -27,6 +27,15 @@ Python 3.12 + requests + cryptography. Tests: `python3 -m unittest discover tool
    (the §2.4 reserve), and every allocated ticker present in `chosen`.
    ABORT if: `chosen` is empty, any chosen ticker is pinned, `spent` is 0 for more than a few
    cycles, `budget` equals 45.00 (reserve not applied), or `day_stop_breached` appears.
+
+## Websocket (SEPARATE deploy, mid-morning — never with a capital raise)
+`ws_feed.py` ships inert: `WS_ENABLED = False` in lip_maker_v4.py. To turn it on:
+    ssh ubuntu@VPS 'pip3 install --user websockets'      # the one authorized extra dependency
+    scp tools/lip_maker_v4/ws_feed.py ubuntu@VPS:~/kalshi_data/scripts/
+    # then set WS_ENABLED = True and restart
+Breadth lifts from 6 to 32 markets ONLY while the socket is connected; any market whose WS
+book is missing/stale/gapped/corrupt falls back to its REST poll. `grep ws_ ~/nestor/data/lip/
+v4_ledger.jsonl` for connect/gap/resubscribe events. Roll back = set the flag False + restart.
 
 ## The $1 make-before-break pair test (§4.2a/§15.6) — run BOTH halves
 **A. Normal (free balance).** Proves the exchange PERMITS overlapping same-side orders. On one live

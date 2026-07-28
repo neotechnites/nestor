@@ -238,6 +238,13 @@ CLASSIFY_MAX_MARKETS = 200              # bound the cold-start sweep.  rho DOES 
 # are likewise undefined on a single market.  Two is the smallest number at which the
 # optimizer is still an optimizer and P3 is still measurable.
 MIN_RANK_POLL_SLOTS = 2
+# §4.6 WEBSOCKET.  The feed lives in ws_feed.py and is OFF by default so that the capital
+# raise and the websocket are never the same deploy: the morning ceiling commit ships this
+# file with the seam inert, and the mid-morning websocket deploy is this one flag.  When it
+# is on and the socket is actually CONNECTED, the poll clamp lifts to ws_feed.MAX_WS_MARKETS;
+# any market whose WS book is missing, stale, gapped or corrupt falls back to its REST poll,
+# so the failure mode is slower, never wrong.
+WS_ENABLED = False
 CLASSIFY_RATE_HZ = 5.0                  # half the ~10 req/s shared budget; the sweep is
                                         # one-shot at start and every CLASSIFY_REFRESH_S
 REVIVAL_PRICE_USD = 0.01                # §6.2 the cheapest legal price on a dead side
@@ -349,6 +356,30 @@ DENY_SERIES = {"KXRAIN"}                # §7.4 seed deny: measured toxic, 40 ma
 EVENT_ALLOWLIST = []                    # FIRST-RUN: EMPTY == OFF.  The scanner ranks
                                         # everything (§7.4).  Populate to restrict the
                                         # shakeout to one event, e.g. ["KXAAAGASD-26JUL29"].
+
+# ws_feed imports THIS module, so importing it at module scope is a cycle: the import runs
+# while lip_maker_v4 is still initialising, fails, and a broad except leaves `ws_feed = None`
+# FOREVER — WS_ENABLED would then flip on at mid-morning and do absolutely nothing, falling
+# back to REST with no error anywhere.  A feature that looks deployed and is inert is worse
+# than one that fails loudly, so the import is LAZY: by first use this module is complete.
+_WS_FEED = None
+_WS_IMPORT_TRIED = False
+
+
+def ws_module():
+    """The ws_feed module, or None if it cannot be imported.  Cached, and never raises."""
+    global _WS_FEED, _WS_IMPORT_TRIED
+    if _WS_IMPORT_TRIED:
+        return _WS_FEED
+    _WS_IMPORT_TRIED = True
+    try:
+        import ws_feed as _m
+        _WS_FEED = _m
+    except Exception as exc:
+        _WS_FEED = None
+        print("ws_feed unavailable (%s: %s); REST only" % (type(exc).__name__, exc))
+    return _WS_FEED
+
 
 DRY = True                              # set by main(); every write path asserts on it
 
@@ -2529,6 +2560,7 @@ class Maker(object):
         self.unknown_retry_ts = {}      # D7: order_id -> last cancel-retry ts
         self.unknown_retries = {}       # D7: order_id -> attempts
         self.last_orphan_poll = 0.0     # C6: orphan-shed poll throttle
+        self.ws = None                  # §4.6 websocket feed, when WS_ENABLED
         self.recon_written = set()      # §12.1 program rows already written
         self.recon_alerted = set()      # §7.3a alerts already sent (once each)
         self.collateral_avg = {}        # program_id -> running mean collateral
@@ -3271,6 +3303,47 @@ class Maker(object):
             self.st.position_cost[ticker] = 0.0
             self.st.position_cost_leg[ticker] = {"yes": 0.0, "no": 0.0}
 
+    def attach_ws(self, progs):
+        """§4.6 — idempotent per cycle.  Never load-bearing: any failure leaves `self.ws`
+        None and every book falls back to REST."""
+        mod = ws_module()
+        if not WS_ENABLED or mod is None:
+            return None
+        try:
+            self.ws = mod.attach(self, self.auth,
+                                 [p["market_ticker"] for p in progs])
+            return self.ws
+        except Exception as exc:
+            log("ws_attach_failed", err="%s: %s" % (type(exc).__name__, exc))
+            self.ws = None
+            return None
+
+    def ws_book(self, ticker):
+        """A FRESH websocket book, or None meaning 'poll REST'.  None on every doubt:
+        feed absent, library absent, socket down, no snapshot, seq gap, corruption,
+        staleness.  There is deliberately no path here that returns a book the feed is not
+        certain about — a slower quote is recoverable, a wrong one is not."""
+        mod = ws_module()
+        if not WS_ENABLED or mod is None or self.ws is None:
+            return None
+        try:
+            return mod.ws_book_or_none(ticker)
+        except Exception:
+            return None
+
+    def poll_cap(self):
+        """§4.6 — 6 on REST; ws_feed.MAX_WS_MARKETS only while the socket is CONNECTED.
+        A configured-but-down websocket must not buy breadth it cannot serve."""
+        mod = ws_module()
+        if not WS_ENABLED or mod is None or self.ws is None:
+            return MAX_REST_MARKETS
+        try:
+            if self.ws.health().get("connected"):
+                return max(MAX_REST_MARKETS, mod.MAX_WS_MARKETS)
+        except Exception:
+            pass
+        return MAX_REST_MARKETS
+
     def inventory_markets(self):
         """Markets we are not allowed to stop watching: a nonzero NET position, or any
         order that is not terminal.  Both mean an unlearned fill is still possible, and a
@@ -3302,7 +3375,8 @@ class Maker(object):
         inv_live = [t for t in inv if t in by_ticker]
         # biggest exposure first, ties on ticker so the choice is deterministic (T7)
         inv_live.sort(key=lambda t: (-abs(self.st.net_position(t)), str(t)))
-        room_for_inv = max(0, MAX_REST_MARKETS - MIN_RANK_POLL_SLOTS)
+        cap = self.poll_cap()
+        room_for_inv = max(0, cap - MIN_RANK_POLL_SLOTS)
         inv_polled = inv_live[:room_for_inv]
         for tk in inv_live[room_for_inv:]:
             self.flatten_only.add(tk)            # overflow -> slow cadence, never dropped
@@ -3311,7 +3385,7 @@ class Maker(object):
                 why="beyond the clamp's inventory room; tracked on the orphan cadence")
         ranked = [t for t in market_poll_rank(self.classified)
                   if t in by_ticker and t not in inv_polled]
-        rank_budget = max(MIN_RANK_POLL_SLOTS, MAX_REST_MARKETS - len(inv_polled))
+        rank_budget = max(MIN_RANK_POLL_SLOTS, cap - len(inv_polled))
         rank_chosen = ranked[:rank_budget]
         shed_only = set(inv_polled) - set(rank_chosen)
         return inv_polled + rank_chosen, shed_only
@@ -3554,6 +3628,7 @@ class Maker(object):
             self.sweep_settlements(now)               # C2, before re-ranking
             self.classify_sweep(progs, now)
         by_ticker = {p["market_ticker"]: p for p in progs}
+        self.attach_ws(progs)
         chosen, shed_only = self.poll_set(by_ticker, now)
         if not chosen:
             # Nothing classified as usable yet (or every candidate is pinned).  Do NOT fall
@@ -3571,10 +3646,12 @@ class Maker(object):
         slots = []
         for p in progs:
             tk = p["market_ticker"]
-            st, body = public_get("/markets/%s/orderbook" % tk, {"depth": "50"})
-            if st != 200:
-                log("book_error", ticker=tk, http=st)
-                continue
+            body = self.ws_book(tk)                    # §4.6 WS first, REST as the fallback
+            if body is None:
+                st, body = public_get("/markets/%s/orderbook" % tk, {"depth": "50"})
+                if st != 200:
+                    log("book_error", ticker=tk, http=st)
+                    continue
             # NEW-4: classify from the book the quoting loop just fetched, so the rank
             # table is never staler than the last poll of that market.
             # A shed-only market is polled so its fills are learned and its closing order

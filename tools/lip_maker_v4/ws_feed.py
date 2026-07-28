@@ -772,6 +772,14 @@ class WsFeed(object):
         return tuple(tickers)
 
     # -- accessors the consumer calls ----------------------------------------------------
+    def needs_resubscribe(self):
+        """True when the feed knows its subscription state is untrustworthy — after a
+        connect, a seq gap, a corruption, or a resubscribe request.  Exposed because it is
+        part of the contract a reviewer and a test must be able to assert on, not merely an
+        internal flag the reader thread happens to consult."""
+        with self._lock:
+            return bool(self._need_resubscribe)
+
     def is_fresh(self, ticker, now=None):
         now = self._clock() if now is None else now
         with self._lock:
