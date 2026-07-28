@@ -1068,34 +1068,46 @@ def ws_compare(ws_body, rest_body):
     return WS_AGREE, detail
 
 
-def parse_exchange_positions(body):
-    """{ticker: net_yes_contracts} from GET /portfolio/positions.
-
-    Tolerant of the envelope and of the field naming, because getting this WRONG in the
-    permissive direction (reading zero where a position exists) reproduces the exact defect
-    it is here to catch: a missing key must not silently look like a flat book.
-    """
-    out = {}
+def position_rows(body):
+    """The raw rows from GET /portfolio/positions, whatever the envelope calls them."""
     if not isinstance(body, dict):
-        return out
+        return []
     rows = body.get("market_positions")
     if rows is None:
         rows = body.get("positions")
-    if not isinstance(rows, (list, tuple)):
-        return out
-    for r in rows:
+    return list(rows) if isinstance(rows, (list, tuple)) else []
+
+
+def parse_exchange_positions(body):
+    """{ticker: net_yes_contracts} from GET /portfolio/positions.
+
+    THE REAL SCHEMA, live-verified: each row carries `ticker` and `position_fp` — a STRING,
+    FRACTIONAL, and SIGNED on the YES axis ("-72.21", "161.20"), which is already the
+    convention `net_position()` uses, so no conversion is needed.  Sibling fields are
+    fees_paid_dollars / market_exposure_dollars / realized_pnl_dollars /
+    total_traded_dollars / last_updated_ts.
+
+    The first version guessed at `position`/`net_position`/`quantity`, found NONE of them,
+    and skipped all 23 live rows — so the detector compared the ledger against an empty
+    dict: three bogus divergences, and the PYPL position it exists to find read as agreement
+    (0 vs 0).  That is precisely the failure this function's own docstring warned about, and
+    a permissive per-row skip is what let it happen quietly.  `position_rows()` now exposes
+    the denominator so the caller can tell "no positions" from "parsed nothing".
+    """
+    out = {}
+    for r in position_rows(body):
         if not isinstance(r, dict):
             continue
         tk = r.get("ticker") or r.get("market_ticker")
-        if not tk:
-            continue
         qty = None
-        for k in ("position", "net_position", "quantity", "market_position"):
+        for k in ("position_fp", "position", "net_position", "quantity",
+                  "market_position"):
             if r.get(k) is not None:
                 qty = num(r.get(k), None)
-                break
-        if qty is None:
-            continue
+                if qty is not None:
+                    break
+        if not tk or qty is None:
+            continue                      # paranoid skip, now with a visible denominator
         out[str(tk)] = float(qty)
     return out
 
@@ -3915,10 +3927,24 @@ class Maker(object):
             log("position_recon_failed", http=st_code)
             return None
         exchange = parse_exchange_positions(body)
+        n_rows = len(position_rows(body))
+        if n_rows and not exchange:
+            # A schema we cannot read is NOT an empty account.  Comparing against an empty
+            # dict makes every held position look divergent and every missing one look
+            # agreed — the detector inverts.  Refuse to compare, and say so loudly.
+            log("position_recon_schema_mismatch", n_rows=n_rows,
+                sample_keys=sorted((position_rows(body)[0] or {}).keys())[:12],
+                why="rows returned but none parsed; comparison ABORTED rather than run "
+                    "against an empty exchange view")
+            ntfy("LIP v4 positions schema mismatch",
+                 "%d position rows returned, none parsed - reconciliation is BLIND until "
+                 "the parser is fixed" % n_rows)
+            return None
         known = self.st.known_tickers()
         ledger = {t: self.st.net_position(t) for t in known}
         divs = position_divergences(exchange, ledger, known)
-        log("position_recon", n_exchange=len(exchange), n_known=len(known),
+        log("position_recon", n_exchange=len(exchange), n_rows=n_rows,
+            n_known=len(known),
             n_divergent=len(divs),
             ignored_not_ours=sorted(set(exchange) - known)[:10])
         for d in divs:
@@ -4368,12 +4394,44 @@ def main(argv):
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--check", action="store_true",
                     help="run the startup assertions and exit")
+    ap.add_argument("--recon-once", action="store_true",
+                    help="reconcile positions against the exchange once and exit "
+                         "(read-only; never freezes, never cancels)")
     ap.add_argument("--clear-freeze", metavar="TICKER",
                     help="C11: operator record clearing a §9.4b assume_filled freeze on "
                          "one market, after reconciling its position BY HAND")
     ap.add_argument("--operator", default=os.environ.get("USER", "operator"),
                     help="who is clearing the freeze (recorded in the ledger)")
     args = ap.parse_args(argv[1:])
+    if args.recon_once:
+        global DRY
+        DRY = False                      # the signed GET is read-only; nothing is placed
+        auth, note = load_auth()
+        print("auth: %s" % note)
+        if not auth:
+            print("FATAL: --recon-once needs credentials.")
+            return 3
+        st = replay_ledger_file(LEDGER_PATH)
+        m = Maker(auth, st, [])
+        code, body = signed(auth, "GET", "/portfolio/positions", params={"limit": 1000})
+        rows = position_rows(body)
+        parsed = parse_exchange_positions(body)
+        print("http=%s rows=%d parsed=%d" % (code, len(rows), len(parsed)))
+        if rows:
+            print("row keys: %s" % sorted((rows[0] or {}).keys()))
+        for tk in sorted(parsed):
+            if abs(parsed[tk]) > 0:
+                print("  exchange %-40s %+10.2f" % (tk, parsed[tk]))
+        known = st.known_tickers()
+        print("ledger knows %d tickers; %d with nonzero net"
+              % (len(known), sum(1 for t in known if abs(st.net_position(t)) > 0)))
+        for d in position_divergences(parsed, {t: st.net_position(t) for t in known},
+                                      known):
+            print("  DIVERGENCE %-36s exchange %+8.2f ledger %+8.2f"
+                  % (d["ticker"], d["exchange_net"], d["ledger_net"]))
+        print("ignored (no v4 history): %s" % sorted(set(parsed) - known)[:12])
+        return 0
+
     if args.clear_freeze:
         # C11 — §9.4b: the freeze "clears ONLY on an explicit operator record".  This is
         # that record, and it is deliberately a separate invocation rather than a flag on a

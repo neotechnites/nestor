@@ -3829,16 +3829,90 @@ class PositionReconciliation(_RunnerCase):
             M.signed, M.RECON_FREEZE_ENABLED = old, old_flag
 
     # ---- pure layer -----------------------------------------------------------------
-    def test_the_positions_payload_is_parsed_tolerantly(self):
-        """Reading zero where a position EXISTS reproduces the exact defect this catches, so
-        a missing key must never silently look like a flat book."""
+    # THE REAL PAYLOAD, copied from a live GET /portfolio/positions row.
+    LIVE_ROW = {"fees_paid_dollars": "0.03", "market_exposure_dollars": "21.66",
+                "position_fp": "-72.21", "realized_pnl_dollars": "0.00",
+                "ticker": "KXEARNINGSMENTIONPYPL-26JUL28-ANTH",
+                "total_traded_dollars": "21.66", "last_updated_ts": 1785000000}
+
+    def live_body(self, *rows):
+        return {"market_positions": [dict(self.LIVE_ROW, **r) for r in rows]}
+
+    def test_the_REAL_payload_schema_parses(self):
+        """SHIPPED BUG.  The first parser guessed at position/net_position/quantity, found
+        NONE of them, and skipped all 23 live rows — so the detector compared the ledger
+        against an EMPTY dict: three bogus divergences, and the PYPL position it exists to
+        find read as agreement (0 vs 0).  Quantity is `position_fp`: a STRING, FRACTIONAL,
+        SIGNED on the YES axis, which is already net_position()'s convention."""
+        got = M.parse_exchange_positions(self.live_body({}, {"ticker": "KXOTHER-1",
+                                                            "position_fp": "161.20"}))
+        self.assertEqual(got, {"KXEARNINGSMENTIONPYPL-26JUL28-ANTH": -72.21,
+                               "KXOTHER-1": 161.20})
+        self.assertIsInstance(got["KXOTHER-1"], float)
+
+    def test_the_sign_convention_matches_the_ledger(self):
+        """position_fp is signed on the YES axis, and so is net_position() — so a negative
+        exchange number and a negative ledger number mean the same thing, and no conversion
+        may be introduced between them."""
+        st = M.LedgerState()
+        st.positions["T"] = {"yes": 0.0, "no": 72.21}
+        self.assertAlmostEqual(st.net_position("T"), -72.21, places=6)
+        ex = M.parse_exchange_positions(self.live_body({"ticker": "T"}))
+        self.assertAlmostEqual(ex["T"], st.net_position("T"), places=6)
+        self.assertEqual(M.position_divergences(ex, {"T": st.net_position("T")}, {"T"}), [])
+
+    def test_fractional_quantities_survive(self):
+        got = M.parse_exchange_positions(self.live_body({"position_fp": "0.95"}))
+        self.assertAlmostEqual(list(got.values())[0], 0.95, places=6)
+
+    def test_rows_missing_ticker_or_quantity_are_skipped_not_guessed(self):
+        self.assertEqual(M.parse_exchange_positions(
+            {"market_positions": [{"ticker": "T"}]}), {})
+        self.assertEqual(M.parse_exchange_positions(
+            {"market_positions": [{"position_fp": "5"}]}), {})
+        for junk in (None, {}, {"market_positions": "x"}, {"market_positions": [None]}):
+            self.assertEqual(M.parse_exchange_positions(junk), {})
+
+    def test_legacy_field_names_still_parse(self):
         self.assertEqual(M.parse_exchange_positions(
             {"market_positions": [{"ticker": "T", "position": 25}]}), {"T": 25.0})
         self.assertEqual(M.parse_exchange_positions(
             {"positions": [{"market_ticker": "T", "net_position": -8}]}), {"T": -8.0})
-        for junk in (None, {}, {"market_positions": "x"}, {"market_positions": [None]},
-                     {"market_positions": [{"ticker": "T"}]}):
-            self.assertEqual(M.parse_exchange_positions(junk), {})
+
+    def test_a_schema_we_cannot_read_ABORTS_rather_than_comparing_against_nothing(self):
+        """The structural fix.  Rows present but none parsed is NOT an empty account: it
+        makes every held position look divergent and every missing one look agreed — the
+        detector INVERTS.  That is what shipped, and it must be impossible to ship again."""
+        m = self._maker([], ledger={})
+        self._body = {"market_positions": [{"weird_key": 1, "another": 2}] * 23}
+        self.assertEqual(len(M.position_rows(self._body)), 23)
+        self.assertEqual(M.parse_exchange_positions(self._body), {})
+        m.st.filled_cum[("T", "bid")] = 0.0
+        m.st.positions["T"] = {"yes": 10.0, "no": 0.0}
+        divs = self._run(m, freeze=False)
+        self.assertIsNone(divs)                      # comparison refused, not run blind
+        ev = [e["event"] for e in self.events()]
+        self.assertIn("position_recon_schema_mismatch", ev)
+        self.assertNotIn("position_divergence_detected", ev)
+
+    def test_an_actually_empty_account_is_not_a_schema_mismatch(self):
+        m = self._maker([], ledger={})
+        self._body = {"market_positions": []}
+        self.assertIsNotNone(self._run(m, freeze=False))
+        self.assertNotIn("position_recon_schema_mismatch",
+                         [e["event"] for e in self.events()])
+
+    def test_the_shipped_bug_end_to_end_PYPL_is_now_found(self):
+        """The regression in one test: exchange holds PYPL, the ledger does not know, and
+        the old parser read agreement (0 vs 0)."""
+        m = self._maker([], ledger={})
+        self._body = self.live_body({})
+        tk = self.LIVE_ROW["ticker"]
+        m.st.filled_cum[(tk, "bid")] = 0.0           # v4 history: it is ours to explain
+        divs = self._run(m, freeze=False)
+        self.assertEqual([d["ticker"] for d in divs], [tk])
+        self.assertAlmostEqual(divs[0]["exchange_net"], -72.21, places=6)
+        self.assertAlmostEqual(divs[0]["ledger_net"], 0.0, places=6)
 
     def test_divergence_is_attributed_only_to_markets_v4_has_touched(self):
         ex = {"OURS": 25.0, "THEIRS": 500.0}
