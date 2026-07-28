@@ -385,20 +385,54 @@ def unit_collateral(side, price_dollars):
     return float(price_dollars) if side == "bid" else (1.0 - float(price_dollars))
 
 
-def closing_qty(side, size, net_yes):
-    """FIX-A — how much of an order of `size` on `side` CLOSES inventory already held.
+def closing_rooms(net_yes):
+    """FIX-A — closing capacity a position offers, per side, before anything consumes it.
 
     `net_yes` = yes contracts held minus no contracts held, on that market.
-      * we are long YES (net > 0): an ASK sells YES, closing up to `net_yes`.
-      * we are long NO  (net < 0): a BID buys YES, closing up to `-net_yes`.
-    A closing contract is delivered out of the position, so the exchange takes NO new
-    collateral for it.  Anything beyond the position is a fresh opening contract.
+      * long YES (net > 0): an ASK sells YES, closing up to `net_yes`.
+      * long NO  (net < 0): a BID buys YES, closing up to `-net_yes`.
     """
-    room = max(0.0, float(net_yes)) if side == "ask" else max(0.0, -float(net_yes))
-    return min(float(size), room)
+    net = float(net_yes)
+    return {"ask": max(0.0, net), "bid": max(0.0, -net)}
 
 
-def order_collateral_usd(side, price_dollars, size, net_yes=0.0):
+def allocate_closing_room(orders, net_yes):
+    """FIX-A-1 — assign a position's closing capacity to the orders already RESTING against
+    it, and report what is left.  Returns (resting_collateral_usd, remaining_room).
+
+    This is the single source of truth for "how much closing room is still available", and
+    both the resting-collateral view and the pre-placement ceiling check must read it.  They
+    previously disagreed: placement netted against the RAW net position, so with 20 YES held
+    and one 20-lot closing ask already resting, a SECOND 20-lot ask also priced at $0 and
+    the ceiling approved it — then both rested and `resting_collateral` jumped by $8.00 that
+    the check had priced at zero.  Make-before-break creates exactly that two-orders-one-side
+    shape on every requote, and because closing orders priced at $0 the FIX-B ceiling guard
+    never fired for them, so the ceiling was BREACHED rather than degraded.
+
+    Deterministic in order_id so the split is stable across replays.
+    """
+    room = closing_rooms(net_yes)
+    total = 0.0
+    for o in sorted(orders, key=lambda x: str(x.order_id)):
+        r = o.resting
+        if r <= 0:
+            continue
+        c = min(r, room.get(o.side, 0.0))
+        room[o.side] = room.get(o.side, 0.0) - c
+        total += (r - c) * unit_collateral(o.side, o.price)
+    return total, room
+
+
+def closing_qty(side, size, net_yes=0.0, room=None):
+    """How much of an order of `size` on `side` CLOSES inventory already held.  Pass `room`
+    to charge against capacity that resting orders have NOT already consumed (FIX-A-1); it
+    falls back to the raw position when no resting orders exist."""
+    if room is None:
+        room = closing_rooms(net_yes).get(side, 0.0)
+    return min(float(size), max(0.0, float(room)))
+
+
+def order_collateral_usd(side, price_dollars, size, net_yes=0.0, room=None):
     """FIX-A — collateral an order COMMITS, net of the part that closes held inventory.
 
     The live deadlock this fixes: at a saturated ceiling the recycler decided MakerShed
@@ -414,7 +448,7 @@ def order_collateral_usd(side, price_dollars, size, net_yes=0.0):
     Partial case (the one that bites): a 25-lot ask against 19.95 held is 19.95 closing
     plus 5.05 opening — only the 5.05 tail is charged.
     """
-    closing = closing_qty(side, size, net_yes)
+    closing = closing_qty(side, size, net_yes, room)
     opening = max(0.0, float(size) - closing)
     return opening * unit_collateral(side, price_dollars)
 
@@ -1395,19 +1429,23 @@ class LedgerState(object):
         later.  The two must agree.  Closing capacity is allocated per ticker, deterministic
         in order_id, so the split is stable across replays.
         """
-        by_ticker = {}
+        total = 0.0
+        for ticker, orders in self._resting_by_ticker().items():
+            total += allocate_closing_room(orders, self.net_position(ticker))[0]
+        return total
+
+    def _resting_by_ticker(self):
+        out = {}
         for o in self.orders.values():
             if o.resting > 0:
-                by_ticker.setdefault(o.ticker, []).append(o)
-        total = 0.0
-        for ticker, orders in by_ticker.items():
-            net = self.net_position(ticker)
-            room = {"ask": max(0.0, net), "bid": max(0.0, -net)}
-            for o in sorted(orders, key=lambda x: str(x.order_id)):
-                c = min(o.resting, room.get(o.side, 0.0))
-                room[o.side] = room.get(o.side, 0.0) - c
-                total += (o.resting - c) * unit_collateral(o.side, o.price)
-        return total
+                out.setdefault(o.ticker, []).append(o)
+        return out
+
+    def closing_room(self, ticker, side):
+        """FIX-A-1 — closing capacity on (ticker, side) NOT already consumed by resting
+        orders.  This is what a new order may net against; anything beyond it opens."""
+        orders = self._resting_by_ticker().get(ticker, [])
+        return allocate_closing_room(orders, self.net_position(ticker))[1].get(side, 0.0)
 
     @property
     def position_collateral(self):
@@ -2112,14 +2150,18 @@ class Maker(object):
             return None
         price = price_c / 100.0
         net = self.st.net_position(ticker)
-        add = order_collateral_usd(side, price, size, net)          # FIX-A
-        closing = closing_qty(side, size, net)
+        # FIX-A-1: net against the closing room RESTING ORDERS HAVE NOT ALREADY TAKEN.
+        # Using the raw net position here let a second closing order on the same side price
+        # at $0 and breach the ceiling once both rested.
+        room = self.st.closing_room(ticker, side)
+        add = order_collateral_usd(side, price, size, room=room)    # FIX-A
+        closing = closing_qty(side, size, room=room)
         if self.st.collateral + add > MAX_TOTAL_COLLATERAL_USD + 1e-9:
             self.last_place_skip = "collateral_ceiling"             # FIX-B needs the reason
             log("skip_post", ticker=ticker, side=side, why="collateral_ceiling",
                 committed=round(self.st.collateral, 4), would_add=round(add, 4),
-                closing_qty=round(closing, 4), gross=round(
-                    size * unit_collateral(side, price), 4),
+                closing_qty=round(closing, 4), closing_room=round(room, 4),
+                gross=round(size * unit_collateral(side, price), 4),
                 ceiling=MAX_TOTAL_COLLATERAL_USD)
             return None
         cap = refill_cap(unit_collateral(side, price))                 # §8.7

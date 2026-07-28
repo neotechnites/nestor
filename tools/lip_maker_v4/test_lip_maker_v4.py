@@ -1705,6 +1705,105 @@ class FIXB_CeilingBlockedRequotesDegradeInsteadOfFreezing(unittest.TestCase):
         self.assertNotIn(("T", "bid"), m.mbb_degraded)
 
 
+class FIXA1_ClosingRoomIsConsumedByRestingOrders(unittest.TestCase):
+    """FIX-A-1 — place() netted against the RAW net position, ignoring closing capacity
+    that resting orders had already taken."""
+
+    def _state(self, net_yes=20.0, cost=8.0):
+        st = M.LedgerState()
+        st.positions = {"T": {"yes": max(0.0, net_yes), "no": max(0.0, -net_yes)}}
+        st.position_cost = {"T": cost}
+        return st
+
+    def test_the_verifiers_measured_walkthrough(self):
+        """20 YES held + one 20-lot closing ask resting ($0, correct).  A SECOND 20-lot ask
+        also priced at $0 and the ceiling approved it; once both rested,
+        resting_collateral jumped by an amount the check had priced at zero."""
+        st = self._state()
+        # first closer: correctly free, and it consumes the whole room
+        self.assertAlmostEqual(st.closing_room("T", "ask"), 20.0, places=9)
+        self.assertAlmostEqual(
+            M.order_collateral_usd("ask", 0.42, 20, room=st.closing_room("T", "ask")),
+            0.0, places=9)
+        st.orders["O1"] = M.OrderState("O1", "c", "T", "ask", 0.42, 20, 0.0, 20.0)
+        self.assertAlmostEqual(st.resting_collateral, 0.0, places=9)
+        # SECOND closer: the room is gone, so it prices its whole size as opening
+        self.assertAlmostEqual(st.closing_room("T", "ask"), 0.0, places=9)
+        second = M.order_collateral_usd("ask", 0.42, 20, room=st.closing_room("T", "ask"))
+        self.assertAlmostEqual(second, 20 * 0.58, places=9)
+        self.assertGreater(second, 0.0)                     # was $0.00 -- the bug
+        # and that is EXACTLY what it costs once it rests: check and view now agree
+        before = st.resting_collateral
+        st.orders["O2"] = M.OrderState("O2", "c", "T", "ask", 0.42, 20, 0.0, 20.0)
+        self.assertAlmostEqual(st.resting_collateral - before, second, places=9)
+        # the raw-net reading, preserved so the regression is unmistakable
+        self.assertAlmostEqual(M.order_collateral_usd("ask", 0.42, 20, 20.0), 0.0, places=9)
+
+    def test_the_check_and_the_resting_view_agree_for_every_shape(self):
+        """The invariant that closes this class: what place() charges for an order is
+        EXACTLY what resting_collateral charges once that order rests."""
+        for net in (20.0, -20.0, 0.0, 5.0):
+            for side in ("bid", "ask"):
+                for size in (1, 5, 20, 25, 40):
+                    st = self._state(net_yes=net)
+                    st.orders["A"] = M.OrderState("A", "c", "T", side, 0.42, 7, 0.0, 7.0)
+                    before = st.resting_collateral
+                    quoted = M.order_collateral_usd(
+                        side, 0.42, size, room=st.closing_room("T", side))
+                    st.orders["B"] = M.OrderState("B", "c", "T", side, 0.42, size, 0.0,
+                                                  float(size))
+                    self.assertAlmostEqual(st.resting_collateral - before, quoted,
+                                           places=9, msg=(net, side, size))
+
+    def test_make_before_break_overlap_is_charged_and_can_degrade(self):
+        """The shape that made this reachable: MBB puts two orders on one side, and while
+        closing orders priced at $0 the FIX-B ceiling guard never fired for them -- so the
+        ceiling was BREACHED rather than degraded.  Now the overlap is priced, the guard
+        fires, and the requote takes the collateral-neutral cancel-first path."""
+        tmp = tempfile.mkdtemp()
+        old = (M.DATA_DIR, M.LEDGER_PATH, M.DRY)
+        try:
+            M.DATA_DIR = os.path.join(tmp, "lip")
+            M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+            M.DRY = False
+            st = self._state(net_yes=20.0, cost=40.00)
+            resting = M.OrderState("OLD", "v4-c", "T", "ask", 0.42, 20, 0.0, 20.0)
+            st.orders["OLD"] = resting
+            m = M.Maker(None, st, [])
+            m.live_by_slot[("T", "ask")] = resting
+            calls = []
+            m.do_cancel = lambda oid: (calls.append(("cancel", oid)),
+                                       (200, {"reduced_by": "20.00"}))[1]
+            m.do_post = lambda body: (calls.append(("post", body["count"])),
+                                      (201, {"order_id": "N1", "fill_count": "0.00",
+                                             "remaining_count": body["count"]}))[1]
+            self.assertAlmostEqual(st.resting_collateral, 0.0, places=9)   # closer is free
+            new = m.requote("T", "ask", 43, 20, 1785000000)
+            # the overlap is now priced at its full tail ($11.60) and does not fit under $45
+            self.assertEqual([c[0] for c in calls], ["cancel", "post"])
+            self.assertIsNotNone(new)
+            events = [json.loads(l)["event"] for l in open(M.LEDGER_PATH)]
+            self.assertIn("mbb_degraded_ceiling", events)   # degraded, NOT breached
+            self.assertNotIn(("T", "ask"), m.mbb_degraded)
+            self.assertLessEqual(st.collateral, M.MAX_TOTAL_COLLATERAL_USD + 1e-9)
+        finally:
+            M.DATA_DIR, M.LEDGER_PATH, M.DRY = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_room_is_shared_across_sides_and_survives_replay(self):
+        st = self._state(net_yes=20.0)
+        st.orders["O1"] = M.OrderState("O1", "c", "T", "ask", 0.42, 12, 0.0, 12.0)
+        self.assertAlmostEqual(st.closing_room("T", "ask"), 8.0, places=9)
+        self.assertAlmostEqual(st.closing_room("T", "bid"), 0.0, places=9)  # long YES
+        self.assertAlmostEqual(
+            M.order_collateral_usd("ask", 0.42, 20, room=st.closing_room("T", "ask")),
+            12 * 0.58, places=9)
+        # allocate_closing_room is deterministic, so a replay reproduces the split exactly
+        orders = list(st.orders.values())
+        self.assertEqual(M.allocate_closing_room(orders, 20.0),
+                         M.allocate_closing_room(list(reversed(orders)), 20.0))
+
+
 class StartupAssertions(unittest.TestCase):
 
     def test_unit_assertion_refuses_a_wrong_unit(self):
