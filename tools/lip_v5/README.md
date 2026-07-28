@@ -49,27 +49,27 @@ hours — no settlement, no credit, no waiting.
 
 | file | lines | what |
 |---|---|---|
-| `config.py` | 527 | every constant, with its spec derivation AND its note-23 §IV mirror answer |
+| `config.py` | 643 | every constant, with its spec derivation AND its note-23 §IV mirror answer |
 | `money.py` | 418 | **(★)**, `L_eff` and the past-due escalation, φ/d estimation, the `r*` fixpoint, shading, dose-response |
 | `presence.py` | 377 | the 1 Hz meter, PSDH/T̂, per-slot kill, the four-branch collapse predicate, compaction |
 | `ratchet.py` | 370 | verified-accrual ladder, `floor_q`, admission bounds, OUT_OF_REACH, stand-down, revive |
 | `cashfeed.py` | 511 | the computed cash feed and its one invariant |
 | `alloc.py` | 450 | ALLOCATE under (★) — v4's water-filling with exactly one substitution |
 | `clusters.py` | 255 | **the underlying-cluster cap** — signed delta + exact worst-case loss per settle source |
-| `guards.py` | 495 | **the rails, B1..B13** — day stop, halt machine, drawdown, daily loss, capital floor, cross-bot, dedupe, refill, UNKNOWN bound, clock skew, and the ORDERED gate `place()` calls |
-| `engine.py` | 515 | **the run cycle** — startup/refusals/adopt/triage, `place()` (the one path to the wire), fills, meter, recon, shutdown |
-| `exchange.py` | 123 | the one wire seam, plus the `FakeExchange` the suite drives |
+| `guards.py` | 529 | **the rails, B1..B13** — day stop, halt machine, drawdown, daily loss, capital floor, cross-bot, dedupe, refill, UNKNOWN bound, clock skew, and the ORDERED gate `place()` calls |
+| `engine.py` | 1548 | **the run cycle** — startup/refusals/adopt/triage, `place()` (the one path to the wire), fills, meter, recon, shutdown |
+| `exchange.py` | 254 | the one wire seam, plus the `FakeExchange` the suite drives |
 | `ratelimit.py` | 265 | token bucket, AIMD, lanes, the SF-1 cancel bound, the degrade ladder |
 | `cutover.py` | 455 | `--gen-adopt`, the W2 adoption gate, **cutover triage**, handback/rollback |
 | `ledger.py` | 131 | the money record, and the separate presence file + compaction |
 | `wsgate.py` | 156 | the W2 3-agreement gate over the vendored feed |
 | `ws_feed.py` | 1221 | **vendored verbatim from v4** — see below |
-| `scan.py` | 450 | **programs feed → classify sweep → slot table** — window guards, runway, deny list, REAL market close, the P6 public-tape check |
-| `quote.py` | 130 | **the pure half of the REQUOTER** — §4.3 triggers, shed geometry (never crossing), whole-second policy |
-| `runner.py` | 171 | **the outer loop** — init/recovery, the systemd cycle, always-shutdown |
+| `scan.py` | 503 | **programs feed → classify sweep → slot table** — window guards, runway, deny list, REAL market close, the P6 public-tape check |
+| `quote.py` | 112 | **the pure half of the REQUOTER** — §4.3 triggers, shed geometry (never crossing), whole-second policy |
+| `runner.py` | 479 | **the outer loop** — init/recovery, the systemd cycle, always-shutdown |
 | `runtime.py` | 363 | the only clock, the only logger, every external effect behind a stubbable seam |
 | `lip_v5.py` | 386 | the binary; note 23 §III's five answered in its header |
-| `tests/` | 4200 | **491 tests**, `python3 -m unittest` green — including the ALIVENESS suite (`test_aliveness.py`): FakeExchange + one good venue ⇒ orders APPEAR; a failing adopted position ⇒ a shed APPEARS |
+| `tests/` | 4900 | **553 tests**, `python3 -m unittest` green — including the ALIVENESS suites (`test_aliveness.py`, `test_fixround.py`): FakeExchange + one good venue ⇒ orders APPEAR; a taker fill at true 1 Hz ⇒ booked via the fills API and REPLENISHED, never frozen; a failing adopted position ⇒ a shed APPEARS; the cliff rescue fires for an UNVERIFIED venue; shadow leaves the money ledger untouched |
 
 ### The rails (`guards.py`) — B1..B13
 
@@ -107,7 +107,7 @@ changing v5, and a v5 deploy needing v4's tree on the box.
 cd tools && python3 -m unittest discover -s lip_v5/tests -t .
 ```
 
-491 tests, ~0.2 s, no network, no filesystem outside the tmpdir, no possibility of paging.
+553 tests, ~0.3 s, no network, no filesystem outside the tmpdir, no possibility of paging.
 
 **The suite cannot page and cannot write outside tmp**, structurally, not by convention — two
 real incidents this week were a unit suite firing a push to a phone and a unit suite writing
@@ -368,8 +368,21 @@ orders appear, sheds appear, completions are measured.
   (≤60 s crash loss), and survives restart. It runs per cycle from the gate rather than at v4's
   window-fraction checkpoints — a deliberate simplification: the gate already re-runs every
   cycle, so a separate checkpoint scheduler would be a second cadence for the same decision.
-- **`venue_reading` is a seam** — the ratchet climbs only when the credits ritual (or a later
-  feed) calls it with popover/credit readings.
+  (Final fix round, BLOCKER-4: the integral runs over presence actually RESTING ON THE WIRE —
+  confirmed orders — never over allocation, and shadow writes zero accrual money rows.)
+- **`venue_reading` has an OPERATOR ENTRY POINT (SF-4)** — the watched file
+  `~/nestor/data/lip/v5_readings.jsonl`, the credits ritual's mirror of `v5_go.json`: append
+  one JSON line per reading and the live process consumes it within a cycle, exactly once
+  (restart-safe via the `ratchet` ledger rows it writes):
+
+  ```bash
+  cat >> ~/nestor/data/lip/v5_readings.jsonl <<'EOF'
+  {"venue": "KXAAAGASD", "reading_usd": 3.10, "projection_usd": 2.80, "settlement_day": 20668}
+  EOF
+  ```
+
+  Optional fields: `"paid": true` (a PAID credit — decrements `rewards_accrued_unpaid`, N3)
+  and `"program_id"` (draws down that program's accrued memory alongside).
 - **`--shadow` without `--live` runs against a `FakeExchange`** and says so. It rehearses the
   loop's shape; it is not a venue ranking. G2's real read-out needs `--shadow --live`.
 - **Note 43 §7's "the exit consumes room"** is modelled qualitatively (inventory blocks the
