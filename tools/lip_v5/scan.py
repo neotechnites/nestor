@@ -397,8 +397,23 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                      else (prior_t_hat if prior_t_hat is not None
                            else C.SHRINK_PRIOR_DEFAULT))
             land_grab = 0
+            # Cheapest legal price ON THE SIDE BEING CREATED, on the YES axis: 1c for a bid,
+            # 99c for an ask (v4's shape, kept — the default-1c-for-both form would sell YES
+            # at 1c, an instantly-marketable CROSS wearing a land grab's name).
+            lg_px_c = C.LAND_GRAB_PRICE_C if side == "bid" \
+                else (100 - C.LAND_GRAB_PRICE_C)
             if not sd["qualifies"] and not rec["pinned"]:
                 land_grab = alloc.t0_qualification_size(sd["cum_size"], rec["target_size"])
+                # Never cross the OTHER side (v4, kept): a bid grab must sit below the yes
+                # ask; an ask grab above the yes bid.
+                yes_bid_c = rec["sides"]["bid"]["p"]
+                no_bid_c = rec["sides"]["ask"]["p"]
+                yes_ask_c = (100 - int(round(no_bid_c * 100))) if no_bid_c else None
+                yes_bid_c = int(round(yes_bid_c * 100)) if yes_bid_c else None
+                if side == "bid" and yes_ask_c is not None and lg_px_c >= yes_ask_c:
+                    land_grab = 0
+                if side == "ask" and yes_bid_c is not None and lg_px_c <= yes_bid_c:
+                    land_grab = 0
             slots.append(alloc.Slot(
                 ticker, side, rho=prog["rho"], S=sd["S"], p=p, venue=rec["series"],
                 pinned=rec["pinned"], legal_price_exists=sd["legal"],
@@ -406,7 +421,7 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                 program_id=prog["program_id"], window_h=prog["window_h"],
                 hours_left=hours_left, hours_to_start=hours_to_start,
                 target_size=rec["target_size"], cum_size=sd["cum_size"],
-                land_grab_size=land_grab,
+                land_grab_size=land_grab, land_grab_price_c=lg_px_c,
                 close_ts=close_ts, program_end_ts=prog["end_ts"],
                 moneyness=abs((rec["yes_mid"] or 0.5) - 0.5) * 100.0))
     return slots

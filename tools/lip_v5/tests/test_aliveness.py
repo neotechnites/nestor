@@ -132,6 +132,51 @@ class TestOrdersAppear(EngineCase):
         self.assertEqual(len(r.m.ex.placed), 1)
 
 
+GRAB_TICKER = "KXGRABALIVE-26JUL29-T4.12"
+
+
+def thin_book():
+    """A YES side short of target (10 of 1000) with a healthy NO side: the §4.5 case where
+    ALLOCATE is right about size and wrong about entry — qualification is a DISCRETE
+    precondition, created by the land grab."""
+    return {"orderbook": {"orderbook_fp": {
+        "yes_dollars": [["0.01", "10"]], "no_dollars": [["0.50", "1200"]]}}}
+
+
+class TestLandGrabAppears(EngineCase):
+    """The qualification pass reaches the wire: a side short of target gets its land-grab
+    order, at the cheapest legal price on the side being created, inside the §1.4 rung-0
+    venue cap."""
+
+    def _runner(self):
+        # reward sized so the venue's floor_q (from the qualifying NO side) covers the grab:
+        # rho ≈ 15.4/h ⇒ floor ≈ $10 ≥ the $9.90 grab.
+        ex = AliveExchange(program_body(series="KXGRABALIVE", tickers=(GRAB_TICKER,),
+                                        reward=2_620_000),
+                           {GRAB_TICKER: thin_book()})
+        m = self.maker(ex=ex)
+        return RUN.Runner(m, sleep=lambda _s: None)
+
+    def test_the_land_grab_order_appears(self):
+        r = self._runner()
+        ok, refusals = r.init(NOW, nestor_state=NESTOR)
+        self.assertTrue(ok, refusals)
+        for i in range(2):
+            r.iteration(NOW + 1 + i)
+        grabs = [b for b in r.m.ex.placed
+                 if b["side"] == "bid" and abs(float(b["price"]) - 0.01) < 1e-9]
+        self.assertTrue(grabs, "NO LAND-GRAB ORDER REACHED THE EXCHANGE")
+        self.assertAlmostEqual(float(grabs[0]["count"]), 990.0, places=6)
+        self.assertTrue(self.logs_of("land_grab"))
+
+    def test_the_grab_respects_the_venue_rung0_cap(self):
+        r = self._runner()
+        r.init(NOW, nestor_state=NESTOR)
+        out = r.iteration(NOW + 1)
+        st = r.m.venues["KXGRABALIVE"]
+        self.assertLessEqual(out["allocate"]["spent"], st.rung0_cap_usd + 1e-6)
+
+
 class TestShedAppears(EngineCase):
     """A failing adopted position → a maker-shed order appears, fully closing, never
     crossing, and its completion feeds l_shed."""

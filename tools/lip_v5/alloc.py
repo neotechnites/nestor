@@ -209,7 +209,7 @@ def t0_qualification_size(cum_size, target_size, min_floor_q=0):
 
 def qualification_pass(slots, budget_usd, caps=None,
                        max_markets=C.P7_MAX_REVIVAL_MARKETS,
-                       max_frac=C.LAND_GRAB_MAX_COLLATERAL_FRAC):
+                       max_frac=C.LAND_GRAB_MAX_COLLATERAL_FRAC, venue_caps=None):
     """spec §4.5's pre-ALLOCATE loop.
 
         for each candidate market, per side, before ALLOCATE:
@@ -226,9 +226,16 @@ def qualification_pass(slots, budget_usd, caps=None,
     rate, and it is handled here.
 
     Returns (alloc {key: qty}, spent).
+
+    `venue_caps` — spec §4.5 subjects the land grab to "the §1.4 rung-0 cap" too.  A grab
+    that does not FIT under its venue's cap is SKIPPED, never shrunk: a sub-target grab
+    cannot create the qualifying side, so shrinking it spends collateral on a side that
+    still pays nobody (the same self-contradiction as a sub-floor_q probe).
     """
     caps = caps or Caps()
+    venue_caps = venue_caps or {}
     alloc, spent = {}, 0.0
+    per_venue = {}
     budget_cap = min(float(budget_usd), float(max_frac) * float(budget_usd))
     by_market = {}
     for s in slots:
@@ -266,8 +273,12 @@ def qualification_pass(slots, budget_usd, caps=None,
                 x.side, x.land_grab_price_c / 100.0) for x in sides)
             if already + cost > mcap + 1e-9:
                 continue
+            vcap = venue_caps.get(s.venue)
+            if vcap is not None and per_venue.get(s.venue, 0.0) + cost > float(vcap) + 1e-9:
+                continue                                     # §1.4 rung-0 cap binds the grab
             alloc[s.key] = qty
             spent += cost
+            per_venue[s.venue] = per_venue.get(s.venue, 0.0) + cost
             took = True
         if took:
             markets += 1
@@ -296,7 +307,7 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.FLOOR_RATE_PER_H
     budget_usd = max(0.0, float(budget_usd))                 # a negative budget funds NOTHING
 
     alloc = {}
-    q_alloc, q_spent = qualification_pass(slots, budget_usd, caps)
+    q_alloc, q_spent = qualification_pass(slots, budget_usd, caps, venue_caps=venue_caps)
     budget_usd_rem = max(0.0, budget_usd - q_spent)
 
     elig = []
