@@ -132,6 +132,15 @@ LAMBDA_MIN_WINDOW_HOURS = 16.0          # §2.3 "per 16h-equivalent" => lambda_m
 STEP_FRACTION = 0.02                    # §2.5 coarsest step landing within 2% of optimum
 PHI_MID = 0.08                          # §2.2 fills/h/contract, mid-priced side (R174)
 PHI_CHEAP = 0.001                       # §2.2 p<0.05: deep-OTM strikes trade in blocks
+# ^ N1, FLAGGED BY REVIEW: this seed may be ~10x LOW.  verify-lip-gas §3d measured the mid
+#   rungs at 100-300 contracts/hour, and §2.2's own PHI_MID (0.08 fills/h/contract at q~100)
+#   is calibrated off that flow; if deep-OTM strikes saw even a tenth of mid-rung flow the
+#   implied phi would be ~0.01, not 0.001.  §2.2 asserts they do not ("deep-OTM strikes
+#   trade in blocks, not flow") and the seed follows the spec.  The consequence of the seed
+#   being 10x low is a 10x-low hurdle on cheap sides (0.001 -> 0.01 /h), i.e. we would
+#   over-fund cheap slots whose fill cost we are under-charging.  KEPT AS SPEC'D, listed as
+#   UNDERIVED (§15.4): replace with the own-tape estimate per (series, side-band) at n>=200
+#   fills, which is the measurement that settles it.  Do not tune it by hand in between.
 PHI_CHEAP_PRICE_CUT = 0.05              # §2.2
 D_SEED_USD = 0.07                       # §2.2 drift 5-9c/cross-cycle pair, midpoint
 PHI_D_MIN_OWN_FILLS = 200               # §2.2 seeds hold until 200 own fills per (series,band)
@@ -152,6 +161,24 @@ S_MOVE_TRIGGER_FRAC = 0.25              # §4.3(c) S moved >25% -> re-run ALLOCA
 SAFETY_RESYNC_S = 60                    # §4.3(e) catches missed stream events
 BOOK_POLL_HZ = 1.0                      # §4.3 triggers evaluated at 1 Hz per market
 MAX_REST_MARKETS = 6                    # §4.6 1 Hz x N vs ~10 req/s shared budget
+# ---- classification sweep: the input to the §4.6 clamp (B1 fix) -------------------------
+# The clamp must choose WHICH 6 markets to poll at 1 Hz.  Ranking by rho alone is degenerate
+# INSIDE one event — every rung of a gas daily carries the identical period_reward and the
+# identical window, so rho cannot separate them and the ticker tie-break decides.  On a gas
+# daily the low tickers are the deep-ITM rungs, which are PINNED: measured 2026-07-28T02:11Z,
+# a rho-ranked clamp picked 4.070/4.075/4.080/4.085/4.090/4.095, of which FOUR can never pay,
+# and never polled 4.100/4.105/4.110 — the three best slots on the board.  Fix: classify
+# first (a cheap low-cadence sweep that learns pinned/qualifies/S/p per market), then clamp
+# the 1 Hz loop to the best 6 by the ALLOCATOR'S OWN first-dollar marginal rate.
+CLASSIFY_REFRESH_S = 900                # re-classify every 15 min: pinned-ness changes only
+                                        # when a 99c/1c tick-boundary order moves, which is
+                                        # far slower than the 1 Hz quoting loop
+CLASSIFY_MAX_MARKETS = 200              # bound the cold-start sweep.  rho DOES rank across
+                                        # events (different pools), it only fails within one,
+                                        # so the top-200 by rho is a sound candidate net.
+CLASSIFY_RATE_HZ = 5.0                  # half the ~10 req/s shared budget; the sweep is
+                                        # one-shot at start and every CLASSIFY_REFRESH_S
+REVIVAL_PRICE_USD = 0.01                # §6.2 the cheapest legal price on a dead side
 COVERAGE_TARGET = 0.95                  # §4.5 probe §4
 COVERAGE_ALERT_FLOOR = 0.90             # §4.5 alert if a slot is <90% for 10 min
 COVERAGE_ALERT_WINDOW_S = 600           # §4.5
@@ -161,6 +188,19 @@ CLOSE_MARGIN_S = 240                    # §4.7/§6.5 expiration_ts and T3 = win
 TAKER_FEE_RATE = 0.07                   # §5.1 F = ceil(0.07*n*p*(1-p)) rounded up to the cent
 SHED_PATIENCE_S = 1800                  # §5.4(ii) shed quote unfilled for 30 min
 SHED_ESCALATE_HOURS_LEFT = 2.0          # §5.4(iii) h < 2
+# TAKER_EXIT is DECIDED and LOGGED but NOT PLACED at this rung of the ladder.  Derivation:
+# §5.4 makes the maker shed strictly preferred and confines escalation to (h<2 or a global
+# cap breach) AFTER 30 unfilled shed minutes.  At MAX_TOTAL_COLLATERAL_USD = $45 the §8.1
+# net cap bounds stranded inventory at $10 per slot, so what a taker exit can recover is the
+# blocked-slot rate over the last <2h of a window — single dollars.  Against that, this
+# would be the ONLY code path in this binary able to cross the spread, and §8.8 says abort
+# on "a fill at a price we did not intend": the tail loss is the whole sleeve, not $10.
+# The arithmetic flips as the ceiling rises (R_blocked scales with deployed size while the
+# crossing risk stays a fixed tail), so this is a LADDER-RUNG decision, not a permanent one:
+# re-enable at the $300 rung.  Every suppressed exit logs the value forgone, so the choice
+# is measured rather than asserted.  README documents that inventory does not self-clear
+# beyond the maker shed while this is False.
+TAKER_EXIT_ENABLED = False
 
 # ---- risk caps (§8) ---------------------------------------------------------------------
 INV_CAP_USD = 10.00                     # §8.1 n_cap = floor($10/p) on NET.  A slot's max
@@ -592,6 +632,83 @@ def should_improve(rho, q, S, r_star, tick=0.01):
     return gain > cost
 
 
+def slot_first_dollar_rate(rho, S, p, qualifies=True, legal=True,
+                           target_size=1000.0, revival_price=REVIVAL_PRICE_USD):
+    """§0.4 marginal rate at q = 0, i.e. `rho/(2*p*S)` — the value of this slot's FIRST
+    collateral dollar, which is exactly the quantity ALLOCATE maximises.  Used to rank
+    markets for the §4.6 poll clamp so that the clamp and the allocator agree.
+
+    A legal-but-UNQUALIFIED side (§1.4 revival) has S = 0, where the marginal form is
+    degenerate.  The size we would have to post to create the qualifying side IS
+    `target_size`, at the minimum legal price, so its first-dollar rate is
+    `rho/(2*revival_price*target_size)` — which is why revivals rank high (§1.4 "highest
+    return on the board") rather than being silently dropped as S = 0.
+    """
+    if not legal or rho <= 0:
+        return 0.0
+    if not qualifies:
+        return marginal_rate(rho, float(target_size), 0, float(revival_price))
+    if S <= 0 or p <= 0:
+        return 0.0
+    return marginal_rate(rho, float(S), 0, float(p))
+
+
+def market_rank_value(entry):
+    """Best first-dollar rate available on one market.  `entry` carries the LAST OBSERVED
+    classification: {"rho", "pinned", "denied", "sides": [{"S","p","qualifies","legal"}]}.
+    A pinned or denied market is worth exactly zero — no snapshot on it can ever be
+    included, so no dollar spent on it can ever be paid (§1.3)."""
+    if entry.get("pinned") or entry.get("denied"):
+        return 0.0
+    rho = float(entry.get("rho", 0.0))
+    best = 0.0
+    for s in entry.get("sides", []):
+        best = max(best, slot_first_dollar_rate(
+            rho, s.get("S", 0.0), s.get("p", 0.0), s.get("qualifies", True),
+            s.get("legal", True), s.get("target_size", 1000.0)))
+    return best
+
+
+def market_poll_rank(classified, max_markets=MAX_REST_MARKETS):
+    """§4.6 CLASSIFY-THEN-CLAMP.  Returns the tickers to poll at 1 Hz, best first.
+
+    Ranking by rho alone is degenerate within one event (every rung shares one pool and one
+    window), so the ticker tie-break decides — and on a gas daily the low tickers are the
+    deep-ITM PINNED rungs.  Ranking by the allocator's own first-dollar rate makes the clamp
+    agree with ALLOCATE, and excluding pinned markets OUTRIGHT (not merely down-ranking
+    them) guarantees no REST slot is spent on a market that can never pay.
+    """
+    scored = []
+    for ticker, entry in classified.items():
+        if entry.get("pinned") or entry.get("denied"):
+            continue
+        v = market_rank_value(entry)
+        if v <= 0:
+            continue
+        scored.append((-v, -float(entry.get("rho", 0.0)), str(ticker)))
+    scored.sort()
+    return [t for _, _, t in scored[:max_markets]]
+
+
+def mark_to_market_pnl(positions, position_cost, yes_mids, fees_paid_usd=0.0):
+    """§8.4 realised+unrealised P&L on inventory.  `yes_mids` is {ticker: yes mid in $}.
+    A YES contract marks at the yes mid; a NO contract marks at (1 - yes mid).  Cost comes
+    from the ledger replay (§9.3), never from an exchange index."""
+    value = 0.0
+    for ticker, pos in (positions or {}).items():
+        mid = yes_mids.get(ticker)
+        if mid is None:
+            continue
+        value += pos.get("yes", 0.0) * float(mid) + pos.get("no", 0.0) * (1.0 - float(mid))
+    return value - sum((position_cost or {}).values()) - float(fees_paid_usd)
+
+
+def day_stop_breached(pnl_usd, projected_day_reward_usd):
+    """§8.4 — breach when the LOSS reaches the stop.  On breach: cancel-all -> flatten ->
+    alert -> exit."""
+    return -float(pnl_usd) >= day_stop_usd(projected_day_reward_usd) - 1e-12
+
+
 def n_cap(p, caps=None):
     """§8.1 — floor($10/p) on NET.  Scales as 1/p: 25 at 40c, 500 at 2c."""
     caps = caps or Caps()
@@ -627,6 +744,10 @@ def allocate(slots, budget_usd, caps=None, lambda_min=LAMBDA_MIN, r_star_wall=No
     loop continues; it breaks only when NO slot can afford one more contract.
     """
     caps = caps or Caps()
+    # N3: a negative budget is reachable from §2.4 (reserve_budget clamps at 0, but a caller
+    # may pass ceiling - max_slot directly).  A negative budget must fund NOTHING, not wrap
+    # into a step of floor(negative/p) somewhere downstream.
+    budget_usd = max(0.0, float(budget_usd))
     lam_h = float(lambda_min) / LAMBDA_MIN_WINDOW_HOURS     # §2.3 in $/h
     rw = lam_h if r_star_wall is None else float(r_star_wall)
 
@@ -1175,6 +1296,10 @@ class LedgerState(object):
         self.last_ts = 0.0
         self.coid_seq = 0
         self.unresolved_404 = []      # order_ids needing §9.4a disambiguation
+        self.seen_fill_ids = set()    # S2: idempotency keys for fills-API rows
+        self.unkeyed_fill_rows = 0    # S2: pre-fix crash-gap rows deduped by content
+        self.accrued = {}             # S3: program_id -> $ of MODEL payout accrued
+        self.checkpoints_done = {}    # S3: program_id -> set(checkpoint fraction)
 
     # -- views ---------------------------------------------------------------------------
     def filled(self, ticker, side):
@@ -1245,6 +1370,12 @@ def ledger_replay(records):
                     st.poisoned.add(rec.get("ticker"))
                 continue
             oid = rec.get("order_id")
+            if oid and str(oid) in st.orders:
+                # N2: a duplicated place_resp line (a retried write, a copied ledger, an
+                # fsync that landed twice) must not create a second order or double-credit
+                # its immediate fill_count.  order_id is the exchange's own identity.
+                st.coid_seq = max(st.coid_seq, int(rec.get("seq", 0) or 0))
+                continue
             if not oid:
                 st.post_error_ts.append(ts)
                 st.poisoned.add(rec.get("ticker"))     # cannot cancel what we cannot name
@@ -1295,6 +1426,28 @@ def ledger_replay(records):
                 st.poisoned.add(o.ticker)
                 st.consec_cancel_anomalies += 1
         elif kind == "fill_obs":
+            # S2: the fills API is queried over OVERLAPPING windows by construction — §9.4
+            # step 4 re-reads [last_ledger_ts - 60s, now] on every restart, so a crash LOOP
+            # re-observes the same fills.  Without an idempotency key replay double-books
+            # them (measured: filled_cum 20 on a truth of 10, collateral $8 on a truth of
+            # $4).  The key is the fills API's own immutable fill/trade id.
+            fid = rec.get("fill_id")
+            if fid is None and rec.get("why") == "crash_gap":
+                # A crash-gap row written by a PRE-FIX binary carries no key.  Its identity
+                # is nonetheless well defined for this class: crash-gap rows exist only
+                # because §9.4 step 4 re-reads an OVERLAPPING window, so a duplicate row is
+                # by construction the same API fill re-observed, and its content is the only
+                # identity available.  Scoped to this class alone — order-scoped rows always
+                # carry a real key from the runner, so no genuine second fill can be
+                # collapsed by this path.
+                fid = "unkeyed-%s|%s|%s|%s" % (rec.get("ticker"), rec.get("side"),
+                                               num(rec.get("count"), 0.0),
+                                               rec.get("price_c"))
+                st.unkeyed_fill_rows += 1
+            if fid is not None:
+                if str(fid) in st.seen_fill_ids:
+                    continue
+                st.seen_fill_ids.add(str(fid))
             oid = rec.get("order_id")
             n = num(rec.get("count"), 0.0)
             o = st.orders.get(str(oid)) if oid else None
@@ -1340,6 +1493,19 @@ def ledger_replay(records):
             st.poisoned.discard(rec.get("ticker"))
         elif kind == "poison":
             st.poisoned.add(rec.get("ticker"))
+        elif kind == "accrual":
+            # S3: `accrued` and `checkpoints_done` are the ONLY pieces of checkpoint state
+            # that cannot be re-derived from orders and fills — A is an integral over the
+            # presence we actually had.  Losing it on restart zeroes A, refires every passed
+            # checkpoint, and ABANDONS a program that had genuinely accrued past the cliff
+            # (reproduced: live A=$0.95 KEEP -> post-restart ABANDON), forfeiting real money
+            # to a bookkeeping gap.  This row is AUTHORITATIVE, unlike "snapshot" (§9.1),
+            # which stays advisory precisely so an advisory row can never move positions.
+            pid = rec.get("program_id")
+            if pid is not None:
+                st.accrued[pid] = num(rec.get("accrued_usd"), 0.0)
+                st.checkpoints_done[pid] = set(
+                    float(f) for f in (rec.get("checkpoints_done") or []))
         elif kind == "coid_seq":
             st.coid_seq = max(st.coid_seq, int(rec.get("seq", 0) or 0))
         # "snapshot" is ADVISORY only (§9.1) and contributes nothing to state.
@@ -1736,9 +1902,15 @@ class Maker(object):
         self.shed_target = {}           # (ticker, side) -> contracts the shed must cover
         self.refilled = {}              # (ticker, side) -> contracts re-posted this window
         self.mbb_degraded = set()       # slots automatically on cancel-first (§4.2)
-        self.checkpoints_done = {}      # program_id -> set(fraction)
-        self.accrued = {}               # program_id -> $ of MODEL payout accrued so far
+        # S3: seeded FROM THE LEDGER, so a restart preserves A and does not refire
+        # checkpoints it already ran.
+        self.checkpoints_done = {k: set(v) for k, v in state.checkpoints_done.items()}
+        self.accrued = dict(state.accrued)
         self.last_accrual_ts = 0.0
+        self.classified = {}            # ticker -> §4.6 classification (B1)
+        self.last_classify = 0.0
+        self.halted = False             # §8.4 day stop / §8.5 budget trip
+        self.fees_paid = 0.0            # taker fees, for the §8.4 mark
         self.last_resync = 0.0
         self.last_snapshot = 0.0
         self.last_paidout_poll = 0.0
@@ -1788,8 +1960,26 @@ class Maker(object):
         fills = (body or {}).get("fills") or []
         return FillsRead(ok=True, count=sum(num(f.get("count"), 0.0) for f in fills)), fills
 
+    @staticmethod
+    def fill_key(f):
+        """S2 — the fills API's own immutable identity for one fill.  Kalshi returns
+        `trade_id` on fills; `fill_id`/`id` are accepted as aliases.  If none is present we
+        SYNTHESISE a deterministic key from the fill's own immutable fields rather than
+        writing None — a row with no key is a row replay cannot deduplicate, and the crash
+        loop re-reads an overlapping window by construction (§9.4 step 4)."""
+        for k in ("trade_id", "fill_id", "id"):
+            v = f.get(k)
+            if v:
+                return str(v)
+        return "syn-%s-%s-%s-%s-%s" % (f.get("order_id"), f.get("ticker"), f.get("side"),
+                                       num(f.get("count"), 0.0),
+                                       f.get("created_time") or f.get("ts"))
+
     # -- placement ------------------------------------------------------------------------
     def place(self, ticker, side, price_c, size, expiration_ts):
+        if self.halted:
+            # §8.4/§8.5: a halted process posts NOTHING, on every path into placement.
+            return None
         if ticker in self.st.poisoned or ticker in self.st.assume_filled:
             return None
         price = price_c / 100.0
@@ -1882,14 +2072,16 @@ class Maker(object):
 
     def resolve_404(self, order):
         """§9.4a — never book zero silently.  Two reads, 36s apart."""
-        r1, _ = self.do_fills(order_id=order.order_id)
+        r1, f1 = self.do_fills(order_id=order.order_id)
+        rows = list(f1)
         verdict, filled, requery_at = disambiguate_404(order, r1)
         if verdict == R404_NEED_REQUERY:
             log("fills_requery_scheduled", order_id=order.order_id, at=requery_at,
                 delay_s=FILLS_REQUERY_DELAY_S)
             while _now() < requery_at and not self.stopping:
                 time.sleep(min(1.0, max(0.0, requery_at - _now())))
-            r2, _ = self.do_fills(order_id=order.order_id)
+            r2, f2 = self.do_fills(order_id=order.order_id)
+            rows = list(f2)
             verdict, filled, _ = disambiguate_404(order, r1, r2)
         if verdict == R404_ASSUME_FILLED:
             self.st.assume_filled.add(order.ticker)
@@ -1913,7 +2105,13 @@ class Maker(object):
         n = max(0.0, filled - order.fill_count)
         log("fill_obs", k="fill_obs", order_id=order.order_id, ticker=order.ticker,
             side=order.side, count=n, price_c=int(round(order.price * 100)),
-            src="fills_api")
+            src="fills_api",
+            # S2: one order-scoped resolution is one idempotent event.  The key is the set
+            # of underlying trade ids when we have them, and the order id otherwise, so a
+            # repeated restart cannot resolve the same 404 twice.
+            fill_id="o404-%s-%s" % (order.order_id,
+                                    ",".join(sorted(self.fill_key(f) for f in rows))
+                                    or "none"))
         order.extra_fills += n
         order.reduced_by = 0.0
         order.state = ST_CLOSED
@@ -1949,7 +2147,13 @@ class Maker(object):
                 for f in fills:
                     if str(f.get("order_id")) in known:
                         continue                       # already attributed above
-                    log("fill_obs", k="fill_obs", order_id=None,
+                    fid = self.fill_key(f)
+                    if fid in self.st.seen_fill_ids:
+                        # S2: the re-query window OVERLAPS the previous one by design, so a
+                        # crash loop re-observes these.  Skip what the ledger already has.
+                        continue
+                    self.st.seen_fill_ids.add(fid)
+                    log("fill_obs", k="fill_obs", order_id=None, fill_id=fid,
                         ticker=f.get("ticker"), side=f.get("side"),
                         count=num(f.get("count"), 0.0),
                         price_c=int(round(num(f.get("yes_price"), 0.0))), src="fills_api",
@@ -2000,6 +2204,94 @@ class Maker(object):
         self.live_by_slot.clear()
 
     # -- one cycle ------------------------------------------------------------------------
+    def classify_market(self, prog, body, now):
+        """Fold one book poll into the classification table used by the §4.6 clamp."""
+        tk = prog["market_ticker"]
+        _, info = slots_from_market(prog, body, now)
+        H = window_hours(prog["start_ts"], prog["end_ts"])
+        rho = pool_rate(prog["period_reward"], H)
+        yb, ya = info["yes_bid_c"], info["yes_ask_c"]
+        sides = []
+        for side, sc, best_c in (("bid", info["yes_entry"], yb),
+                                 ("ask", info["no_entry"], ya)):
+            p = unit_collateral(side, (best_c or MIN_LEGAL_PRICE_C) / 100.0)
+            sides.append({"S": sc.S, "p": max(p, 0.01), "qualifies": sc.qualifies,
+                          "legal": not info["pinned"],
+                          "target_size": prog["target_size_fp"]})
+        self.classified[tk] = {"rho": rho, "pinned": info["pinned"],
+                               "denied": tk in self.st.poisoned
+                               or tk in self.st.assume_filled,
+                               "sides": sides, "ts": now}
+        self.books[tk] = body
+        self.scores[tk] = info
+        return info
+
+    def classify_sweep(self, progs, now):
+        """§4.6 cold start / low-cadence refresh.  One classification poll per candidate
+        market, rate-limited to half the shared budget.  Candidates are the allowlisted
+        event's markets when EVENT_ALLOWLIST is set, else the top CLASSIFY_MAX_MARKETS by
+        rho — rho DOES rank across events, it only fails within one."""
+        cands = sorted(progs, key=lambda p: (-pool_rate(
+            p["period_reward"], window_hours(p["start_ts"], p["end_ts"])),
+            str(p["market_ticker"])))
+        if not EVENT_ALLOWLIST:
+            cands = cands[:CLASSIFY_MAX_MARKETS]
+        log("classify_sweep_begin", n=len(cands), allowlist=EVENT_ALLOWLIST or "OFF")
+        pinned_ct = 0
+        for p in cands:
+            if self.stopping:
+                break
+            tk = p["market_ticker"]
+            st, body = public_get("/markets/%s/orderbook" % tk, {"depth": "50"})
+            if st != 200:
+                log("book_error", ticker=tk, http=st, phase="classify")
+                continue
+            info = self.classify_market(p, body, now)
+            if info["pinned"]:
+                pinned_ct += 1
+            time.sleep(1.0 / CLASSIFY_RATE_HZ)
+        self.last_classify = now
+        ranked = market_poll_rank(self.classified)
+        log("classify_sweep_done", n_classified=len(self.classified), pinned=pinned_ct,
+            chosen=ranked,
+            chosen_values=[round(market_rank_value(self.classified[t]), 6)
+                           for t in ranked])
+
+    def check_day_stop(self, slots, alloc, now):
+        """§8.4 global day stop.  Reads the ledger-reconstructed positions and cost (§9.3)
+        marked against the current books — never an exchange index (§8.6)."""
+        mids = {}
+        for tk, info in self.scores.items():
+            yb, ya = info.get("yes_bid_c"), info.get("yes_ask_c")
+            if yb is not None and ya is not None:
+                mids[tk] = (yb + ya) / 200.0
+        pnl = mark_to_market_pnl(self.st.positions, self.st.position_cost, mids,
+                                 self.fees_paid)
+        proj_day = sum(reward_rate(s.rho, alloc.get(s.key, 0), s.S + s.W)
+                       for s in slots) * 24.0
+        self.day_pnl = pnl
+        if not day_stop_breached(pnl, proj_day):
+            return False
+        log("day_stop_breached", pnl_usd=round(pnl, 4),
+            projected_day_reward_usd=round(proj_day, 4),
+            stop_usd=round(day_stop_usd(proj_day), 4))
+        ntfy("LIP v4 DAY STOP",
+             "pnl $%.2f breached the $%.2f stop - cancelling all, flattening, exiting"
+             % (pnl, day_stop_usd(proj_day)))
+        self.halted = True                       # §8.4: no further posts, on any path
+        self.cancel_all("day_stop")
+        for tk in list(self.st.positions.keys()):
+            self.run_recycler(tk, alloc, slots, now)      # §5.4 flatten via maker shed
+        self.stopping = True
+        return True
+
+    def persist_accrual(self, program_id):
+        """S3 — the one piece of checkpoint state that cannot be re-derived from orders and
+        fills.  Written every accrual tick and immediately on every checkpoint."""
+        log("accrual", k="accrual", program_id=program_id,
+            accrued_usd=round(self.accrued.get(program_id, 0.0), 6),
+            checkpoints_done=sorted(self.checkpoints_done.get(program_id, set())))
+
     def cycle(self, now=None):
         now = _now() if now is None else now
         progs = [p for p in self.programs.values() if p["end_ts"] > now
@@ -2008,15 +2300,23 @@ class Maker(object):
         if not progs:
             self.stopping = True
             return
-        # REST rate budget (§4.6): 1 Hz x N markets vs ~10 req/s shared => max 6 on REST.
-        # The clamp forces a PRE-BOOK ranking, which the spec does not specify because it
-        # assumes the websocket.  rho descending is the derived proxy: §0.4's rate is linear
-        # in rho and S is unknowable before the book poll.  Ties break on ticker so the
-        # selection is deterministic (T7's property, extended to market selection).
-        progs.sort(key=lambda p: (-pool_rate(p["period_reward"],
-                                             window_hours(p["start_ts"], p["end_ts"])),
-                                  str(p["market_ticker"])))
-        progs = progs[:MAX_REST_MARKETS]
+        # §4.6 CLASSIFY-THEN-CLAMP (B1).  The 1 Hz REST budget covers 6 markets; WHICH 6 is
+        # decided by the classification sweep, not by rho (degenerate inside one event —
+        # see the CLASSIFY_* block).  Pinned markets are excluded outright.
+        if now - self.last_classify >= CLASSIFY_REFRESH_S:
+            self.classify_sweep(progs, now)
+        by_ticker = {p["market_ticker"]: p for p in progs}
+        chosen = [t for t in market_poll_rank(self.classified) if t in by_ticker]
+        if not chosen:
+            # Nothing classified as usable yet (or every candidate is pinned).  Do NOT fall
+            # back to a rho ordering — that is the defect.  Re-sweep instead.
+            self.classify_sweep(progs, now)
+            chosen = [t for t in market_poll_rank(self.classified) if t in by_ticker]
+        if not chosen:
+            log("no_pollable_markets", n_candidates=len(progs),
+                n_classified=len(self.classified))
+            return
+        progs = [by_ticker[t] for t in chosen]
         slots = []
         for p in progs:
             tk = p["market_ticker"]
@@ -2115,6 +2415,9 @@ class Maker(object):
                 funded.add(s.program_id)
                 self.accrued[s.program_id] = self.accrued.get(s.program_id, 0.0) + \
                     reward_rate(s.rho, alloc[s.key], s.S + s.W) * dt_h
+        if dt_h > 0 and now - self.last_snapshot >= BOOK_SNAPSHOT_S:
+            for pid in funded:
+                self.persist_accrual(pid)               # S3, at the 60s snapshot cadence
 
         # §3.4 checkpoints, at WINDOW FRACTIONS of each program's own period
         for p in progs:
@@ -2125,6 +2428,7 @@ class Maker(object):
                     continue
                 done.add(frac)
                 self.run_checkpoint(p, alloc, slots, now, len(funded))
+                self.persist_accrual(p["program_id"])   # S3: fire-once must survive restart
 
         # §12.4 capture the window's OWN book snapshots for reconciliation
         if now - self.last_snapshot >= BOOK_SNAPSHOT_S:
@@ -2140,10 +2444,14 @@ class Maker(object):
             tk = p["market_ticker"]
             self.run_recycler(tk, alloc, slots, now)
 
+        if self.check_day_stop(slots, alloc, now):      # §8.4
+            return
+
         trip = self.st.budget_tripped(now)
         if trip:
             log("error_budget_tripped", why=trip)
             ntfy("LIP v4 error budget tripped", trip + " - cancelling all and exiting")
+            self.halted = True
             self.stopping = True
 
     def run_checkpoint(self, prog, alloc, slots, now, funded_programs=1):
@@ -2201,6 +2509,15 @@ class Maker(object):
         log("recycle", ticker=ticker, action=action, **{k: round(v, 6)
                                                         if isinstance(v, float) else v
                                                         for k, v in info2.items()})
+        if action == TAKER_EXIT and not TAKER_EXIT_ENABLED:
+            # S4: decided, priced, logged — NOT placed at this rung.  See the
+            # TAKER_EXIT_ENABLED derivation in the config block.  The value forgone is the
+            # RHS minus the LHS of §5.2, i.e. what the exit would have recovered.
+            log("taker_exit_suppressed", ticker=ticker,
+                value_forgone_usd=round(info2.get("rhs", 0.0) - info2.get("lhs", 0.0), 4),
+                net=info2.get("net"), hours_left=round(h, 3),
+                why="TAKER_EXIT_ENABLED=False at ceiling $%.2f" % MAX_TOTAL_COLLATERAL_USD)
+            action = MAKER_SHED                        # keep shedding as a maker
         shed_key = (ticker, shed_slot(held_side))
         if action == MAKER_SHED:
             self.shed_since.setdefault(ticker, now)

@@ -1014,6 +1014,270 @@ class RiskAndPolicy(unittest.TestCase):
         self.assertNotIn(b"?", fk.msg)
 
 
+# =============================================================================================
+# ADVERSARIAL REVIEW REGRESSIONS (B1, S1-S4) — each asserts the FIXED behaviour, on the
+# reviewer's own live-measured shape where one exists.
+# =============================================================================================
+RHO_GAS = M.pool_rate(1000000, M.window_hours(1785585600.0, 1785643140.0))
+# LIVE-MEASURED 2026-07-28T02:11Z: 4.070-4.085 pinned (yes_bid=99); 4.130-4.150 pinned
+# (yes_ask=1).  Qualifying-side scores from verify-lip-gas §3b where published.
+GAS_PINNED_NOW = {"4.070", "4.075", "4.080", "4.085",
+                  "4.130", "4.135", "4.140", "4.145", "4.150"}
+GAS_SIDES = {"4.090": [(155.6, 0.96), (1041.0, 0.02)],
+             "4.095": [(120.0, 0.91), (300.0, 0.09)],
+             "4.100": [(60.5, 0.68), (5.2, 0.31)],
+             "4.105": [(24.9, 0.40), (73.2, 0.59)],
+             "4.110": [(18.0, 0.30), (40.0, 0.64)],
+             "4.115": [(9.0, 0.04), (600.0, 0.94)],
+             "4.120": [(6.0, 0.01), (900.0, 0.97)],
+             "4.125": [(4.0, 0.01), (1500.0, 0.98)]}
+GAS_RUNGS = ["4.070", "4.075", "4.080", "4.085", "4.090", "4.095", "4.100", "4.105",
+             "4.110", "4.115", "4.120", "4.125", "4.130", "4.135", "4.140", "4.145",
+             "4.150"]
+
+
+def gas_classified():
+    out = {}
+    for r in GAS_RUNGS:
+        sides = [{"S": S, "p": p, "qualifies": True, "legal": r not in GAS_PINNED_NOW}
+                 for S, p in GAS_SIDES.get(r, [(1.0, 0.99)])]
+        out["KXAAAGASD-26JUL28-%s" % r] = {
+            "rho": RHO_GAS, "pinned": r in GAS_PINNED_NOW, "denied": False, "sides": sides}
+    return out
+
+
+class B1_ClassifyThenClamp(unittest.TestCase):
+
+    def test_rho_alone_cannot_rank_inside_one_event(self):
+        """B1 root cause — every rung of one gas daily carries the identical period_reward
+        and the identical window, so rho is CONSTANT across all 17 and the ticker tie-break
+        decides the §4.6 clamp entirely."""
+        rhos = {M.pool_rate(1000000, M.window_hours(1785585600.0, 1785643140.0))
+                for _ in GAS_RUNGS}
+        self.assertEqual(len(rhos), 1)
+        # ... and ticker-ascending on a gas daily is deep-ITM-first, i.e. pinned-first
+        by_ticker = sorted(GAS_RUNGS)[:M.MAX_REST_MARKETS]
+        self.assertEqual(len([r for r in by_ticker if r in GAS_PINNED_NOW]), 4)
+
+    def test_clamp_never_spends_a_rest_slot_on_a_pinned_market(self):
+        """B1 fix — classify THEN clamp.  No snapshot on a pinned market can EVER be
+        included, so no REST slot may be spent on one."""
+        picked = [t.rsplit("-", 1)[1] for t in M.market_poll_rank(gas_classified())]
+        self.assertEqual(len(picked), M.MAX_REST_MARKETS)
+        self.assertEqual([r for r in picked if r in GAS_PINNED_NOW], [])
+        # the reviewer's live selection is exactly what must NOT happen any more
+        self.assertNotEqual(picked, ["4.070", "4.075", "4.080", "4.085", "4.090", "4.095"])
+
+    def test_clamp_selects_the_slots_the_allocator_would_fund(self):
+        """B1 fix — the clamp ranks by the ALLOCATOR'S OWN first-dollar rate, so the three
+        best slots on the board can no longer be starved of a poll."""
+        picked = [t.rsplit("-", 1)[1] for t in M.market_poll_rank(gas_classified())]
+        self.assertFalse({"4.100", "4.105", "4.110"}.isdisjoint(picked))
+        # ranking is by value, descending, and deterministic
+        vals = [M.market_rank_value(gas_classified()["KXAAAGASD-26JUL28-%s" % r])
+                for r in picked]
+        self.assertEqual(vals, sorted(vals, reverse=True))
+        self.assertEqual(M.market_poll_rank(gas_classified()),
+                         M.market_poll_rank(gas_classified()))
+
+    def test_first_dollar_rate_is_the_allocator_rate_and_prices_revivals(self):
+        """§0.4 at q=0, and §1.4: a legal-but-unqualified side has S=0, where the marginal
+        form is degenerate — it must rank HIGH (the revival trade), never as zero."""
+        self.assertAlmostEqual(M.slot_first_dollar_rate(6.25, 50.0, 0.40),
+                               M.marginal_rate(6.25, 50.0, 0, 0.40), places=12)
+        rev = M.slot_first_dollar_rate(6.25, 0.0, 0.99, qualifies=False, target_size=1000.0)
+        self.assertGreater(rev, 0.0)
+        self.assertAlmostEqual(rev, M.marginal_rate(6.25, 1000.0, 0, 0.01), places=12)
+        # pinned / illegal is worth exactly zero, not "a little"
+        self.assertEqual(M.slot_first_dollar_rate(6.25, 50.0, 0.40, legal=False), 0.0)
+        self.assertEqual(M.market_rank_value({"rho": 6.25, "pinned": True,
+                                              "sides": [{"S": 5.0, "p": 0.02}]}), 0.0)
+        self.assertEqual(M.market_poll_rank({"P": {"rho": 6.25, "pinned": True,
+                                                   "sides": [{"S": 5.0, "p": 0.02}]}}), [])
+
+
+class S1_DayStop(unittest.TestCase):
+
+    def test_mark_to_market_and_the_breach_predicate(self):
+        """§8.4 — YES marks at the yes mid, NO at (1 - yes mid); cost from the ledger."""
+        pos = {"T": {"yes": 10.0, "no": 0.0}}
+        cost = {"T": 4.00}                                   # 10 YES bought at 40c
+        self.assertAlmostEqual(M.mark_to_market_pnl(pos, cost, {"T": 0.40}), 0.0, places=9)
+        self.assertAlmostEqual(M.mark_to_market_pnl(pos, cost, {"T": 0.30}), -1.0, places=9)
+        self.assertAlmostEqual(M.mark_to_market_pnl(pos, cost, {"T": 0.30}, 0.68),
+                               -1.68, places=9)
+        no = {"T": {"yes": 0.0, "no": 10.0}}
+        self.assertAlmostEqual(M.mark_to_market_pnl(no, {"T": 6.00}, {"T": 0.40}), 0.0,
+                               places=9)
+        # a market with no mid available cannot be marked and must not be guessed at
+        self.assertAlmostEqual(M.mark_to_market_pnl(pos, cost, {}), -4.00, places=9)
+
+    def test_breach_thresholds(self):
+        """§8.4 — -max($20, 0.35*projected), capped at -$150."""
+        self.assertFalse(M.day_stop_breached(-19.99, 0.0))
+        self.assertTrue(M.day_stop_breached(-20.00, 0.0))
+        self.assertFalse(M.day_stop_breached(-34.99, 100.0))
+        self.assertTrue(M.day_stop_breached(-35.00, 100.0))
+        self.assertFalse(M.day_stop_breached(-149.0, 10000.0))
+        self.assertTrue(M.day_stop_breached(-150.0, 10000.0))
+        self.assertFalse(M.day_stop_breached(500.0, 100.0))      # profit never breaches
+
+    def test_a_breached_stop_actually_stops_posting(self):
+        """S1 — the fix is not the predicate, it is the CALL SITE.  A halted maker places
+        nothing, on every path into placement, and consumes no coid sequence."""
+        m = M.Maker(None, M.LedgerState(), [])
+        m.halted = True
+        self.assertIsNone(m.place("T", "bid", 40, 10, 1785000000))
+        self.assertEqual(m.st.coid_seq, 0)                  # no seq burned, no wire call
+        self.assertEqual(m.st.orders, {})
+
+    def test_the_day_stop_is_wired_into_the_cycle(self):
+        """S1 — a breach cancels all, flattens, alerts and halts.  Runs with no network:
+        there are no live orders to cancel and no positions to flatten."""
+        tmp = tempfile.mkdtemp()
+        old_dir, old_led = M.DATA_DIR, M.LEDGER_PATH
+        try:
+            M.DATA_DIR = os.path.join(tmp, "lip")
+            M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+            st = M.LedgerState()
+            st.positions = {"T": {"yes": 100.0, "no": 0.0}}
+            st.position_cost = {"T": 40.00}
+            m = M.Maker(None, st, [])
+            m.scores = {"T": {"yes_bid_c": 5, "yes_ask_c": 7}}   # marked down to ~6c
+            self.assertTrue(m.check_day_stop([], {}, 1000.0))
+            self.assertTrue(m.halted)
+            self.assertTrue(m.stopping)
+            self.assertLess(m.day_pnl, -20.0)
+            self.assertIsNone(m.place("T", "bid", 40, 10, 1785000000))
+        finally:
+            M.DATA_DIR, M.LEDGER_PATH = old_dir, old_led
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class S2_FillIdempotency(unittest.TestCase):
+
+    def test_the_same_api_fill_is_booked_once_however_many_restarts(self):
+        """S2 — §9.4 step 4 re-reads [last_ts-60s, now] BY DESIGN, so a crash loop
+        re-observes the same fills.  Without an idempotency key replay double-books them."""
+        base = [rec_place("O1")]
+        gap = {"k": "fill_obs", "t": 1010.0, "order_id": None, "fill_id": "trade-777",
+               "ticker": T, "side": "bid", "count": 10, "price_c": 40,
+               "src": "fills_api", "why": "crash_gap"}
+        one = M.ledger_replay(base + [gap])
+        self.assertAlmostEqual(one.filled(T, "bid"), 10.0)
+        for n_restarts in (2, 3, 5):
+            recs = base + [dict(gap, t=1010.0 + 25 * i) for i in range(n_restarts)]
+            st = M.ledger_replay(recs)
+            self.assertAlmostEqual(st.filled(T, "bid"), 10.0, msg=n_restarts)
+            self.assertAlmostEqual(st.net_position(T), 10.0)
+            # $4.00 of position + the $4.00 still resting on O1 (never cancelled here)
+            self.assertAlmostEqual(st.collateral, 4.00 + 4.00, places=6)
+            self.assertAlmostEqual(st.position_collateral, 4.00, places=6)
+        # ... and the re-query window genuinely does overlap, which is why this is needed
+        lo, hi = M.crash_gap_window(1010.0, now=1035.0)
+        self.assertLess(lo, 1010.0)
+
+    def test_distinct_fills_are_still_counted_separately(self):
+        """The dedup must not collapse two genuinely different fills."""
+        base = [rec_place("O1", size=20, rem=20)]
+        a = {"k": "fill_obs", "t": 1010.0, "order_id": None, "fill_id": "trade-1",
+             "ticker": T, "side": "bid", "count": 10, "price_c": 40, "src": "fills_api",
+             "why": "crash_gap"}
+        b = dict(a, fill_id="trade-2", t=1011.0)
+        self.assertAlmostEqual(M.ledger_replay(base + [a, b]).filled(T, "bid"), 20.0)
+
+    def test_pre_fix_unkeyed_crash_gap_rows_are_deduped_by_content_and_counted(self):
+        """A row written by a pre-fix binary carries no key.  Its identity is well defined
+        for this class alone (an overlapping re-read of the same window), and the fallback
+        is COUNTED so the operator can see it was used."""
+        base = [rec_place("O1")]
+        gap = {"k": "fill_obs", "t": 1010.0, "order_id": None, "ticker": T, "side": "bid",
+               "count": 10, "price_c": 40, "src": "fills_api", "why": "crash_gap"}
+        st = M.ledger_replay(base + [gap, dict(gap, t=1035.0)])
+        self.assertAlmostEqual(st.filled(T, "bid"), 10.0)
+        self.assertEqual(st.unkeyed_fill_rows, 2)
+
+    def test_N2_duplicate_place_resp_creates_one_order(self):
+        """N2 — a retried write or a copied ledger must not create a second order or
+        double-credit its immediate fill_count."""
+        r = rec_place("O1", fill=3, rem=7)
+        st = M.ledger_replay([r, dict(r, t=1001.0)])
+        self.assertEqual(len(st.orders), 1)
+        self.assertAlmostEqual(st.filled(T, "bid"), 3.0)
+        self.assertAlmostEqual(st.collateral, 3 * 0.40 + 7 * 0.40, places=9)
+
+
+class S3_AccrualSurvivesRestart(unittest.TestCase):
+
+    def test_the_reviewers_scenario_restart_preserves_KEEP(self):
+        """S3 — reproduced by review: live A=$0.95 KEEP, post-restart A=0 ABANDON, which
+        forfeits real accrued score to a bookkeeping gap."""
+        rho, S, q, p = 6.25, 60.0, 100, 0.40
+        r_star = M.LAMBDA_MIN / M.LAMBDA_MIN_WINDOW_HOURS
+        C, h = q * p, 0.30
+        rate_now = M.reward_rate(rho, q, S)
+        live = M.rescue(0.95, rate_now, h, rho, S, q, p, r_star, C, has_other_program=True)
+        self.assertEqual(live.action, M.KEEP)
+        # WITHOUT persistence the restarted process abandons ...
+        lost = M.rescue(0.0, rate_now, h, rho, S, q, p, r_star, C, has_other_program=True)
+        self.assertEqual(lost.action, M.ABANDON)
+        # ... WITH it, the ledger hands A back and the decision is unchanged
+        st = M.ledger_replay([{"k": "accrual", "t": 5000.0, "program_id": "P1",
+                               "accrued_usd": 0.95, "checkpoints_done": [0.25, 0.50]}])
+        self.assertAlmostEqual(st.accrued["P1"], 0.95, places=9)
+        restarted = M.rescue(st.accrued["P1"], rate_now, h, rho, S, q, p, r_star, C,
+                             has_other_program=True)
+        self.assertEqual(restarted.action, M.KEEP)
+        self.assertEqual(restarted.action, live.action)
+
+    def test_checkpoints_do_not_refire_after_a_restart(self):
+        st = M.ledger_replay([{"k": "accrual", "t": 5000.0, "program_id": "P1",
+                               "accrued_usd": 0.95, "checkpoints_done": [0.25, 0.50]}])
+        self.assertEqual(st.checkpoints_done["P1"], {0.25, 0.50})
+        m = M.Maker(None, st, [])
+        self.assertEqual(m.accrued["P1"], 0.95)
+        self.assertEqual(m.checkpoints_done["P1"], {0.25, 0.50})
+        self.assertIn(0.25, m.checkpoints_done["P1"])         # would refire without this
+        self.assertNotIn(0.80, m.checkpoints_done["P1"])      # and 80% still must fire
+        # the LAST accrual row wins (it is a checkpoint of the integral, not a delta)
+        st2 = M.ledger_replay([
+            {"k": "accrual", "t": 5000.0, "program_id": "P1", "accrued_usd": 0.95,
+             "checkpoints_done": [0.25]},
+            {"k": "accrual", "t": 5060.0, "program_id": "P1", "accrued_usd": 1.40,
+             "checkpoints_done": [0.25, 0.50]}])
+        self.assertAlmostEqual(st2.accrued["P1"], 1.40, places=9)
+        self.assertEqual(st2.checkpoints_done["P1"], {0.25, 0.50})
+
+    def test_accrual_rows_are_authoritative_but_snapshots_are_still_advisory(self):
+        """§9.1's invariant is preserved: an ADVISORY snapshot still cannot move state.
+        `accrual` is a separate, authoritative record kind precisely so that stays true."""
+        base = [rec_place("O1"), rec_cancel("O1", 200, "10.00")]
+        a = M.ledger_replay(base)
+        b = M.ledger_replay(base + [{"k": "snapshot", "t": 2000.0,
+                                     "positions": {T: {"yes": 999.0}},
+                                     "collateral_usd": 999.0, "orders": {}}])
+        self.assertEqual(a.positions, b.positions)
+        self.assertEqual(a.collateral, b.collateral)
+        self.assertEqual(b.accrued, {})
+
+
+class S4_TakerExitIsSuppressedAtThisRung(unittest.TestCase):
+
+    def test_the_decision_is_still_computed_and_priced(self):
+        """S4 — the §5.2 inequality and the §5.4 escalation are unchanged; only the ORDER
+        is withheld, and the value forgone is computable so the choice stays measured."""
+        action, info = M.recycle(40, 0, 0.41, 0.40, 1.5, 0.00625, 1.87, shed_age_s=1801)
+        self.assertEqual(action, M.TAKER_EXIT)
+        self.assertGreater(info["rhs"] - info["lhs"], 0.0)
+
+    def test_the_gate_is_off_at_the_first_run_ceiling_and_is_a_ladder_decision(self):
+        self.assertFalse(M.TAKER_EXIT_ENABLED)
+        self.assertEqual(M.MAX_TOTAL_COLLATERAL_USD, 45.0)
+        # the bound the derivation rests on: stranded inventory is capped per slot at $10
+        self.assertAlmostEqual(M.n_cap(0.40) * 0.40, 10.0, places=9)
+        self.assertLessEqual(M.n_cap(0.02) * 0.02, 10.0 + 1e-9)
+
+
 class StartupAssertions(unittest.TestCase):
 
     def test_unit_assertion_refuses_a_wrong_unit(self):
