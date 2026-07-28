@@ -3095,6 +3095,136 @@ class Phase1_NtfyNeverPagesFromTests(unittest.TestCase):
                 os.environ["NTFY_DISABLE"] = old_env
 
 
+class InventorySlotGuarantee(_RunnerCase):
+    """LIVE DEFECT (Ryan's find): the §4.6 six-market clamp de-polled markets where we HELD
+    INVENTORY.  Fills are learned from cancel `reduced_by`, so a de-polled market is never
+    requoted, never cancelled, its fills are never learned, and no shed is ever posted --
+    the position goes invisible to our own books and strands until settlement.  Live
+    evidence: the exchange showed PYPL and UST10AD-T4.65 positions while v4's snapshot
+    showed no PYPL at all and no shed for either."""
+
+    def _prog(self, tk, rho_reward=1_000_000.0):
+        return {"program_id": "P-" + tk, "market_ticker": tk, "series": "KX",
+                "period_reward": rho_reward, "target_size_fp": 1000.0,
+                "discount_factor_bps": 5000.0, "start_ts": 0.0,
+                "end_ts": 9e9, "paid_out": False}
+
+    def _maker(self, tickers, inventory=None):
+        st = M.LedgerState()
+        for tk, n in (inventory or {}).items():
+            st.positions[tk] = {"yes": max(0.0, n), "no": max(0.0, -n)}
+            st.position_cost[tk] = abs(n) * 0.40
+            st.position_cost_leg[tk] = {"yes": max(0.0, n) * 0.40,
+                                        "no": max(0.0, -n) * 0.40}
+        m = M.Maker(None, st, [self._prog(t) for t in tickers])
+        # every market classified as usable, ranked by descending value via S
+        for i, tk in enumerate(tickers):
+            m.classified[tk] = {"rho": 6.25, "pinned": False, "denied": False,
+                                "sides": [{"S": 10.0 + i, "p": 0.40, "qualifies": True}]}
+        return m
+
+    def test_a_market_with_inventory_is_always_polled_even_when_it_ranks_last(self):
+        tickers = ["M%d" % i for i in range(10)]
+        # M9 ranks LAST (largest S => lowest first-dollar rate) but holds inventory
+        m = self._maker(tickers, inventory={"M9": 25.0})
+        by = {t: self._prog(t) for t in tickers}
+        chosen, shed_only = m.poll_set(by, 1000.0)
+        self.assertIn("M9", chosen)                       # was silently dropped
+        self.assertIn("M9", shed_only)                    # ... as a SHED-ONLY slot
+        self.assertLessEqual(len(chosen), M.MAX_REST_MARKETS)
+        # and it did not eat the whole breadth
+        self.assertGreaterEqual(len(chosen) - len(shed_only), M.MIN_RANK_POLL_SLOTS)
+
+    def test_a_shed_only_market_gets_zero_opening_allocation(self):
+        """It is polled so fills are learned and the closing order tracks the book -- not so
+        we can put fresh capital into a market that did not earn a slot."""
+        s = M.Slot("M9", "bid", 6.25, 50.0, 0.02, denied=True)
+        al, spent = M.allocate([s], 45.0, BIG)
+        self.assertEqual(al[s.key], 0)
+        self.assertEqual(spent, 0.0)
+
+    def test_a_non_terminal_order_also_pins_the_market(self):
+        """An unresolved order can still fill, and a fill we never learn is a position we
+        never shed."""
+        tickers = ["M%d" % i for i in range(10)]
+        m = self._maker(tickers)
+        o = M.OrderState("O1", "v4-c", "M9", "bid", 0.40, 10, 0.0, 10.0)
+        m.st.orders["O1"] = o
+        self.assertIn("M9", m.inventory_markets())
+        chosen, _ = m.poll_set({t: self._prog(t) for t in tickers}, 1000.0)
+        self.assertIn("M9", chosen)
+        # an UNKNOWN order counts too
+        o.remaining_count = 0.0
+        o.state = M.ST_UNKNOWN
+        self.assertIn("M9", m.inventory_markets())
+        # a fully terminal one does not
+        o.state = M.ST_CLOSED
+        o.reduced_by = 10.0
+        self.assertNotIn("M9", m.inventory_markets())
+
+    def test_inventory_can_never_consume_all_of_breadth(self):
+        tickers = ["M%d" % i for i in range(10)]
+        inv = {t: 25.0 for t in tickers}               # every market holds inventory
+        m = self._maker(tickers, inventory=inv)
+        by = {t: self._prog(t) for t in tickers}
+        chosen, shed_only = m.poll_set(by, 1000.0)
+        self.assertLessEqual(len(chosen), M.MAX_REST_MARKETS)
+        rank_slots = len([t for t in chosen if t not in shed_only])
+        self.assertGreaterEqual(rank_slots, M.MIN_RANK_POLL_SLOTS)
+        self.assertEqual(M.MIN_RANK_POLL_SLOTS, 2)
+
+    def test_overflow_inventory_is_tracked_on_the_slow_cadence_never_dropped(self):
+        tickers = ["M%d" % i for i in range(10)]
+        inv = {t: 25.0 for t in tickers}
+        m = self._maker(tickers, inventory=inv)
+        by = {t: self._prog(t) for t in tickers}
+        chosen, _ = m.poll_set(by, 1000.0)
+        overflow = [t for t in tickers if t not in chosen]
+        self.assertTrue(overflow)
+        for t in overflow:
+            self.assertIn(t, m.flatten_only)           # picked up by the orphan requoter
+        ev = [e["event"] for e in self.events()]
+        self.assertIn("inventory_slot_overflow", ev)
+
+    def test_biggest_exposure_is_prioritised_deterministically(self):
+        tickers = ["M%d" % i for i in range(10)]
+        m = self._maker(tickers, inventory={"M1": 5.0, "M2": 50.0, "M3": 20.0})
+        by = {t: self._prog(t) for t in tickers}
+        a, _ = m.poll_set(by, 1000.0)
+        b, _ = m.poll_set(by, 1000.0)
+        self.assertEqual(a, b)                          # deterministic
+        self.assertLess(a.index("M2"), a.index("M3"))   # 50 before 20
+        self.assertLess(a.index("M3"), a.index("M1"))   # 20 before 5
+
+    def test_a_market_with_no_live_program_but_inventory_goes_to_flatten_only(self):
+        m = self._maker(["M0", "M1"], inventory={"GONE": 20.0})
+        m.poll_set({"M0": self._prog("M0"), "M1": self._prog("M1")}, 1000.0)
+        self.assertIn("GONE", m.flatten_only)
+
+    def test_when_the_inventory_settles_the_slot_returns_to_rank(self):
+        tickers = ["M%d" % i for i in range(10)]
+        m = self._maker(tickers, inventory={"M9": 25.0})
+        by = {t: self._prog(t) for t in tickers}
+        chosen, shed_only = m.poll_set(by, 1000.0)
+        self.assertIn("M9", shed_only)
+        rank_before = len([t for t in chosen if t not in shed_only])
+        # settlement (C2) zeroes the position ...
+        m.st.positions["M9"] = {"yes": 0.0, "no": 0.0}
+        m.st.position_cost["M9"] = 0.0
+        chosen2, shed_only2 = m.poll_set(by, 2000.0)
+        self.assertEqual(shed_only2, set())            # ... the shed-only slot is released
+        self.assertNotIn("M9", m.inventory_markets())
+        self.assertGreater(len([t for t in chosen2 if t not in shed_only2]), rank_before)
+
+    def test_the_guarantee_and_C6_are_one_mechanism(self):
+        """An ended-program shed and a de-polled live-program shed are the same problem:
+        inventory nobody is watching.  Both land in flatten_only / the inventory set."""
+        m = self._maker(["M0", "M1"], inventory={"GONE": 20.0})
+        m.poll_set({"M0": self._prog("M0"), "M1": self._prog("M1")}, 1000.0)
+        self.assertIn("GONE", m.flatten_only)
+        self.assertIn("GONE", m.inventory_markets())
+
+
 class StartupAssertions(unittest.TestCase):
 
     def test_unit_assertion_refuses_a_wrong_unit(self):

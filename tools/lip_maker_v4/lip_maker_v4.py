@@ -221,6 +221,23 @@ CLASSIFY_REFRESH_S = 900                # re-classify every 15 min: pinned-ness 
 CLASSIFY_MAX_MARKETS = 200              # bound the cold-start sweep.  rho DOES rank across
                                         # events (different pools), it only fails within one,
                                         # so the top-200 by rho is a sound candidate net.
+# INVENTORY-SLOT GUARANTEE.  The §4.6 clamp chose the six best markets by rank and simply
+# stopped polling everything else — including markets where we HELD INVENTORY.  Fills are
+# learned from cancel `reduced_by`, so a de-polled market is never requoted, never
+# cancelled, and its fills are never learned: the position becomes invisible to our own
+# books and no shed is ever posted.  Live evidence: the exchange showed PYPL and
+# UST10AD-T4.65 positions while v4's snapshot showed no PYPL at all and no shed for either.
+# Inventory is stranded silently until settlement, which is the §5.3 "inventory BLOCKS THE
+# SLOT" failure with the block made permanent.
+# Rule: a market with a nonzero net position, or any non-terminal order, is ALWAYS polled.
+# It consumes a clamp slot as a SHED-ONLY slot (zero opening allocation) unless it also
+# earns its place on rank.  MIN_RANK_POLL_SLOTS is the floor that stops inventory eating all
+# breadth.  Derivation: §2.1's content is marginal-rate ORDERING ACROSS slots, so with fewer
+# than two rank-chosen markets ALLOCATE has nothing to compare and degenerates into "fund
+# whatever we happened to poll"; §10.3-P3's portfolio ratios (>=1/3 of markets two-sided)
+# are likewise undefined on a single market.  Two is the smallest number at which the
+# optimizer is still an optimizer and P3 is still measurable.
+MIN_RANK_POLL_SLOTS = 2
 CLASSIFY_RATE_HZ = 5.0                  # half the ~10 req/s shared budget; the sweep is
                                         # one-shot at start and every CLASSIFY_REFRESH_S
 REVIVAL_PRICE_USD = 0.01                # §6.2 the cheapest legal price on a dead side
@@ -3117,6 +3134,51 @@ class Maker(object):
             self.st.position_cost[ticker] = 0.0
             self.st.position_cost_leg[ticker] = {"yes": 0.0, "no": 0.0}
 
+    def inventory_markets(self):
+        """Markets we are not allowed to stop watching: a nonzero NET position, or any
+        order that is not terminal.  Both mean an unlearned fill is still possible, and a
+        fill we never learn is a position we never shed."""
+        out = set()
+        for tk, pos in (self.st.positions or {}).items():
+            if abs(pos.get("yes", 0.0) - pos.get("no", 0.0)) > 1e-9:
+                out.add(tk)
+        for o in self.st.orders.values():
+            if o.resting > 0 or (o.state == ST_UNKNOWN and o.reduced_by is None):
+                out.add(o.ticker)
+        return out
+
+    def poll_set(self, by_ticker, now):
+        """The §4.6 clamp, with the inventory-slot guarantee.  Returns
+        (tickers_to_poll, shed_only_tickers).
+
+        Inventory markets come first and are never dropped.  If they would consume more than
+        MAX_REST_MARKETS - MIN_RANK_POLL_SLOTS of the budget, the overflow does NOT get
+        dropped either — it falls through to the slower orphan-shed cadence (the C6
+        mechanism), so nothing holding inventory is ever unwatched, and the 1 Hz rate budget
+        still holds.
+        """
+        inv = self.inventory_markets()
+        # a market holding inventory with no live program at all is already C6's job
+        for tk in inv:
+            if tk not in by_ticker and abs(self.st.net_position(tk)) > 1e-9:
+                self.flatten_only.add(tk)
+        inv_live = [t for t in inv if t in by_ticker]
+        # biggest exposure first, ties on ticker so the choice is deterministic (T7)
+        inv_live.sort(key=lambda t: (-abs(self.st.net_position(t)), str(t)))
+        room_for_inv = max(0, MAX_REST_MARKETS - MIN_RANK_POLL_SLOTS)
+        inv_polled = inv_live[:room_for_inv]
+        for tk in inv_live[room_for_inv:]:
+            self.flatten_only.add(tk)            # overflow -> slow cadence, never dropped
+            log("inventory_slot_overflow", ticker=tk,
+                net=self.st.net_position(tk),
+                why="beyond the clamp's inventory room; tracked on the orphan cadence")
+        ranked = [t for t in market_poll_rank(self.classified)
+                  if t in by_ticker and t not in inv_polled]
+        rank_budget = max(MIN_RANK_POLL_SLOTS, MAX_REST_MARKETS - len(inv_polled))
+        rank_chosen = ranked[:rank_budget]
+        shed_only = set(inv_polled) - set(rank_chosen)
+        return inv_polled + rank_chosen, shed_only
+
     def requote_orphan_sheds(self, now):
         """C6 — a closing order KEPT past its program's window end (or through a day stop)
         still has to track the book.  Nothing else requotes it: its market has no live
@@ -3258,16 +3320,19 @@ class Maker(object):
             self.sweep_settlements(now)               # C2, before re-ranking
             self.classify_sweep(progs, now)
         by_ticker = {p["market_ticker"]: p for p in progs}
-        chosen = [t for t in market_poll_rank(self.classified) if t in by_ticker]
+        chosen, shed_only = self.poll_set(by_ticker, now)
         if not chosen:
             # Nothing classified as usable yet (or every candidate is pinned).  Do NOT fall
             # back to a rho ordering — that is the defect.  Re-sweep instead.
             self.classify_sweep(progs, now)
-            chosen = [t for t in market_poll_rank(self.classified) if t in by_ticker]
+            chosen, shed_only = self.poll_set(by_ticker, now)
         if not chosen:
             log("no_pollable_markets", n_candidates=len(progs),
                 n_classified=len(self.classified))
             return
+        if shed_only:
+            log("inventory_slots", shed_only=sorted(shed_only),
+                nets={t: self.st.net_position(t) for t in sorted(shed_only)})
         progs = [by_ticker[t] for t in chosen]
         slots = []
         for p in progs:
@@ -3278,8 +3343,12 @@ class Maker(object):
                 continue
             # NEW-4: classify from the book the quoting loop just fetched, so the rank
             # table is never staler than the last poll of that market.
+            # A shed-only market is polled so its fills are learned and its closing order
+            # tracks the book, but it gets ZERO opening allocation until it earns a rank
+            # slot on its own merits.
             s2, info = self.classify_market(
-                p, body, now, denied=(tk in self.st.poisoned),
+                p, body, now,
+                denied=(tk in self.st.poisoned or tk in shed_only),
                 assume_filled=(tk in self.st.assume_filled))
             slots.extend(s2)
         if not slots:
