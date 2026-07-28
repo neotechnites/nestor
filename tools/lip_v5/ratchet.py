@@ -50,6 +50,10 @@ def floor_q_contracts(rho, S, window_h, entry_floor=C.ENTRY_FLOOR_USD):
     """
     A = (float(rho) / 2.0) * float(window_h)
     F = float(entry_floor)
+    if F <= 0:
+        # BLOCKER-2 (rescue exemption): a floor already met (RESCUE_TARGET − A ≤ 0) needs
+        # only the minimum tradeable presence — one contract — to keep earning.
+        return 1
     if A <= F:
         return None
     S = float(S)
@@ -59,7 +63,7 @@ def floor_q_contracts(rho, S, window_h, entry_floor=C.ENTRY_FLOOR_USD):
         # book).  One contract is the arithmetic answer here; the qualification path, not the
         # ratchet, sets the real size.
         return 1
-    return int(math.ceil(F * S / (A - F)))
+    return max(1, int(math.ceil(F * S / (A - F))))
 
 
 def floor_q_usd(rho, S, p, window_h, entry_floor=C.ENTRY_FLOOR_USD):

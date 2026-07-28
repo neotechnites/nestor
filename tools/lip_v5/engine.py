@@ -19,12 +19,13 @@ the classify-then-clamp ordering, the inventory-slot guarantee, and the restart 
 prefix-only coid ownership.
 """
 
+import os
 import signal
 
 from . import alloc, cashfeed, clusters as CL, config as C, cutover
 from . import guards as G, ledger as LG, money as M, presence as P
 from . import quote as Q
-from . import ratchet as RT, ratelimit as RL, runtime as R, wsgate
+from . import ratchet as RT, ratelimit as RL, runtime as R, scan, wsgate
 
 
 class Maker(object):
@@ -80,7 +81,10 @@ class Maker(object):
         self.S_ref = {}                      # (ticker, side) -> S at last requote (§4.3(c))
         self.qual_ref = {}                   # (ticker, side) -> qualifies at last look (§4.3(d))
         self.mbb_degraded = {}               # (ticker, side) -> ts of the balance reject
-        self.last_resync = float(now)        # §4.3(e)
+        # §4.3(e) PER SLOT (final fix round, BLOCKER-3): the earlier scalar was set to `now`
+        # at the end of EVERY pass, so trigger (e) could never fire — a dead guard wearing a
+        # live constant.  Resync tracks when each slot was last EXAMINED with fresh data.
+        self.slot_examined = {}              # (ticker, side) -> ts last examined
         self.land_grabbed = set()            # log land_grab once per (ticker, side)
         # --- the shed path (charter A) ---
         self.triage_shed = set()             # tickers the cutover triage sentenced to shed
@@ -101,6 +105,13 @@ class Maker(object):
         self.last_accrual_ts = None
         self.last_accrual_write = 0.0
         self._accrual_written = {}           # program_id -> last persisted value
+        # --- FINAL FIX ROUND state ---
+        self.last_fills_poll = None          # BLOCKER-1: fills cadence on the verify lane
+        self.pending_404 = {}                # oid -> {"requery_at", "second_read"} (§9.4a)
+        self.last_alloc = {}                 # key -> qty from the last ALLOCATE (SF-1 input)
+        self.readings_line = 0               # SF-4: v5_readings.jsonl lines consumed
+        self._readings_stat = None           # (mtime, size) — skip unchanged files
+        self.close_cache = {}                # ticker -> close_ts (halted closing pass)
 
     # =========================================================================================
     # STARTUP
@@ -259,8 +270,22 @@ class Maker(object):
         self.publisher.publish_before_wire(coid, 0.0 if fully_closing else collateral, now)
 
         status, resp = self.ex.place(body)
+        self.note_http(status, now)                           # SF-2
         if status not in (200, 201) or not (resp.get("order") or {}).get("order_id"):
-            self.cash.reject_order(coid)
+            if status == 0:
+                # TRANSPORT failure: the POST may have LANDED (v4's B2 class).  The order
+                # would be live with no order_id in our books — freeze the market so nothing
+                # quotes over an invisible order, and KEEP the reservation counted (§5.3's
+                # invariant: released-but-landed would publish above the truth; kept-but-dead
+                # only under-publishes, the safe side).  The fills poll and the restart
+                # sweep are the mitigation.  MIRROR (order live ↔ order dead): dead costs
+                # one frozen market and an under-published reservation until an operator
+                # reconciles; live-and-untracked is a naked collateral hole.
+                self.frozen.add(ticker)
+                self.ledger.write("phantom_risk", ticker=ticker, coid=coid)
+                R.ntfy("poison", "lip_v5 phantom risk (transport-failed POST): %s" % ticker)
+            else:
+                self.cash.reject_order(coid)
             self.publisher.publish(now)
             self.ledger.write("place_resp", ticker=ticker, side=side, coid=coid,
                               err=str(resp)[:200])
@@ -295,6 +320,7 @@ class Maker(object):
             return False, why
         self.ledger.write("cancel_req", ticker=o["ticker"], order_id=oid)
         status, resp = self.ex.cancel(oid)
+        self.note_http(status, now)                           # SF-2
         if status == 200 and resp.get("reduced_by") is not None:
             reduced = float(resp["reduced_by"])
             learned = max(0.0, o["remaining"] - reduced)
@@ -312,6 +338,12 @@ class Maker(object):
                               reduced_by=reduced)
             self.publisher.publish(now)
             return True, "ok"
+        if status == 404:
+            # v1 §9.4a — AMBIGUOUS: fully filled OR expired.  NEVER book zero silently; the
+            # fills endpoint disambiguates (BLOCKER-1: the constant existed with no
+            # implementation, and the honest FakeExchange now exercises this branch).
+            self.note_cancel_404(oid, o, now)
+            return False, "gone_404"
         # B10 — anything else leaves the order UNKNOWN: it may be live, and it holds collateral.
         self.unknown.note(oid, o["ticker"], o["side"], o["remaining"], now)
         self.ledger.write("cancel_resp", ticker=o["ticker"], order_id=oid, http=status)
@@ -370,7 +402,7 @@ class Maker(object):
             self.cash.fill(ticker, coid or "o", count, unit)
         if fee_usd:
             self.pay_fee(fee_usd)
-        self.refill.note_fill(ticker, side, count)
+        self.refill.note_fill(ticker, side, count, ts=now)    # SF-6: window-keyed
         self.meter.note_fill((ticker, side), count, count * unit)
         self.rollback.note_fill(ticker, leg, now)
         self.ledger.write("fill_obs", ticker=ticker, side=side, count=count,
@@ -385,32 +417,196 @@ class Maker(object):
         self.cash.pay_fee(usd)
         self.fees_paid = self.cash.fees_paid
 
+    def note_http(self, status, now):
+        """SF-2: EVERY exchange response passes through here — a 429 (ours or anyone's,
+        since we cannot tell) yields the bucket (§3.2 AIMD)."""
+        if status == 429:
+            self.bucket.on_429(now)
+        return status
+
+    def book_fill_row(self, row, now, idx=None):
+        """Book ONE real-shape fills row: `trade_id`, `order_id`, `side` ("yes"/"no"),
+        `action` ("buy"/"sell"), `count`, `yes_price` in CENTS, `is_taker` — the payload
+        v4's prod parsing consumes (its `fill_key`/`normalize_fill`).  Legacy `price`
+        (dollars) and `fill_id` are accepted as aliases.
+
+        OPEN vs CLOSE is OUR book's fact, not the row's: the fills axis (yes, sell) is an
+        ask-shaped execution that CLOSES a held YES leg or OPENS a NO leg — the row cannot
+        tell them apart.  Attribution order: the ORDER the row names (its side and
+        `fully_closing` are authoritative), else the position (enough held ⇒ closing —
+        v4's apply_fill netting, the crash-gap case)."""
+        leg, sign = cutover.normalize_fill(row.get("side"), row.get("action", "buy"))
+        count = float(row.get("count", 0))
+        yp = row.get("yes_price")
+        price = (float(yp) / 100.0) if yp is not None else float(row.get("price", 0))
+        # One YES-axis fact: was this execution bid-shaped (acquires YES) or ask-shaped
+        # (acquires NO / sheds YES)?  (yes, sell) and (no, buy) are the same ask-shaped act.
+        ask_like = (leg == "bid" and sign < 0) or (leg == "ask" and sign > 0)
+        ticker = row.get("ticker")
+        o = self.orders.get(str(row.get("order_id"))) if row.get("order_id") is not None \
+            else None
+        if o is not None:
+            side, closing = o["side"], bool(o.get("fully_closing"))
+        else:
+            side = "ask" if ask_like else "bid"
+            pos = self.positions.get(ticker) or {}
+            held = pos.get("yes", 0.0) if ask_like else pos.get("no", 0.0)
+            closing = held >= count - 1e-9
+        # Fee-bearing event (charter B): a maker fill is free; `is_taker` means we crossed
+        # (should be unreachable under STP, but if the exchange says we paid, we book it —
+        # a fee we refuse to book is a silent divergence in the cash feed).
+        fee = cutover.taker_fee_usd(count, price) if row.get("is_taker") else 0.0
+        # v4 NEW-3: the fallback key carries order_id, price, time AND the enumeration
+        # index — a keyless 5+5 split at one price must not collide (colliding keys DROP
+        # the second fill: the naked-short direction).
+        fid = row.get("trade_id") or row.get("fill_id") or row.get("id")
+        fallback = "syn-%s|%s|%s|%s|%s|%s|%s" % (
+            row.get("order_id"), ticker, row.get("side"), count,
+            yp if yp is not None else row.get("price"), row.get("created_time"),
+            "?" if idx is None else int(idx))
+        return self.book_fill(ticker, side, count, price, now,
+                              fill_id=fid if fid else fallback, closing=closing,
+                              order_id=row.get("order_id"), fee_usd=fee,
+                              closed_leg=("yes" if side == "ask" else "no"))
+
     def poll_fills(self, now, since=None):
+        """One `/portfolio/fills` read (verify lane).  Ownership is by `order_id` ∈ our
+        books (the real payload's identity — v4 attributed by order_id) with the coid
+        prefix as a fallback for rows that carry one; everything else is skipped — never
+        trust the index about someone else's order (shared account, §8.6)."""
         admitted, _ = self.bucket.admit("verify", now)
         if not admitted:
             return 0
-        status, body = self.ex.fills(since)
+        status, body = self.ex.fills(min_ts=since)
+        self.note_http(status, now)
         if status != 200:
             return 0
         n = 0
-        for row in (body.get("fills") or []):
-            if not R.owns_coid(row.get("client_order_id", "")):
-                continue                     # never trust the index about someone else's order
-            leg, sign = cutover.normalize_fill(row.get("side"), row.get("action", "buy"))
-            count = float(row.get("count", 0))
-            price = float(row.get("price", 0))
-            # Fee-bearing event (charter B): a maker fill is free; `is_taker` means we
-            # crossed (should be unreachable under STP, but if the exchange says we paid,
-            # we book it — a fee we refuse to book is a silent divergence in the cash feed).
-            fee = cutover.taker_fee_usd(count, price) if row.get("is_taker") else 0.0
-            if self.book_fill(row.get("ticker"), leg, count, price, now,
-                              fill_id=row.get("fill_id"), closing=(sign < 0),
-                              order_id=row.get("order_id"), fee_usd=fee,
-                              # fills rows speak the LEG axis: a sell of YES arrives as
-                              # ("bid", −1) and must close the YES leg, not the NO leg.
-                              closed_leg=("yes" if leg == "bid" else "no")):
+        for i, row in enumerate(body.get("fills") or []):
+            oid = str(row.get("order_id")) if row.get("order_id") is not None else None
+            ours = (oid in self.orders) or R.owns_coid(row.get("client_order_id", ""))
+            if not ours:
+                continue
+            if self.book_fill_row(row, now, idx=i):
                 n += 1
+        self.last_fills_poll = float(now)
         return n
+
+    def poll_fills_due(self, now):
+        """BLOCKER-1 — the LIVE fills cadence (FILLS_POLL_S on the verify lane), with the
+        §9.4(4) overlap so a boundary fill is never missed; B8's dedupe absorbs the
+        re-reads.  The reviewer's proof of the missing half: 630 cycles, 0 fills calls, a
+        taker-filled market frozen as a position_divergence at t+601 s."""
+        if self.last_fills_poll is not None and \
+                float(now) - self.last_fills_poll < C.FILLS_POLL_S:
+            return 0
+        since = None if self.last_fills_poll is None \
+            else self.last_fills_poll - C.CRASH_GAP_LOOKBACK_S
+        return self.poll_fills(now, since=since)
+
+    # =========================================================================================
+    # v1 §9.4a — 404-ON-CANCEL DISAMBIGUATION (fully filled OR expired; never book zero
+    # silently).  FILLS_REQUERY_DELAY_S finally has its implementation.
+    # =========================================================================================
+    def fills_for_order(self, oid, now):
+        """One order-scoped fills read.  Returns (ok, rows): ok=None rate-refused (ask again
+        next cycle), ok=False the QUERY ERRORED (not "no fills")."""
+        admitted, _ = self.bucket.admit("verify", now)
+        if not admitted:
+            return None, []
+        status, body = self.ex.fills(order_id=oid)
+        self.note_http(status, now)
+        if status != 200:
+            return False, []
+        return True, [r for r in (body.get("fills") or [])
+                      if str(r.get("order_id")) == str(oid)]
+
+    def note_cancel_404(self, oid, o, now):
+        """First contact with the ambiguity.  The order is NOT resting (the wire said so):
+        mark it `gone_404` so the requoter stops counting it as presence, but KEEP its
+        collateral counted (published below truth is the safe side) until the fills index
+        speaks.  MIRROR (booking the fill twice ↔ never booking it): B8's dedupe guards the
+        first end; the requery-then-assume ladder below guards the second."""
+        o["gone_404"] = True
+        self.ledger.write("cancel_resp", ticker=o["ticker"], order_id=oid, http=404)
+        ok, rows = self.fills_for_order(oid, now)
+        if ok is None:
+            self.pending_404[str(oid)] = {"requery_at": float(now), "second_read": False}
+            return
+        if ok is False:
+            # v1 §9.4a: query ERROR ⇒ assume fully filled and freeze (conservative — we
+            # over-state inventory, never under-state it).
+            self.assume_404_filled(oid, now, why="fills_query_error")
+            return
+        if rows:
+            self.book_404_rows(oid, rows, now, verdict="filled_first_read")
+            return
+        # NO fills on the first read is NOT "expired": the fills index has its own
+        # propagation lag (~12 s worst observed).  Re-query once after 36 s = 3× that.
+        self.pending_404[str(oid)] = {"requery_at": float(now) + C.FILLS_REQUERY_DELAY_S,
+                                      "second_read": True}
+
+    def book_404_rows(self, oid, rows, now, verdict):
+        """Fills explain the 404: book them; whatever the index does NOT explain was the
+        expired remainder — its collateral comes home and the order is terminal (an
+        `expired` row, so replay agrees)."""
+        for i, row in enumerate(rows):
+            self.book_fill_row(row, now, idx=i)
+        o = self.orders.pop(str(oid), None)
+        if o is not None and o.get("remaining", 0.0) > 1e-9:
+            self.cash.release_order(o.get("coid"))
+            self.ledger.write("expired", ticker=o["ticker"], order_id=oid,
+                              remaining=o.get("remaining"))
+        self.pending_404.pop(str(oid), None)
+        self.unknown.resolved(oid)
+        R.log("cancel_404_resolved", order_id=oid, verdict=verdict, fills=len(rows))
+        self.publisher.publish(now)
+
+    def assume_404_filled(self, oid, now, why):
+        """v1 §9.4a's terminal branch: book the WHOLE remainder as filled and freeze the
+        market (quoting AND recycling, §9.4b)."""
+        self.pending_404.pop(str(oid), None)
+        o = self.orders.get(str(oid))
+        if o is None:
+            return
+        self.book_fill(o["ticker"], o["side"], o.get("remaining", 0.0), o["price"], now,
+                       fill_id="assume404:%s" % oid, order_id=oid,
+                       closing=bool(o.get("fully_closing")))
+        self.orders.pop(str(oid), None)
+        self.frozen.add(o["ticker"])
+        self.ledger.write("assume_filled", ticker=o["ticker"], order_id=oid, why=why)
+        R.ntfy("assume_filled", "lip_v5 assume_filled %s (%s)" % (o["ticker"], why))
+        self.unknown.resolved(oid)
+
+    def pump_404(self, now):
+        """Advance every pending disambiguation.  Two clean zero reads 36 s apart ⇒ EXPIRED
+        (collateral home, order terminal); fills ⇒ booked; a read error ⇒ assume filled."""
+        for oid in sorted(self.pending_404):
+            e = self.pending_404.get(oid)
+            if e is None or float(now) < e["requery_at"]:
+                continue
+            ok, rows = self.fills_for_order(oid, now)
+            if ok is None:
+                continue                      # rate-refused; ask again next cycle
+            if ok is False:
+                self.assume_404_filled(oid, now, why="fills_requery_error")
+                continue
+            if rows:
+                self.book_404_rows(oid, rows, now, verdict="filled_on_requery")
+                continue
+            if not e["second_read"]:
+                e["requery_at"] = float(now) + C.FILLS_REQUERY_DELAY_S
+                e["second_read"] = True
+                continue
+            o = self.orders.pop(oid, None)
+            self.pending_404.pop(oid, None)
+            if o is not None:
+                self.cash.release_order(o.get("coid"))
+                self.ledger.write("expired", ticker=o["ticker"], order_id=oid,
+                                  remaining=o.get("remaining"))
+            self.unknown.resolved(oid)
+            R.log("cancel_404_resolved", order_id=oid, verdict="expired", fills=0)
+            self.publisher.publish(now)
 
     # =========================================================================================
     # THE CYCLE
@@ -421,7 +617,11 @@ class Maker(object):
         out = {"ts": now, "cycle": self.cycles}
 
         # --- clock / rate ---
-        self.bucket.step(now)
+        for alert in self.bucket.step(now):
+            # SF-2: the AIMD mirror's alarm — silent permanent yielding is
+            # indistinguishable from a dead bot.
+            R.ntfy(alert, "lip_v5 %s: bucket %.2f req/s (cap %.2f)"
+                   % (alert, self.bucket.b, self.bucket.cap_hz))
         if server_epoch is not None:                                          # B12
             skew = G.clock_skew_s(server_epoch, now)
             self.skew_ok = not G.clock_skew_alarming(skew)
@@ -431,6 +631,14 @@ class Maker(object):
 
         # --- metering: FIXED 1 Hz phase, independent of the quoting loop ---
         self.meter_tick(now, books or {})
+
+        # --- BLOCKER-1: the fills feedback half, BEFORE the day stop and the reconcile so
+        # a taker fill is in our books before anything judges the book against the wire ---
+        out["fills_booked"] = self.poll_fills_due(now)
+        self.pump_404(now)
+
+        # --- SF-4: the operator's venue readings (credits ritual → ratchet) ---
+        self.consume_readings(now)
 
         # --- day stop (B2) ---
         pnl = G.mark_to_market_pnl(self.positions, self.position_cost, yes_mids or {},
@@ -478,8 +686,17 @@ class Maker(object):
             # ration an infeasible plan first-come).
             budget = alloc.reserve_budget(
                 self.ceiling_usd - self.cash.inventory_basis, self.slot_cap_usd)
+            # SF-6: the turnover window is the slot's own PROGRAM PERIOD, set before the
+            # requoter consults the B9 guard.
+            for s in slots:
+                if s.program_end_ts is not None and s.window_h:
+                    self.refill.set_window(s.ticker, s.side,
+                                           s.program_end_ts - s.window_h * 3600.0)
+                if s.close_ts is not None:
+                    self.close_cache[s.ticker] = s.close_ts   # halted closing pass (SF-3)
             a, spent, res = alloc.allocate_with_rstar(slots, budget, caps=caps,
                                                       venue_caps=venue_caps, held=held)
+            self.last_alloc = dict(a)
             out["allocate"] = {"spent": spent, "r_star": res.r_star,
                                "converged": res.converged, "slots": len(slots),
                                "slot_cap_usd": self.slot_cap_usd,
@@ -489,6 +706,13 @@ class Maker(object):
             out["alloc"] = a
             out["requote"] = self.requote_pass(now, slots, a, res.r_star)
             out["accrued"] = self.integrate_accrual(now, slots, a)
+            # SF-1: the day stop's scale is OUR projected accrual — share × ρ/2 over the
+            # slots we actually fund (allocated or resting) — never the board's pools.  A
+            # board-pool projection saturated the stop at $150 against a ≤$60 launch
+            # deployment: a stop that could never trip.  Computed AFTER allocation, so it
+            # scales the NEXT cycle's stop with what is genuinely at risk.
+            self.projected_day_reward = self.project_day_reward(slots, a)
+            out["projected_day_reward"] = self.projected_day_reward
 
         # --- cash feed cadence (30 s heartbeat; every wire call publishes anyway) ---
         if self.publisher.due(now):
@@ -536,8 +760,8 @@ class Maker(object):
         self.last_meter_tick = sec
         obs = {}
         for o in self.orders.values():
-            if o.get("remaining", 0) <= 0:
-                continue
+            if o.get("remaining", 0) <= 0 or o.get("gone_404"):
+                continue                      # a 404'd order is NOT resting on the wire
             key = (o["ticker"], o["side"])
             best = (books.get(o["ticker"]) or {}).get(o["side"])
             # Both sides on the YES axis.  "Behind" points OPPOSITE ways per side: a bid is
@@ -572,6 +796,7 @@ class Maker(object):
         if not admitted:
             return None
         status, body = self.ex.positions()
+        self.note_http(status, now)                           # SF-2
         if status != 200:
             return None
         exch = {}
@@ -585,9 +810,11 @@ class Maker(object):
                 R.ntfy("assume_filled", "lip_v5 position divergence %s" % t)
                 self.frozen.add(t)
         sb, bal = self.ex.balance()
+        self.note_http(sb, now)                               # SF-2
         if sb == 200:
             self.cash.observe_balance(float(bal.get("balance", 0)) / 100.0, now)
         ss, srows = self.ex.settlements()
+        self.note_http(ss, now)                               # SF-2
         if ss == 200:
             for row in (srows.get("settlements") or []):
                 self.cash.settlement_row(row.get("ticker"), float(row.get("revenue", 0)) / 100.0)
@@ -620,10 +847,7 @@ class Maker(object):
         per_market = C.PER_MARKET_BUDGET_FRAC * self.ceiling_usd
         candidates = []
         for venue, ss in sorted(by_venue.items()):
-            floors = [RT.floor_q_usd(s.rho, s.S, s.p, s.hours_left)
-                      for s in ss if s.S > 0 and s.p > 0]
-            floors = [f for f in floors if f is not None]
-            floor_usd = min(floors) if floors else None
+            floor_usd = self.venue_floor_usd(ss)
             st = self.venues.get(venue)
             if st is None:
                 net0 = max(s.net_at(0, C.FLOOR_RATE_PER_H) for s in ss)
@@ -664,16 +888,63 @@ class Maker(object):
             caps[venue] = st.cap_usd(per_market, self.ceiling_usd) if st else 0.0
         return caps
 
-    def venue_reading(self, venue, reading_usd, projection_usd, now, settlement_day=None):
+    def venue_floor_usd(self, venue_slots):
+        """The venue's probe floor in dollars — with BLOCKER-2's RESCUE_TARGET exemption.
+
+        `floor_q` normally sizes against ENTRY_FLOOR over the REMAINING window, so late in a
+        program the floor stops fitting and the venue reads UNPROBEABLE — the runway death.
+        `runway_ok` (the slot-table twin) already carries the exemption: with accrual A > 0
+        at stake, the reachability target is the forfeit CLIFF, not the entry floor.  The
+        MIRROR was applied to one twin and not the other, so venue admission zeroed the cap
+        at exactly the moment the cliff rescue needed room to fire (reviewer's P3).  Here:
+        when a slot's program has A > 0 and the cliff is REACHABLE at the ρ/2 ceiling, the
+        floor becomes the top-up itself — `RESCUE_TARGET − A` — which is the smallest probe
+        that still measures (it can pay: the stranded A makes it pay).  A venue whose cliff
+        is UNREACHABLE gets no exemption: dead accrual buys no cap room (the abandon end).
+
+        The exemption is a FALLBACK, never a discount: while the ENTRY floor still fits
+        under the caps, it stands — a probe sized only to clear $1.10 projects below
+        ENTRY_FLOOR and its reading would be OUT_OF_REACH, i.e. a cheaper probe that
+        cannot verify.  Only when the entry floor has died (unreachable pool, or no longer
+        fitting under the slot/market caps) does the rescue floor take over the runway.
+        """
+        per_market = C.PER_MARKET_BUDGET_FRAC * self.ceiling_usd
+        fits = min(self.slot_cap_usd, per_market)
+        floors = []
+        for s in venue_slots:
+            if s.S <= 0 or s.p <= 0:
+                continue
+            f = RT.floor_q_usd(s.rho, s.S, s.p, s.hours_left)
+            if f is None or f > fits + 1e-9:
+                A = float(s.accrued)
+                if A > 0 and A + (s.rho / 2.0) * s.hours_left \
+                        >= C.RESCUE_TARGET_USD - 1e-12:
+                    f = RT.floor_q_usd(s.rho, s.S, s.p, s.hours_left,
+                                       entry_floor=max(0.0, C.RESCUE_TARGET_USD - A))
+            if f is not None:
+                floors.append(f)
+        return min(floors) if floors else None
+
+    def venue_reading(self, venue, reading_usd, projection_usd, now, settlement_day=None,
+                      src=None, line_no=None):
         """§1.4's verification input (operator popover_estimate or paid credit).  Moves the
-        rung, writes the `ratchet` money row, pages on stand-down.  The SEAM for the credits
-        ritual — the ladder is inert until a human (or a later feed) calls this."""
+        rung, writes the `ratchet` money row, pages on stand-down.  Fed by the SF-4 watched
+        file (`consume_readings`) or called directly.  The row carries `src`/`line_no` (so
+        a restart never re-applies a consumed reading) and `rung0_cap` (so replay can
+        rebuild a climbed venue's cap, not just its rung)."""
         st = self.venues.get(venue)
         if st is None:
-            return None
+            # A reading about a venue not currently admitted still moves its ladder —
+            # verification evidence outlives admission (stand-downs and revives depend on
+            # it).  cap_usd stays 0 until admission funds it.
+            st = RT.VenueState(venue)
+            self.venues[venue] = st
         verdict, ratio, detail = RT.apply_reading(st, reading_usd, projection_usd, ts=now,
                                                   settlement_day=settlement_day)
-        self.ledger.write("ratchet", venue=venue, verdict=verdict, ratio=ratio, **detail)
+        fields = dict(detail)
+        fields.update(venue=venue, verdict=verdict, ratio=ratio, src=src, line_no=line_no,
+                      rung0_cap=st.rung0_cap_usd, stood_down=st.stood_down)
+        self.ledger.write("ratchet", **fields)
         if verdict == RT.OUT_OF_REACH:
             self.ledger.write("venue_out_of_reach", venue=venue,
                               projection=projection_usd)
@@ -681,6 +952,66 @@ class Maker(object):
         if st.stood_down:
             R.ntfy("venue_stand_down", "lip_v5 venue stand-down: %s" % venue)
         return verdict
+
+    def consume_readings(self, now):
+        """SF-4 — the operator's entry point for venue readings: a WATCHED FILE
+        (`v5_readings.jsonl`, mirror of v5_go.json's hand-written pattern).  The credits
+        ritual appends rows `{"venue","reading_usd","projection_usd","settlement_day"?,
+        "program_id"?,"paid"?}`; the live process consumes each row exactly once.
+
+        Restart idempotence: every applied reading writes a `ratchet` ledger row carrying
+        `src="readings_file"` + `line_no`; recovery replays those rows, so `readings_line`
+        resumes past everything already applied and a restart can never double-move the
+        ladder.  MIRROR (a row applied twice ↔ a row never applied): line accounting guards
+        the first; consuming EVERY cycle (a stat() when unchanged) bounds the second at one
+        cycle of latency.  A malformed row is logged and SKIPPED but still counted — a bad
+        line must not wedge the file forever.
+        """
+        path = os.path.join(self.data_dir, C.READINGS_NAME)
+        try:
+            stt = os.stat(path)
+        except OSError:
+            return 0
+        key = (stt.st_mtime, stt.st_size)
+        if key == self._readings_stat:
+            return 0
+        self._readings_stat = key
+        rows = R.read_jsonl(path)
+        if len(rows) <= self.readings_line:
+            return 0
+        applied = 0
+        for i in range(self.readings_line, len(rows)):
+            row, line_no = rows[i], i + 1
+            try:
+                venue = str(row["venue"])
+                reading = float(row["reading_usd"])
+                projection = float(row["projection_usd"])
+            except (KeyError, TypeError, ValueError):
+                R.log("reading_bad_row", line_no=line_no)
+                continue
+            self.venue_reading(venue, reading, projection, now,
+                               settlement_day=row.get("settlement_day"),
+                               src="readings_file", line_no=line_no)
+            if row.get("paid"):
+                self.credit_paid(row.get("program_id"), reading, now)
+            applied += 1
+        self.readings_line = len(rows)
+        return applied
+
+    def credit_paid(self, program_id, paid_usd, now):
+        """N3 — a PAID credit retires the accrued-unpaid claim it satisfies: the cash
+        feed's positive band shrinks (`reward_paid`) and the program's accrued memory is
+        drawn down and re-persisted, so replay and the live book agree that this accrual
+        has become cash."""
+        paid = max(0.0, float(paid_usd))
+        self.cash.reward_paid(paid)
+        if program_id is not None and program_id in self.accrued:
+            newv = round(max(0.0, self.accrued[program_id] - paid), 6)
+            self.accrued[program_id] = newv
+            self.ledger.write("accrual", program_id=str(program_id), accrued=newv)
+            self._accrual_written[program_id] = newv
+        R.log("credit_paid", program_id=program_id, paid=paid)
+        return paid
 
     # =========================================================================================
     # THE SHED PATH (charter A): triage verdicts + inventory whose venue fails (★) ongoing
@@ -784,7 +1115,9 @@ class Maker(object):
         slot_by_key = {s.key: s for s in slots}
         live_by_slot = {}
         for oid, o in sorted(self.orders.items()):
-            if o.get("remaining", 0) > 0:
+            # gone_404 orders are NOT on the wire (the exchange said so) — counting them as
+            # presence would suppress the very replenish their fill should trigger.
+            if o.get("remaining", 0) > 0 and not o.get("gone_404"):
                 live_by_slot.setdefault((o["ticker"], o["side"]), []).append(o)
 
         for s in sorted(slots, key=lambda x: (x.ticker, x.side)):
@@ -811,9 +1144,20 @@ class Maker(object):
             q = max(q_alloc, shed_q)
             if q <= 0:
                 if cur is not None:
+                    if s.S <= 0 and float(s.cum_size) >= float(s.target_size):
+                        # SF-5 consequence, spec §4.5: S here is the RIVAL score, and zero
+                        # rivals means WE are the qualifying side — ALLOCATE is right about
+                        # size and wrong about entry.  Cancelling would un-qualify the
+                        # snapshot we are being paid to create; the resting minimum stays.
+                        R.log("sole_qualifier_hold", ticker=s.ticker, side=s.side,
+                              remaining=cur["remaining"])
+                        stats["skipped"] += 1
+                        self.slot_examined[key] = now
+                        continue
                     ok, _ = self.cancel(cur["order_id"], now, lane="requote_cancel")
                     if ok:
                         stats["cancelled"] += 1
+                self.slot_examined[key] = now
                 continue
 
             # Price, on the YES axis (order bodies speak YES; `s.p` is the SAME-SIDE best in
@@ -855,13 +1199,19 @@ class Maker(object):
             our_c = int(round(cur["price"] * 100)) if cur else None
             best_c = int(round(price * 100))
             qualifies_now = float(s.cum_size) >= float(s.target_size)
+            # §4.3(e), PER SLOT: how long since THIS slot was last examined with fresh data.
+            # First sight counts as examined now (a fresh slot needs no resync); the trigger
+            # fires only when a slot's examination genuinely lapsed — a classify gap, a
+            # stalled loop — and forces the quote to be re-proven against the book.
+            since_resync = now - self.slot_examined.get(key, now)
             trig = Q.requote_triggers(
                 our_c, best_c, cur["remaining"] if cur else 0.0, q,
                 s.S, self.S_ref.get(key, s.S), qualifies_now,
                 self.qual_ref.get(key, qualifies_now),
-                (now - cur["placed_ts"]) if cur else 0.0, now - self.last_resync)
+                (now - cur["placed_ts"]) if cur else 0.0, since_resync)
             self.S_ref[key] = s.S
             self.qual_ref[key] = qualifies_now
+            self.slot_examined[key] = now
             if cur is None or trig:
                 placed = self._requote_slot(key, s.ticker, s.side, price, q, exp, now,
                                             fully_closing, shed_q, cur)
@@ -878,7 +1228,19 @@ class Maker(object):
         for key in sorted(set(self.shed_target) - slot_keys):
             R.log("shed_unpriced", ticker=key[0], side=key[1],
                   target=self.shed_target[key])
-        self.last_resync = now
+        # BLOCKER-3's other half: an ORDER whose slot vanished from the table is examined
+        # by nobody above.  Surface every such order past the resync deadline — the runner's
+        # poll set always contains ordered tickers, so the fix is a fresh classify, and this
+        # log is the tripwire if that contract ever breaks.
+        for key, orders_ in sorted(live_by_slot.items()):
+            if key in slot_keys:
+                continue
+            last = self.slot_examined.get(key, min(o.get("placed_ts", now)
+                                                   for o in orders_))
+            if now - last >= C.SAFETY_RESYNC_S:
+                self.slot_examined[key] = now                 # log once per lapse, not 1 Hz
+                R.log("resync_overdue", ticker=key[0], side=key[1],
+                      since_s=round(now - last, 1))
         return stats
 
     def _requote_slot(self, key, ticker, side, price, q, exp, now, fully_closing, shed_q,
@@ -961,14 +1323,47 @@ class Maker(object):
                 held[s.key] = -net
         return held
 
-    def integrate_accrual(self, now, slots, alloc_map,
+    def resting_by_slot(self):
+        """Confirmed presence ON THE WIRE per (ticker, side): live orders only — never
+        gone_404 ghosts, never allocation intent (BLOCKER-4)."""
+        resting = {}
+        for o in self.orders.values():
+            if o.get("remaining", 0) > 0 and not o.get("gone_404"):
+                k = (o["ticker"], o["side"])
+                resting[k] = resting.get(k, 0.0) + float(o["remaining"])
+        return resting
+
+    def project_day_reward(self, slots, alloc_map):
+        """SF-1 — OUR projected day accrual: `share(q,S) × ρ/2 × min(24h, hours_left)` over
+        slots we fund (q = the larger of resting and allocated — both are commitments the
+        day's P&L rides on).  S is already the RIVAL score (SF-5), so `share` is the
+        filing's own share."""
+        resting = self.resting_by_slot()
+        total = 0.0
+        for s in slots:
+            q = max(float(alloc_map.get(s.key, 0)), resting.get(s.key, 0.0))
+            if q <= 0:
+                continue
+            total += alloc.our_share(q, s.S) * (s.rho / 2.0) * \
+                min(24.0, max(0.0, s.hours_left))
+        return total
+
+    def integrate_accrual(self, now, slots, alloc_map=None,
                           write_s=C.ACCRUAL_WRITE_S):
-        """SECOND AMENDMENT (b): integrate the MODEL accrual over the presence we actually
-        allocated — `share(q,S) × ρ/2 × dt` per funded slot, per program (v4's shape: never
-        rate × elapsed_window, which credits hours before we started).  Feeds the cliff
-        decision (`Slot.accrued` next cycle), widens the cash feed's positive side
-        (`rewards_accrued_unpaid` — over-stating is the safe direction, §5.2), and persists
-        as `accrual` money rows so a crash loses ≤ ACCRUAL_WRITE_S of memory.
+        """SECOND AMENDMENT (b), corrected by BLOCKER-4: integrate the MODEL accrual ONLY
+        over presence actually RESTING ON THE WIRE (confirmed orders) — `share(q,S) × ρ/2 ×
+        dt` per program.  Never over allocation: the scorer samples the BOOK, and an
+        allocation the requoter could not land (rate-refused, capital-refused, shadow) is
+        presence nobody held — accruing it inflates the cliff's A with money the credits
+        ritual will DISAGREE, walking the ratchet down on our own bookkeeping.  Feeds the
+        cliff decision (`Slot.accrued` next cycle), widens the cash feed's positive side
+        (over-stating is the safe direction ONLY about timing, §5.2 — not about phantom
+        presence), and persists as `accrual` money rows (≤ ACCRUAL_WRITE_S crash loss).
+
+        SHADOW writes ZERO accrual money rows (BLOCKER-4): shadow's place() refuses before
+        the wire, so nothing rests and the integral is zero by construction — and the guard
+        below makes it structural, so a later shadow-mode change cannot contaminate the
+        live replay at G3.
 
         dt is capped at 5 s: a stalled loop must not mint accrual for presence nobody held.
         MIRROR (accrual over-counted ↔ under-counted): over-counting inflates only the
@@ -976,13 +1371,16 @@ class Maker(object):
         DISAGREES a venue whose credits undershoot the model; under-counting forfeits
         rescues, today's tape.  The ratchet is the referee either way.
         """
+        if self.shadow:
+            return 0.0
         dt_h = 0.0
         if self.last_accrual_ts is not None:
             dt_h = min(max(0.0, float(now) - self.last_accrual_ts), 5.0) / 3600.0
         self.last_accrual_ts = float(now)
+        resting = self.resting_by_slot()
         delta_total = 0.0
         for s in slots:
-            q = alloc_map.get(s.key, 0)
+            q = resting.get(s.key, 0.0)
             if q <= 0 or dt_h <= 0:
                 continue
             d_acc = alloc.reward_rate(s.rho, q, s.S) * dt_h
@@ -1004,6 +1402,63 @@ class Maker(object):
         """Cancel-all on the EXIT lane — never refused, never counted against the cancel share."""
         for oid in list(self.orders):
             self.cancel(oid, now, lane="exit_cancel")
+
+    def halted_closing_pass(self, now):
+        """SF-3 — while HALTED, a closing-only requote pass so the book can LEAVE.
+
+        The halt/day-stop exemption in `place_allowed` admits only `fully_closing` orders;
+        this pass posts exactly those: one maker shed per held market, priced at the
+        opposing best (never crossing — G6 stays off), re-posted each halted-idle pass while
+        the position remains.  Without it a halted book holds its inventory to settlement —
+        the day stop's flatten cancels ORDERS but cannot exit POSITIONS, and the normal shed
+        path is dead because a halted iteration never reaches the requoter.
+
+        MIRROR (a halted book that cannot leave ↔ a halted book that keeps trading): the
+        fully_closing flag is the second end's guard — this pass can only REDUCE exposure,
+        and its book reads run on the book_poll lane at the halted-idle cadence (≤ one read
+        per held market per 30 s).
+        """
+        placed = 0
+        for ticker in sorted(self.positions):
+            net = self.net_position(ticker)
+            if abs(net) < 1.0 or ticker in self.frozen:
+                continue                      # dust cannot trade; frozen covers recycling
+            held = Q.held_leg_of(net)
+            side = Q.shed_side(held)
+            live = [o for o in self.orders.values()
+                    if o["ticker"] == ticker and o["side"] == side
+                    and o.get("remaining", 0) > 0 and not o.get("gone_404")]
+            if live:
+                continue                      # a shed already rests; let it work
+            admitted, _ = self.bucket.admit("book_poll", now)
+            if not admitted:
+                break
+            status, body = self.ex.book(ticker)
+            self.note_http(status, now)
+            if status != 200:
+                continue
+            yes_lv, no_lv = scan._book_levels(body)
+            yes_bid = max(p for p, _ in yes_lv) / 100.0 if yes_lv else None
+            no_bid = max(p for p, _ in no_lv) / 100.0 if no_lv else None
+            yes_ask = (1.0 - no_bid) if no_bid is not None else None
+            px = Q.shed_price(held, yes_bid, yes_ask)
+            if px is None:
+                R.log("shed_unpriced", ticker=ticker, side=side,
+                      why="halted_pass_crossed_or_one_sided")
+                continue
+            close = self.close_cache.get(ticker)
+            exp = int(close - C.CLOSE_MARGIN_S) if close \
+                else int(now + C.HALTED_SHED_TTL_S)
+            if exp <= now:
+                continue
+            ok, _reason, _ = self.place(ticker, side, round(px, 4), Q.shed_qty(net), exp,
+                                        now, fully_closing=True,
+                                        available_cash_usd=self._available_cash())
+            if ok:
+                placed += 1
+        if placed:
+            R.log("halted_closing_pass", placed=placed)
+        return placed
 
     # =========================================================================================
     # SHUTDOWN
@@ -1032,6 +1487,13 @@ class Maker(object):
         R.log("shutdown", reason=reason, rollback_clean=self.rollback.clean)
         try:
             self.flatten(now)
+            # A cancel that 404'd during the flatten cannot wait FILLS_REQUERY_DELAY_S in a
+            # dying process.  v1 §9.4a's conservative terminal applies: assume fully
+            # filled + freeze, so the handback covers the inventory we MIGHT hold rather
+            # than omitting inventory we DO — over-stating costs capacity, under-stating is
+            # the naked-short direction.
+            for oid in sorted(list(self.pending_404)):
+                self.assume_404_filled(oid, now, why="shutdown_unresolved_404")
         except Exception as exc:                              # noqa: BLE001 - SF-4
             R.log("shutdown_flatten_error", err="%s: %s" % (type(exc).__name__, exc))
         held = []

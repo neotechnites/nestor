@@ -608,6 +608,26 @@ LEDGER_KINDS = V1_LEDGER_KINDS + V5_LEDGER_KINDS
 PRESENCE_KIND = "presence"                   # spec §6.2 N2 — its OWN file, never the ledger
 FILLS_REQUERY_DELAY_S = 36                   # v1 §9.4a — 3× the ~12 s worst observed lag
 CRASH_GAP_LOOKBACK_S = 60                    # v1 §9.4(4)
+# FINAL FIX ROUND (BLOCKER-1): the live fills poll, on the verify lane.  Derivation of 15 s:
+# half the MINIMUM RESTING LIFE (30 s) — the Nyquist bound on the shortest presence
+# commitment, so a fill is OBSERVED within one half-life and the replenish decision happens
+# inside the same resting period; also 1/4 of the 60 s drift-measurement horizon, so the
+# d-sample's mark can still be read near the fill.  Cost: 1/15 req/s = 1.7% of the 4 Hz
+# budget.  MIRROR (polling too fast ↔ too slow): fast burns the shared budget the residual
+# doctrine protects; slow is the reviewer's proven failure — 630 cycles, 0 fills calls, a
+# taker-filled market frozen as a position_divergence at t+601 s.
+FILLS_POLL_S = 15.0
+# SF-4: the operator's venue-reading entry point — a WATCHED FILE, mirror of v5_go.json's
+# hand-written pattern: the credits ritual appends rows, the live process consumes them.
+# Rows: {"venue","reading_usd","projection_usd","settlement_day"?,"program_id"?,"paid"?}.
+READINGS_NAME = "v5_readings.jsonl"
+READINGS_PATH = os.path.join(DATA_DIR, READINGS_NAME)
+# SF-3: the halted closing pass posts fully-closing sheds so a halted book can LEAVE.  When
+# the market's close is UNKNOWN (halt before the classify sweep learned it) the expiration
+# backstop cannot discharge its real job, so the order's life is bounded by the halt's own
+# human-review scale instead: one hour, re-posted each halted-idle pass while the position
+# remains.  UNDERIVED as a distribution; derived as "bounded, and long enough to rest".
+HALTED_SHED_TTL_S = 3600.0
 
 # =============================================================================================
 # ALERTS  (spec §11) — every one of these is detect-and-page, never silent.

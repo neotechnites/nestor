@@ -272,15 +272,44 @@ class RefillTracker(object):
     of those buckets.  T̂'s cadence cannot bound a 1 Hz failure; this can.  Beyond the cap the
     slot is a FLOW MAGNET, not a maker, which is a statement about the venue and not about our
     sizing.
+
+    SF-6 (final fix round): the WINDOW is the slot's own PROGRAM PERIOD, not the process
+    lifetime.  The prior form reset only on restart — wrong BOTH directions: a long-lived
+    process carried yesterday's turnovers into today's period (refusing legitimate refills),
+    and a restart amnestied a flow magnet mid-period.  `set_window` keys the count to the
+    program's [start, end); fills carry their timestamp so a restart REBUILDS the current
+    period's count from ledger replay and DROPS prior periods' — surviving restart in both
+    directions.  MIRROR (window too long ↔ too short): too long is the process-lifetime
+    defect; too short (per-cycle) would never bind at all — the period is the one window the
+    turnover bound's own derivation names (v1 §8.7 "in one window").
     """
 
     def __init__(self, turnovers=C.REFILL_CAP_TURNOVERS):
         self.turnovers = int(turnovers)
         self.filled = {}                                      # (ticker, side) -> contracts
+        self.events = {}                                      # key -> [(ts_or_None, n)]
+        self.window_start = {}                                # key -> program period start ts
 
-    def note_fill(self, ticker, side, contracts):
+    def note_fill(self, ticker, side, contracts, ts=None):
+        """`ts=None` (tests/manual) counts in EVERY window; live fills and replayed
+        `fill_obs` rows pass their timestamp so period boundaries can drop them."""
         k = (ticker, side)
-        self.filled[k] = self.filled.get(k, 0.0) + abs(float(contracts))
+        n = abs(float(contracts))
+        self.filled[k] = self.filled.get(k, 0.0) + n
+        self.events.setdefault(k, []).append((None if ts is None else float(ts), n))
+
+    def set_window(self, ticker, side, start_ts):
+        """Called each cycle with the slot's program-period start.  On a CHANGE (first
+        sighting, or a new period), the count is rebuilt from timestamped events at or after
+        the new start — untimed (manual) entries always survive."""
+        k = (ticker, side)
+        start = float(start_ts)
+        if self.window_start.get(k) == start:
+            return
+        self.window_start[k] = start
+        ev = [(t, n) for (t, n) in self.events.get(k, []) if t is None or t >= start]
+        self.events[k] = ev
+        self.filled[k] = sum(n for _, n in ev)
 
     def cap_for(self, price, n_cap_fn):
         return self.turnovers * n_cap_fn(price)
@@ -290,6 +319,7 @@ class RefillTracker(object):
 
     def reset_window(self):
         self.filled = {}
+        self.events = {}
 
 
 # =============================================================================================

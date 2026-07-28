@@ -115,6 +115,8 @@ class Scanner(object):
                 R.log("scan_deferred", pages=pages)
                 break
             status, body = ex.programs(cursor)
+            if status == 429:
+                bucket.on_429(now)            # SF-2: a 429 yields, whoever it belonged to
             if status != 200:
                 R.log("scan_failed", status=status)
                 break
@@ -210,6 +212,8 @@ class Classifier:
         if not ok:
             return
         status, body = ex.market(ticker)
+        if status == 429:
+            bucket.on_429(now)                # SF-2
         if status != 200:
             return                            # transient; retried next sweep
         mkt = (body or {}).get("market") or body or {}
@@ -236,6 +240,8 @@ class Classifier:
         if not ok:
             return
         status, body = ex.trades(ticker, min_ts=float(now) - lookback_days * 86400.0)
+        if status == 429:
+            bucket.on_429(now)                # SF-2
         if status != 200:
             return                            # unknown, retried; p6_ok admits meanwhile
         traded = bool((body or {}).get("trades"))
@@ -262,6 +268,8 @@ class Classifier:
                 if not ok:
                     break                     # out of budget: the rest waits for the next pass
                 status, body = ex.book(ticker)
+                if status == 429:
+                    bucket.on_429(now)        # SF-2
                 if status != 200:
                     continue
             self.classify_one(ticker, body, program, now)
@@ -342,8 +350,30 @@ def preposition_ok(hours_to_start, lead_h=C.PREPOSITION_LEAD_H):
     return float(hours_to_start) <= float(lead_h) + 1e-12
 
 
+def rival_S(S, ref_p, our_orders, df=C.DISCOUNT_FACTOR_DEFAULT):
+    """SF-5 — the spec defines S as the RIVAL qualifying score, and the public book (which
+    the classifier scored) REFLECTS our own resting orders.  Subtract our contribution:
+    `qty × DF^(ref − our_price)` in cents.  Two honest notes on the approximation, both
+    conservative:
+      * the classifier scores in LEVELS mode (DF^level_index); cents-distance ≥ level index,
+        so the cents form UNDERSTATES our contribution and leaves S slightly HIGH — the
+        direction that under-allocates, never over-allocates.  At our usual price (the best
+        itself) the two coincide exactly.
+      * clamped at 0: when we ARE the whole qualifying side, S_rival = 0 and ALLOCATE
+        correctly refuses to size up into our own book (spec §4.5) — the requoter's
+        sole-qualifier hold keeps the minimum presence instead.
+    """
+    if not our_orders or ref_p is None:
+        return float(S)
+    ref_c = int(round(float(ref_p) * 100))
+    own = 0.0
+    for px_c, qty in our_orders:
+        own += float(qty) * (float(df) ** max(0, ref_c - int(px_c)))
+    return max(0.0, float(S) - own)
+
+
 def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen=None,
-                l_shed=None, prior_t_hat=None, p6=None, accrued=None):
+                l_shed=None, prior_t_hat=None, p6=None, accrued=None, own_orders=None):
     """The slot table `engine.cycle()` consumes.
 
     Every exclusion that can be decided WITHOUT a request is applied here, so the rate budget is
@@ -393,6 +423,8 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             if not sd["legal"] or p is None or p <= 0:
                 continue
             key = (ticker, side)
+            # SF-5: S is the RIVAL score — the classified book contains our own orders.
+            S_riv = rival_S(sd["S"], p, (own_orders or {}).get(key))
             rows = [r for r in presence_rows
                     if (r.get("ticker"), r.get("side")) == key]
             t = tape.get(key, {})
@@ -425,7 +457,7 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                 if side == "ask" and yes_bid_c is not None and lg_px_c <= yes_bid_c:
                     land_grab = 0
             slots.append(alloc.Slot(
-                ticker, side, rho=prog["rho"], S=sd["S"], p=p, venue=rec["series"],
+                ticker, side, rho=prog["rho"], S=S_riv, p=p, venue=rec["series"],
                 pinned=rec["pinned"], legal_price_exists=sd["legal"],
                 phi=phi, d=d, l_eff=l_eff, t_hat=t_hat,
                 program_id=prog["program_id"], window_h=prog["window_h"],

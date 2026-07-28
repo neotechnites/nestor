@@ -243,6 +243,13 @@ class CashState(object):
     def accrue_reward(self, usd):
         self.rewards_accrued_unpaid += float(usd)
 
+    def reward_paid(self, usd):
+        """N3 — MIRROR (accrue ↔ pay): a credit that LANDS retires the accrued-unpaid claim
+        it satisfies, or the positive band widens forever and every later credit looks
+        smaller than the pending it should extinguish.  Floored at zero: a credit larger
+        than the claim is the exchange's statement, not a debt of ours."""
+        self.rewards_accrued_unpaid = max(0.0, self.rewards_accrued_unpaid - float(usd))
+
     def pay_fee(self, usd):
         self.fees_paid += float(usd)
 

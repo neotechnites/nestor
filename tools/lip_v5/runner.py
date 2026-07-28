@@ -23,7 +23,7 @@ Three properties this file exists to hold, each of which a naive loop loses:
 import time
 
 from . import config as C, cutover, engine, guards as G, ledger as LG
-from . import money as M, runtime as R, scan
+from . import money as M, ratchet as RT, ratelimit as RL, runtime as R, scan
 
 
 class Runner(object):
@@ -37,6 +37,11 @@ class Runner(object):
         self.iterations = 0
         self.last_cycle_ts = None
         self.started = False
+        # --- BLOCKER-3: the book-poll lane ---
+        self.book_polled = {}                # ticker -> ts of last successful poll
+        self.degrade_steps = ()              # last applied §3.4 ladder (logged on change)
+        self.coverage_bad_since = None       # spec §11: coverage <90% for 10 min pages
+        self.coverage_alerted = False
 
     # =========================================================================================
     # INIT
@@ -115,6 +120,34 @@ class Runner(object):
         for r in rows:
             if (r.get("k") or r.get("kind")) == "accrual" and r.get("program_id"):
                 self.m.accrued[r["program_id"]] = float(r.get("accrued") or 0.0)
+        for r in rows:
+            kind = r.get("k") or r.get("kind")
+            # SF-6: the turnover count survives restart — replayed fills carry their
+            # timestamps, and the first `set_window` of the new process drops the ones from
+            # prior program periods.  Without this a restart amnesties a flow magnet.
+            if kind == "fill_obs":
+                self.m.refill.note_fill(r.get("ticker"), r.get("side"),
+                                        float(r.get("count") or 0.0),
+                                        ts=float(r.get("ts") or 0.0))
+            # SF-4/ratchet: verification evidence is MONEY state and survives restart —
+            # rung, verified-ness, stand-down and the rung0 cap come back from the
+            # `ratchet` rows, and `readings_line` resumes past consumed file rows so no
+            # reading is ever applied twice.
+            elif kind == "ratchet" and r.get("venue"):
+                v = r["venue"]
+                st = self.m.venues.get(v)
+                if st is None:
+                    st = RT.VenueState(v)
+                    self.m.venues[v] = st
+                st.rung = int(r.get("rung_after", st.rung) or 0)
+                if r.get("verdict") == RT.VERIFY:
+                    st.verified = True
+                if r.get("stood_down") or r.get("stand_down"):
+                    st.stood_down = True
+                if r.get("rung0_cap"):
+                    st.rung0_cap_usd = float(r["rung0_cap"])
+                if r.get("src") == "readings_file" and r.get("line_no"):
+                    self.m.readings_line = max(self.m.readings_line, int(r["line_no"]))
 
         self.recover_orders(rows, now)
 
@@ -186,6 +219,7 @@ class Runner(object):
         if not admitted:
             return
         status, body = self.m.ex.orders()
+        self.m.note_http(status, now)                         # SF-2
         if status != 200:
             R.log("recovery_sweep_failed", http=status)
             return
@@ -240,6 +274,9 @@ class Runner(object):
                     self.m.halt_flatten_done = True
                 if self.m.publisher.due(now):
                     self.m.publisher.publish(now)
+                # SF-3: the closing-only pass — a halted book must still be able to LEAVE.
+                # Runs at the halted-idle cadence, posts only fully_closing sheds.
+                self.m.halted_closing_pass(now)
             except Exception as exc:                          # noqa: BLE001 - SF-3: no crash
                 R.log("halted_idle_error", err="%s: %s" % (type(exc).__name__, exc))
             R.log("iteration_skipped_halted", reason=self.m.halt.reason)
@@ -248,6 +285,12 @@ class Runner(object):
         # (2) scan → classify → slots.  Each is cadence-gated and rate-laned inside.
         programs = self.scanner.scan(self.m.ex, self.m.bucket, now)
         self.classifier.sweep(self.m.ex, self.m.bucket, programs, now, books=books)
+
+        # (2b) BLOCKER-3: the book_poll lane — held/ordered markets ALWAYS, best-ranked
+        # rest up to breadth, refreshing the classification so the requoter's price
+        # reference, trigger (a), the day-stop mids and the meter's ticks_behind all read
+        # a ≤1 s book instead of a ≤15 min one.
+        self.book_poll_pass(now, programs)
 
         # (2a) charter B: books/yes_mids for the day stop and the meter come from the
         # classify table (the exchange's own statements), with any WS-fed entries the caller
@@ -270,10 +313,11 @@ class Runner(object):
         self.slots = scan.build_slots(programs, self.classifier, now,
                                       presence_rows=seg, frozen=self.m.frozen,
                                       l_shed=l_shed, p6=self.classifier.p6_ok,
-                                      accrued=self.m.accrued)
-        self.m.projected_day_reward = sum(
-            (s.rho / 2.0) * min(24.0, s.hours_left) for s in self.slots) or \
-            self.m.projected_day_reward
+                                      accrued=self.m.accrued,
+                                      own_orders=self.own_orders())
+        # SF-1: `projected_day_reward` is OURS (share × ρ/2 over funded slots), computed by
+        # the cycle from its own allocation — the board-pool sum that used to live here
+        # saturated the day stop at $150 against a ≤$60 deployment: untrippable.
 
         # (3) the cycle
         out = self.m.cycle(now, slots=self.slots, books=books, yes_mids=yes_mids,
@@ -283,6 +327,107 @@ class Runner(object):
         out["slots"] = len(self.slots)
         self.last_cycle_ts = now
         return out
+
+    def own_orders(self):
+        """SF-5's input: our live resting orders per slot key, prices on the SLOT's axis
+        (a bid slot prices in YES cents; an ask slot in NO cents = 100 − YES)."""
+        own = {}
+        for o in self.m.orders.values():
+            if o.get("remaining", 0) <= 0 or o.get("gone_404"):
+                continue
+            if o["side"] == "bid":
+                key, px_c = (o["ticker"], "bid"), int(round(o["price"] * 100))
+            else:
+                key, px_c = (o["ticker"], "ask"), int(round((1.0 - o["price"]) * 100))
+            own.setdefault(key, []).append((px_c, float(o["remaining"])))
+        return own
+
+    def book_poll_pass(self, now, programs):
+        """BLOCKER-3 — the book_poll lane.
+
+        THE SET: every market we hold or rest an order in, ALWAYS (the inventory-slot
+        guarantee — a de-polled held market is never requoted, never shed, and its fills
+        arrive as surprises), plus the best-ranked rest up to `MAX_REST_MARKETS`.
+
+        THE CADENCE, derived with the §3.4 ladder: demand = classify (amortized) + fills
+        (1/15) + recon (1/600) + one poll per market at BOOK_POLL_HZ.  When demand exceeds
+        the bucket's CURRENT AIMD budget, `degrade_plan` applies the spec's ladder — held
+        markets carry net = +inf so breadth-shedding (step 3) drops them LAST, and step 4
+        halves the cadence rather than dropping the held set.  Derivation for the WS
+        question (charter: "decide with a derivation"): the 1 Hz contract for the HELD set
+        holds whenever `held ≤ B − fixed ≈ 3.7` markets at full budget; beyond that the
+        ladder degrades non-held breadth first, then cadence to 0.5 Hz.  WS's value is
+        BREADTH (6 → 32), not the held set's cadence — so ws_feed stays vendored+gated and
+        un-wired this round, and `MAX_REST_MARKETS = 6` is the binding breadth.
+
+        MIRROR (polling a market we left ↔ never polling one we hold): the always-set is
+        the second end's guard; the first costs one deferrable request and is shed by the
+        ladder.  Coverage below 90% for 10 min pages `coverage_low` (spec §11).
+        """
+        m = self.m
+        held = {t for t, p in m.positions.items()
+                if abs(p.get("yes", 0.0)) + abs(p.get("no", 0.0)) > 0}
+        ordered = {o["ticker"] for o in m.orders.values()
+                   if o.get("remaining", 0) > 0 and not o.get("gone_404")}
+        always = held | ordered
+        tickers = scan.poll_set(self.slots, always, connected=False)
+        if not tickers:
+            return {"polled": 0, "due": 0}
+        net_by = {}
+        for s in self.slots:
+            net_by[s.ticker] = max(net_by.get(s.ticker, float("-inf")),
+                                   s.net_at(0, C.FLOOR_RATE_PER_H))
+        markets = [{"ticker": t,
+                    "net": float("inf") if t in always else net_by.get(t, 0.0),
+                    "ws_fresh_gated": False} for t in tickers]
+        classify_amortized = max(1, len(self.classifier.table)) / C.CLASSIFY_REFRESH_S
+        demand = RL.Demand(markets, classify_hz=classify_amortized,
+                           book_poll_hz=C.BOOK_POLL_HZ, recon_s=C.RECON_POSITIONS_S,
+                           fixed_hz=1.0 / C.FILLS_POLL_S)
+        steps, demand = RL.degrade_plan(demand, m.bucket.b)
+        if tuple(steps) != self.degrade_steps:
+            self.degrade_steps = tuple(steps)
+            R.log("degrade_plan", steps=list(steps), dropped=list(demand.dropped),
+                  budget_hz=m.bucket.b)
+        interval = 1.0 / demand.book_poll_hz
+        due = [x["ticker"] for x in demand.polled()
+               if now - self.book_polled.get(x["ticker"], float("-inf"))
+               >= interval - 1e-9]
+        by_prog = {p["program_id"]: p for p in programs}
+        polled = 0
+        for tk in due:
+            admitted, _ = m.bucket.admit("book_poll", now)
+            if not admitted:
+                break
+            status, body = m.ex.book(tk)
+            m.note_http(status, now)
+            if status != 200:
+                continue
+            self.book_polled[tk] = float(now)
+            polled += 1
+            rec = self.classifier.table.get(tk)
+            prog = by_prog.get(rec["program_id"]) if rec else next(
+                (p for p in programs if tk in p["tickers"]), None)
+            if prog is not None:
+                self.classifier.classify_one(tk, body, prog, now)
+        self.note_coverage(now, polled, len(due))
+        return {"polled": polled, "due": len(due)}
+
+    def note_coverage(self, now, polled, due):
+        """spec §11: coverage < 90% for 10 min pages — the alarm on the seam between the
+        poll plan and the budget that must fund it."""
+        frac = 1.0 if due == 0 else polled / float(due)
+        if frac < C.COVERAGE_ALERT_FLOOR:
+            if self.coverage_bad_since is None:
+                self.coverage_bad_since = float(now)
+            elif not self.coverage_alerted and \
+                    float(now) - self.coverage_bad_since >= C.COVERAGE_ALERT_WINDOW_S:
+                self.coverage_alerted = True
+                R.ntfy("coverage_low", "lip_v5 book coverage %.0f%% for %d s"
+                       % (100 * frac, C.COVERAGE_ALERT_WINDOW_S))
+        else:
+            self.coverage_bad_since = None
+            self.coverage_alerted = False
 
     def run(self, max_iterations=None, deadline=None):
         """The systemd loop.  Exits on `stopping` (SIGTERM/SIGINT), the deadline, or the

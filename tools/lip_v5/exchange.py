@@ -55,8 +55,14 @@ class Exchange(object):
     def balance(self):                                       # pragma: no cover - network
         return R.signed(self.auth, "GET", "/portfolio/balance")
 
-    def fills(self, min_ts=None):                            # pragma: no cover - network
-        params = {"min_ts": int(min_ts)} if min_ts else None
+    def fills(self, min_ts=None, order_id=None):             # pragma: no cover - network
+        """`order_id` scoping is the v1 §9.4a disambiguation read (v4's `do_fills` shape);
+        `min_ts` is the cadenced live poll and the §9.4(4) crash-gap window."""
+        params = {"limit": 200}
+        if min_ts:
+            params["min_ts"] = int(min_ts)
+        if order_id:
+            params["order_id"] = order_id
         return R.signed(self.auth, "GET", "/portfolio/fills", params=params)
 
     def settlements(self):                                   # pragma: no cover - network
@@ -73,7 +79,23 @@ class Exchange(object):
 class FakeExchange(object):
     """A scriptable exchange for the suite.  Deliberately lives in the shipped package rather
     than in the tests: the engine's contract with the wire is part of the design, and a fake
-    that drifts from it silently is worse than no fake at all."""
+    that drifts from it silently is worse than no fake at all.
+
+    REAL-WIRE FIDELITY (final fix round — the fake's leniency is what hid the missing
+    feedback half):
+      * `cancel` of an order the book no longer holds returns **404**, never 200 with
+        `reduced_by = 0` — on the real wire a fully-filled order is GONE, and the old fake
+        let the engine "learn" its fill from a cancel that the wire would refuse.
+      * the public `book` REFLECTS OUR OWN RESTING ORDERS — the real book does, which is
+        why S must subtract our size (SF-5) and why a fake that hid us made that defect
+        invisible.
+      * `fills` rows carry the REAL payload shape v4's prod parsing consumes: `trade_id`,
+        `order_id`, `side` ("yes"/"no"), `action`, `count`, `yes_price` in CENTS,
+        `is_taker` — no invented `price`/`fill_id` dollars fields.
+      * `take(oid, n)` executes a taker against a resting order: the ONLY way a fill
+        becomes learnable is the fills API (plus a smaller `reduced_by` on a later cancel),
+        exactly as on the wire.
+    """
 
     def __init__(self, books=None, positions=None, balance_cents=0, now=0.0):
         self.books = dict(books or {})
@@ -95,7 +117,39 @@ class FakeExchange(object):
     # -- reads -------------------------------------------------------------------------
     def book(self, ticker):
         b = self.books.get(ticker)
-        return (200, b) if b is not None else (404, {})
+        if b is None:
+            return 404, {}
+        return 200, self.with_own_orders(ticker, b)
+
+    def with_own_orders(self, ticker, body):
+        """Merge OUR resting orders into the public book, as the real book does.  A bid
+        joins `yes_dollars` at its YES price; an ask (a NO bid at 1 − p) joins
+        `no_dollars`."""
+        import copy
+        out = copy.deepcopy(body)
+        fp = ((out.get("orderbook") or {}).get("orderbook_fp")
+              or out.get("orderbook_fp"))
+        if fp is None:
+            return out
+        for o in self.resting.values():
+            if o.get("ticker") != ticker:
+                continue
+            n = float(o.get("count", 0))
+            if n <= 0:
+                continue
+            px = float(o.get("price", 0))
+            if o.get("side") == "bid":
+                key, level_px = "yes_dollars", px
+            else:
+                key, level_px = "no_dollars", round(1.0 - px, 4)
+            levels = fp.setdefault(key, [])
+            for lv in levels:
+                if abs(float(lv[0]) - level_px) < 1e-9:
+                    lv[1] = str(float(lv[1]) + n)
+                    break
+            else:
+                levels.append(["%.4f" % level_px, str(n)])
+        return out
 
     def market(self, ticker):
         body = {"status": "active", "ticker": ticker}
@@ -120,8 +174,11 @@ class FakeExchange(object):
     def balance(self):
         return 200, {"balance": self.balance_cents}
 
-    def fills(self, min_ts=None):
-        return 200, {"fills": list(self.fills_rows)}
+    def fills(self, min_ts=None, order_id=None):
+        rows = list(self.fills_rows)
+        if order_id is not None:
+            rows = [r for r in rows if str(r.get("order_id")) == str(order_id)]
+        return 200, {"fills": rows}
 
     def settlements(self):
         return 200, {"settlements": list(self.settlement_rows)}
@@ -155,5 +212,43 @@ class FakeExchange(object):
         if self.cancel_status != 200:
             return self.cancel_status, {}
         body = self.resting.pop(order_id, None)
-        remaining = float(body.get("count", 0)) if body else 0.0
-        return 200, {"reduced_by": remaining}
+        if body is None:
+            # REAL wire: a fully-filled / already-gone order 404s.  It does NOT return
+            # 200/reduced_by=0 — that leniency let the engine "learn" fills from a call the
+            # exchange would refuse, hiding the missing fills poll.
+            return 404, {"error": {"code": "order_not_found"}}
+        return 200, {"reduced_by": float(body.get("count", 0))}
+
+    # -- the taker ---------------------------------------------------------------------
+    def take(self, order_id, count, now=None, trade_id=None):
+        """A taker crosses into our resting order.  Emits the REAL consequences and nothing
+        else: the resting size shrinks (gone at zero), a real-shaped `/portfolio/fills` row
+        appears, and the net position moves.  The engine may learn this ONLY through the
+        fills API (or a smaller `reduced_by` on a later cancel)."""
+        body = self.resting.get(order_id)
+        if body is None:
+            return None
+        n = min(float(count), float(body.get("count", 0)))
+        body["count"] = float(body.get("count", 0)) - n
+        if body["count"] <= 1e-9:
+            self.resting.pop(order_id, None)
+        yes_price_c = int(round(float(body.get("price", 0)) * 100))
+        # The real payload speaks the YES axis with a direction: a filled bid reads
+        # (yes, buy), a filled ask (yes, sell) — v4's prod-proven normalize consumes exactly
+        # this pair (its B3 note: "a fills row carrying side='yes'...").
+        action = "buy" if body.get("side") == "bid" else "sell"
+        row = {"trade_id": trade_id or ("t-%d" % (len(self.fills_rows) + 1)),
+               "order_id": order_id, "ticker": body.get("ticker"),
+               "side": "yes", "action": action, "count": n,
+               "yes_price": yes_price_c, "no_price": 100 - yes_price_c,
+               "is_taker": False, "created_time": now}
+        self.fills_rows.append(row)
+        sign = 1 if action == "buy" else -1
+        tk = body.get("ticker")
+        for p in self._positions:
+            if p.get("ticker") == tk:
+                p["position"] = float(p.get("position", 0)) + sign * n
+                break
+        else:
+            self._positions.append({"ticker": tk, "position": sign * n})
+        return row
