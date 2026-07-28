@@ -153,8 +153,14 @@ WS_MAX_BOOK_AGE_S = 10.0
 # answering is torn down within PING_INTERVAL + PING_TIMEOUT = 10 s, matching the 11.5 s
 # blindness budget above.  On teardown `connected` goes False and books_for() returns {}
 # IMMEDIATELY -- staleness is not a second 10 s on top of the detection latency.
-WS_PING_INTERVAL_S = 5.0
-WS_PING_TIMEOUT_S = 5.0
+# MEASURED: 25 connects / 12 disconnects in 15 minutes — roughly one reconnect every 36s on
+# a socket that was never idle.  Not "keepalive missing": keepalive TOO AGGRESSIVE.  A 5s
+# ping_timeout declares a server dead if it has not answered a protocol ping within 5s, which
+# conflates "slow" with "gone" on a link carrying 32-market snapshot bursts.  20/20 is the
+# `websockets` library default and sits well inside typical idle-drop windows (60s+), so it
+# still detects a genuinely dead socket while no longer manufacturing reconnects.
+WS_PING_INTERVAL_S = 20.0
+WS_PING_TIMEOUT_S = 20.0
 # Reader wake cadence.  The loop refreshes its liveness stamp at least this often, so while
 # connected the liveness term is never what stales a book: 2.0 s is 5x under WS_MAX_BOOK_AGE_S.
 # It is also the granularity at which a `stop()` is noticed.
@@ -166,6 +172,23 @@ WS_RECV_TIMEOUT_S = 2.0
 # -- an order of magnitude inside §4.5's 5% coverage budget -- while bounding the exposure to
 # a frozen book at 300 s.  It is the WS analogue of §4.3(e)'s 60 s "safety re-sync regardless".
 WS_RESNAPSHOT_S = 300.0
+# TICKER-SET HYSTERESIS.  MEASURED: 836 clamp-set changes in 15 minutes — about one per
+# second, because `market_poll_rank` reshuffles as S moves and `attach()` republishes every
+# 1 Hz cycle.  Every change set _need_resubscribe, and every resubscribe clears the books and
+# costs a 32-frame snapshot burst, so NO market could survive long enough to be proven: the
+# W2 gate needs 3 agreements at WS_VERIFY_INTERVAL_S = 180s, and only 5 markets ever gated.
+# Rule: a SMALL change is rank noise and waits; a LARGE one is a regime change and applies at
+# once.
+#   WS_TICKER_CHANGE_MIN_S = one verify interval — below this the set churns faster than a
+#     market can be proven, which is self-defeating by construction.
+#   WS_TICKER_CHANGE_BIG = a quarter of the set.  Rank jitter moves one or two tickers; a
+#     quarter turning over is a different opportunity set and should not wait a minute.
+WS_TICKER_CHANGE_MIN_S = 60.0
+WS_TICKER_CHANGE_BIG = max(2, MAX_WS_MARKETS // 4)
+# A resubscribe costs a full snapshot burst.  Bursts arriving faster than they can be
+# consumed compound rather than recover, so one gap must cost at most one burst per this
+# interval — the difference between recovery and a storm.
+WS_RESUBSCRIBE_MIN_S = 5.0
 
 # ---- reconnect backoff -------------------------------------------------------------------
 # Base 1.0 s: the consumer evaluates triggers at BOOK_POLL_HZ = 1 Hz, so reconnecting faster
@@ -558,6 +581,11 @@ class WsFeed(object):
         self._cmd_id = 0
         self._reproof_epoch = 0
         self._clamp_logged = None
+        self._active_sid = None
+        self._stale_sid_frames = 0
+        self._last_ticker_change = 0.0
+        self._last_resubscribe_ts = 0.0
+        self._pending_tickers = None
         self._connected = False
         self._liveness_ts = 0.0         # last time the reader confirmed the socket open
         self._last_msg_ts = 0.0
@@ -604,15 +632,31 @@ class WsFeed(object):
         elif self._clamp_logged is not None:
             self._clamp_logged = None
         new = tuple(clean)
+        now = self._clock()
         with self._lock:
-            changed = new != self._tickers
+            cur = self._tickers
+            if new == cur:
+                return False
+            delta = len(set(new) ^ set(cur))
+            # Only a SWAP is noise.  A set that GROWS is new coverage, never churn, so it
+            # applies at once — deferring it would leave markets unwatched to protect
+            # against a reshuffle that is not happening.
+            swap = len(new) <= len(cur)
+            if cur and swap and delta < WS_TICKER_CHANGE_BIG and \
+                    (now - self._last_ticker_change) < WS_TICKER_CHANGE_MIN_S:
+                # Rank noise.  Applying it would tear down the subscription, clear every
+                # book and re-burst 32 snapshots — for a reshuffle that will reverse next
+                # cycle.  Remember the request; it lands when the window opens.
+                self._pending_tickers = new
+                return False
+            self._pending_tickers = None
+            self._last_ticker_change = now
             self._tickers = new
-            if changed:
-                self._need_resubscribe = True
-                for t in list(self._books):
-                    if t not in seen:
-                        self._books.pop(t, None)
-        return changed
+            self._need_resubscribe = True
+            for t in list(self._books):
+                if t not in seen:
+                    self._books.pop(t, None)
+        return True
 
     @property
     def tickers(self):
@@ -647,6 +691,8 @@ class WsFeed(object):
             self._books.clear()
             self._seq.forget()
             self._sid_tickers.clear()
+            self._active_sid = None            # a new socket: no subscription is active yet
+            self._last_resubscribe_ts = 0.0    # the first subscribe must not be rate-limited
             self._need_resubscribe = True
             self._reproof_epoch += 1
         # N2 — a reconnect invalidates every prior agreement.  The consumer's W2 gate keys
@@ -713,7 +759,11 @@ class WsFeed(object):
                 with self._lock:
                     self._sid_tickers[sid] = self._tickers
                     self._seq.forget(sid)
-            self._log("ws_subscribed", sid=sid, n_tickers=len(self.tickers))
+                    prev, self._active_sid = self._active_sid, sid
+            else:
+                prev = None
+            self._log("ws_subscribed", sid=sid, n_tickers=len(self.tickers),
+                      superseded_sid=prev if prev != sid else None)
             return "ok"
 
         if typ == "error":
@@ -730,6 +780,26 @@ class WsFeed(object):
             return "ignored"
 
         sid = _first_int(frame.get("sid"))
+        # A resubscribe on a live socket creates a NEW subscription; the OLD one is never
+        # cancelled and keeps streaming.  Its deltas would apply on top of books rebuilt from
+        # the new subscription's snapshot — the same change counted twice, drifting sizes
+        # until one goes negative and the book is dropped, which triggers another
+        # resubscribe.  That is the 4,183-gap runaway.  A superseded sid is not our stream
+        # any more: ignore it, and never let its seq touch the tracker.
+        with self._lock:
+            active = self._active_sid
+        if active is not None and sid is not None and sid != active:
+            with self._lock:
+                self._stale_sid_frames += 1
+                if self._stale_sid_frames in (1, 100, 1000):
+                    stale_note = (sid, self._stale_sid_frames)
+                else:
+                    stale_note = None
+            if stale_note:
+                self._log("ws_stale_sid_frame", sid=stale_note[0], active=active,
+                          count=stale_note[1],
+                          why="superseded subscription still streaming; ignored")
+            return "ignored"
         verdict = SEQ_OK
         if "seq" in frame:
             with self._lock:
@@ -997,11 +1067,22 @@ class WsFeed(object):
             except Exception:
                 pass
 
+    def resubscribe_due(self, now=None):
+        """Rate limit: one snapshot burst per WS_RESUBSCRIBE_MIN_S.  A gap storm must cost
+        one recovery, not one burst per frame."""
+        now = self._clock() if now is None else now
+        with self._lock:
+            return (now - self._last_resubscribe_ts) >= WS_RESUBSCRIBE_MIN_S
+
     async def _resubscribe(self, conn):                   # pragma: no cover - I/O only
+        if not self.resubscribe_due():
+            return False
         with self._lock:
             self._resubscribes += 1
+            self._last_resubscribe_ts = self._clock()
             self._books.clear()
         await self._send(conn, self.subscribe_frame())
+        return True
 
     async def _send(self, conn, obj):                     # pragma: no cover - I/O only
         await conn.send(json.dumps(obj))

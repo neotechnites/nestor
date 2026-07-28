@@ -733,6 +733,154 @@ class RealCapturedFrames(unittest.TestCase):
             M.WS_ENABLED = old
 
 
+class FeedCyclingFixes(unittest.TestCase):
+    """15-min live census: ws_connect 25 / ws_disconnect 12 / ws_seq_gap 4,183 /
+    ws_ticker_clamp 836 (change-only!) / ws_subscribed 18.  Only 5 markets ever gated,
+    because nothing survived long enough to be proven."""
+
+    def feed(self, tickers=None, t0=1000.0):
+        self.now = [t0]
+        return W.WsFeed(auth=None, tickers=tickers or [T], clock=lambda: self.now[0])
+
+    # ---- (a) keepalive ---------------------------------------------------------------
+    def test_the_ping_timeout_no_longer_declares_a_live_server_dead(self):
+        """25 connects in 15 min on a socket that was never idle is not an idle-drop — it is
+        keepalive TOO AGGRESSIVE.  A 5s timeout conflates "slow" with "gone" on a link
+        carrying 32-market snapshot bursts."""
+        self.assertGreaterEqual(W.WS_PING_TIMEOUT_S, 20.0)
+        self.assertGreaterEqual(W.WS_PING_INTERVAL_S, 20.0)
+        # still well inside a typical 60s idle-drop window, so a dead socket is still caught
+        self.assertLess(W.WS_PING_INTERVAL_S, 60.0)
+
+    # ---- (b) superseded subscriptions ------------------------------------------------
+    def test_a_superseded_sid_is_ignored_and_never_touches_the_seq_tracker(self):
+        """THE 4,183-GAP RUNAWAY.  A resubscribe on a live socket creates a NEW subscription;
+        the OLD one is never cancelled and keeps streaming.  Its deltas applied on top of
+        books rebuilt from the new snapshot — the same change counted twice, drifting sizes
+        until one went negative, dropping the book, triggering another resubscribe."""
+        f = self.feed()
+        f.on_open()
+        f.subscribe_frame()
+        f.handle_frame({"type": "subscribed", "id": 1, "msg": {"sid": 1}})
+        f.handle_frame({"type": "orderbook_snapshot", "sid": 1, "seq": 1,
+                        "msg": snap([[44, 25]])})
+        self.assertIsNotNone(f.book_or_none(T))
+        # resubscribe -> the server issues sid 2; sid 1 is now superseded
+        f.subscribe_frame()
+        f.handle_frame({"type": "subscribed", "id": 2, "msg": {"sid": 2}})
+        f.handle_frame({"type": "orderbook_snapshot", "sid": 2, "seq": 1,
+                        "msg": snap([[44, 25]])})
+        before = M.book_levels(f.book_or_none(T))[0]
+        gaps_before = f.health()["gaps"]
+        # the old subscription keeps streaming: a delta AND a wild seq
+        self.assertEqual(f.handle_frame({"type": "orderbook_delta", "sid": 1, "seq": 900,
+                                         "msg": delta(44, -25)}), "ignored")
+        self.assertEqual(M.book_levels(f.book_or_none(T))[0], before)  # not double-applied
+        self.assertEqual(f.health()["gaps"], gaps_before)              # and NOT a gap
+
+    def test_the_active_sid_follows_the_latest_subscription(self):
+        f = self.feed()
+        f.on_open()
+        f.handle_frame({"type": "subscribed", "id": 1, "msg": {"sid": 7}})
+        f.handle_frame({"type": "orderbook_snapshot", "sid": 7, "seq": 1,
+                        "msg": snap([[44, 25]])})
+        self.assertIsNotNone(f.book_or_none(T))
+        f.handle_frame({"type": "subscribed", "id": 2, "msg": {"sid": 8}})
+        self.assertEqual(f.handle_frame({"type": "orderbook_delta", "sid": 7, "seq": 2,
+                                         "msg": delta(44, -5)}), "ignored")
+        self.assertEqual(f.handle_frame({"type": "orderbook_delta", "sid": 8, "seq": 2,
+                                         "msg": delta(44, -5)}), "ok")
+
+    def test_a_reconnect_clears_the_active_sid(self):
+        f = self.feed()
+        f.on_open()
+        f.handle_frame({"type": "subscribed", "id": 1, "msg": {"sid": 1}})
+        f.on_close("dropped")
+        f.on_open()
+        # no subscription is active yet, so the first frames are accepted on their own sid
+        self.assertEqual(f.handle_frame({"type": "orderbook_snapshot", "sid": 5, "seq": 1,
+                                         "msg": snap([[44, 25]])}), "ok")
+
+    # ---- (c) ticker-set hysteresis ---------------------------------------------------
+    def test_small_swaps_are_deferred_so_markets_can_survive_to_be_proven(self):
+        """The W2 gate needs 3 agreements at 60s = 180s.  A set churning once per second can
+        never prove anything — which is exactly what the census showed."""
+        base = ["M%02d" % i for i in range(10)]
+        f = self.feed(base)
+        f.on_open()
+        swapped = base[:-1] + ["NEW"]
+        self.assertFalse(f.set_tickers(swapped))          # rank noise: deferred
+        self.assertEqual(list(f.tickers), base)
+        self.now[0] += W.WS_TICKER_CHANGE_MIN_S + 1
+        self.assertTrue(f.set_tickers(swapped))           # the window opened
+        self.assertIn("NEW", f.tickers)
+
+    def test_a_large_change_applies_immediately(self):
+        base = ["M%02d" % i for i in range(20)]
+        f = self.feed(base)
+        f.on_open()
+        big = ["X%02d" % i for i in range(20)]
+        self.assertGreaterEqual(len(set(big) ^ set(base)), W.WS_TICKER_CHANGE_BIG)
+        self.assertTrue(f.set_tickers(big))               # regime change, not jitter
+        self.assertEqual(list(f.tickers), big)
+
+    def test_growth_is_never_treated_as_churn(self):
+        """Deferring growth would leave markets unwatched to protect against a reshuffle
+        that is not happening."""
+        f = self.feed(["A"])
+        f.on_open()
+        self.assertTrue(f.set_tickers(["A", "B"]))
+        self.assertEqual(list(f.tickers), ["A", "B"])
+
+    def test_an_unchanged_set_is_never_a_change(self):
+        f = self.feed(["A", "B"])
+        for _ in range(50):
+            self.assertFalse(f.set_tickers(["A", "B"]))
+
+    def test_the_hysteresis_window_is_the_verify_interval(self):
+        self.assertEqual(W.WS_TICKER_CHANGE_MIN_S, M.WS_VERIFY_INTERVAL_S)
+        self.assertLess(W.WS_TICKER_CHANGE_MIN_S,
+                        M.WS_AGREE_REQUIRED * M.WS_VERIFY_INTERVAL_S)
+
+    # ---- (d) resubscribe rate limit ---------------------------------------------------
+    def test_a_gap_storm_costs_one_recovery_not_one_burst_per_frame(self):
+        f = self.feed()
+        f.on_open()
+        self.assertTrue(f.resubscribe_due())              # the first is never rate-limited
+        f._last_resubscribe_ts = self.now[0]
+        self.assertFalse(f.resubscribe_due())
+        self.now[0] += W.WS_RESUBSCRIBE_MIN_S + 0.1
+        self.assertTrue(f.resubscribe_due())
+
+    def test_the_first_subscribe_after_a_connect_is_not_rate_limited(self):
+        f = self.feed()
+        f._last_resubscribe_ts = self.now[0]
+        f.on_open()
+        self.assertTrue(f.resubscribe_due())
+
+    # ---- the invariants this round must not have touched ------------------------------
+    def test_genuine_gaps_on_the_ACTIVE_sid_still_drop_the_book(self):
+        f = self.feed()
+        f.on_open()
+        f.handle_frame({"type": "subscribed", "id": 1, "msg": {"sid": 1}})
+        f.handle_frame({"type": "orderbook_snapshot", "sid": 1, "seq": 1,
+                        "msg": snap([[44, 25]])})
+        self.assertEqual(f.handle_frame({"type": "orderbook_delta", "sid": 1, "seq": 99,
+                                         "msg": delta(44, -5)}), "resubscribe")
+        self.assertIsNone(f.book_or_none(T))
+        self.assertGreaterEqual(f.health()["gaps"], 1)
+
+    def test_corruption_still_drops_the_book(self):
+        f = self.feed()
+        f.on_open()
+        f.handle_frame({"type": "subscribed", "id": 1, "msg": {"sid": 1}})
+        f.handle_frame({"type": "orderbook_snapshot", "sid": 1, "seq": 1,
+                        "msg": snap([[44, 25]])})
+        self.assertEqual(f.handle_frame({"type": "orderbook_delta", "sid": 1, "seq": 2,
+                                         "msg": delta(44, -99)}), "resubscribe")
+        self.assertIsNone(f.book_or_none(T))
+
+
 class AuthSigning(unittest.TestCase):
 
     def test_the_ws_signature_covers_the_ws_path_and_excludes_any_query(self):
