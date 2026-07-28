@@ -7,6 +7,7 @@ confidently-wrong book is the failure this whole module exists to stop, and it i
 failure that produces confident quotes rather than an obvious outage.
 """
 
+import json
 import os
 import unittest
 
@@ -19,12 +20,23 @@ import ws_feed as W
 T = "KXAAAGASD-26JUL28-4.100"
 
 
+# ---------------------------------------------------------------------------------------
+# THE REAL WIRE SHAPE, from the 2026-07-28 live capture (ws_raw_frames.jsonl).  These
+# helpers take CENTS because every fixture below is written in cents, and emit the DOLLAR
+# STRINGS the exchange actually sends — so the whole state-machine suite exercises the real
+# parser rather than the shape we inferred and got wrong.
+# ---------------------------------------------------------------------------------------
 def snap(yes=None, no=None, ticker=T):
-    return {"market_ticker": ticker, "yes": yes or [], "no": no or []}
+    return {"market_ticker": ticker, "market_id": "test-id",
+            "yes_dollars_fp": [["%.4f" % (p / 100.0), "%.2f" % z] for p, z in (yes or [])],
+            "no_dollars_fp": [["%.4f" % (p / 100.0), "%.2f" % z] for p, z in (no or [])]}
 
 
 def delta(price, d, side="yes", ticker=T):
-    return {"market_ticker": ticker, "price": price, "delta": d, "side": side}
+    return {"market_ticker": ticker, "market_id": "test-id",
+            "price_dollars": "%.4f" % (price / 100.0), "delta_fp": "%.2f" % d,
+            "side": side, "ts": "2026-07-28T13:56:02.218673Z",
+            "ts_ms": 1785246962218}
 
 
 class BookStateRebuild(unittest.TestCase):
@@ -586,6 +598,139 @@ class ClampLoggingIsNotSpam(unittest.TestCase):
             f.set_tickers(["A", "B", "C"])
         self.assertEqual([r for r in rows if r[0] == "ws_ticker_clamp"], [])
         self.assertLessEqual(len(f.tickers), W.MAX_WS_MARKETS)
+
+
+# VERBATIM frames from the live capture (~/nestor/data/lip/ws_raw_frames.jsonl, variant A).
+# Copied byte-for-byte, not reconstructed: an inferred fixture is what produced the outage
+# this class exists to close.
+RAW_SUBSCRIBED = ('{"type":"subscribed","id":1,'
+                  '"msg":{"channel":"orderbook_delta","sid":1}}')
+RAW_SNAPSHOT = ('{"type":"orderbook_snapshot","sid":1,"seq":1,'
+                '"msg":{"market_ticker":"KXAAAGASD-26JUL29-4.075",'
+                '"market_id":"798a","yes_dollars_fp":[["0.0100","1003.00"],'
+                '["0.0200","5.00"]],"no_dollars_fp":[["0.0100","1000.00"]]}}')
+RAW_DELTA = ('{"type":"orderbook_delta","sid":1,"seq":9,'
+             '"msg":{"market_ticker":"KXAAAGASD-26JUL29-4.095","market_id":"4486",'
+             '"price_dollars":"0.4400","delta_fp":"-5.00","side":"yes",'
+             '"ts":"2026-07-28T13:56:02.218673Z","ts_ms":1785246962218}}')
+RAW_ERROR = '{"type":"error","id":1,"msg":{"code":3,"msg":"Channels required"}}'
+RAW_T1 = "KXAAAGASD-26JUL29-4.075"
+RAW_T2 = "KXAAAGASD-26JUL29-4.095"
+
+
+class RealCapturedFrames(unittest.TestCase):
+    """FIRST LIVE CONTACT FAILED HERE.  ws_connect OK, ws_subscribed OK, and then ZERO data
+    for 3+ minutes: the subscribe was bound and the socket was healthy, but the payload keys
+    were `yes_dollars_fp`/`no_dollars_fp` with DOLLAR-string prices, not the `yes`/`no` with
+    cent prices we inferred — so every snapshot was silently discarded and the books stayed
+    empty forever.  The delta fields were `price_dollars`/`delta_fp`, not `price`/`delta`.
+    These fixtures are copied verbatim from the capture, because inferring them is exactly
+    what went wrong."""
+
+    def feed(self):
+        self.now = [1000.0]
+        f = W.WsFeed(auth=None, tickers=[RAW_T1, RAW_T2], clock=lambda: self.now[0])
+        f.on_open()
+        f.subscribe_frame()
+        return f
+
+    def test_the_subscribed_frame_binds_the_sid_from_INSIDE_msg(self):
+        f = self.feed()
+        self.assertEqual(f.handle_frame(json.loads(RAW_SUBSCRIBED)), "ok")
+
+    def test_the_real_snapshot_builds_a_real_book(self):
+        f = self.feed()
+        f.handle_frame(json.loads(RAW_SUBSCRIBED))
+        self.assertEqual(f.handle_frame(json.loads(RAW_SNAPSHOT)), "ok")
+        body = f.book_or_none(RAW_T1)
+        self.assertIsNotNone(body, "the snapshot was discarded — the live outage")
+        yes, no = M.book_levels(body)
+        self.assertEqual(sorted(yes), [(1, 1003.0), (2, 5.0)])
+        self.assertEqual(sorted(no), [(1, 1000.0)])
+        # dollars on the wire, cents to the consumer, and best_from_book agrees
+        self.assertEqual(M.best_from_book(body), (2, 99))
+
+    def test_the_real_delta_applies_at_the_right_price_and_sign(self):
+        f = self.feed()
+        f.handle_frame(json.loads(RAW_SUBSCRIBED))
+        snap2 = json.loads(RAW_SNAPSHOT)
+        snap2["seq"] = 8
+        snap2["msg"]["market_ticker"] = RAW_T2
+        snap2["msg"]["yes_dollars_fp"] = [["0.4400", "25.00"], ["0.4300", "10.00"]]
+        self.assertEqual(f.handle_frame(snap2), "ok")
+        d = json.loads(RAW_DELTA)                       # seq 9 follows seq 8 contiguously
+        self.assertEqual(f.handle_frame(d), "ok")
+        yes, _ = M.book_levels(f.book_or_none(RAW_T2))
+        self.assertEqual(dict(yes)[44], 20.0)           # 25 - 5, at 44c not at 0c
+        self.assertEqual(dict(yes)[43], 10.0)
+
+    def test_a_delta_removing_a_level_removes_it(self):
+        f = self.feed()
+        f.handle_frame(json.loads(RAW_SUBSCRIBED))
+        snap2 = json.loads(RAW_SNAPSHOT)
+        snap2["seq"] = 8
+        snap2["msg"]["market_ticker"] = RAW_T2
+        snap2["msg"]["yes_dollars_fp"] = [["0.4400", "5.00"], ["0.4300", "10.00"]]
+        f.handle_frame(snap2)
+        f.handle_frame(json.loads(RAW_DELTA))           # -5.00 at 44c
+        yes, _ = M.book_levels(f.book_or_none(RAW_T2))
+        self.assertEqual(sorted(yes), [(43, 10.0)])
+
+    def test_the_real_error_frame_is_counted_and_does_not_kill_the_loop(self):
+        f = self.feed()
+        f.handle_frame(json.loads(RAW_SUBSCRIBED))
+        self.assertEqual(f.handle_frame(json.loads(RAW_ERROR)), "error")
+        self.assertGreaterEqual(f.health()["errors"], 1)
+        self.assertEqual(f.handle_frame(json.loads(RAW_SNAPSHOT)), "ok")
+        self.assertIsNotNone(f.book_or_none(RAW_T1))
+
+    def test_the_multi_market_snapshot_burst_then_deltas(self):
+        """The captured session: snapshots seq 1..N (one per subscribed market) on ONE sid,
+        then deltas continuing the SAME counter — so the burst must not read as gaps."""
+        f = self.feed()
+        f.handle_frame(json.loads(RAW_SUBSCRIBED))
+        for i, tk in enumerate((RAW_T1, RAW_T2), start=1):
+            fr = json.loads(RAW_SNAPSHOT)
+            fr["seq"] = i
+            fr["msg"]["market_ticker"] = tk
+            fr["msg"]["yes_dollars_fp"] = [["0.4400", "25.00"]]
+            self.assertEqual(f.handle_frame(fr), "ok", tk)
+        d = json.loads(RAW_DELTA)
+        d["seq"] = 3
+        self.assertEqual(f.handle_frame(d), "ok")
+        self.assertEqual(f.health()["gaps"], 0)
+        self.assertEqual(len(f.books_for([RAW_T1, RAW_T2])), 2)
+
+    def test_the_dollar_to_cent_conversion_is_explicit_never_inferred(self):
+        """Guessing the unit from magnitude is the dollars-vs-cents ambiguity W2 exists to
+        catch; a module that guesses makes that gate the only thing between us and a
+        100x-wrong book."""
+        self.assertEqual(W._cents("0.0100"), 1)
+        self.assertEqual(W._cents("0.4400"), 44)
+        self.assertEqual(W._cents("0.9900"), 99)
+        self.assertEqual(W._cents(0.68), 68)
+        self.assertIsNone(W._cents(None))
+        self.assertIsNone(W._cents("abc"))
+
+    def test_an_unreadable_level_refuses_the_WHOLE_snapshot(self):
+        f = self.feed()
+        f.handle_frame(json.loads(RAW_SUBSCRIBED))
+        fr = json.loads(RAW_SNAPSHOT)
+        fr["msg"]["yes_dollars_fp"] = [["0.0100", "1003.00"], ["oops"]]
+        self.assertEqual(f.handle_frame(fr), "ignored")
+        self.assertIsNone(f.book_or_none(RAW_T1))       # never half-applied
+
+    def test_the_W2_gate_is_untouched_by_this_fix(self):
+        """A working feed still may not price a quote until it has matched REST."""
+        old = M.WS_ENABLED
+        try:
+            M.WS_ENABLED = True
+            m = M.Maker(None, M.LedgerState(), [])
+            m.ws = self.feed()
+            m.ws_epoch = m.ws.reproof_epoch()
+            self.assertFalse(m.ws_trusted(RAW_T1, 1000.0))
+        finally:
+            M.WS_ENABLED = old
 
 
 class AuthSigning(unittest.TestCase):

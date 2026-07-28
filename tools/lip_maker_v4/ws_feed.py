@@ -305,8 +305,14 @@ class BookState(object):
         case nothing is mutated: a half-applied snapshot is worse than no snapshot)."""
         if not isinstance(msg, dict):
             return "bad_snapshot"
-        yes = _levels_from_wire(msg.get("yes"))
-        no = _levels_from_wire(msg.get("no"))
+        # LIVE-CAPTURED SHAPE.  The payload keys are `yes_dollars_fp` / `no_dollars_fp`, and
+        # each row is [price_DOLLARS_string, size_fp_string] — e.g. ["0.0100","1003.00"].
+        # The inferred keys ("yes"/"no", price in cents) matched nothing, so every snapshot
+        # was silently discarded: the socket was healthy, the subscription was bound, and the
+        # books stayed empty forever.  The old names are kept as a fallback ONLY so a schema
+        # revert cannot black us out again; they are not what the exchange sends today.
+        yes = _levels_from_wire(msg.get("yes_dollars_fp", msg.get("yes")))
+        no = _levels_from_wire(msg.get("no_dollars_fp", msg.get("no")))
         if yes is None or no is None:
             return "bad_snapshot"
         self.yes = yes
@@ -339,10 +345,16 @@ class BookState(object):
         book = self.yes if side == "yes" else (self.no if side == "no" else None)
         if book is None:
             return "bad_delta"
+        # LIVE-CAPTURED SHAPE: `price_dollars` ("0.4400") and `delta_fp` ("-5.00"), both
+        # STRINGS, price in DOLLARS.  The inferred `price`/`delta` in cents matched nothing.
+        px = msg.get("price_dollars", msg.get("price"))
+        dl = msg.get("delta_fp", msg.get("delta"))
         try:
-            price = int(round(float(msg["price"])))
-            delta = float(msg["delta"])
-        except (KeyError, TypeError, ValueError):
+            price = _cents(px)
+            delta = float(dl)
+        except (TypeError, ValueError):
+            return "bad_delta"
+        if price is None:
             return "bad_delta"
         if not self.has_snapshot or self.corrupt:
             return "no_base"
@@ -386,10 +398,24 @@ class BookState(object):
             "no_dollars": _levels_to_wire(self.no)}}}
 
 
+def _cents(price_dollars):
+    """DOLLAR string/number -> integer cents.  The wire speaks dollars ("0.0100"); BookState
+    speaks cents, because `best_from_book()` and `score_side()` do.  This conversion is
+    EXPLICIT and one-directional on purpose: inferring the unit from the magnitude is exactly
+    the dollars-vs-cents ambiguity the W2 divergence gate exists to catch, and a module that
+    guesses would make that gate the only thing standing between us and a 100x-wrong book."""
+    if price_dollars is None:
+        return None
+    try:
+        return int(round(float(price_dollars) * 100.0))
+    except (TypeError, ValueError):
+        return None
+
+
 def _levels_from_wire(rows):
-    """[[price_cents, size], ...] -> {price_cents: size}.  None on anything unusable, so the
-    caller can refuse the whole snapshot rather than accept a partial one.  A missing side is
-    an EMPTY side (a legally empty book), not an error."""
+    """[[price_DOLLARS, size], ...] -> {price_cents: size}.  None on anything unusable, so
+    the caller can refuse the whole snapshot rather than accept a partial one.  A missing
+    side is an EMPTY side (a legally empty book), not an error."""
     if rows is None:
         return {}
     if not isinstance(rows, (list, tuple)):
@@ -398,10 +424,12 @@ def _levels_from_wire(rows):
     for row in rows:
         if not isinstance(row, (list, tuple)) or len(row) < 2:
             return None
+        price = _cents(row[0])
         try:
-            price = int(round(float(row[0])))
             size = float(row[1])
         except (TypeError, ValueError):
+            return None
+        if price is None:
             return None
         if size > 0:
             out[price] = out.get(price, 0.0) + size
