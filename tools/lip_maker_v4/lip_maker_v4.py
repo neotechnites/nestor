@@ -325,13 +325,13 @@ SHED_ESCALATE_HOURS_LEFT = 2.0          # §5.4(iii) h < 2
 # re-enable at the $300 rung.  Every suppressed exit logs the value forgone, so the choice
 # is measured rather than asserted.  README documents that inventory does not self-clear
 # beyond the maker shed while this is False.
-TAKER_EXIT_ENABLED = True
+TAKER_EXIT_ENABLED = False
 # The startup assertion previously refused $300 with the exit OFF, full stop.  That is
 # wrong: "$300 with the taker exit off, decided and accepted" is a legitimate outcome — the
 # thing that must never happen is reaching $300 having never MADE the decision.  So the gate
 # is on the DECISION, not on the answer.  "undecided" refuses; "on" and "off_accepted" both
 # run, and both are recorded in the ledger at every start so the choice is never implicit.
-TAKER_EXIT_DECISION = "on"       # "undecided" | "on" | "off_accepted"
+TAKER_EXIT_DECISION = "off_accepted"       # "undecided" | "on" | "off_accepted"
 # NEW-5: the derivation above is a function of the CEILING, so the two must not drift.  At
 # or above this ceiling a startup assertion REFUSES TO RUN while TAKER_EXIT_ENABLED is
 # False.  Deliberately NOT an auto-enable: crossing the spread is a human decision and this
