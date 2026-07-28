@@ -23,7 +23,7 @@ Three properties this file exists to hold, each of which a naive loop loses:
 import time
 
 from . import config as C, cutover, engine, guards as G, ledger as LG
-from . import runtime as R, scan
+from . import money as M, runtime as R, scan
 
 
 class Runner(object):
@@ -54,8 +54,18 @@ class Runner(object):
 
         self.recover(now)
 
-        if adopt_obj is not None:
-            verdicts = self.m.triage(now, venues or {})
+        if adopt_obj is not None and venues:
+            # Venue readings supplied up front: triage NOW and feed the verdicts to the shed
+            # path (charter A: "maker-shed orders for cutover-triage verdicts").  With no
+            # readings the positions sit in `m.pending_triage` and are judged per position
+            # as the classify sweep produces a slot for them — never blind.
+            verdicts = self.m.triage(now, venues)
+            for v in verdicts:
+                if v.get("exit_path") == cutover.MAKER_SHED:
+                    self.m.triage_shed.add(v["ticker"])
+            triaged = {v["ticker"] for v in verdicts}
+            self.m.pending_triage = [p for p in self.m.pending_triage
+                                     if p["ticker"] not in triaged]
             R.log("cutover_triage_summary",
                   keep=sum(1 for v in verdicts if v["decision"] == cutover.KEEP),
                   shed=sum(1 for v in verdicts if v["exit_path"] == cutover.MAKER_SHED),
@@ -68,20 +78,39 @@ class Runner(object):
         to the next.
 
         The ORDER is the derivation.  Replay first, because it is the only source that knows
-        what we INTENDED.  Then the crash-gap fills window, because the ledger's last timestamp
-        is what bounds it.  Then positions, because that is the exchange's statement and it can
-        only be COMPARED against something we have already reconstructed — reconciling before
-        replay would compare the exchange against an empty book and freeze everything.
+        what we INTENDED — positions AND resting orders (BLOCKER-1: the earlier build rebuilt
+        positions only, so every pre-crash resting order became invisible: uncancellable,
+        unfilled-in-our-books, and its collateral vanished from the cash feed).  Then the
+        step-4 coid-prefix sweep against the exchange's own order list, because it can only
+        be DIFFED against a book we have already reconstructed.  Then the crash-gap fills
+        window, bounded by the ledger's last timestamp.  Then positions, the exchange's
+        statement, compared last — reconciling before replay would compare the exchange
+        against an empty book and freeze everything.
         """
         rows = self.m.ledger.read()
         st = cutover.V4Positions().replay(rows)               # same arithmetic, v5's own tape
+        # Positions/costs are ASSIGNED from replay, never accumulated onto whatever startup
+        # already staged (BLOCKER-2: adoption writes `adopt` rows, replay rebuilds them, and
+        # adding on top would double `position_cost` on every restart).
         for r in st.rows():
             leg = r["side"]
             self.m.positions.setdefault(r["ticker"], {"yes": 0.0, "no": 0.0})[leg] = r["net"]
             self.m.entry_basis[(r["ticker"], leg)] = r["basis"]
-            self.m.position_cost[r["ticker"]] = \
-                self.m.position_cost.get(r["ticker"], 0.0) + r["net"] * r["basis"]
             self.m.cash.inventory[r["ticker"]] = {"n": r["net"], "basis": r["basis"]}
+        for ticker in {r["ticker"] for r in st.rows()}:
+            self.m.position_cost[ticker] = sum(
+                r["net"] * r["basis"] for r in st.rows() if r["ticker"] == ticker)
+        # A persisted freeze survives restart (v1 §9.4b: a freeze a restart clears is a
+        # naked-short generator).
+        cleared = {r.get("ticker") for r in rows
+                   if (r.get("k") or r.get("kind")) == "assume_filled_clear"}
+        for r in rows:
+            if (r.get("k") or r.get("kind")) == "assume_filled" and \
+                    r.get("ticker") not in cleared:
+                self.m.frozen.add(r.get("ticker"))
+
+        self.recover_orders(rows, now)
+
         last_ts = max([float(x.get("ts", 0.0)) for x in rows] or [0.0])
         self.m.coid_seq = max(self.m.coid_seq, LG.coid_seq_load())
 
@@ -91,8 +120,98 @@ class Runner(object):
             self.m.poll_fills(now, since=last_ts - C.CRASH_GAP_LOOKBACK_S)
         self.m.reconcile(now)
         R.log("recovered", ledger_rows=len(rows), positions=len(self.m.positions),
-              coid_seq=self.m.coid_seq, last_ledger_ts=last_ts)
+              orders=len(self.m.orders), coid_seq=self.m.coid_seq, last_ledger_ts=last_ts)
         return st
+
+    def recover_orders(self, rows, now):
+        """BLOCKER-1 — rebuild `self.orders` from replay, then the v1 §9.4 step-4 sweep.
+
+        Replay half: an order is live iff its `place_resp` succeeded and no terminal row
+        (cancel_resp 200 / expired / assume_filled) followed; `fill_obs` rows carrying its
+        order_id reduce its remaining.  Every rebuilt order's collateral is re-counted into
+        the cash feed (keyed by its coid, exactly as `place()` counted it) — the invariant
+        "published never above truth" REQUIRES counting it, because the exchange is still
+        holding those dollars.
+
+        Sweep half: every exchange resting order carrying our coid prefix that replay does
+        NOT know is registered, its collateral counted (same invariant), and handed to the
+        B10 UNKNOWN machinery — which retries its cancel and, exhausted, books it FILLED and
+        freezes the market (the conservative direction).  Replay-live orders the exchange no
+        longer shows go to the SAME machinery: their cancel either confirms (reduced_by → a
+        learned fill or a clean release) or 404s into assume_filled.  Symmetric treatment,
+        one resolution path.
+        """
+        live = {}
+        for rec in rows:
+            kind = rec.get("k") or rec.get("kind")
+            oid = str(rec.get("order_id")) if rec.get("order_id") is not None else None
+            if kind == "place_resp" and oid and not rec.get("err"):
+                size = float(rec.get("size") or 0.0)
+                rc = rec.get("remaining_count")
+                live[oid] = {"order_id": oid, "coid": rec.get("coid"),
+                             "ticker": rec.get("ticker"), "side": rec.get("side"),
+                             "price": float(rec.get("price") or 0.0), "size": size,
+                             "remaining": float(size if rc is None else rc),
+                             "fully_closing": bool(rec.get("fully_closing")),
+                             "expiration_ts": rec.get("expiration_ts"),
+                             "placed_ts": float(rec.get("ts") or 0.0)}
+            elif kind in ("cancel_resp", "expired") and oid:
+                if kind == "cancel_resp" and int(rec.get("http", 0) or 0) != 200:
+                    continue                  # a failed cancel is not terminal (B10 owns it)
+                live.pop(oid, None)
+            elif kind == "assume_filled" and oid:
+                live.pop(oid, None)
+            elif kind == "fill_obs" and oid and oid in live:
+                live[oid]["remaining"] -= float(rec.get("count") or 0.0)
+                if live[oid]["remaining"] <= 1e-9:
+                    live.pop(oid, None)
+        for oid, o in sorted(live.items()):
+            exp = o.get("expiration_ts")
+            if exp is not None and float(exp) <= float(now):
+                continue                      # the backstop already fired; nothing rests
+            self.m.orders[oid] = o
+            if not o.get("fully_closing") and o.get("coid"):
+                self.m.cash.resting_by_order[o["coid"]] = \
+                    o["remaining"] * R.unit_collateral(o["side"], o["price"])
+
+        # --- step-4 sweep against the exchange ---
+        admitted, _ = self.m.bucket.admit("verify", now)
+        if not admitted:
+            return
+        status, body = self.m.ex.orders()
+        if status != 200:
+            R.log("recovery_sweep_failed", http=status)
+            return
+        exch = {}
+        for row in (body or {}).get("orders") or []:
+            coid = row.get("client_order_id") or ""
+            if not R.owns_coid(coid):
+                continue                      # never touch another process's orders
+            exch[str(row.get("order_id"))] = row
+        for oid, row in sorted(exch.items()):
+            if oid in self.m.orders:
+                continue
+            remaining = float(row.get("remaining_count") or 0.0)
+            price = float(row.get("price") or 0.0)
+            side = row.get("side") if row.get("side") in ("bid", "ask") else \
+                ("bid" if str(row.get("side")).lower() == "yes" else "ask")
+            o = {"order_id": oid, "coid": row.get("client_order_id"),
+                 "ticker": row.get("ticker"), "side": side, "price": price,
+                 "size": remaining, "remaining": remaining, "placed_ts": 0.0}
+            self.m.orders[oid] = o
+            if o["coid"]:
+                self.m.cash.resting_by_order[o["coid"]] = \
+                    remaining * R.unit_collateral(side, price)
+            self.m.unknown.note(oid, o["ticker"], side, remaining, now)
+            R.log("recovery_unknown_order", order_id=oid, ticker=o["ticker"],
+                  why="exchange shows our prefix; replay does not know it")
+        for oid in sorted(set(self.m.orders) - set(exch)):
+            o = self.m.orders[oid]
+            if o.get("placed_ts", 0.0) == 0.0:
+                continue
+            self.m.unknown.note(oid, o["ticker"], o["side"], o.get("remaining", 0.0), now)
+            R.log("recovery_order_gone", order_id=oid, ticker=o["ticker"],
+                  why="replay says live; exchange does not show it")
 
     # =========================================================================================
     # THE LOOP
@@ -103,16 +222,47 @@ class Runner(object):
         self.iterations += 1
 
         # (1) B5 FIRST — a halted process stops doing work, not just stops placing.
+        # SF-3: every halt path flattens ONCE (the in-cycle halts already flattened; this
+        # catches iteration_error and any halt armed outside the cycle), and the cash-feed
+        # heartbeat keeps publishing — a halted-but-alive v5 still holds inventory, and a
+        # stale feed would page nestor's operator about a process that is fine.
         if self.m.halt.halted:
+            try:
+                if not self.m.halt_flatten_done:
+                    self.m.flatten(now)
+                    self.m.halt_flatten_done = True
+                if self.m.publisher.due(now):
+                    self.m.publisher.publish(now)
+            except Exception as exc:                          # noqa: BLE001 - SF-3: no crash
+                R.log("halted_idle_error", err="%s: %s" % (type(exc).__name__, exc))
             R.log("iteration_skipped_halted", reason=self.m.halt.reason)
             return {"halted": True, "reason": self.m.halt.reason}
 
         # (2) scan → classify → slots.  Each is cadence-gated and rate-laned inside.
         programs = self.scanner.scan(self.m.ex, self.m.bucket, now)
         self.classifier.sweep(self.m.ex, self.m.bucket, programs, now, books=books)
+
+        # (2a) charter B: books/yes_mids for the day stop and the meter come from the
+        # classify table (the exchange's own statements), with any WS-fed entries the caller
+        # passed taking precedence (they are fresher when the gate has passed).  Both sides
+        # are on the YES axis — the ask's same-side best is 1 − best_no_bid.
+        books = dict(books or {})
+        yes_mids = dict(yes_mids or {})
+        for tk, rec in self.classifier.table.items():
+            yb = rec["sides"]["bid"]["p"]
+            nb = rec["sides"]["ask"]["p"]
+            entry = books.setdefault(tk, {})
+            entry.setdefault("bid", yb)
+            entry.setdefault("ask", (1.0 - nb) if nb is not None else None)
+            if tk not in yes_mids and rec.get("yes_mid") is not None:
+                yes_mids[tk] = rec["yes_mid"]
+
         seg = self.m.presence_log.read_segment(now)
+        l_shed = {k: M.l_shed_median_h(v)
+                  for k, v in self.m.shed_completed_h.items()}
         self.slots = scan.build_slots(programs, self.classifier, now,
-                                      presence_rows=seg, frozen=self.m.frozen)
+                                      presence_rows=seg, frozen=self.m.frozen,
+                                      l_shed=l_shed, p6=self.classifier.p6_ok)
         self.m.projected_day_reward = sum(
             (s.rho / 2.0) * min(24.0, s.hours_left) for s in self.slots) or \
             self.m.projected_day_reward
@@ -138,8 +288,10 @@ class Runner(object):
                 started = self.clock()
                 if deadline is not None and started >= deadline:
                     break
+                halted_pass = False
                 try:
-                    self.iteration(started)
+                    out = self.iteration(started)
+                    halted_pass = bool(out and out.get("halted"))
                 except Exception as exc:                      # noqa: BLE001
                     # An exception inside ONE iteration must not take the process down without
                     # the shutdown path: that would leave orders resting and no handback.
@@ -150,7 +302,10 @@ class Runner(object):
                 elapsed = self.clock() - started
                 if elapsed > period + C.CYCLE_OVERRUN_WARN_S:
                     R.log("cycle_overrun", elapsed=elapsed, period=period)
-                remaining = period - elapsed
+                # SF-3: a halted loop drops to the slow idle cadence — no spin, no crash-loop
+                # exit; the halt is a persisted decision and the loop's only remaining duties
+                # (heartbeat, SIGTERM) run fine at HALTED_IDLE_S.
+                remaining = (C.HALTED_IDLE_S if halted_pass else period) - elapsed
                 if remaining > 0:
                     self._sleep(remaining)
         finally:

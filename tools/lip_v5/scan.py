@@ -146,6 +146,13 @@ class Classifier:
         self.max_markets = int(max_markets)
         self.table = {}                      # ticker -> classification
         self.last = {}                       # ticker -> ts
+        # REAL market close (charter B): a market's settlement close is FIXED at listing, so
+        # one fetch per ticker suffices — cached forever, never re-spent.
+        self.close_ts = {}                   # ticker -> epoch s (market close, NOT program end)
+        self.close_missing = set()           # tickers whose market object carried no close
+        # P6 — public-trade-tape existence, per ticker, re-checked at P6_RECHECK_S.
+        self.p6 = {}                         # ticker -> bool (True = someone trades here)
+        self.p6_ts = {}                      # ticker -> last check ts
 
     def due(self, ticker, now):
         t = self.last.get(ticker)
@@ -183,17 +190,70 @@ class Classifier:
                         "legal": no_bid_c is not None and no_bid_c < C.MAX_LEGAL_PRICE_C},
             },
             "yes_mid": _mid(yes_bid_c, yes_ask_c),
+            "close_ts": self.close_ts.get(ticker),
             "ts": float(now),
         }
         self.table[ticker] = rec
         self.last[ticker] = float(now)
         return rec
 
+    def learn_close(self, ex, bucket, ticker, now):
+        """Fetch the market's SETTLEMENT close once, ever (charter B: `Slot.close_ts` must be
+        the market close, NOT the program window end — the PYPL geometry is exactly a market
+        that settles months after its reward window).  MIRROR (close unknown ↔ close wrong):
+        an unfetchable close falls back to the PROGRAM end downstream — logged once per
+        ticker as `market_close_unknown`, because that fallback UNDERSTATES carry on any
+        market that outlives its program, which is the dangerous direction."""
+        if ticker in self.close_ts or ticker in self.close_missing:
+            return
+        ok, _ = bucket.admit("classify_sweep", now)
+        if not ok:
+            return
+        status, body = ex.market(ticker)
+        if status != 200:
+            return                            # transient; retried next sweep
+        mkt = (body or {}).get("market") or body or {}
+        ts = parse_iso(mkt.get("close_time") or mkt.get("expiration_time"))
+        if ts is None:
+            self.close_missing.add(ticker)
+            R.log("market_close_unknown", ticker=ticker,
+                  note="falling back to program end_ts; carry may be UNDERSTATED")
+        else:
+            self.close_ts[ticker] = ts
+
+    def learn_p6(self, ex, bucket, ticker, now,
+                 lookback_days=C.P6_LOOKBACK_DAYS, recheck_s=C.P6_RECHECK_S):
+        """P6 pre-entry filter (charter B / note 43 §5's mirror): does ANYONE ever trade
+        here?  One `trades` read per ticker per P6_RECHECK_S through the classify lane.
+        MIRROR (refusing on a failed read ↔ admitting a dead book): a transient read failure
+        leaves the verdict UNKNOWN, and unknown ADMITS (p6_ok) — refusing every market on an
+        endpoint hiccup would stop the whole bot; a dead book admitted for one recheck period
+        costs presence-rate only, and the §2.5 kill still covers it once we are there."""
+        last = self.p6_ts.get(ticker)
+        if last is not None and float(now) - last < float(recheck_s):
+            return
+        ok, _ = bucket.admit("classify_sweep", now)
+        if not ok:
+            return
+        status, body = ex.trades(ticker, min_ts=float(now) - lookback_days * 86400.0)
+        if status != 200:
+            return                            # unknown, retried; p6_ok admits meanwhile
+        traded = bool((body or {}).get("trades"))
+        if not traded:
+            R.log("p6_refused", ticker=ticker, lookback_days=lookback_days)
+        self.p6[ticker] = traded
+        self.p6_ts[ticker] = float(now)
+
+    def p6_ok(self, ticker):
+        return self.p6.get(ticker, True)      # unknown admits; see learn_p6's mirror
+
     def sweep(self, ex, bucket, programs, now, books=None):
         """One pass.  Returns the number of markets (re)classified."""
         books = books or {}
         n = 0
         for rho, ticker, program in self.candidates(programs, now):
+            self.learn_close(ex, bucket, ticker, now)
+            self.learn_p6(ex, bucket, ticker, now)
             if not self.due(ticker, now):
                 continue
             body = books.get(ticker)
@@ -310,6 +370,13 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
 
         if p6 is not None and not p6(ticker):
             continue                          # P6: nobody trades here; presence buys nothing
+        # Charter B: `close_ts` is the MARKET's settlement close; `program_end_ts` is the
+        # reward window's end.  They differ on exactly the markets the horizon exclusion and
+        # the carry term exist for (PYPL settles months after its window).  Fallback to the
+        # program end when the market object carried no close — logged in `learn_close`,
+        # understates carry, and is the reason the classify sweep fetches the real one.
+        market_close = rec.get("close_ts")
+        close_ts = market_close if market_close is not None else prog["end_ts"]
         for side in ("bid", "ask"):
             sd = rec["sides"][side]
             p = sd["p"]
@@ -324,7 +391,7 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                                   P.rest_contract_hours(rows, key) if rows else 0.0))
             phi = M.phi_estimate(fills, rest_ch, p=p)
             d = M.d_estimate(t.get("drift_samples"), p)
-            l_eff = M.l_eff_h(prog["end_ts"], now,
+            l_eff = M.l_eff_h(close_ts, now,
                               (l_shed or {}).get(key), settled=False)
             t_hat = (P.t_hat_shrunk(rows, key, prior=prior_t_hat) if rows
                      else (prior_t_hat if prior_t_hat is not None
@@ -340,7 +407,7 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                 hours_left=hours_left, hours_to_start=hours_to_start,
                 target_size=rec["target_size"], cum_size=sd["cum_size"],
                 land_grab_size=land_grab,
-                close_ts=prog["end_ts"], program_end_ts=prog["end_ts"],
+                close_ts=close_ts, program_end_ts=prog["end_ts"],
                 moneyness=abs((rec["yes_mid"] or 0.5) - 0.5) * 100.0))
     return slots
 

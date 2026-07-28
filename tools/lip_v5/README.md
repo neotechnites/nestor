@@ -225,12 +225,23 @@ ALWAYS writes `v5_handback.json`. Past the boundary the procedure is
 
 ### Step 4 — G3: probe capital (Ryan)
 
+**The arm is one hand-written file.** `--live` alone refuses (exit 2); the binary requires the
+operator gate artifact, written BY HAND — the file's existence IS the human decision:
+
+```bash
+cat > ~/nestor/data/lip/v5_go.json <<'EOF'
+{"gate": "G3", "operator": "ryan", "note": "G2 shadow observed clean; probe capital approved",
+ "ts": "<date -u>"}
+EOF
+sudo systemctl start lip-v5        # unit already carries --live; the artifact arms it
+```
+
 Rung-0 caps live: floor-clearing probes only, ≤20% of ceiling unverified in total, ≤8
 concurrent, ≤2 oversized.
 **READ-OUT** on the first `allocate` line: `Σ unverified ≤ 0.20×ceiling`,
 `count(unverified) ≤ 8`, `count(probe_oversized) ≤ 2`, and **no venue funded below its
 `floor_q`**.
-**Rollback:** SIGTERM.
+**Rollback:** SIGTERM, then delete `v5_go.json` (un-arms the unit; a restart refuses again).
 **The human must be on the ntfy topic BEFORE this step** — the alarm chain needs a human at the
 end of it.
 

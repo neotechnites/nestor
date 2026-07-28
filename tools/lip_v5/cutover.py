@@ -171,6 +171,18 @@ class V4Positions(object):
                 o = self.orders.get(str(rec.get("order_id")))
                 if o is not None:
                     o["reduced_by"] = o["remaining_count"]      # nothing filled
+            elif kind == "adopt":
+                # BLOCKER-2: adoption is a money event; replay rebuilds the adopted position
+                # from its own row so a restart without the adopt file loses nothing, and
+                # startup can detect (and SKIP) a re-supplied adoption.  Applied directly —
+                # the row's `basis` is the LEG's per-contract cost, which `_apply` would
+                # re-derive through `unit_collateral` and get wrong for the NO leg.
+                tk, leg = rec.get("ticker"), rec.get("side")
+                n, b = float(rec.get("net") or 0.0), float(rec.get("basis") or 0.0)
+                if tk and leg in ("yes", "no") and n > 0:
+                    self.positions.setdefault(tk, {"yes": 0.0, "no": 0.0})[leg] += n
+                    legs = self.cost_leg.setdefault(tk, {"yes": 0.0, "no": 0.0})
+                    legs[leg] += n * b
             elif kind == "settlement":
                 tk = rec.get("ticker")
                 self.positions[tk] = {"yes": 0.0, "no": 0.0}

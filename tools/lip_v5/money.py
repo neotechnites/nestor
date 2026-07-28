@@ -257,14 +257,15 @@ def _clip01(x):
 # allocation, the allocation sets r*.  Precedent: v4's budget-reserve fixpoint.
 # =============================================================================================
 class RStarResult(object):
-    __slots__ = ("r_star", "iters", "converged", "trace", "alloc")
+    __slots__ = ("r_star", "iters", "converged", "trace", "alloc", "dropped")
 
-    def __init__(self, r_star, iters, converged, trace, alloc=None):
+    def __init__(self, r_star, iters, converged, trace, alloc=None, dropped=None):
         self.r_star = r_star
         self.iters = iters
         self.converged = converged
         self.trace = trace
         self.alloc = alloc
+        self.dropped = dropped               # forfeit-gate drops, set by allocate_with_rstar
 
     def __repr__(self):
         return "RStar(%.6f iters=%d conv=%s)" % (self.r_star, self.iters, self.converged)

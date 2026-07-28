@@ -23,6 +23,7 @@ import signal
 
 from . import alloc, cashfeed, clusters as CL, config as C, cutover
 from . import guards as G, ledger as LG, money as M, presence as P
+from . import quote as Q
 from . import ratchet as RT, ratelimit as RL, runtime as R, wsgate
 
 
@@ -60,7 +61,9 @@ class Maker(object):
         self.entry_basis = {}                # (ticker, leg) -> $/contract
         self.orders = {}                     # oid -> dict
         self.frozen = set()
-        self.venues = {}                     # venue -> RT.VenueState
+        self.venues = {}                     # venue -> RT.VenueState (ADMITTED only; a venue
+                                             # absent here allocates ZERO — see admit_venues)
+        self.venue_status = {}               # venue -> last admission status (telemetry)
         self.health = {}                     # (ticker, side) -> P.SlotHealth
         self.rollback = cutover.RollbackState()
         self.coid_seq = LG.coid_seq_load()
@@ -72,6 +75,22 @@ class Maker(object):
         self.last_meter_tick = None
         self.last_recon = 0.0
         self.cycles = 0
+
+        # --- requoter state (charter A) ---
+        self.S_ref = {}                      # (ticker, side) -> S at last requote (§4.3(c))
+        self.qual_ref = {}                   # (ticker, side) -> qualifies at last look (§4.3(d))
+        self.mbb_degraded = {}               # (ticker, side) -> ts of the balance reject
+        self.last_resync = float(now)        # §4.3(e)
+        self.land_grabbed = set()            # log land_grab once per (ticker, side)
+        # --- the shed path (charter A) ---
+        self.triage_shed = set()             # tickers the cutover triage sentenced to shed
+        self.pending_triage = []             # adopted positions awaiting a venue reading
+        self.shed_target = {}                # (ticker, shed_side) -> contracts to unwind
+        self.shed_since = {}                 # ticker -> ts the shed began (l_shed's clock)
+        self.shed_held = {}                  # ticker -> held leg at shed start
+        self.shed_completed_h = {}           # (ticker, held_leg) -> [hours open->flat]
+        # --- SF-3 ---
+        self.halt_flatten_done = False       # every halt path flattens ONCE
 
     # =========================================================================================
     # STARTUP
@@ -113,15 +132,28 @@ class Maker(object):
                 R.log("startup_refusal", reason=msg)
             return False, refusals
 
-        # §6.3-C — adoption, then triage.
+        # §6.3-C — adoption, then triage.  BLOCKER-2: adoption is IDEMPOTENT — if replay
+        # already shows `adopt` rows, a re-supplied adopt file is SKIPPED, so `position_cost`
+        # can never double and a restart with the same command line is safe.
         if adopt_obj is not None:
-            self.adopt(now, adopt_obj, exchange_positions or {}, marks or {})
+            if any((r.get("k") or r.get("kind")) == "adopt" for r in rows):
+                R.log("adopt_skipped_already_adopted",
+                      note="ledger replay carries adopt rows; state comes from replay")
+                self.rollback.set_adopted(
+                    [{"ticker": r.get("ticker"), "side": r.get("side")}
+                     for r in rows if (r.get("k") or r.get("kind")) == "adopt"])
+            else:
+                self.adopt(now, adopt_obj, exchange_positions or {}, marks or {})
         return True, []
 
     def adopt(self, now, adopt_obj, exchange_positions, marks):
         res = cutover.adoption_gate(adopt_obj.get("positions", []), exchange_positions, marks)
         for tk in res["frozen"] + res["refused_for_quoting"]:
             self.frozen.add(tk)
+        for e in res["excluded"]:
+            # Durable freeze: replay rebuilds `frozen` from these rows (v1 §9.4b — a freeze
+            # that a restart clears is a naked-short generator).
+            self.ledger.write("assume_filled", ticker=e["ticker"], reason=e["reason"])
         for a in res["adopted"]:
             leg = a["side"]
             pos = self.positions.setdefault(a["ticker"], {"yes": 0.0, "no": 0.0})
@@ -130,7 +162,12 @@ class Maker(object):
             self.position_cost[a["ticker"]] = \
                 self.position_cost.get(a["ticker"], 0.0) + a["net"] * a["basis"]
             self.cash.inventory[a["ticker"]] = {"n": float(a["net"]), "basis": float(a["basis"])}
+            # BLOCKER-2: one MONEY row per adopted leg, so replay rebuilds the position and
+            # a second adoption is detectable.
+            self.ledger.write("adopt", ticker=a["ticker"], side=leg, net=a["net"],
+                              basis=a["basis"])
         self.rollback.set_adopted(res["adopted"])
+        self.pending_triage = list(res["adopted"])     # triaged when a venue reading exists
         R.log("adopt", adopted=len(res["adopted"]), excluded=len(res["excluded"]),
               orphans=len(res["orphans"]))
         return res
@@ -221,11 +258,15 @@ class Maker(object):
         self.orders[oid] = {"order_id": oid, "coid": coid, "ticker": ticker, "side": side,
                             "price": float(price), "size": float(count),
                             "remaining": float(o.get("remaining_count", count)),
+                            "fully_closing": fully_closing,
+                            "expiration_ts": int(expiration_ts),
                             "placed_ts": now}
         self.ledger.write("place_resp", ticker=ticker, side=side, coid=coid, order_id=oid,
                           price=price, size=count,
                           remaining_count=o.get("remaining_count"),
-                          fill_count=o.get("fill_count", 0), seq=self.coid_seq)
+                          fill_count=o.get("fill_count", 0), seq=self.coid_seq,
+                          expiration_ts=int(expiration_ts),
+                          fully_closing=fully_closing)
         self.publisher.publish(now)
         return True, "ok", resp
 
@@ -245,8 +286,11 @@ class Maker(object):
             learned = max(0.0, o["remaining"] - reduced)
             if learned:
                 self.book_fill(o["ticker"], o["side"], learned, o["price"], now,
-                               fill_id="cancel:%s" % oid)
-            self.cash.release_order(o["coid"])
+                               fill_id="cancel:%s" % oid, order_id=oid,
+                               closing=bool(o.get("fully_closing")))
+            # SF-4: `.get`, never `[...]` — an order rebuilt from replay or the recovery
+            # sweep may carry no coid, and shutdown's cancel-all must survive that.
+            self.cash.release_order(o.get("coid"))
             o["remaining"] = 0.0
             self.orders.pop(str(oid), None)
             self.unknown.resolved(oid)
@@ -263,17 +307,45 @@ class Maker(object):
     # FILLS
     # =========================================================================================
     def book_fill(self, ticker, side, count, price, now, fill_id=None, closing=False,
-                  proceeds=None):
-        """The single entry point for a fill into state, so B8's dedupe cannot be bypassed."""
+                  proceeds=None, order_id=None, fee_usd=0.0, closed_leg=None):
+        """The single entry point for a fill into state, so B8's dedupe cannot be bypassed.
+
+        `order_id` links the fill to the resting order that produced it: the order's
+        `remaining` shrinks and its resting collateral (keyed by coid in the cash feed)
+        shrinks with it.  Without the link a fill leaves the collateral counted AND books the
+        inventory — published expected-cash drifts BELOW truth (the safe direction, but a
+        drift), and the requoter reads a stale `remaining` and under-refills.
+
+        CLOSING AXIS (defect found by the aliveness suite, fixed here): a closing fill
+        reduces the leg it SOLD, which on the ORDER axis is the OPPOSITE of the side's
+        opening leg — an ask that opens buys NO, but an ask that closes sells the YES we
+        hold.  The earlier code reduced the side's own leg, so a shed-ask fill decremented a
+        zero NO leg, positions diverged from the cash feed's (correct) inventory, and the
+        next reconcile froze the very market the shed had just cleaned.  Fills-API rows
+        speak the LEG axis and pass `closed_leg` explicitly.  The cash value realized is the
+        CLOSED leg's price: p for YES, 1−p for NO.
+        """
         if not self.dedupe.is_new(fill_id, fallback_key="%s|%s|%s|%s" %
                                   (ticker, side, count, price)):
             return False
         leg = "yes" if side == "bid" else "no"
         pos = self.positions.setdefault(ticker, {"yes": 0.0, "no": 0.0})
         unit = R.unit_collateral(side, price)
+        o = self.orders.get(str(order_id)) if order_id is not None else None
+        coid = o.get("coid") if o else None
+        if o is not None:
+            o["remaining"] = max(0.0, o.get("remaining", 0.0) - float(count))
+            if o["remaining"] <= 1e-9:
+                self.orders.pop(str(order_id), None)
         if closing:
-            pos[leg] = max(0.0, pos[leg] - float(count))
-            self.cash.fill(ticker, "shed", count, unit, side_sign=-1.0,
+            leg = closed_leg or ("yes" if side == "ask" else "no")
+            n_closed = min(float(count), max(0.0, pos.get(leg, 0.0)))
+            pos[leg] = max(0.0, pos.get(leg, 0.0) - float(count))
+            basis = self.entry_basis.get((ticker, leg), 0.0)
+            self.position_cost[ticker] = max(
+                0.0, self.position_cost.get(ticker, 0.0) - n_closed * basis)
+            value = float(price) if leg == "yes" else (1.0 - float(price))
+            self.cash.fill(ticker, coid or "shed", count, value, side_sign=-1.0,
                            proceeds_per_contract=proceeds)
         else:
             prev = pos[leg] * self.entry_basis.get((ticker, leg), 0.0)
@@ -281,13 +353,23 @@ class Maker(object):
             self.entry_basis[(ticker, leg)] = ((prev + count * unit) / pos[leg]) \
                 if pos[leg] > 0 else 0.0
             self.position_cost[ticker] = self.position_cost.get(ticker, 0.0) + count * unit
-            self.cash.fill(ticker, "o", count, unit)
+            self.cash.fill(ticker, coid or "o", count, unit)
+        if fee_usd:
+            self.pay_fee(fee_usd)
         self.refill.note_fill(ticker, side, count)
         self.meter.note_fill((ticker, side), count, count * unit)
         self.rollback.note_fill(ticker, leg, now)
         self.ledger.write("fill_obs", ticker=ticker, side=side, count=count,
-                          price_c=int(round(price * 100)), fill_id=fill_id)
+                          price_c=int(round(price * 100)), fill_id=fill_id,
+                          order_id=order_id)
         return True
+
+    def pay_fee(self, usd):
+        """Charter B: `fees_paid` wired on any fee-bearing event.  ONE source of truth — the
+        cash feed's component — mirrored into the engine field the P&L reads, so the two can
+        never disagree."""
+        self.cash.pay_fee(usd)
+        self.fees_paid = self.cash.fees_paid
 
     def poll_fills(self, now, since=None):
         admitted, _ = self.bucket.admit("verify", now)
@@ -301,9 +383,18 @@ class Maker(object):
             if not R.owns_coid(row.get("client_order_id", "")):
                 continue                     # never trust the index about someone else's order
             leg, sign = cutover.normalize_fill(row.get("side"), row.get("action", "buy"))
-            if self.book_fill(row.get("ticker"), leg, float(row.get("count", 0)),
-                              float(row.get("price", 0)), now, fill_id=row.get("fill_id"),
-                              closing=(sign < 0)):
+            count = float(row.get("count", 0))
+            price = float(row.get("price", 0))
+            # Fee-bearing event (charter B): a maker fill is free; `is_taker` means we
+            # crossed (should be unreachable under STP, but if the exchange says we paid,
+            # we book it — a fee we refuse to book is a silent divergence in the cash feed).
+            fee = cutover.taker_fee_usd(count, price) if row.get("is_taker") else 0.0
+            if self.book_fill(row.get("ticker"), leg, count, price, now,
+                              fill_id=row.get("fill_id"), closing=(sign < 0),
+                              order_id=row.get("order_id"), fee_usd=fee,
+                              # fills rows speak the LEG axis: a sell of YES arrives as
+                              # ("bid", −1) and must close the YES leg, not the NO leg.
+                              closed_leg=("yes" if leg == "bid" else "no")):
                 n += 1
         return n
 
@@ -329,35 +420,44 @@ class Maker(object):
 
         # --- day stop (B2) ---
         pnl = G.mark_to_market_pnl(self.positions, self.position_cost, yes_mids or {},
-                                   self.fees_paid)
+                                   self.cash.fees_paid)
         out["pnl"] = pnl
         out["unpriced"] = G.unpriced_positions(self.positions, yes_mids or {})
         if G.day_stop_breached(pnl, self.projected_day_reward):
             self.day_stopped = True
             self.halt.halt("day_stop", now, {"pnl": pnl})
             self.flatten(now)
+            self.halt_flatten_done = True
             out["day_stop"] = True
             return out
 
-        # --- drawdown (B3) ---
-        equity = pnl + self.cash.raw_delta + self.ceiling_usd
+        # --- drawdown (B3, equity fix per finish-round charter) ---
+        # Drawdown measures LOSS, never deployment: resting collateral and inventory are
+        # ASSETS (collateral at par, inventory at mark — `pnl` above already carries mark
+        # minus cost), so equity = ceiling + realized + unrealized − fees.  The earlier form
+        # added `raw_delta`, which counts every deployed dollar as GONE — full deployment at
+        # zero loss read as a 100% drawdown and halted a healthy book at its first allocation.
+        equity = self.ceiling_usd + self.cash.realized_pnl + pnl
         dd, breached = self.peak.observe(equity, now)
         out["drawdown"] = dd
         if breached:
             self.halt.halt("max_drawdown", now, {"drawdown": dd, "peak": self.peak.peak})
             self.flatten(now)
+            self.halt_flatten_done = True
             return out
 
-        # --- allocate ---
+        # --- allocate → REQUOTE (charter A: the stage that was never written) ---
         if slots:
-            venue_caps = {v: st.cap_usd(self.ceiling_usd * C.PER_MARKET_BUDGET_FRAC,
-                                        self.ceiling_usd)
-                          for v, st in self.venues.items()}
+            venue_caps = self.admit_venues(now, slots)
             budget = alloc.reserve_budget(self.ceiling_usd, C.INV_CAP_USD)
             a, spent, res = alloc.allocate_with_rstar(slots, budget, venue_caps=venue_caps)
             out["allocate"] = {"spent": spent, "r_star": res.r_star,
-                               "converged": res.converged, "slots": len(slots)}
+                               "converged": res.converged, "slots": len(slots),
+                               "venues_admitted": len(self.venues),
+                               "dropped_programs": sorted(str(d) for d in
+                                                          (res.dropped or ()))}
             out["alloc"] = a
+            out["requote"] = self.requote_pass(now, slots, a, res.r_star)
 
         # --- cash feed cadence (30 s heartbeat; every wire call publishes anyway) ---
         if self.publisher.due(now):
@@ -409,8 +509,15 @@ class Maker(object):
                 continue
             key = (o["ticker"], o["side"])
             best = (books.get(o["ticker"]) or {}).get(o["side"])
-            ticks_behind = 0 if best is None else max(
-                0, int(round((best - o["price"]) * 100)))
+            # Both sides on the YES axis.  "Behind" points OPPOSITE ways per side: a bid is
+            # behind when BELOW the best bid, an ask when ABOVE the best ask.  One sign for
+            # both would grade every off-best ask as at-best (mirror of the bid case).
+            if best is None:
+                ticks_behind = 0
+            elif o["side"] == "bid":
+                ticks_behind = max(0, int(round((best - o["price"]) * 100)))
+            else:
+                ticks_behind = max(0, int(round((o["price"] - best) * 100)))
             e = obs.setdefault(key, {"orders": [], "net_position": 0.0, "entry_basis": 0.0})
             e["orders"].append({"remaining": o["remaining"], "price": o["price"],
                                 "ticks_behind": ticks_behind})
@@ -455,6 +562,362 @@ class Maker(object):
                 self.cash.settlement_row(row.get("ticker"), float(row.get("revenue", 0)) / 100.0)
         return exch
 
+    # =========================================================================================
+    # VENUE ADMISSION (charter B: populate self.venues — wakes the §1.4 caps in allocation)
+    # =========================================================================================
+    def admit_venues(self, now, slots):
+        """Run §1.4's rung-0 admission over the venues the slot table names, and return the
+        `venue_caps` map ALLOCATE binds against.
+
+        THE CONTRACT THAT WAKES THE CAP: every venue in `slots` gets an entry — admitted
+        venues get their ratchet cap, everything else (queued, unprobeable, stood-down,
+        never-seen) gets 0.0.  A venue absent from the map would be UNCAPPED in ALLOCATE,
+        which is the dormant-guard state this round exists to end.
+
+        `floor_q` is computed over the REMAINING window (hours_left), not the full one: the
+        probe must clear ENTRY_FLOOR from NOW, or the forfeit gate drops the very program the
+        probe was sized for — a probe and a gate that disagree fund nothing forever.  For a
+        rung-0 unverified venue the cap TRACKS the floor upward as the window shrinks (spec:
+        "never shrink the probe below floor_q"); once the floor no longer fits under the
+        per-slot/per-market caps the venue reads UNPROBEABLE and its cap drops to 0 — the
+        runway death, arriving through the same door as `runway_ok`.
+        """
+        by_venue = {}
+        for s in slots:
+            by_venue.setdefault(s.venue, []).append(s)
+
+        per_market = C.PER_MARKET_BUDGET_FRAC * self.ceiling_usd
+        candidates = []
+        for venue, ss in sorted(by_venue.items()):
+            floors = [RT.floor_q_usd(s.rho, s.S, s.p, s.hours_left)
+                      for s in ss if s.S > 0 and s.p > 0]
+            floors = [f for f in floors if f is not None]
+            floor_usd = min(floors) if floors else None
+            st = self.venues.get(venue)
+            if st is None:
+                net0 = max(s.net_at(0, C.FLOOR_RATE_PER_H) for s in ss)
+                candidates.append((venue, floor_usd, net0))
+            elif st.rung == 0 and not st.verified and not st.stood_down:
+                cap, status = RT.rung0_cap(floor_usd, C.INV_CAP_USD, per_market)
+                st.rung0_cap_usd = cap        # tracks floor_q up; 0.0 when UNPROBEABLE
+                if status == RT.UNPROBEABLE:
+                    self.venue_status[venue] = RT.UNPROBEABLE
+
+        # Admission, ranked by net(0) (spec §1.4 "QUEUE it (ranked by net(0))").  Trying the
+        # queue every cycle IS the exploration-floor mirror: the moment the unverified bounds
+        # have room, the best queued venue is admitted.
+        unverified = [st for st in self.venues.values()
+                      if not st.verified and not st.stood_down]
+        expo = sum(st.rung0_cap_usd * (2.0 ** st.rung) for st in unverified)
+        n_unver = len(unverified)
+        n_oversized = sum(1 for st in unverified if st.oversized)
+        for venue, floor_usd, _net0 in sorted(candidates, key=lambda kv: (-kv[2], kv[0])):
+            vs = RT.VenueState(venue)
+            status, cap, detail = RT.admit(vs, floor_usd, C.INV_CAP_USD, per_market,
+                                           self.ceiling_usd, expo, n_unver, n_oversized)
+            prev = self.venue_status.get(venue)
+            if status != prev:
+                R.log("venue_admission", venue=venue, status=status, cap_usd=cap, **detail)
+                if status == RT.OVERSIZED:
+                    self.ledger.write("probe_oversized", venue=venue, cap_usd=cap)
+            self.venue_status[venue] = status
+            if status in (RT.ADMITTED, RT.OVERSIZED):
+                self.venues[venue] = vs
+                expo += cap
+                n_unver += 1
+                n_oversized += 1 if vs.oversized else 0
+
+        caps = {}
+        for venue in by_venue:
+            st = self.venues.get(venue)
+            caps[venue] = st.cap_usd(per_market, self.ceiling_usd) if st else 0.0
+        return caps
+
+    def venue_reading(self, venue, reading_usd, projection_usd, now, settlement_day=None):
+        """§1.4's verification input (operator popover_estimate or paid credit).  Moves the
+        rung, writes the `ratchet` money row, pages on stand-down.  The SEAM for the credits
+        ritual — the ladder is inert until a human (or a later feed) calls this."""
+        st = self.venues.get(venue)
+        if st is None:
+            return None
+        verdict, ratio, detail = RT.apply_reading(st, reading_usd, projection_usd, ts=now,
+                                                  settlement_day=settlement_day)
+        self.ledger.write("ratchet", venue=venue, verdict=verdict, ratio=ratio, **detail)
+        if verdict == RT.OUT_OF_REACH:
+            self.ledger.write("venue_out_of_reach", venue=venue,
+                              projection=projection_usd)
+            R.ntfy("venue_out_of_reach", "lip_v5 venue out of reach: %s" % venue)
+        if st.stood_down:
+            R.ntfy("venue_stand_down", "lip_v5 venue stand-down: %s" % venue)
+        return verdict
+
+    # =========================================================================================
+    # THE SHED PATH (charter A): triage verdicts + inventory whose venue fails (★) ongoing
+    # =========================================================================================
+    def net_position(self, ticker):
+        p = self.positions.get(ticker) or {}
+        return float(p.get("yes", 0.0)) - float(p.get("no", 0.0))
+
+    def run_pending_triage(self, now, slots, r_star):
+        """Adopted positions are triaged as soon as a venue reading exists — the slot table
+        IS the reading (rho, S, p, phi, d, close/program end all live there).  Triage at
+        adoption time would run with NO readings and sentence the whole book to shed on
+        `no_venue_reading`; deferring until the classify sweep has spoken judges each
+        position on evidence.  MIRROR (never judged ↔ judged blind): a position whose market
+        never classifies again stays pending — reported every cycle in the read-out, held,
+        and ridden to settlement rather than shed at a price nobody derived."""
+        if not self.pending_triage:
+            return
+        by_key = {s.key: s for s in slots}
+        still = []
+        for pos in self.pending_triage:
+            leg = pos.get("side")
+            s = by_key.get((pos["ticker"], "bid" if leg == "yes" else "ask"))
+            if s is None:
+                still.append(pos)
+                continue
+            venue = {"rho": s.rho, "S": s.S, "p": s.p, "phi": s.phi, "d": s.d,
+                     "close_ts": s.close_ts, "program_end_ts": s.program_end_ts,
+                     "l_shed_h": None, "t_hat": s.t_hat}
+            v = cutover.triage_position(pos, venue, now, r_star)
+            R.log("cutover_triage", **v)
+            if v.get("exit_path") == cutover.MAKER_SHED:
+                self.triage_shed.add(pos["ticker"])
+        self.pending_triage = still
+
+    def update_shed_targets(self, now, slots, r_star):
+        """Recompute the shed set each cycle:
+          (1) cutover-triage verdicts (permanent for the position they judged), and
+          (2) inventory whose venue fails (★) NOW — the same equation that would refuse the
+              entry, applied to capital already inside (the carry term is forward-looking;
+              that the dollars are already there changes nothing about where they should be).
+        Completed sheds (position reaches flat, or untradeable dust) feed the `l_shed`
+        measurement — spec §1.2's liquidity horizon learns from its own exits.
+        """
+        by_key = {s.key: s for s in slots}
+        for ticker in sorted(set(self.positions) | set(self.shed_since)):
+            net = self.net_position(ticker)
+            if abs(net) < 1.0:
+                # Flat (or dust, which cannot trade — v4 T1).  If a shed was running, it
+                # COMPLETED: record hours open→flat for L_shed.
+                if ticker in self.shed_since:
+                    dur_h = (float(now) - self.shed_since.pop(ticker)) / 3600.0
+                    held = self.shed_held.pop(ticker, "yes")
+                    self.shed_completed_h.setdefault((ticker, held), []).append(dur_h)
+                    self.shed_target.pop((ticker, Q.shed_side(held)), None)
+                    R.log("shed_complete", ticker=ticker, hours=round(dur_h, 4),
+                          dust=abs(net) > 1e-9)
+                continue
+            if ticker in self.frozen:
+                continue                      # assume_filled freeze covers RECYCLING (§9.4b)
+            held = Q.held_leg_of(net)
+            reason = None
+            if ticker in self.triage_shed:
+                reason = "cutover_triage"
+            else:
+                s = by_key.get((ticker, "bid" if held == "yes" else "ask"))
+                if s is not None:
+                    fails_star = not M.admits(s.net_at(abs(net), r_star))
+                    horizon = (s.close_ts is not None and s.program_end_ts is not None and
+                               M.horizon_excluded(s.close_ts, now, s.program_end_ts, s.rung))
+                    if fails_star or horizon:
+                        reason = "horizon_excluded" if horizon else "venue_fails_star"
+                # No slot this cycle: KEEP the previous verdict rather than judging blind —
+                # a transient classify gap must not start (or stop) a shed.
+                elif ticker in self.shed_since:
+                    reason = "held_from_last_reading"
+            key = (ticker, Q.shed_side(held))
+            if reason:
+                if ticker not in self.shed_since:
+                    self.shed_since[ticker] = float(now)
+                    self.shed_held[ticker] = held
+                    R.log("shed_started", ticker=ticker, held=held, net=net, reason=reason)
+                self.shed_target[key] = Q.shed_qty(net)
+            else:
+                if self.shed_target.pop(key, None) is not None:
+                    R.log("shed_stopped", ticker=ticker, reason="venue_passes_star_again")
+                self.shed_since.pop(ticker, None)
+                self.shed_held.pop(ticker, None)
+
+    # =========================================================================================
+    # THE REQUOTING STAGE (charter A) — diff the post-forfeit-gate allocation against the
+    # resting book; every emission goes through place()/cancel(), the rails stay the one path.
+    # =========================================================================================
+    def requote_pass(self, now, slots, alloc_map, r_star):
+        """One requote pass.  Returns the read-out {placed, cancelled, sheds, skipped}."""
+        self.run_pending_triage(now, slots, r_star)
+        self.update_shed_targets(now, slots, r_star)
+
+        stats = {"placed": 0, "cancelled": 0, "sheds": 0, "skipped": 0,
+                 "pending_triage": len(self.pending_triage)}
+        slot_by_key = {s.key: s for s in slots}
+        live_by_slot = {}
+        for oid, o in sorted(self.orders.items()):
+            if o.get("remaining", 0) > 0:
+                live_by_slot.setdefault((o["ticker"], o["side"]), []).append(o)
+
+        for s in sorted(slots, key=lambda x: (x.ticker, x.side)):
+            key = s.key
+            if s.close_ts is None:
+                continue                      # no close ⇒ no expiration backstop ⇒ no quote
+            exp = int(s.close_ts - C.CLOSE_MARGIN_S)
+            if exp <= now:
+                continue                      # window END: the backstop would be in the past
+            cur_list = sorted(live_by_slot.get(key) or [],
+                              key=lambda o: o.get("placed_ts", 0.0))
+            # Self-heal: >1 live order on a slot (an MBB cancel that was rate-refused).
+            # Cancel the OLDER ones first; the newest is the quote.
+            for stale in cur_list[:-1]:
+                ok, _ = self.cancel(stale["order_id"], now, lane="requote_cancel")
+                if ok:
+                    stats["cancelled"] += 1
+            cur = cur_list[-1] if cur_list else None
+
+            q_alloc = int(alloc_map.get(key, 0))
+            shed_q = Q.shed_qty(self.net_position(s.ticker),
+                                self.shed_target.get(key)) \
+                if key in self.shed_target else 0
+            q = max(q_alloc, shed_q)
+            if q <= 0:
+                if cur is not None:
+                    ok, _ = self.cancel(cur["order_id"], now, lane="requote_cancel")
+                    if ok:
+                        stats["cancelled"] += 1
+                continue
+
+            # Price, on the YES axis (order bodies speak YES; `s.p` is the SAME-SIDE best in
+            # its own collateral currency, so the ask converts).
+            if s.is_land_grab and 0 < q_alloc <= s.land_grab_size and q == q_alloc:
+                price = s.land_grab_price_c / 100.0
+                if key not in self.land_grabbed:
+                    self.land_grabbed.add(key)
+                    R.log("land_grab", ticker=s.ticker, side=s.side, size=q,
+                          price_c=s.land_grab_price_c, target_size=s.target_size,
+                          cum_size=s.cum_size)
+            elif shed_q > 0:
+                # v1 §5.4: the shed joins the OPPOSING queue and NEVER crosses (G6 stays
+                # off).  `shed_price` refuses a crossed/locked book outright — joining a
+                # crossed book would in fact take.
+                bid_s = slot_by_key.get((s.ticker, "bid"))
+                ask_s = slot_by_key.get((s.ticker, "ask"))
+                px = Q.shed_price(self.shed_held.get(s.ticker, "yes"),
+                                  bid_s.p if bid_s else None,
+                                  (1.0 - ask_s.p) if ask_s else None)
+                if px is None:
+                    R.log("shed_unpriced", ticker=s.ticker, side=s.side,
+                          why="crossed_or_one_sided_book")
+                    stats["skipped"] += 1
+                    continue
+                price = px
+            else:
+                price = s.p if s.side == "bid" else (1.0 - s.p)
+            price = round(price, 4)
+            if not (C.MIN_LEGAL_PRICE_C / 100.0 <= price <= C.MAX_LEGAL_PRICE_C / 100.0):
+                stats["skipped"] += 1
+                continue
+
+            # Fully-closing iff the WHOLE order reduces inventory (the halt/day-stop/cap
+            # exemptions apply to it; a combined earning+shed order is not exempt).
+            room = abs(self.net_position(s.ticker))
+            fully_closing = shed_q > 0 and q <= room + 1e-9
+
+            our_c = int(round(cur["price"] * 100)) if cur else None
+            best_c = int(round(price * 100))
+            qualifies_now = float(s.cum_size) >= float(s.target_size)
+            trig = Q.requote_triggers(
+                our_c, best_c, cur["remaining"] if cur else 0.0, q,
+                s.S, self.S_ref.get(key, s.S), qualifies_now,
+                self.qual_ref.get(key, qualifies_now),
+                (now - cur["placed_ts"]) if cur else 0.0, now - self.last_resync)
+            self.S_ref[key] = s.S
+            self.qual_ref[key] = qualifies_now
+            if cur is None or trig:
+                placed = self._requote_slot(key, s.ticker, s.side, price, q, exp, now,
+                                            fully_closing, shed_q, cur)
+                if placed:
+                    stats["placed"] += 1
+                    if shed_q > 0:
+                        stats["sheds"] += 1
+                else:
+                    stats["skipped"] += 1
+        # A shed target whose opposing slot vanished from the table cannot be priced this
+        # cycle.  Say so — a shed that silently never posts is the locked-inventory state
+        # the shed path exists to end.
+        slot_keys = {s.key for s in slots}
+        for key in sorted(set(self.shed_target) - slot_keys):
+            R.log("shed_unpriced", ticker=key[0], side=key[1],
+                  target=self.shed_target[key])
+        self.last_resync = now
+        return stats
+
+    def _requote_slot(self, key, ticker, side, price, q, exp, now, fully_closing, shed_q,
+                      cur):
+        """MAKE-BEFORE-BREAK (v1 §4.1) with the §4.2 automatic cancel-first degrade, plus
+        v4's C4 shed retry.  Returns True iff a new order is resting.
+
+        MIRROR (make-before-break ↔ break-before-make): an insufficient-balance reject on
+        the make leg latches THIS SLOT to cancel-first for one SAFETY_RESYNC_S period (v4
+        retried MBB at its window checkpoints; v5 carries no checkpoint machinery, and one
+        resync period bounds the retry cost at one reject per minute per slot) — recorded as
+        an `mbb_degraded` money row.  Under cancel-first, voluntary requotes are paced at
+        T* = 46 s (v1 §4.2's optimum) and never inside the placement's own second (§4.2
+        whole-second policy).
+        """
+        degraded_ts = self.mbb_degraded.get(key)
+        if degraded_ts is not None and now - degraded_ts >= C.SAFETY_RESYNC_S:
+            self.mbb_degraded.pop(key, None)              # retry MBB after one resync period
+            degraded_ts = None
+
+        if C.MAKE_BEFORE_BREAK and degraded_ts is None:
+            ok, reason, resp = self.place(ticker, side, price, q, exp, now,
+                                          fully_closing=fully_closing,
+                                          available_cash_usd=self._available_cash())
+            if ok:
+                if cur is not None:
+                    self.cancel(cur["order_id"], now, lane="requote_cancel")
+                return True
+            if reason == "reject" and "insufficient" in str(resp).lower():
+                self.mbb_degraded[key] = now
+                self.ledger.write("mbb_degraded", ticker=ticker, side=side,
+                                  cancel_first_period_s=C.CANCEL_FIRST_PERIOD_S,
+                                  why="make_leg_insufficient_balance")
+                # fall through to cancel-first NOW (v4's shape): the quote must not freeze
+            elif shed_q > 0 and q > shed_q and reason not in ("shadow",):
+                # C4 (v4): the COMBINED order (earning tail + shed) can fail a cap as one
+                # order and the shed inside it then vanishes — the inventory locks.  A
+                # closing-only order passes by netting; the earning tail is forgone this
+                # cycle, unwinding the inventory is not.
+                R.log("shed_retry_after_combined_reject", ticker=ticker, side=side,
+                      combined=q, shed_only=shed_q, refused_by=reason)
+                ok2, _, _ = self.place(ticker, side, price, shed_q, exp, now,
+                                       fully_closing=True,
+                                       available_cash_usd=self._available_cash())
+                if ok2 and cur is not None:
+                    self.cancel(cur["order_id"], now, lane="requote_cancel")
+                return ok2
+            else:
+                return False
+
+        # --- cancel-first path (§4.2) ---
+        if cur is not None:
+            if Q.same_second(now, cur.get("placed_ts")):
+                return False                  # whole-second policy (§4.2)
+            if now - cur.get("placed_ts", 0.0) < C.CANCEL_FIRST_PERIOD_S:
+                return False                  # T* pacing: requotes cost g seconds each here
+            ok, _ = self.cancel(cur["order_id"], now, lane="requote_cancel")
+            if not ok:
+                return False                  # stale quote stands; a rate loss, not a risk
+        ok, reason, _resp = self.place(ticker, side, price, q, exp, now,
+                                       fully_closing=fully_closing,
+                                       available_cash_usd=self._available_cash())
+        return ok
+
+    def _available_cash(self):
+        """B11's input: the last observed shared-account balance.  None (never read) skips
+        the floor rather than fabricating a number — the reconcile pass reads it within its
+        first cadence."""
+        return self.cash.last_balance
+
     def flatten(self, now):
         """Cancel-all on the EXIT lane — never refused, never counted against the cancel share."""
         for oid in list(self.orders):
@@ -468,23 +931,49 @@ class Maker(object):
             signal.signal(sig, lambda *_: setattr(self, "stopping", True))
 
     def shutdown(self, now, reason="sigterm"):
-        """cancel-all → shed → handback (ALWAYS) → zeroed cash feed.
+        """cancel-all → handback (ALWAYS) → zeroed cash feed.
 
         ORDER IS THE GUARANTEE.  §5.4's mirror: an ABSENT feed file reads as (0,0), which is
         correct only if v5 is truly flat — so the zeroed feed is written LAST, after the orders
         are actually gone.  And the handback is written in BOTH regimes (§6.3 SF-2), not only
         the dirty one, because a file that exists only sometimes is a file nobody trusts when
         it matters.
+
+        SF-4 — CRASH-PROOF: each of the three steps survives the others' failure, and the
+        HANDBACK survives everything, because it is the one artifact that lets v4 restart
+        onto reality.  A cancel-all that raises must not cost the handback; a handback that
+        raises must not cost the zeroed feed (the feed then honestly reports whatever state
+        the cancel-all reached... except it reports ZERO, which is only correct if the
+        cancel-all emptied the book — so the zeroed feed is SKIPPED when orders remain, and
+        the last live feed stands as the conservative record, §5.4's own fallback).
         """
         R.log("shutdown", reason=reason, rollback_clean=self.rollback.clean)
-        self.flatten(now)
-        held = [{"ticker": t, "side": leg, "net": p[leg],
-                 "basis": self.entry_basis.get((t, leg), 0.0)}
-                for t, p in sorted(self.positions.items())
-                for leg in ("yes", "no") if abs(p.get(leg, 0.0)) > 0]
-        ok, _ = self.persist.write(R.atomic_write_json, C.HANDBACK_PATH,
-                                   cutover.handback(held, now))
-        self.publisher.publish_zeroed(now)
+        try:
+            self.flatten(now)
+        except Exception as exc:                              # noqa: BLE001 - SF-4
+            R.log("shutdown_flatten_error", err="%s: %s" % (type(exc).__name__, exc))
+        held = []
+        try:
+            held = [{"ticker": t, "side": leg, "net": p[leg],
+                     "basis": self.entry_basis.get((t, leg), 0.0)}
+                    for t, p in sorted(self.positions.items())
+                    for leg in ("yes", "no") if abs(p.get(leg, 0.0)) > 0]
+            ok, _ = self.persist.write(R.atomic_write_json, C.HANDBACK_PATH,
+                                       cutover.handback(held, now))
+        except Exception as exc:                              # noqa: BLE001 - SF-4
+            R.log("shutdown_handback_error", err="%s: %s" % (type(exc).__name__, exc))
+            ok = False
+        try:
+            if self.orders:
+                # §5.4 mirror: a zeroed feed with orders still resting would publish
+                # expected-cash ABOVE the truth — the one forbidden direction.  Leave the
+                # last live feed standing (conservative) and page instead.
+                R.log("shutdown_feed_not_zeroed", orders_remaining=len(self.orders))
+                R.ntfy("halt", "lip_v5 shutdown left %d orders resting" % len(self.orders))
+            else:
+                self.publisher.publish_zeroed(now)
+        except Exception as exc:                              # noqa: BLE001 - SF-4
+            R.log("shutdown_feed_error", err="%s: %s" % (type(exc).__name__, exc))
         R.log("shutdown_complete", handback_written=ok, positions=len(held),
               rollback_clean=self.rollback.clean,
               procedure=self.rollback.procedure())

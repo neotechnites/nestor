@@ -72,7 +72,7 @@ if __package__ in (None, ""):                                # allow `python3 li
     __package__ = "lip_v5"
 
 from . import alloc, cashfeed, config as C, cutover, ledger, money, presence
-from . import ratchet, ratelimit, runtime as R, wsgate
+from . import ratchet, ratelimit, runtime as R, scan, wsgate
 
 
 # =============================================================================================
@@ -173,6 +173,97 @@ def nestor_state(path=None):
         return None
     return {"open_order_tickers": sorted(orders),
             "position_tickers": sorted(nestor_position_tickers(path))}
+
+
+def go_artifact_ok(path=None):
+    """The G3 gate artifact (charter D).  `--live` alone NEVER starts a quoting loop; the
+    operator writes `v5_go.json` BY HAND (README step 4) and this verifies it.  Three
+    requirements, each refusing a distinct accident:
+      * the file exists and parses — a touch(1) or a truncated write is not a decision;
+      * `operator` is non-empty — the decision has an author;
+      * `gate` == "G3" — a leftover artifact from some other ceremony cannot arm this one.
+    MIRROR (arming by accident ↔ unable to arm): the exact recipe lives in README step 4 and
+    in this refusal's own output, so the gate is one hand-typed file, not folklore.
+    """
+    p = path or C.GO_ARTIFACT_PATH
+    obj = R.read_json(p, default=None)
+    if not isinstance(obj, dict):
+        return False, ("gate artifact %s missing or unparseable; write it by hand per "
+                       "README step 4" % p)
+    if not str(obj.get("operator", "")).strip():
+        return False, "gate artifact has no non-empty 'operator' field"
+    if obj.get("gate") != "G3":
+        return False, "gate artifact 'gate' != 'G3' (found %r)" % obj.get("gate")
+    return True, "ok"
+
+
+# =============================================================================================
+# --live  (gate G3+) — the staged live branch (charter D)
+# =============================================================================================
+def run_live(args, now=None):                                # pragma: no cover - network
+    """The real ExecStart.  Every refusal here happens BEFORE `set_live`, so a refused start
+    can neither page nor reach the wire.  Sequence: gate artifact → key → arm → unit
+    assertion (v1 §0.3, verbatim) → v4-heartbeat refusal → adopt file if present → init
+    (which runs every startup refusal in `Maker.startup`) → the loop, whose every exit path
+    runs shutdown."""
+    from . import exchange as X, runner as RUN
+    now = R._now() if now is None else float(now)
+    go_path = os.path.join(args.data_dir, C.GO_ARTIFACT_NAME)
+    ok, why = go_artifact_ok(go_path)
+    if not ok:
+        print("--live REFUSED: %s" % why)
+        return 2
+    auth, note = R.load_auth()
+    if auth is None:
+        print("--live REFUSED: no key (%s)" % note)
+        return 2
+    R.set_live(True)
+    ex = X.Exchange(auth)
+
+    # v1 §0.3's startup refusal assertion, kept verbatim: a wrong pool unit is a 10x-10,000x
+    # sizing error and the binary must not run on one.
+    status, body = ex.programs(None)
+    programs = scan.parse_programs(body) if status == 200 else []
+    ok_unit, n = unit_assertion_check(programs)
+    if not ok_unit and C.REFUSE_ON_UNIT_MISMATCH:
+        print("--live REFUSED: unit assertion failed (%d matches, need %d)"
+              % (n, C.UNIT_ASSERT_MIN_MATCHES))
+        return 2
+
+    fresh, ts = v4_heartbeat_fresh(args.data_dir, now)
+    if fresh:
+        print("--live REFUSED: v4 heartbeat fresh (%.0fs ago) — two makers on one rung"
+              % (now - ts))
+        return 2
+
+    adopt_obj = R.read_json(C.ADOPT_PATH, default=None)
+    exchange_positions = None
+    if adopt_obj is not None:
+        st_p, pb = ex.positions()
+        if st_p != 200:
+            print("--live REFUSED: adopt file present but positions unreadable (HTTP %d)"
+                  % st_p)
+            return 2
+        exchange_positions = {}
+        for row in (pb or {}).get("market_positions") or []:
+            net = float(row.get("position", 0))
+            if net > 0:
+                exchange_positions[(row.get("ticker"), "yes")] = net
+            elif net < 0:
+                exchange_positions[(row.get("ticker"), "no")] = -net
+
+    r = RUN.build(ex, now, mode=args.mode, live=True)
+    r.m.install_signal_handlers()
+    ok, refusals = r.init(now, adopt_obj=adopt_obj, exchange_positions=exchange_positions,
+                          nestor_state=nestor_state(), allow_fresh=args.allow_fresh,
+                          reader_enabled=nestor_reader_enabled())
+    if not ok:
+        for msg in refusals:
+            print("REFUSED: %s" % msg)
+        return 2
+    R.log("live_armed", operator_gate=go_path, mode=args.mode)
+    r.run()
+    return 0
 
 
 # =============================================================================================
@@ -358,13 +449,20 @@ def main(argv=None):
     ap.add_argument("--shadow", action="store_true", help="G2: meter only, zeroed cash feed")
     ap.add_argument("--live", action="store_true",
                     help="G3+: REQUIRED for any order or any page.  Absent = INERT.")
+    ap.add_argument("--allow-fresh", action="store_true",
+                    help="B7 escape: blank ledger against a non-flat account, STATED "
+                         "(the cutover's one legitimate instance)")
     ap.add_argument("--mode", default=C.CASH_MODE_SHARED,
                     choices=[C.CASH_MODE_SHARED, C.CASH_MODE_SUBACCOUNT])
     ap.add_argument("--data-dir", default=C.DATA_DIR)
     args = ap.parse_args(argv)
 
     R.set_write_roots([C.NESTOR_HOME, args.data_dir])
-    R.set_live(bool(args.live))
+    # `set_live` is NOT set from the bare flag here: the quoting branch arms itself only
+    # after the G3 gate artifact and the key both check out (run_live), so a refused start
+    # is inert end to end.  --shadow --live still needs the runtime armed for its reads.
+    if args.live and args.shadow:
+        R.set_live(True)
 
     if args.check:
         ok, results = run_check(args.mode, args.data_dir)
@@ -394,13 +492,11 @@ def main(argv=None):
         return 0
 
     if args.live:
-        # G3+ is a HUMAN GATE, and the binary refuses to be the one that opens it.  Reaching
-        # here means someone passed --live without the staged sequence; the README's step 4 is
-        # the only path, and it is a Ryan-owned decision with its own read-out and rollback.
-        print("--live requires the staged sequence in README.md (G1 --check, G2 --shadow, then "
-              "G3 with the operator read-out). Refusing to start a quoting loop from a bare "
-              "flag.")
-        return 2
+        # G3+ is a HUMAN GATE: `--live` alone NEVER quotes.  `run_live` verifies the
+        # operator-created gate artifact (v5_go.json, README step 4) BEFORE arming anything;
+        # without it this prints the refusal and exits 2 — and the unit file's
+        # RestartPreventExitStatus honors that as "do not retry a human decision".
+        return run_live(args)
 
     ap.print_help()
     return 2

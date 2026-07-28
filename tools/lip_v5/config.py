@@ -42,6 +42,13 @@ HANDBACK_PATH = os.path.join(DATA_DIR, "v5_handback.json")         # §6.3 rollb
 V4_LEDGER_PATH = os.path.join(DATA_DIR, "v4_ledger.jsonl")         # READ-ONLY, §6.3 C.1
 V4_HEARTBEAT_GLOB = os.path.join(DATA_DIR, "v4_*.jsonl")           # §6.1 freshness refusal
 CASH_FEED_PATH = os.path.join(NESTOR_HOME, "data", "lip_cash_feed.json")   # §5.1
+# Charter D — the G3 operator gate artifact.  `--live` alone NEVER starts a quoting loop; the
+# operator writes this file BY HAND (README step 4) and the binary verifies it before arming.
+# MIRROR (starting without a human ↔ a human unable to start it): the artifact is the first
+# guard; the README's exact `cat > v5_go.json` recipe is the second's answer — the gate is one
+# hand-typed file, not a ceremony that can rot.
+GO_ARTIFACT_NAME = "v5_go.json"
+GO_ARTIFACT_PATH = os.path.join(DATA_DIR, GO_ARTIFACT_NAME)
 NESTOR_STATE_PATH = os.path.join(NESTOR_HOME, "data", "state.json")  # §11 Collisions
 NTFY_TOPIC = "senate-nestor-2732e947"                              # §11 Alerts
 
@@ -271,11 +278,16 @@ DENY_SERIES = {
 
 
 def series_denied(ticker, deny=None):
-    """A ticker belongs to a denied series iff the series is its prefix.  Prefix, not equality:
-    Kalshi tickers are `SERIES-EVENT-STRIKE`, so the series is what the deny list can name."""
+    """A ticker belongs to a denied series iff the series IS the ticker or is its
+    dash-delimited prefix.  Kalshi tickers are `SERIES-EVENT-STRIKE`, so `KXRAIN-...` is
+    denied by "KXRAIN" — but `KXRAINBOW-...` is NOT: the earlier bare-`startswith` clause
+    denied every series that merely SHARED A SPELLING with a toxic one, an overbroad match
+    that silently widened the deny list beyond what its evidence supports (finish-round
+    charter item D).  MIRROR (denying too much ↔ too little): the dash-anchored match is the
+    "too much" fix; the deny list itself remains the "too little" guard."""
     deny = DENY_SERIES if deny is None else deny
     t = str(ticker or "").upper()
-    return any(t == s or t.startswith(s + "-") or t.startswith(s) for s in deny)
+    return any(t == s or t.startswith(s + "-") for s in deny)
 
 
 LANES = ("exit_cancel", "requote_cancel", "place", "verify", "book_poll", "classify_sweep")
@@ -316,6 +328,14 @@ CYCLE_HZ = 1.0
 # A cycle that overruns its budget is a cycle whose telemetry lies about cadence; log it rather
 # than silently drifting.  100 ms is 10% of the period.
 CYCLE_OVERRUN_WARN_S = 0.100
+# SF-3 — the HALTED-IDLE cadence.  A halted process has exactly two remaining duties: keep the
+# cash-feed heartbeat fresh (a halted-but-alive v5 still holds inventory, and a stale feed
+# pages nestor's operator about a process that is fine) and notice SIGTERM.  The heartbeat's
+# own cadence (30 s) is therefore the loop's cadence — spinning faster does no work, and
+# sleeping longer than 120 s would trip the staleness page.  30 s leaves a 4x margin.
+# MIRROR (halted loop spinning ↔ halted loop dead): the idle cadence is the spin guard; the
+# heartbeat it publishes is what distinguishes "halted, alive" from "dead" on nestor's side.
+HALTED_IDLE_S = 30.0
 BOOK_POLL_HZ = 1.0                           # spec §3.4 step 4 from
 BOOK_POLL_HZ_DEGRADED = 0.5                  # spec §3.4 step 4 to
 RECON_POSITIONS_S = 600.0                    # spec §3.4 step 5 from
@@ -437,6 +457,12 @@ P4_FILL_HONOR_FLOOR = 0.90
 P6_LOOKBACK_DAYS = 5                         # MIRROR (kill for too MANY fills — we are the
                                              # fish ↔ kill for ZERO fills ever — a decorative
                                              # book): §2.5 is the first end, P6 the second.
+# P6 re-check cadence: 1/20 of the lookback window.  A market with zero public trades over 5
+# DAYS does not become tradeable inside minutes, so re-asking every classify pass (15 min)
+# buys nothing; at 6 h the admission latency for a venue that just came alive is bounded at
+# 1/20 of the evidence window that judged it dead.  The FIRST check is immediate (at first
+# classify), so a newly listed market with trades admits without waiting.
+P6_RECHECK_S = P6_LOOKBACK_DAYS * 86400 / 20.0               # = 6 h
 P7_MAX_REVIVAL_MARKETS = 3
 P7_MAX_SIDE_SHARE = 0.90
 P7_MAX_SIDE_SHARE_DAYS = 5
@@ -529,7 +555,12 @@ V5_LEDGER_KINDS = ("cash_feed", "rate_yield", "ratchet", "venue_kill", "venue_ou
                    "shade_decision", "orphan_position", "adopt_basis_rejected",
                    "mbb_degraded", "rstar_no_converge", "cancel_share_exceeded",
                    "probe_oversized", "venue_rank", "allocate", "idle_capital",
-                   "rollback_clean", "presence_collapse", "unit_mismatch")
+                   "rollback_clean", "presence_collapse", "unit_mismatch",
+                   # BLOCKER-2: adoption is a MONEY event and must survive restart via the
+                   # same replay path as every other money event — one `adopt` row per
+                   # adopted (ticker, side).  Replay rebuilds the position from it, and its
+                   # presence is what makes a second adoption a SKIP instead of a double.
+                   "adopt")
 LEDGER_KINDS = V1_LEDGER_KINDS + V5_LEDGER_KINDS
 PRESENCE_KIND = "presence"                   # spec §6.2 N2 — its OWN file, never the ledger
 FILLS_REQUERY_DELAY_S = 36                   # v1 §9.4a — 3× the ~12 s worst observed lag

@@ -36,8 +36,21 @@ class Exchange(object):
             params["cursor"] = cursor
         return R.public_get("/liquidity_incentive_programs", params=params)
 
+    def trades(self, ticker, min_ts=None, limit=1):          # pragma: no cover - network
+        """Public trade tape — P6's evidence source ("does ANYONE ever trade here?").
+        `limit=1` because P6 needs existence, not volume: one row answers the question."""
+        params = {"ticker": ticker, "limit": int(limit)}
+        if min_ts is not None:
+            params["min_ts"] = int(min_ts)
+        return R.public_get("/markets/trades", params=params)
+
     def positions(self):                                     # pragma: no cover - network
         return R.signed(self.auth, "GET", "/portfolio/positions")
+
+    def orders(self):                                        # pragma: no cover - network
+        """Resting orders — the v1 §9.4 step-4 recovery sweep's evidence.  Same path family
+        as place/cancel (`/portfolio/orders` 410s; the events form is the live one)."""
+        return R.signed(self.auth, "GET", C.ORDERS_PATH, params={"status": "resting"})
 
     def balance(self):                                       # pragma: no cover - network
         return R.signed(self.auth, "GET", "/portfolio/balance")
@@ -68,13 +81,15 @@ class FakeExchange(object):
         self.balance_cents = int(balance_cents)
         self.placed = []
         self.cancelled = []
-        self.orders = {}
+        self.resting = {}                    # oid -> the placed body (the fake's own book)
         self._oid = 0
         self.place_status = 201
         self.place_error = None
         self.cancel_status = 200
         self.fills_rows = []
         self.settlement_rows = []
+        self.market_closes = {}              # ticker -> close_ts (epoch s); optional
+        self.trades_rows = None              # None => "one recent trade" (P6 admits)
         self.now = now
 
     # -- reads -------------------------------------------------------------------------
@@ -83,13 +98,24 @@ class FakeExchange(object):
         return (200, b) if b is not None else (404, {})
 
     def market(self, ticker):
-        return 200, {"status": "active", "ticker": ticker}
+        body = {"status": "active", "ticker": ticker}
+        close = self.market_closes.get(ticker)
+        if close is not None:
+            from datetime import datetime, timezone
+            body["close_time"] = datetime.fromtimestamp(
+                float(close), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return 200, {"market": body}
 
-    def programs(self, cursor=None):
-        return 200, {"liquidity_incentive_programs": []}
+    def trades(self, ticker, min_ts=None, limit=1):
+        if self.trades_rows is not None:
+            return 200, {"trades": list(self.trades_rows)}
+        return 200, {"trades": [{"ticker": ticker, "created_time": self.now}]}
 
     def positions(self):
         return 200, {"market_positions": list(self._positions)}
+
+    def programs(self, cursor=None):
+        return 200, {"liquidity_incentive_programs": []}
 
     def balance(self):
         return 200, {"balance": self.balance_cents}
@@ -100,6 +126,16 @@ class FakeExchange(object):
     def settlements(self):
         return 200, {"settlements": list(self.settlement_rows)}
 
+    def orders(self):
+        rows = []
+        for oid, body in sorted(self.resting.items()):
+            rows.append({"order_id": oid,
+                         "client_order_id": body.get("client_order_id"),
+                         "ticker": body.get("ticker"), "side": body.get("side"),
+                         "price": body.get("price"),
+                         "remaining_count": float(body.get("count", 0))})
+        return 200, {"orders": rows}
+
     # -- writes ------------------------------------------------------------------------
     def place(self, body):
         self.placed.append(dict(body))
@@ -107,7 +143,7 @@ class FakeExchange(object):
             return self.place_status, {"error": {"message": self.place_error}}
         self._oid += 1
         oid = "fake-%d" % self._oid
-        self.orders[oid] = dict(body)
+        self.resting[oid] = dict(body)
         return self.place_status, {"order": {"order_id": oid,
                                              "client_order_id": body.get("client_order_id"),
                                              "status": "resting",
@@ -118,6 +154,6 @@ class FakeExchange(object):
         self.cancelled.append(order_id)
         if self.cancel_status != 200:
             return self.cancel_status, {}
-        body = self.orders.pop(order_id, None)
+        body = self.resting.pop(order_id, None)
         remaining = float(body.get("count", 0)) if body else 0.0
         return 200, {"reduced_by": remaining}

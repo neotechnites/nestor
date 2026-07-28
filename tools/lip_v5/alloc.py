@@ -311,7 +311,10 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.FLOOR_RATE_PER_H
         if s.close_ts is not None and s.program_end_ts is not None:
             # spec §1.2's hard horizon exclusion — the PYPL geometry, refused before it costs
             # anything.  Evaluated in HOURS on both sides; the type error matters.
-            if M.horizon_excluded(s.close_ts, s.close_ts - s.hours_left * 3600.0,
+            # `now` is reconstructed from the PROGRAM end minus the program-relative
+            # hours_left — never from close_ts, which is the MARKET close and (on exactly
+            # the markets this guard exists for) a different, later time.
+            if M.horizon_excluded(s.close_ts, s.program_end_ts - s.hours_left * 3600.0,
                                   s.program_end_ts, s.rung):
                 continue
         if s.key in q_alloc or s.p <= 0 or s.rho <= 0 or s.S <= 0:
@@ -431,20 +434,27 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
 
 def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
                         floor_rate=C.FLOOR_RATE_PER_H, venue_caps=None):
-    """The full cycle: solve spec §1.3's r* fixpoint around ALLOCATE, then allocate at it.
+    """The full cycle: solve spec §1.3's r* fixpoint around ALLOCATE — the FORFEIT-GATED
+    ALLOCATE, because the allocation the requoter diffs against must be the post-gate one
+    (finish-round charter A): quoting a program the gate would drop posts collateral into a
+    slot whose projected payout cannot clear the $2.00 floor, i.e. a knowingly forfeited
+    entry.
 
-    Returns (alloc, spent, RStarResult).  Non-convergence uses `max(r*_0..r*_4)` — the
-    CONSERVATIVE direction — and logs `rstar_no_converge`.
+    Returns (alloc, spent, RStarResult); `res.dropped` carries the gate's drops.
+    Non-convergence uses `max(r*_0..r*_k)` — the CONSERVATIVE direction — and logs
+    `rstar_no_converge`.
     """
     caps = caps or Caps()
     r0 = M.rstar_seed(trailing_rate, floor_rate)
 
     def run(r_star):
-        a, sp, marg = allocate(slots, budget_usd, r_star, caps, floor_rate, venue_caps)
-        return (a, sp), (marg if marg > 0 else floor_rate)
+        a, sp, marg, dropped = allocate_with_forfeit_gate(
+            slots, budget_usd, r_star, caps, floor_rate=floor_rate, venue_caps=venue_caps)
+        return (a, sp, dropped), (marg if marg > 0 else floor_rate)
 
     res = M.solve_rstar(lambda r: run(r), r0)
     if not res.converged:
         R.log("rstar_no_converge", r_star=res.r_star, trace=res.trace)
-    alloc, spent = res.alloc
+    alloc, spent, dropped = res.alloc
+    res.dropped = dropped
     return alloc, spent, res
