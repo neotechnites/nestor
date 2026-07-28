@@ -636,7 +636,7 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
     return alloc, spent, last_rate
 
 
-def cliff_clearing_q(slot, target_usd=1.0):
+def cliff_clearing_q(slot, target_usd=None):
     """The SMALLEST size on this rung that can still reach the $1 forfeit cliff.
 
     Solve `share(q) x (rho/2) x hours_left + accrued >= target` for q, with
@@ -657,6 +657,13 @@ def cliff_clearing_q(slot, target_usd=1.0):
     Returns None when the cliff is unreachable at ANY size (share_needed >= 1): the whole
     side's remaining pool cannot pay $1, so no amount of capital rescues it.
     """
+    # TARGET THE ENTRY FLOOR, NOT THE BARE CLIFF.  v1 §3.1 set ENTRY_FLOOR_USD = 2.00 as
+    # "2x the $1.00 payout cliff", and the doubling is margin for the three things that move
+    # between sizing and payout: FILLS take us out of the book (resting hours < window hours),
+    # RIVALS add size and dilute our share, and our own rate model can be optimistic.  Sizing
+    # to exactly $1.00 leaves zero headroom for any of them, and a rung that lands at $0.95
+    # pays the same as a rung that lands at zero.
+    target_usd = C.ENTRY_FLOOR_USD if target_usd is None else float(target_usd)
     avail = (float(slot.rho) / 2.0) * max(0.0, float(slot.hours_left))
     need = max(0.0, float(target_usd) - float(getattr(slot, "accrued", 0.0) or 0.0))
     if need <= 0:

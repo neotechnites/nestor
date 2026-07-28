@@ -417,7 +417,10 @@ class TestTheCliffSetsMinimumSize(LipTestCase):
 
     def test_the_cliff_size_matches_the_closed_form(self):
         s = self._rung("KXV-1")
-        self.assertEqual(alloc.cliff_clearing_q(s), 21)      # 2% of a 1000-lot side
+        # Targets ENTRY_FLOOR ($2 = 2x the cliff), which is margin for fills, rival
+        # dilution and model error — see the docstring.  The bare-cliff size is half it.
+        self.assertEqual(alloc.cliff_clearing_q(s), 42)
+        self.assertEqual(alloc.cliff_clearing_q(s, 1.0), 21)
 
     def test_an_unreachable_cliff_returns_None(self):
         s = self._rung("KXV-1", h=0.1)                       # side's whole pool < $1
@@ -442,7 +445,7 @@ class TestTheCliffSetsMinimumSize(LipTestCase):
         funded = [q for q in a.values() if q > 0]
         self.assertLess(len(funded), 10, "must not spread below the cliff across all rungs")
         for q in funded:
-            self.assertGreaterEqual(q, 21)
+            self.assertGreaterEqual(q, 42)
 
 
 class TestTheRungCapMustExceedTheCliff(LipTestCase):
@@ -464,4 +467,4 @@ class TestTheRungCapMustExceedTheCliff(LipTestCase):
                             venue="KXV", window_h=16.0)]
         caps = alloc.Caps(inv_cap_usd=30.0)
         a, _, _ = alloc.allocate(rungs, 300.0, 0.0625, caps=caps, cluster_cap_usd=75.0)
-        self.assertGreaterEqual(a[("KXV-0", "bid")], 21)
+        self.assertGreaterEqual(a[("KXV-0", "bid")], 42)
