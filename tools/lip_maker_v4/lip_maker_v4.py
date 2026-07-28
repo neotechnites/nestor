@@ -1441,6 +1441,8 @@ class LedgerState(object):
         self.filled_cum = {}          # (ticker, side) -> contracts  (§9.2)
         self.positions = {}           # ticker -> {"yes": n, "no": n}
         self.position_cost = {}       # ticker -> $ paid for the held contracts
+        self.position_cost_leg = {}   # ticker -> {"yes": $, "no": $}  (C9 entry basis)
+        self.realized_pnl = 0.0       # C2: released at settlement, feeds the §8.4 stop
         self.assume_filled = set()    # §9.4b freeze, survives restart
         self.poisoned = set()         # §8.5
         self.unknown_orders = []      # §9.4 step 2
@@ -1457,6 +1459,49 @@ class LedgerState(object):
     # -- views ---------------------------------------------------------------------------
     def filled(self, ticker, side):
         return self.filled_cum.get((ticker, side), 0.0)
+
+    def entry_basis(self, ticker, leg):
+        """C9 — average dollars PAID per contract on a leg.  The inventory cap must bind
+        against what we actually paid, not against the current price: a contract-count cap
+        of floor($10/p) re-permits at p=$0.20 against inventory bought at $0.34, which is
+        how a $10 cap silently becomes a $17 one."""
+        qty = (self.positions.get(ticker) or {}).get(leg, 0.0)
+        if qty <= 0:
+            return 0.0
+        return (self.position_cost_leg.get(ticker, {}).get(leg, 0.0)) / qty
+
+    def net_exposure_usd(self, ticker, side, prospective_size=0.0,
+                         prospective_price=None):
+        """C1 — the per-market net-inventory DOLLAR exposure if `prospective_size` on `side`
+        filled in full, INCLUDING what orders already resting on that side could still add.
+
+        The defect this closes (the DXY root cause): place()'s old check bounded `net+size`
+        but was blind to orders ALREADY RESTING on the same side.  Make-before-break puts
+        two orders on one side by construction, so both passed the check independently and
+        both filled — 2x the cap, reproduced at 58 modelled against 59 observed.
+
+            |net_after| * entry_basis  +  sum(resting OPENING size, same side) * unit_collat
+                                                                            <= INV_CAP_USD
+        """
+        net = self.net_position(ticker)
+        delta = float(prospective_size) if side == "bid" else -float(prospective_size)
+        net_after = net + delta
+        leg = "yes" if net_after > 0 else "no"
+        basis = self.entry_basis(ticker, leg)
+        if basis <= 0:
+            # no inventory on that leg yet: the exposure is being created at this order's
+            # own price, which is the only basis that exists.
+            basis = float(prospective_price) if prospective_price is not None else 0.0
+        held = abs(net_after) * basis
+        resting = [o for o in self.orders.values() if o.ticker == ticker and o.resting > 0]
+        _, _, closing = allocate_closing_room(resting, net)
+        opening = 0.0
+        for o in resting:
+            if o.side != side:
+                continue
+            open_qty = max(0.0, o.resting - closing.get(str(o.order_id), 0.0))
+            opening += open_qty * unit_collateral(o.side, o.price)
+        return held + opening
 
     def net_position(self, ticker):
         pos = self.positions.get(ticker, {})
@@ -1520,8 +1565,10 @@ class LedgerState(object):
         pos = self.positions.setdefault(order.ticker, {"yes": 0.0, "no": 0.0})
         leg = "yes" if order.side == "bid" else "no"
         pos[leg] += n
-        self.position_cost[order.ticker] = self.position_cost.get(order.ticker, 0.0) \
-            + n * unit_collateral(order.side, order.price)
+        spent = n * unit_collateral(order.side, order.price)
+        self.position_cost[order.ticker] = self.position_cost.get(order.ticker, 0.0) + spent
+        legs = self.position_cost_leg.setdefault(order.ticker, {"yes": 0.0, "no": 0.0})
+        legs[leg] += spent
 
 
 def ledger_replay(records):
@@ -1668,6 +1715,19 @@ def ledger_replay(records):
             st.poisoned.discard(rec.get("ticker"))
         elif kind == "poison":
             st.poisoned.add(rec.get("ticker"))
+        elif kind == "settlement":
+            # C2 — positions and position_cost had NO writer that decremented, so the
+            # ledger accumulated forever and replay faithfully rebuilt every ghost: a
+            # synthetic 16h tape reconstructed $3,612 of position_cost and the §8.3 ceiling
+            # self-sealed on window 2.  This is the release.  Idempotent by construction:
+            # it zeroes, so a duplicate row releases a position that is already zero.
+            tk = rec.get("ticker")
+            pos = st.positions.get(tk)
+            if pos and (abs(pos.get("yes", 0.0)) + abs(pos.get("no", 0.0))) > 0:
+                st.realized_pnl += num(rec.get("realized_pnl"), 0.0)
+            st.positions[tk] = {"yes": 0.0, "no": 0.0}
+            st.position_cost[tk] = 0.0
+            st.position_cost_leg[tk] = {"yes": 0.0, "no": 0.0}
         elif kind == "accrual":
             # S3: `accrued` and `checkpoints_done` are the ONLY pieces of checkpoint state
             # that cannot be re-derived from orders and fills — A is an integral over the
@@ -1686,6 +1746,47 @@ def ledger_replay(records):
         # "snapshot" is ADVISORY only (§9.1) and contributes nothing to state.
     st.unknown_orders = [o.order_id for o in st.orders.values() if o.state == ST_UNKNOWN]
     return st
+
+
+SETTLEABLE_STATUSES = ("settled", "finalized", "determined", "closed")
+
+
+def settlement_release(positions, position_cost, result):
+    """C2 — what a settled market returns.  `result` is the exchange's own, from the PUBLIC
+    market endpoint: "yes" pays $1.00 per YES contract, "no" pays $1.00 per NO contract, and
+    the losing leg pays zero.  Returns (released_yes, released_no, cost_released,
+    realized_pnl).
+
+    Doctrine (§8.6): the market result is MARKET TRUTH from a public endpoint, not a
+    portfolio index.  It is also the only thing that can authorise a release — see
+    `is_settleable`.  A release without an exchange result is impossible by construction
+    because `result` has no default and no inference path.
+    """
+    yes = float((positions or {}).get("yes", 0.0))
+    no = float((positions or {}).get("no", 0.0))
+    cost = float(position_cost or 0.0)
+    if result == "yes":
+        proceeds = yes * 1.0
+    elif result == "no":
+        proceeds = no * 1.0
+    else:
+        return 0.0, 0.0, 0.0, 0.0            # not a settlement; release nothing
+    return yes, no, cost, proceeds - cost
+
+
+def is_settleable(market_body):
+    """C2 — a market may only release a position when the EXCHANGE says it resolved.
+    Requires a non-empty result AND a settleable status; either alone is not enough."""
+    m = (market_body or {}).get("market") or market_body or {}
+    if not isinstance(m, dict):
+        return False, None
+    result = str(m.get("result") or "").strip().lower()
+    status = str(m.get("status") or "").strip().lower()
+    if result not in ("yes", "no"):
+        return False, None
+    if status not in SETTLEABLE_STATUSES:
+        return False, None
+    return True, result
 
 
 class FillsRead(object):
@@ -2216,12 +2317,21 @@ class Maker(object):
             return None
         # §8.1/§5.5 — the inventory cap is on NET, and it binds on the WORST CASE of this
         # order filling in full.  A shed order is exempt: it reduces |net| by construction.
+        # §8.1/§5.5 + C1/C9 — the inventory cap is a DOLLAR cap on NET exposure, measured
+        # against what we PAID, and it counts what orders already resting on this side could
+        # still add.  The old form bounded `net + size` in CONTRACTS against the current
+        # price and was blind to resting orders, so make-before-break's two-orders-one-side
+        # shape let both pass independently and both fill — 2x the cap.
+        exposure = self.st.net_exposure_usd(ticker, side, size,
+                                            unit_collateral(side, price))
         worst = net + size if side == "bid" else net - size
-        ncap = n_cap(unit_collateral(side, price))
-        if abs(worst) > ncap and abs(worst) > abs(net):
+        if exposure > INV_CAP_USD + 1e-9 and abs(worst) > abs(net):
             self.last_place_skip = "net_inventory_cap"
             log("skip_post", ticker=ticker, side=side, why="net_inventory_cap",
-                net=net, worst=worst, n_cap=ncap)
+                net=net, worst=worst, exposure_usd=round(exposure, 4),
+                cap_usd=INV_CAP_USD,
+                basis=round(self.st.entry_basis(
+                    ticker, "yes" if worst > 0 else "no"), 4))
             return None
         seq = self.next_seq()
         coid = make_coid(ticker, side, seq)
@@ -2570,6 +2680,36 @@ class Maker(object):
                 cancelled=cancelled, kept_closing=kept,
                 net_position=self.st.net_position(tk))
 
+    def sweep_settlements(self, now):
+        """C2 — release settled inventory.  Runs on the classify sweep's 900s cadence, which
+        is ample: settlement is a once-per-market event and the release only ever FREES
+        capacity, so being late costs opportunity, never safety.
+
+        Doctrine-clean (§8.6): this reads the PUBLIC market endpoint — market truth — never
+        the portfolio positions index.  A position is released if and only if the exchange
+        published a result for its market.
+        """
+        for ticker in sorted(self.st.positions.keys()):
+            pos = self.st.positions.get(ticker) or {}
+            if (abs(pos.get("yes", 0.0)) + abs(pos.get("no", 0.0))) <= 0:
+                continue                      # nothing held: idempotency guard
+            st_code, body = public_get("/markets/%s" % ticker)
+            if st_code != 200:
+                log("settlement_check_failed", ticker=ticker, http=st_code)
+                continue
+            ok, result = is_settleable(body)
+            if not ok:
+                continue
+            ry, rn, cost, pnl = settlement_release(pos, self.st.position_cost.get(ticker),
+                                                   result)
+            log("settlement", k="settlement", ticker=ticker, result=result,
+                released_yes=ry, released_no=rn, cost_released=round(cost, 4),
+                realized_pnl=round(pnl, 4))
+            self.st.realized_pnl += pnl
+            self.st.positions[ticker] = {"yes": 0.0, "no": 0.0}
+            self.st.position_cost[ticker] = 0.0
+            self.st.position_cost_leg[ticker] = {"yes": 0.0, "no": 0.0}
+
     def check_day_stop(self, slots, alloc, now):
         """§8.4 global day stop.  Reads the ledger-reconstructed positions and cost (§9.3)
         marked against the current books — never an exchange index (§8.6)."""
@@ -2579,7 +2719,7 @@ class Maker(object):
             if yb is not None and ya is not None:
                 mids[tk] = (yb + ya) / 200.0
         pnl = mark_to_market_pnl(self.st.positions, self.st.position_cost, mids,
-                                 self.fees_paid)
+                                 self.fees_paid) + self.st.realized_pnl   # C2
         unpriced = unpriced_positions(self.st.positions, mids)
         if unpriced:
             # NEW-2: these are marked at cost, i.e. excluded from the stop's evidence.
@@ -2624,6 +2764,7 @@ class Maker(object):
         # decided by the classification sweep, not by rho (degenerate inside one event —
         # see the CLASSIFY_* block).  Pinned markets are excluded outright.
         if now - self.last_classify >= CLASSIFY_REFRESH_S:
+            self.sweep_settlements(now)               # C2, before re-ranking
             self.classify_sweep(progs, now)
         by_ticker = {p["market_ticker"]: p for p in progs}
         chosen = [t for t in market_poll_rank(self.classified) if t in by_ticker]
@@ -2699,7 +2840,13 @@ class Maker(object):
             # §5.4/D4 — the maker shed IS the opposing slot's quote, floored at the size of
             # the position being unwound.  It scores, costs no incremental collateral (the
             # position covers it) and does not stop the side the charter would have stopped.
-            q = max(q, int(self.shed_target.get(s.key, 0)))
+            # C8: clamp the shed at |net| so it can never FLIP the sign.  A 40-lot shed
+            # against 20 held would take -20 to +20 — not a shed at all, a fresh opposite
+            # position wearing a shed's name.  Anything the ALLOCATOR wants beyond |net| is
+            # an earning quote and is governed by the C1 dollar cap in place(), not by this.
+            shed_q = int(min(self.shed_target.get(s.key, 0),
+                             abs(self.st.net_position(s.ticker))))
+            q = max(q, shed_q)
             info = self.scores.get(s.ticker, {})
             best_c = info.get("yes_bid_c") if s.side == "bid" else info.get("yes_ask_c")
             cur = self.live_by_slot.get(s.key)

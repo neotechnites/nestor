@@ -1955,6 +1955,273 @@ class RunwayGuardAndProgramEndRelease(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class C1_NetInventoryDollarCapIsRestingAware(unittest.TestCase):
+    """C1/C8/C9 -- the DXY root cause.  place()'s old check bounded `net + size` in CONTRACTS
+    against the CURRENT price and was blind to orders already RESTING on the same side.
+    Make-before-break puts two orders on one side by construction, so both passed
+    independently and both filled: 2x the cap, reproduced at 58 modelled vs 59 observed."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = (M.DATA_DIR, M.LEDGER_PATH, M.DRY)
+        M.DATA_DIR = os.path.join(self.tmp, "lip")
+        M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+        M.DRY = False
+
+    def tearDown(self):
+        M.DATA_DIR, M.LEDGER_PATH, M.DRY = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _maker(self):
+        m = M.Maker(None, M.LedgerState(), [])
+        self.n = 0
+
+        def post(body):
+            self.n += 1
+            return (201, {"order_id": "N%d" % self.n, "fill_count": "0.00",
+                          "remaining_count": body["count"]})
+        m.do_post = post
+        m.do_cancel = lambda oid: (200, {"reduced_by": "0.00"})
+        return m
+
+    def _fill(self, m, order):
+        """The order fills in full, exactly as a cancel returning reduced_by 0 reports."""
+        order.reduced_by = 0.0
+        order.state = M.ST_CLOSED
+        m.st._credit_fill(order, order.remaining_count)
+
+    def test_COMPOSITION_mbb_overlap_both_fill_then_refill_hits_the_cap(self):
+        """The full sequence, not a pure function: post, MBB-overlap post, both fill, then
+        try to refill against the cap."""
+        m = self._maker()
+        cap_contracts = int(M.INV_CAP_USD / 0.34)              # 29 at a $0.34 basis
+        # 1. first order rests
+        o1 = m.place("DXY", "bid", 34, cap_contracts, 1785000000)
+        self.assertIsNotNone(o1)
+        # 2. MAKE-BEFORE-BREAK overlap: a second order on the SAME side, o1 still resting.
+        #    The old check passed this because it only looked at `net + size` with net = 0.
+        o2 = m.place("DXY", "bid", 34, cap_contracts, 1785000000)
+        self.assertIsNone(o2, "resting-blind cap let the MBB overlap through -> 2x the cap")
+        self.assertEqual(m.last_place_skip, "net_inventory_cap")
+        # 3. o1 fills in full; exposure is now real inventory rather than resting risk
+        self._fill(m, o1)
+        self.assertAlmostEqual(m.st.net_position("DXY"), cap_contracts, places=6)
+        self.assertAlmostEqual(m.st.entry_basis("DXY", "yes"), 0.34, places=6)
+        # 4. refill attempt on the same side is refused: we are already at the dollar cap
+        o3 = m.place("DXY", "bid", 34, 5, 1785000000)
+        self.assertIsNone(o3)
+        self.assertEqual(m.last_place_skip, "net_inventory_cap")
+        # and the invariant holds on the realised book
+        self.assertLessEqual(m.st.net_exposure_usd("DXY", "bid", 0), M.INV_CAP_USD + 1e-9)
+        self.assertLessEqual(abs(m.st.net_position("DXY")) * 0.34, M.INV_CAP_USD + 1e-9)
+
+    def test_COMPOSITION_two_resting_orders_can_never_jointly_breach(self):
+        """The invariant, swept: whatever sequence of same-side posts is ACCEPTED, the total
+        that could fill never exceeds the cap."""
+        for size in (5, 10, 15, 29):
+            m = self._maker()
+            accepted = []
+            for _ in range(6):
+                o = m.place("DXY", "bid", 34, size, 1785000000)
+                if o is None:
+                    break
+                accepted.append(o)
+            worst = sum(o.remaining_count for o in accepted) * 0.34
+            self.assertLessEqual(worst, M.INV_CAP_USD + 1e-9, msg=size)
+
+    def test_C9_the_cap_is_dollars_against_entry_basis_not_count_at_current_price(self):
+        """A contract-count cap of floor($10/p) re-permits at p=$0.20 against inventory
+        bought at $0.34 -- which is how a $10 cap silently becomes a $17 one."""
+        m = self._maker()
+        o1 = m.place("DXY", "bid", 34, 29, 1785000000)
+        self._fill(m, o1)
+        self.assertEqual(M.n_cap(0.20), 50)                    # the old count cap re-permits
+        self.assertGreater(50, 29)
+        o2 = m.place("DXY", "bid", 20, 10, 1785000000)         # price fell to 20c
+        self.assertIsNone(o2, "count-at-current-price cap would have re-permitted here")
+        self.assertAlmostEqual(m.st.entry_basis("DXY", "yes"), 0.34, places=6)
+
+    def test_C8_a_shed_can_never_flip_the_position_sign(self):
+        """A 40-lot shed against 20 held would take -20 to +20: not a shed, a fresh opposite
+        position wearing a shed's name."""
+        m = self._maker()
+        m.st.positions["DXY"] = {"yes": 0.0, "no": 20.0}       # net -20
+        m.st.position_cost["DXY"] = 20 * 0.34
+        m.st.position_cost_leg["DXY"] = {"yes": 0.0, "no": 20 * 0.34}
+        self.assertAlmostEqual(m.st.net_position("DXY"), -20.0, places=6)
+        m.shed_target[("DXY", "bid")] = 40                     # oversized shed intent
+        shed_q = int(min(m.shed_target[("DXY", "bid")],
+                         abs(m.st.net_position("DXY"))))
+        self.assertEqual(shed_q, 20)                           # clamped at |net|
+        self.assertEqual(m.st.net_position("DXY") + shed_q, 0.0)   # cannot cross zero
+        # AND -- the reason C8 is not redundant with C1 -- the DOLLAR cap does NOT catch
+        # this on its own: ending at +20 at 34c is $6.80 of exposure, genuinely under the
+        # $10 cap.  The cap is sign-agnostic by construction, so only the clamp prevents an
+        # oversized shed from silently reversing the position.
+        self.assertLess(m.st.net_exposure_usd("DXY", "bid", 40, 0.34), M.INV_CAP_USD)
+        self.assertAlmostEqual(m.st.net_exposure_usd("DXY", "bid", 40, 0.34), 6.80,
+                               places=6)
+        # the clamped shed lands exactly flat, which is what a shed is for
+        self.assertAlmostEqual(m.st.net_exposure_usd("DXY", "bid", shed_q, 0.34), 0.0,
+                               places=6)
+
+    def test_closing_orders_are_still_permitted_at_the_cap(self):
+        """The cap must not re-create the FIX-A deadlock: an order that REDUCES |net| is
+        never refused by it."""
+        m = self._maker()
+        m.st.positions["DXY"] = {"yes": 29.0, "no": 0.0}
+        m.st.position_cost["DXY"] = 29 * 0.34
+        m.st.position_cost_leg["DXY"] = {"yes": 29 * 0.34, "no": 0.0}
+        self.assertGreaterEqual(m.st.net_exposure_usd("DXY", "bid", 0), M.INV_CAP_USD - 0.2)
+        o = m.place("DXY", "ask", 36, 29, 1785000000)          # fully closing
+        self.assertIsNotNone(o)
+        self.assertNotEqual(m.last_place_skip, "net_inventory_cap")
+
+
+class C2_SettlementRelease(unittest.TestCase):
+    """C2 -- positions and position_cost had NO writer that decremented.  The ledger
+    accumulated forever, replay faithfully rebuilt every ghost (a synthetic 16h tape
+    reconstructed $3,612 of position_cost) and the §8.3 ceiling self-sealed on window 2."""
+
+    def test_settle_releases_collateral_and_ceiling_room(self):
+        st = M.LedgerState()
+        st.positions = {"T": {"yes": 20.0, "no": 0.0}}
+        st.position_cost = {"T": 8.0}
+        st.position_cost_leg = {"T": {"yes": 8.0, "no": 0.0}}
+        self.assertAlmostEqual(st.collateral, 8.0, places=9)
+        ry, rn, cost, pnl = M.settlement_release(st.positions["T"], 8.0, "yes")
+        self.assertEqual((ry, rn), (20.0, 0.0))
+        self.assertAlmostEqual(cost, 8.0, places=9)
+        self.assertAlmostEqual(pnl, 12.0, places=9)            # 20 x $1.00 - $8.00
+        recs = [{"k": "settlement", "t": 9000.0, "ticker": "T", "result": "yes",
+                 "released_yes": 20.0, "released_no": 0.0, "cost_released": 8.0,
+                 "realized_pnl": 12.0}]
+        st2 = M.ledger_replay([rec_place("O1", "T", "bid", 0.40, 20, fill=20, rem=0)]
+                              + recs)
+        self.assertAlmostEqual(st2.collateral, 0.0, places=9)   # ceiling room returned
+        self.assertEqual(st2.positions["T"], {"yes": 0.0, "no": 0.0})
+        self.assertAlmostEqual(st2.realized_pnl, 12.0, places=9)
+
+    def test_replay_across_a_settlement_row_reconstructs_zero(self):
+        """The ghost-accumulation failure, end to end: two windows of fills with a
+        settlement between them must not carry window 1 into window 2."""
+        recs = []
+        for i in range(20):
+            recs.append(rec_place("A%02d" % i, "T", "bid", 0.40, 10, fill=10, rem=0,
+                                  ts=100.0 + i))
+        mid = M.ledger_replay(recs)
+        self.assertAlmostEqual(mid.position_cost["T"], 200 * 0.40, places=9)
+        recs.append({"k": "settlement", "t": 500.0, "ticker": "T", "result": "no",
+                     "released_yes": 200.0, "released_no": 0.0, "cost_released": 80.0,
+                     "realized_pnl": -80.0})
+        after = M.ledger_replay(recs)
+        self.assertAlmostEqual(after.position_cost["T"], 0.0, places=9)
+        self.assertAlmostEqual(after.collateral, 0.0, places=9)
+        self.assertAlmostEqual(after.realized_pnl, -80.0, places=9)
+        # window 2 starts from a clean book
+        recs.append(rec_place("B1", "T", "bid", 0.40, 10, fill=10, rem=0, ts=600.0))
+        w2 = M.ledger_replay(recs)
+        self.assertAlmostEqual(w2.position_cost["T"], 10 * 0.40, places=9)
+
+    def test_a_double_settlement_row_is_a_no_op(self):
+        base = [rec_place("O1", "T", "bid", 0.40, 20, fill=20, rem=0)]
+        row = {"k": "settlement", "t": 9000.0, "ticker": "T", "result": "yes",
+               "released_yes": 20.0, "released_no": 0.0, "cost_released": 8.0,
+               "realized_pnl": 12.0}
+        once = M.ledger_replay(base + [row])
+        twice = M.ledger_replay(base + [row, dict(row, t=9100.0)])
+        self.assertEqual(once.positions, twice.positions)
+        self.assertAlmostEqual(once.collateral, twice.collateral, places=9)
+        self.assertAlmostEqual(once.realized_pnl, twice.realized_pnl, places=9)
+        self.assertAlmostEqual(twice.realized_pnl, 12.0, places=9)   # counted ONCE
+
+    def test_release_without_an_exchange_result_is_impossible_by_construction(self):
+        """The wrong direction -- releasing a position the exchange has not resolved -- has
+        no code path: `settlement_release` releases nothing without a yes/no result, and
+        `is_settleable` demands BOTH a result and a settleable status."""
+        pos = {"yes": 20.0, "no": 0.0}
+        for bad in ("", None, "unknown", "void", "YES!", "maybe"):
+            self.assertEqual(M.settlement_release(pos, 8.0, bad), (0.0, 0.0, 0.0, 0.0))
+        self.assertEqual(M.is_settleable({"market": {"result": "", "status": "settled"}}),
+                         (False, None))
+        self.assertEqual(M.is_settleable({"market": {"result": "yes", "status": "active"}}),
+                         (False, None))
+        self.assertEqual(M.is_settleable({"market": {"status": "settled"}}), (False, None))
+        self.assertEqual(M.is_settleable({}), (False, None))
+        self.assertEqual(M.is_settleable({"market": {"result": "yes",
+                                                     "status": "settled"}}), (True, "yes"))
+
+    def test_the_sweep_is_idempotent_and_reads_market_truth_only(self):
+        """§8.6 doctrine: the PUBLIC market endpoint, never the portfolio positions index."""
+        tmp = tempfile.mkdtemp()
+        old = (M.DATA_DIR, M.LEDGER_PATH, M.DRY, M.public_get)
+        try:
+            M.DATA_DIR = os.path.join(tmp, "lip")
+            M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+            M.DRY = False
+            calls = []
+
+            def fake_get(path, params=None):
+                calls.append(path)
+                return 200, {"market": {"result": "yes", "status": "settled"}}
+            M.public_get = fake_get
+            st = M.LedgerState()
+            st.positions = {"T": {"yes": 20.0, "no": 0.0}}
+            st.position_cost = {"T": 8.0}
+            st.position_cost_leg = {"T": {"yes": 8.0, "no": 0.0}}
+            m = M.Maker(None, st, [])
+            m.sweep_settlements(1000.0)
+            self.assertEqual(calls, ["/markets/T"])            # market truth only
+            self.assertEqual(st.positions["T"], {"yes": 0.0, "no": 0.0})
+            self.assertAlmostEqual(st.realized_pnl, 12.0, places=9)
+            self.assertAlmostEqual(st.collateral, 0.0, places=9)
+            m.sweep_settlements(2000.0)                        # nothing held: no re-read
+            self.assertEqual(calls, ["/markets/T"])
+            self.assertAlmostEqual(st.realized_pnl, 12.0, places=9)
+            events = [json.loads(l)["event"] for l in open(M.LEDGER_PATH)]
+            self.assertEqual(events.count("settlement"), 1)
+        finally:
+            M.DATA_DIR, M.LEDGER_PATH, M.DRY, M.public_get = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_an_unsettled_market_is_left_alone(self):
+        tmp = tempfile.mkdtemp()
+        old = (M.DATA_DIR, M.LEDGER_PATH, M.DRY, M.public_get)
+        try:
+            M.DATA_DIR = os.path.join(tmp, "lip")
+            M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+            M.DRY = False
+            M.public_get = lambda path, params=None: (
+                200, {"market": {"result": "", "status": "active"}})
+            st = M.LedgerState()
+            st.positions = {"T": {"yes": 20.0, "no": 0.0}}
+            st.position_cost = {"T": 8.0}
+            st.position_cost_leg = {"T": {"yes": 8.0, "no": 0.0}}
+            M.Maker(None, st, []).sweep_settlements(1000.0)
+            self.assertEqual(st.positions["T"], {"yes": 20.0, "no": 0.0})
+            self.assertAlmostEqual(st.position_cost["T"], 8.0, places=9)
+            self.assertEqual(st.realized_pnl, 0.0)
+        finally:
+            M.DATA_DIR, M.LEDGER_PATH, M.DRY, M.public_get = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_realized_pnl_feeds_the_day_stop(self):
+        st = M.LedgerState()
+        st.realized_pnl = -30.0
+        m = M.Maker(None, st, [])
+        m.scores = {}
+        tmp = tempfile.mkdtemp()
+        old = (M.DATA_DIR, M.LEDGER_PATH)
+        try:
+            M.DATA_DIR = os.path.join(tmp, "lip")
+            M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
+            self.assertTrue(m.check_day_stop([], {}, 1000.0))
+            self.assertAlmostEqual(m.day_pnl, -30.0, places=9)
+        finally:
+            M.DATA_DIR, M.LEDGER_PATH = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class StartupAssertions(unittest.TestCase):
 
     def test_unit_assertion_refuses_a_wrong_unit(self):
