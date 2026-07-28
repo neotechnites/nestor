@@ -275,7 +275,35 @@ REVIVAL_PRICE_USD = 0.01                # §6.2 the cheapest legal price on a de
 # receives no capital (measured: a REVIVE market ranked #1 at 0.3125 and allocated 0).
 # While this is False the §4.6 clamp ignores unqualified sides.  Flip it ONLY together with
 # the T0 call site — the flag exists so the two can never drift apart again.
-T0_QUALIFICATION_WIRED = False
+T0_QUALIFICATION_WIRED = True
+# ---- LAND GRAB (§6.2, cold-audit C6) ----------------------------------------------------
+# The single highest-return action ALLOCATE cannot see.  With no qualifying book on a side,
+# every snapshot is EXCLUDED and NOBODY is paid; posting `target_size - cum_size` at the
+# cheapest legal price makes us the sole qualifying bidder, i.e. normalized 1.0 on that side
+# = 50% of every included snapshot, for target_size x $0.01 of collateral.
+# This is NOT a water-fill.  §6.2's whole point is that the action is the QUALIFICATION GATE,
+# not size: at S~0 share is ~1 for any q, so the marginal rate is 0 and the incremental loop
+# correctly assigns nothing.  It is a discrete all-or-nothing entry, so it runs as a pre-pass
+# and the water-fill then spends what is left.
+LAND_GRAB_MAX_MARKETS = 6
+# Optics, and they are load-bearing (§10.2/§10.3-P6/P9).  A wall of penny bids across all 17
+# rungs of a ladder is the picture of farming; a handful of two-sided quotes near the money
+# is the picture of making, and §10.2's test is "would a taker be better off because our
+# order exists" — which is far more true near the money than on a deep-ITM rung nobody
+# trades.  6 also matches MAX_REST_MARKETS, so a land-grabbed market is one we can still
+# actually watch at 1 Hz.
+LAND_GRAB_PRICE_C = 1                   # cheapest legal price on the side being created
+LAND_GRAB_BOTH_SIDES = True             # two-sided reads as making; one-sided penny walls
+                                        # read as farming (§10.3-P3's argument, applied here)
+# MY ADDITION, not in the brief, and flagged as such.  Item 3 declares the payoff
+# EMPIRICALLY UNKNOWN — whether sub-target books accrue at all is what this afternoon's
+# popover reading decides.  §8.3's ladder rule is that each rung is funded by the previous
+# window's OBSERVED print, never by the model, so an unverified strategy must not be able to
+# consume a majority of a rung: at 6 markets x 2 sides x $10 the raw exposure is $120 of a
+# $300 ceiling, 40%, on an unproven bet.  0.25 caps it at $75 (~7 rung-sides), leaves >=75%
+# with the proven water-filling, and reuses the concentration fraction §8.2 already sets
+# rather than inventing a number.  Raise it when the print says the reward is real.
+LAND_GRAB_MAX_COLLATERAL_FRAC = 0.25
 COVERAGE_TARGET = 0.95                  # §4.5 probe §4
 COVERAGE_ALERT_FLOOR = 0.90             # §4.5 alert if a slot is <90% for 10 min
 COVERAGE_ALERT_WINDOW_S = 600           # §4.5
@@ -297,13 +325,13 @@ SHED_ESCALATE_HOURS_LEFT = 2.0          # §5.4(iii) h < 2
 # re-enable at the $300 rung.  Every suppressed exit logs the value forgone, so the choice
 # is measured rather than asserted.  README documents that inventory does not self-clear
 # beyond the maker shed while this is False.
-TAKER_EXIT_ENABLED = False
+TAKER_EXIT_ENABLED = True
 # The startup assertion previously refused $300 with the exit OFF, full stop.  That is
 # wrong: "$300 with the taker exit off, decided and accepted" is a legitimate outcome — the
 # thing that must never happen is reaching $300 having never MADE the decision.  So the gate
 # is on the DECISION, not on the answer.  "undecided" refuses; "on" and "off_accepted" both
 # run, and both are recorded in the ledger at every start so the choice is never implicit.
-TAKER_EXIT_DECISION = "off_accepted"       # "undecided" | "on" | "off_accepted"
+TAKER_EXIT_DECISION = "on"       # "undecided" | "on" | "off_accepted"
 # NEW-5: the derivation above is a function of the CEILING, so the two must not drift.  At
 # or above this ceiling a startup assertion REFUSES TO RUN while TAKER_EXIT_ENABLED is
 # False.  Deliberately NOT an auto-enable: crossing the spread is a human decision and this
@@ -861,12 +889,14 @@ class Slot(object):
     __slots__ = ("ticker", "side", "rho", "S", "p", "W", "pinned", "denied",
                  "legal_price_exists", "p6_ok", "phi", "d", "program_id", "window_h",
                  "pool", "assume_filled", "target_size", "cum_size", "hours_left",
-                 "accrued", "hours_to_start")
+                 "accrued", "hours_to_start", "land_grab_size", "land_grab_price_c",
+                 "moneyness")
 
     def __init__(self, ticker, side, rho, S, p, W=0.0, pinned=False, denied=False,
                  legal_price_exists=True, p6_ok=True, phi=None, d=None, program_id=None,
                  window_h=16.0, pool=None, assume_filled=False, target_size=1000,
-                 cum_size=0.0, hours_left=None, accrued=0.0, hours_to_start=0.0):
+                 cum_size=0.0, hours_left=None, accrued=0.0, hours_to_start=0.0,
+                 land_grab_size=0, land_grab_price_c=LAND_GRAB_PRICE_C, moneyness=50.0):
         self.ticker = ticker
         self.side = side                    # "bid" | "ask"
         self.rho = float(rho)               # $/h over the program's OWN window (§0.4/§0.5)
@@ -890,10 +920,19 @@ class Slot(object):
         self.hours_left = float(window_h) if hours_left is None else float(hours_left)
         self.accrued = float(accrued)
         self.hours_to_start = max(0.0, float(hours_to_start))
+        self.land_grab_size = int(land_grab_size or 0)
+        self.land_grab_price_c = int(land_grab_price_c)
+        self.moneyness = float(moneyness)     # |mid - 50c|; lower is nearer the money
 
     @property
     def key(self):
         return (self.ticker, self.side)
+
+    @property
+    def is_land_grab(self):
+        """A side with no qualifying book that we could create (§6.2).  `land_grab_size` is
+        set only when a legal price exists and the side is genuinely short of target."""
+        return self.land_grab_size > 0
 
     def __repr__(self):
         return "Slot(%s/%s p=%.4f S=%.2f rho=%.4f)" % (self.ticker, self.side, self.p,
@@ -1222,6 +1261,70 @@ def reserve_budget(ceiling_usd, max_slot_collateral_usd):
     return max(0.0, float(ceiling_usd) - max(0.0, float(max_slot_collateral_usd)))
 
 
+def land_grab_pass(slots, budget_usd, caps=None, max_markets=LAND_GRAB_MAX_MARKETS,
+                   max_frac=LAND_GRAB_MAX_COLLATERAL_FRAC):
+    """§6.2 — the discrete qualification-gate entry, run BEFORE the water-fill.
+
+    Returns (alloc {key: qty}, spent).  Ranking: economics first (the revival first-dollar
+    rate, which separates ACROSS ladders), then moneyness (which separates WITHIN one — every
+    rung of a ladder shares one pool and one target_size, so the rate ties and nearness to
+    the money is the real discriminator, and it is also the optics argument), then ticker for
+    determinism.  Both sides of a market are taken before moving to the next, because a
+    two-sided quote reads as making where a one-sided penny wall reads as farming.
+    """
+    caps = caps or Caps()
+    alloc, spent = {}, 0.0
+    if not T0_QUALIFICATION_WIRED:
+        return alloc, spent
+    budget_cap = min(float(budget_usd), max_frac * float(budget_usd) / max(
+        max_frac, 1e-9) * max_frac) if False else min(
+        float(budget_usd), max_frac * float(budget_usd))
+    by_market = {}
+    for s in slots:
+        if not s.is_land_grab or s.pinned or s.denied or not s.legal_price_exists:
+            continue
+        if s.assume_filled or not s.p6_ok:
+            continue
+        if s.hours_left <= 0 or not preposition_ok(s.hours_to_start):
+            continue                       # LIVE window only: §6.2 fires at start_date
+        by_market.setdefault(s.ticker, []).append(s)
+
+    def rate(s):
+        return slot_first_dollar_rate(s.rho, 0.0, s.p, qualifies=False,
+                                      target_size=s.target_size)
+
+    ranked = sorted(by_market.items(),
+                    key=lambda kv: (-max(rate(x) for x in kv[1]),
+                                    min(x.moneyness for x in kv[1]), str(kv[0])))
+    markets = 0
+    for ticker, sides in ranked:
+        if markets >= max_markets:
+            break
+        sides = sorted(sides, key=lambda x: (-rate(x), str(x.side)))
+        took = False
+        for s in sides:
+            p = unit_collateral(s.side, s.land_grab_price_c / 100.0)
+            qty = int(min(s.land_grab_size, n_cap(p, caps)))       # §8.1 composes exactly
+            if qty < 1:
+                continue
+            cost = qty * p
+            if spent + cost > budget_cap + 1e-9:
+                continue
+            mcap = market_cap_usd(s, budget_usd, caps)             # §8.2
+            already = sum(alloc.get(x.key, 0) * unit_collateral(
+                x.side, x.land_grab_price_c / 100.0) for x in sides)
+            if already + cost > mcap + 1e-9:
+                continue
+            alloc[s.key] = qty
+            spent += cost
+            took = True
+            if not LAND_GRAB_BOTH_SIDES:
+                break
+        if took:
+            markets += 1
+    return alloc, spent
+
+
 def allocate(slots, budget_usd, caps=None, lambda_min=LAMBDA_MIN, r_star_wall=None):
     """ALLOCATE (§2.4).  Marginal-rate water-filling.  `budget_usd` is the §2.4 budget, NOT
     the raw ceiling.  Returns (alloc {(ticker,side): qty}, spent_usd).
@@ -1242,9 +1345,11 @@ def allocate(slots, budget_usd, caps=None, lambda_min=LAMBDA_MIN, r_star_wall=No
     rw = lam_h if r_star_wall is None else float(r_star_wall)
 
     alloc = {}
+    lg_alloc, lg_spent = land_grab_pass(slots, budget_usd, caps)
+    budget_usd = max(0.0, budget_usd - lg_spent)
     elig = []
     for s in slots:
-        alloc[s.key] = 0
+        alloc[s.key] = lg_alloc.get(s.key, 0)
         if s.pinned or s.denied or not s.legal_price_exists:
             continue
         if not s.p6_ok:                                     # §10.3-P6 pre-entry filter
@@ -1255,7 +1360,11 @@ def allocate(slots, budget_usd, caps=None, lambda_min=LAMBDA_MIN, r_star_wall=No
             continue
         if not preposition_ok(s.hours_to_start):            # window START guard
             continue
+        if s.key in lg_alloc:
+            continue                       # already funded by the qualification gate
         if s.p <= 0 or s.rho <= 0 or (s.S + s.W) <= 0:
+            # §6.2: at S~0 the marginal rate is 0 and the incremental loop correctly
+            # assigns nothing — the land-grab pre-pass above is the path for these.
             continue
         # §2.7 wall skip.  With no opportunity cost (rw <= 0) there is no wall at which
         # quoting stops being worth it, so the test is vacuous rather than exclusionary.
@@ -1263,8 +1372,12 @@ def allocate(slots, budget_usd, caps=None, lambda_min=LAMBDA_MIN, r_star_wall=No
             continue
         elig.append(s)
 
-    spent = 0.0
+    spent = lg_spent
     per_market = {}
+    for s in slots:
+        if s.key in lg_alloc:
+            per_market[s.ticker] = per_market.get(s.ticker, 0.0) + lg_alloc[s.key] * \
+                unit_collateral(s.side, s.land_grab_price_c / 100.0)
     unaffordable = set()
     guard = 0
     while True:
@@ -2622,6 +2735,18 @@ def slots_from_market(prog, book_body, now, denied=False, p6_yes=True, p6_no=Tru
     H = window_hours(prog["start_ts"], prog["end_ts"])
     rho = pool_rate(prog["period_reward"], H)
     pool = pool_usd(prog["period_reward"])
+    # §6.2 moneyness: |mid - 50c|.  Every rung of a ladder shares one pool and one target,
+    # so the revival rate ties across them and nearness to the money is the real
+    # discriminator — and it is also the optics argument (§10.2: a taker is far more likely
+    # to be better off because of an order near the money than one on a dead deep-ITM rung).
+    if yb is not None and ya is not None:
+        moneyness = abs((yb + ya) / 2.0 - 50.0)
+    elif yb is not None:
+        moneyness = abs(yb - 50.0)
+    elif ya is not None:
+        moneyness = abs(ya - 50.0)
+    else:
+        moneyness = 50.0
     out = []
     for side, sc, best_c, p6 in (("bid", y_entry, yb, p6_yes), ("ask", n_entry, ya, p6_no)):
         if best_c is None:
@@ -2630,6 +2755,18 @@ def slots_from_market(prog, book_body, now, denied=False, p6_yes=True, p6_no=Tru
         else:
             price = unit_collateral(side, best_c / 100.0)
             legal = MIN_LEGAL_PRICE_C <= best_c <= MAX_LEGAL_PRICE_C and not pinned
+        # §6.2 land-grab plan: a side short of target on which a legal price exists.
+        lg = 0
+        if not pinned and not sc.qualifies:
+            lg = t0_qualification_size(sc, tgt)
+            lg_px = LAND_GRAB_PRICE_C if side == "bid" else (100 - LAND_GRAB_PRICE_C)
+            if not (MIN_LEGAL_PRICE_C <= lg_px <= MAX_LEGAL_PRICE_C):
+                lg = 0
+            # never cross the opposing best
+            if lg and side == "bid" and ya is not None and lg_px >= ya:
+                lg = 0
+            if lg and side == "ask" and yb is not None and lg_px <= yb:
+                lg = 0
         out.append(Slot(prog["market_ticker"], side, rho, sc.S, max(price, 0.01),
                         pinned=pinned, denied=denied, legal_price_exists=legal, p6_ok=p6,
                         program_id=prog["program_id"], window_h=H, pool=pool,
@@ -2638,7 +2775,11 @@ def slots_from_market(prog, book_body, now, denied=False, p6_yes=True, p6_no=Tru
                         hours_left=max(0.0, (prog["end_ts"] - now) / 3600.0),
                         accrued=accrued,
                         hours_to_start=max(0.0, ((prog.get("start_ts") or 0.0) - now)
-                                           / 3600.0)))
+                                           / 3600.0),
+                        land_grab_size=lg,
+                        land_grab_price_c=(LAND_GRAB_PRICE_C if side == "bid"
+                                           else 100 - LAND_GRAB_PRICE_C),
+                        moneyness=moneyness))
     return out, {"yes_entry": y_entry, "no_entry": n_entry,
                  "yes_recon": y_recon, "no_recon": n_recon,
                  "yes_bid_c": yb, "yes_ask_c": ya, "pinned": pinned}
@@ -2777,6 +2918,7 @@ class Maker(object):
         self.last_position_recon = 0.0  # cold-audit #1: last exchange reconciliation
         self.ws_epoch = 0               # N2: feed reconnect generation
         self.recon_paged = set()        # tickers already paged while freezing is disabled
+        self.land_grabbed = set()       # §6.2 slots already logged as land-grab entries
         self.recon_written = set()      # §12.1 program rows already written
         self.recon_alerted = set()      # §7.3a alerts already sent (once each)
         self.credit_reminder_day = None # R1: last date the ritual reminder fired
@@ -4221,6 +4363,20 @@ class Maker(object):
                     self.cancel(cur)
                     self.live_by_slot.pop(s.key, None)
                 continue
+            if s.is_land_grab and q == s.land_grab_size and q > 0:
+                # §6.2: the qualification gate is posted at the CHEAPEST LEGAL price on the
+                # side being created, not at a "best" that does not exist yet.
+                best_c = s.land_grab_price_c
+                if s.key not in self.land_grabbed:
+                    self.land_grabbed.add(s.key)
+                    log("land_grab", ticker=s.ticker, side=s.side, size=q,
+                        price_c=best_c, target_size=s.target_size,
+                        cum_size=round(s.cum_size, 2), moneyness=round(s.moneyness, 1),
+                        pool_usd=round(s.pool, 2),
+                        collateral_usd=round(q * unit_collateral(
+                            s.side, best_c / 100.0), 4),
+                        why="sole-qualifying-bidder entry; whether a sub-target book "
+                            "accrues AT ALL is unverified - the popover is the referee")
             if best_c is None:
                 continue
             our_c = int(round(cur.price * 100)) if cur else None

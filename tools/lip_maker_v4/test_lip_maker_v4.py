@@ -1307,29 +1307,42 @@ class S4_TakerExitIsSuppressedAtThisRung(unittest.TestCase):
 # =============================================================================================
 class NEW1_RevivalsDoNotBurnARestSlot(unittest.TestCase):
 
-    def test_a_market_allocate_will_never_fund_does_not_take_the_slot(self):
-        """NEW-1 — market_rank_value promoted revival markets whose sides ALLOCATE then
-        skips (S=0 => marginal rate 0 => $0 forever), because §6.2's T0 qualification path
-        has zero call sites.  A REVIVE market took a top-6 REST slot and earned nothing."""
+    def test_ranking_and_allocation_agree_in_BOTH_flag_states(self):
+        """NEW-1's premise INVERTED when the land grab was wired, and the invariant is what
+        survives: the clamp must rank a market high only if ALLOCATE would actually fund it.
+        With T0 unwired that meant excluding revivals (rate 0.3125 but $0 funded — a wasted
+        REST slot); with T0 wired it means INCLUDING them, because now they are funded.
+        Either way, rank-but-unfundable is the defect (the B1 shape)."""
         revive = {"rho": 6.25, "pinned": False, "denied": False,
                   "sides": [{"S": 0.0, "p": 0.99, "qualifies": False, "legal": True,
                              "target_size": 1000.0}]}
         good = {"rho": 6.25, "pinned": False, "denied": False,
                 "sides": [{"S": 60.5, "p": 0.68, "qualifies": True, "legal": True}]}
-        # the revival PROXY really does out-rank the good market -- that was the defect
-        self.assertGreater(M.market_rank_value(revive, count_unqualified=True),
-                           M.market_rank_value(good))
-        # ... and ALLOCATE funds the revival exactly $0, which is why the slot was wasted
-        rev_slot = M.Slot("REVIVE", "bid", 6.25, 0.0, 0.99)
-        al, spent = M.allocate([rev_slot], 45.0, BIG)
-        self.assertEqual(al[rev_slot.key], 0)
-        self.assertEqual(spent, 0.0)
-        # FIX: while the T0 path is unwired the clamp ignores unqualified sides, so with one
-        # REST slot the GOOD market takes it.
-        self.assertFalse(M.T0_QUALIFICATION_WIRED)
-        self.assertEqual(M.market_rank_value(revive), 0.0)
-        self.assertEqual(M.market_poll_rank({"REVIVE": revive, "GOOD": good}, 1), ["GOOD"])
-        self.assertEqual(M.market_poll_rank({"REVIVE": revive, "GOOD": good}), ["GOOD"])
+        rev_slot = M.Slot("REVIVE", "bid", 6.25, 0.0, 0.01, land_grab_size=1000,
+                          target_size=1000)
+        funded = M.allocate([rev_slot], 45.0, BIG)[0][rev_slot.key] > 0
+        ranked_in = "REVIVE" in M.market_poll_rank({"REVIVE": revive, "GOOD": good})
+        self.assertEqual(funded, ranked_in,
+                         "the clamp and the allocator disagree about revivals")
+        self.assertEqual(M.T0_QUALIFICATION_WIRED, funded)
+
+    def test_with_the_flag_OFF_a_revival_is_neither_ranked_nor_funded(self):
+        revive = {"rho": 6.25, "pinned": False, "denied": False,
+                  "sides": [{"S": 0.0, "p": 0.99, "qualifies": False, "legal": True,
+                             "target_size": 1000.0}]}
+        good = {"rho": 6.25, "pinned": False, "denied": False,
+                "sides": [{"S": 60.5, "p": 0.68, "qualifies": True, "legal": True}]}
+        old = M.T0_QUALIFICATION_WIRED
+        try:
+            M.T0_QUALIFICATION_WIRED = False
+            self.assertEqual(M.market_rank_value(revive), 0.0)
+            self.assertEqual(M.market_poll_rank({"REVIVE": revive, "GOOD": good}, 1),
+                             ["GOOD"])
+            s = M.Slot("REVIVE", "bid", 6.25, 0.0, 0.01, land_grab_size=1000,
+                       target_size=1000)
+            self.assertEqual(M.allocate([s], 45.0, BIG)[0][s.key], 0)
+        finally:
+            M.T0_QUALIFICATION_WIRED = old
 
     def test_the_revival_arithmetic_itself_is_untouched_and_returns_when_wired(self):
         """The gate is on USING the value, not on the maths -- §1.4 stays correct so that
