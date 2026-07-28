@@ -3816,13 +3816,17 @@ class PositionReconciliation(_RunnerCase):
         self._body = {"market_positions": exchange_rows}
         return m
 
-    def _run(self, m, now=1000.0):
-        old = M.signed
+    def _run(self, m, now=1000.0, freeze=True):
+        """`freeze` arms RECON_FREEZE_ENABLED for the tests that exercise the ACTION.  The
+        shipped default is False — detection and paging only — because freezing on today's
+        signal fires guaranteed false positives (see the constant)."""
+        old, old_flag = M.signed, M.RECON_FREEZE_ENABLED
         try:
             M.signed = lambda *a, **k: (200, self._body)
+            M.RECON_FREEZE_ENABLED = freeze
             return m.reconcile_positions(now, force=True)
         finally:
-            M.signed = old
+            M.signed, M.RECON_FREEZE_ENABLED = old, old_flag
 
     # ---- pure layer -----------------------------------------------------------------
     def test_the_positions_payload_is_parsed_tolerantly(self):
@@ -3861,7 +3865,73 @@ class PositionReconciliation(_RunnerCase):
             self.assertIn(t, known)
         self.assertNotIn("NEVER_TOUCHED", known)
 
-    # ---- wired layer ----------------------------------------------------------------
+
+    # ---- the SHIPPED default: detect and page, never act -----------------------------
+    def test_the_shipped_default_is_detect_and_page_only(self):
+        """The DETECTION is sound; the ACTION is not yet.  R171 measured 41 min of
+        settlement-index lag, so at 600s polling a correctly-settled market reads divergent
+        for ~4 polls — up to 4 spurious freeze+cancel+page per settled market.  Paging a
+        human costs a human a look; freezing costs a market its quotes."""
+        self.assertFalse(M.RECON_FREEZE_ENABLED)
+        m = self._maker([{"ticker": "KXPYPL-1", "position": 10}], ledger={})
+        m.st.filled_cum[("KXPYPL-1", "bid")] = 0.0
+        quote = M.OrderState("Q", "v4-c", "KXPYPL-1", "bid", 0.40, 10, 0.0, 10.0)
+        m.st.orders["Q"] = quote
+        m.live_by_slot[("KXPYPL-1", "bid")] = quote
+        cancelled = []
+        m.do_cancel = lambda oid: (cancelled.append(oid), (200, {"reduced_by": "0"}))[1]
+
+        divs = self._run(m, freeze=False)
+        self.assertEqual(len(divs), 1)                       # still DETECTED
+        ev = [e for e in self.events() if e["event"] == "position_divergence_detected"]
+        self.assertEqual(len(ev), 1)                         # still PAGED
+        self.assertEqual(ev[0]["exchange_net"], 10.0)
+        self.assertEqual(ev[0]["ledger_net"], 0.0)           # both numbers, as before
+        # ... and nothing acted on
+        self.assertNotIn("KXPYPL-1", m.st.assume_filled)
+        self.assertNotIn("KXPYPL-1", m.st.poisoned)
+        self.assertEqual(cancelled, [])
+        self.assertIn(("KXPYPL-1", "bid"), m.live_by_slot)
+
+    def test_the_detect_only_row_can_never_freeze_via_replay(self):
+        """The flag must not be able to leak its effect through the ledger: a row written
+        while freezing is off must not freeze a market on some later restart."""
+        m = self._maker([{"ticker": "T", "position": 10}], ledger={})
+        m.st.filled_cum[("T", "bid")] = 0.0
+        self._run(m, freeze=False)
+        st = M.ledger_replay(self.events())
+        self.assertNotIn("T", st.assume_filled)
+        self.assertNotIn("T", st.poisoned)
+        self.assertEqual([e for e in self.events()
+                          if e["event"] == "position_divergence"], [])
+
+    def test_it_pages_once_per_market_not_once_per_poll(self):
+        """Without a freeze there is no de-dup for free, and 600s polling against 41 min of
+        settlement lag would otherwise page ~4 times per settled market."""
+        m = self._maker([{"ticker": "T", "position": 10}], ledger={})
+        m.st.filled_cum[("T", "bid")] = 0.0
+        for i in range(5):
+            self._run(m, now=1000.0 + i * (M.RECON_POSITIONS_S + 1), freeze=False)
+        self.assertEqual(len([e for e in self.events()
+                              if e["event"] == "position_divergence_detected"]), 1)
+
+    def test_the_recon_log_line_survives_either_way(self):
+        m = self._maker([{"ticker": "T", "position": 10}], ledger={})
+        m.st.filled_cum[("T", "bid")] = 0.0
+        self._run(m, freeze=False)
+        row = [e for e in self.events() if e["event"] == "position_recon"][0]
+        self.assertEqual(row["n_divergent"], 1)
+
+    def test_the_arming_guards_are_documented_for_the_next_session(self):
+        """Flipping the flag without these three is how the false positives arrive."""
+        import inspect
+        src = inspect.getsource(M)
+        head = src[:src.index("RECON_FREEZE_ENABLED = False")]
+        for needle in ("SETTLEMENT-LAG SKIP", "RECENCY + PERSISTENCE",
+                       "CURRENT-INVOLVEMENT ATTRIBUTION", "3600", "R171"):
+            self.assertIn(needle, head, needle)
+
+    # ---- the ARMED path (RECON_FREEZE_ENABLED = True) --------------------------------
     def test_a_divergence_freezes_the_market_and_alerts(self):
         m = self._maker([{"ticker": "KXPYPL-1", "position": 10}], ledger={})
         m.st.filled_cum[("KXPYPL-1", "bid")] = 0.0     # v4 history: we touched it

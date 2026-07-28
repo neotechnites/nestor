@@ -390,6 +390,31 @@ FILLS_REQUERY_DELAY_S = 36              # §9.4a 3x the ~12s worst observed inde
 # constant and ~1 fill below meaningful exposure, and nests inside every other cadence here
 # (SHED_PATIENCE_S 1800, PAID_OUT_POLL_S 1800, CLASSIFY_REFRESH_S 900).
 RECON_POSITIONS_S = 600
+# The DETECTION is sound; the ACTION is not yet.  Freezing on divergence fires guaranteed
+# false positives today, and a spurious freeze cancels a market's quotes and pages a human
+# for a book that was never wrong — at 600s polling that is up to ~4 spurious
+# freeze+cancel+page per settled market:
+#   (a) SETTLEMENT-INDEX LAG.  R171 measured 41 min between settlement and the positions
+#       index reflecting it, so a correctly-settled market reads as divergent for ~4 polls.
+#   (b) FILL-INDEX LAG.  ~48%/h on hot slots: a fill we have not yet learned, or one the
+#       index has not yet published, is an ordinary transient — the same eventual
+#       consistency §8.6/§9.4a already price at 36s.
+#   (c) EVER-TOUCHED ATTRIBUTION.  known_tickers() spans the whole account history, so on a
+#       SHARED account (§13.4 — the subaccount does not exist yet) a market v4 traded days
+#       ago and nestor holds today is attributed to us and freezes.
+# So: keep the poll, the comparison, the `position_recon` line and the PAGE — that is the
+# whole PYPL-detection value, and paging a human costs a human a look.  No freeze, no
+# cancel, no replayable row while this is False.
+# ARMING GUARDS, for the session that flips this to True — all three, not any one:
+#   1. SETTLEMENT-LAG SKIP: ignore a divergence on a market settled within the last 3600s
+#      (R171's 41 min plus margin).
+#   2. RECENCY + PERSISTENCE: ignore unless the last fill on that market is >36s old (the
+#      §9.4a constant) AND the divergence survives TWO consecutive polls — the same
+#      "prove it twice before acting" shape W2 uses for the websocket gate.
+#   3. CURRENT-INVOLVEMENT ATTRIBUTION: attribute on CURRENT involvement (open orders, or
+#      fills inside this program period) rather than ever-touched, and exclude a configured
+#      NESTOR_SERIES set outright.
+RECON_FREEZE_ENABLED = False
 CRASH_GAP_LOOKBACK_S = 60               # §9.4(4) fills query over [last_ledger_ts-60s, now]
 # C10: in-memory retention of TERMINAL orders.  closing_room()/resting_collateral() walk
 # st.orders on every placement, so an unbounded dict makes a multi-day run quadratic.  400
@@ -2739,6 +2764,7 @@ class Maker(object):
         self.ws_divergences = {}        # W2: ticker -> lifetime divergences
         self.last_position_recon = 0.0  # cold-audit #1: last exchange reconciliation
         self.ws_epoch = 0               # N2: feed reconnect generation
+        self.recon_paged = set()        # tickers already paged while freezing is disabled
         self.recon_written = set()      # §12.1 program rows already written
         self.recon_alerted = set()      # §7.3a alerts already sent (once each)
         self.credit_reminder_day = None # R1: last date the ritual reminder fired
@@ -3899,6 +3925,25 @@ class Maker(object):
             tk = d["ticker"]
             if tk in self.st.assume_filled:
                 continue                            # already frozen; do not re-page
+            if not RECON_FREEZE_ENABLED:
+                # DETECT AND PAGE ONLY.  Deliberately a DIFFERENT event name with no `k`,
+                # so replay does not recognise it and the row can never freeze anything on
+                # a later restart — the flag must not be able to leak its effect through
+                # the ledger.
+                if tk in self.recon_paged:
+                    continue
+                self.recon_paged.add(tk)
+                log("position_divergence_detected", ticker=tk,
+                    exchange_net=d["exchange_net"], ledger_net=d["ledger_net"],
+                    delta=d["delta"], freeze_enabled=False,
+                    why="exchange and ledger disagree; PAGE ONLY — freezing on this today "
+                        "would fire on settlement-index lag (R171: 41 min), fill-index lag "
+                        "and ever-touched attribution")
+                ntfy("LIP v4 position divergence %s (no freeze)" % tk,
+                     "exchange holds %.2f, ledger says %.2f (delta %.2f). NOT frozen — "
+                     "check by hand; if this is real, the ledger is wrong about %s"
+                     % (d["exchange_net"], d["ledger_net"], d["delta"], tk))
+                continue
             log("position_divergence", k="position_divergence", ticker=tk,
                 exchange_net=d["exchange_net"], ledger_net=d["ledger_net"],
                 delta=d["delta"],
