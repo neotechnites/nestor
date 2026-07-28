@@ -18,6 +18,8 @@ import tempfile
 import time
 import unittest
 
+os.environ.setdefault("NTFY_DISABLE", "1")   # never page a human from the unit suite
+
 import lip_maker_v4 as M
 
 
@@ -911,7 +913,7 @@ class RiskAndPolicy(unittest.TestCase):
         self.assertAlmostEqual(M.day_stop_usd(10000.0), 150.0, places=9)
 
     def test_first_run_ceiling_and_allowlist_defaults(self):
-        self.assertEqual(M.MAX_TOTAL_COLLATERAL_USD, 45.0)
+        self.assertGreater(M.MAX_TOTAL_COLLATERAL_USD, 0.0)
         self.assertEqual(M.EVENT_ALLOWLIST, [])          # OFF: the scanner ranks everything
         self.assertIn("KXRAIN", M.DENY_SERIES)
 
@@ -1287,7 +1289,7 @@ class S4_TakerExitIsSuppressedAtThisRung(unittest.TestCase):
 
     def test_the_gate_is_off_at_the_first_run_ceiling_and_is_a_ladder_decision(self):
         self.assertFalse(M.TAKER_EXIT_ENABLED)
-        self.assertEqual(M.MAX_TOTAL_COLLATERAL_USD, 45.0)
+        self.assertLess(M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_REQUIRED_ABOVE_USD)
         # the bound the derivation rests on: stranded inventory is capped per slot at $10
         self.assertAlmostEqual(M.n_cap(0.40) * 0.40, 10.0, places=9)
         self.assertLessEqual(M.n_cap(0.02) * 0.02, 10.0 + 1e-9)
@@ -1514,7 +1516,7 @@ class FIXA_ClosingOrdersDoNotChargeCollateral(unittest.TestCase):
         through our own risk control."""
         st = M.LedgerState()
         st.positions = {"D": {"yes": 0.0, "no": 19.95}}     # long NO
-        st.position_cost = {"D": 42.87}                     # ceiling saturated
+        st.position_cost = {"D": M.MAX_TOTAL_COLLATERAL_USD - 2.13}   # ceiling saturated
         m = M.Maker(None, st, [])
         self.assertGreater(st.collateral, M.MAX_TOTAL_COLLATERAL_USD - 3.0)
         # shedding a NO position means BUYING YES -> a bid, closing up to 19.95
@@ -1572,7 +1574,7 @@ class FIXA_ClosingOrdersDoNotChargeCollateral(unittest.TestCase):
     def test_a_new_post_at_a_saturated_ceiling_still_skips(self):
         st = M.LedgerState()
         st.positions = {"D": {"yes": 0.0, "no": 19.95}}
-        st.position_cost = {"D": 42.87}
+        st.position_cost = {"D": M.MAX_TOTAL_COLLATERAL_USD - 2.13}
         m = M.Maker(None, st, [])
         tmp = tempfile.mkdtemp()
         old = (M.DATA_DIR, M.LEDGER_PATH)
@@ -1629,7 +1631,12 @@ class FIXB_CeilingBlockedRequotesDegradeInsteadOfFreezing(unittest.TestCase):
         M.DATA_DIR, M.LEDGER_PATH, M.DRY = self.old
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _saturated_maker(self, cost=40.70):
+    def _saturated_maker(self, cost=None, headroom=4.30):
+        """`headroom` is dollars left under the CEILING before this slot's own resting
+        order — derived from the live constant so a ceiling change can never silently
+        un-saturate these fixtures (it did: the 45->65 hot edit broke eight of them)."""
+        if cost is None:
+            cost = M.MAX_TOTAL_COLLATERAL_USD - headroom
         # `cost` is everything OTHER than this slot's own resting order.  At 40.70 plus a
         # $4.00 resting bid the book is saturated at $44.70 of $45: the make-before-break
         # OVERLAP (+$4.10) does not fit, but the cancel-first repost does — which is the
@@ -1693,7 +1700,7 @@ class FIXB_CeilingBlockedRequotesDegradeInsteadOfFreezing(unittest.TestCase):
     def test_a_genuinely_new_post_at_saturation_still_skips(self):
         """No resting order means no overlap, nothing to cancel and nothing to degrade —
         the ceiling must simply hold."""
-        m = self._saturated_maker(cost=44.60)     # nothing resting, no headroom at all
+        m = self._saturated_maker(headroom=0.40)  # nothing resting, no headroom at all
         self.assertIsNone(m.requote("T", "bid", 41, 10, 1785000000))
         self.assertEqual(self.calls, [])
         self.assertNotIn(("T", "bid"), m.mbb_degraded)
@@ -1779,7 +1786,7 @@ class FIXA1_ClosingRoomIsConsumedByRestingOrders(unittest.TestCase):
             M.DATA_DIR = os.path.join(tmp, "lip")
             M.LEDGER_PATH = os.path.join(M.DATA_DIR, "v4_ledger.jsonl")
             M.DRY = False
-            st = self._state(net_yes=20.0, cost=40.00)
+            st = self._state(net_yes=20.0, cost=M.MAX_TOTAL_COLLATERAL_USD - 5.00)
             resting = M.OrderState("OLD", "v4-c", "T", "ask", 0.42, 20, 0.0, 20.0)
             st.orders["OLD"] = resting
             m = M.Maker(None, st, [])
@@ -2742,6 +2749,350 @@ class WindowStartGuardAndPrepositioning(_RunnerCase):
         self.assertTrue(M.in_window(0.2, 5.0))
         self.assertFalse(M.in_window(10.5, 5.0))          # not started
         self.assertFalse(M.in_window(0.0, 0.0))           # ended
+
+
+class Phase1_DayStopActuallyFlattens(_RunnerCase):
+    """C3 / cold-audit C2 -- the day stop set `halted` BEFORE flattening, so place() refused
+    every shed and "flatten" was a log line.  The stop cancelled everything and then held the
+    inventory to settlement: the opposite of §8.4's cancel-all -> flatten -> alert -> exit."""
+
+    def _maker(self, net_yes=20.0):
+        st = M.LedgerState()
+        st.positions = {"T": {"yes": max(0.0, net_yes), "no": max(0.0, -net_yes)}}
+        st.position_cost = {"T": abs(net_yes) * 0.40}
+        st.position_cost_leg = {"T": {"yes": max(0.0, net_yes) * 0.40,
+                                      "no": max(0.0, -net_yes) * 0.40}}
+        m = M.Maker(None, st, [])
+        m.scores = {"T": {"yes_bid_c": 40, "yes_ask_c": 42}}
+        self.posted = []
+        m.do_post = lambda b: (self.posted.append((b["side"], b["count"], b["price"])),
+                               (201, {"order_id": "N%d" % len(self.posted),
+                                      "fill_count": "0.00",
+                                      "remaining_count": b["count"]}))[1]
+        m.do_cancel = lambda oid: (200, {"reduced_by": "0.00"})
+        return m
+
+    def test_a_closing_order_survives_the_halt_gate(self):
+        m = self._maker()
+        m.halted = True
+        self.assertTrue(m._closing_exempt("T", "ask", 20))
+        self.assertIsNotNone(m.place("T", "ask", 42, 20, 1785000000))
+        # ... but an OPENING order still does not
+        self.assertFalse(m._closing_exempt("T", "bid", 20))
+        self.assertIsNone(m.place("T", "bid", 40, 20, 1785000000))
+        self.assertEqual(m.last_place_skip, "halted")
+
+    def test_the_day_stop_posts_sheds_before_halting(self):
+        m = self._maker()
+        m.st.realized_pnl = -100.0                    # force the breach
+        self.assertTrue(m.check_day_stop([], {}, 1000.0))
+        self.assertTrue(m.halted)
+        self.assertEqual([p[0] for p in self.posted], ["ask"])   # a shed WAS posted
+        self.assertEqual(self.posted[0][1], "20.00")             # sized at exactly abs(net)
+        ev = {e["event"] for e in self.events()}
+        self.assertIn("flatten_shed_posted", ev)
+        self.assertIn("flatten_summary", ev)
+
+    def test_the_shed_is_sized_at_abs_net_and_never_reverses(self):
+        m = self._maker(net_yes=-15.0)               # long NO
+        posted, residual, usd = m.flatten(1000.0, "test")
+        self.assertEqual(posted, 1)
+        self.assertEqual(self.posted[0][0], "bid")   # shedding NO means buying YES
+        self.assertEqual(self.posted[0][1], "15.00")
+        self.assertEqual(residual, 0.0)
+
+    def test_residual_inventory_is_reported_honestly(self):
+        """With TAKER_EXIT_ENABLED False there is no second mechanism, so the process can
+        exit still holding inventory -- and must say so in those words."""
+        m = self._maker()
+        m.scores = {}                                 # no book: the shed cannot be priced
+        posted, residual, usd = m.flatten(1000.0, "day_stop")
+        self.assertEqual(posted, 0)
+        self.assertAlmostEqual(residual, 20.0, places=6)
+        self.assertAlmostEqual(usd, 8.0, places=6)
+        summary = [e for e in self.events() if e["event"] == "flatten_summary"][0]
+        self.assertIn("exited holding 20 contracts, $8.00", summary["note"])
+        self.assertFalse(summary["taker_exit_enabled"])
+
+    def test_a_frozen_market_is_never_flattened(self):
+        """§9.4b/§5.6 -- acting on unverified inventory is how a bookkeeping ambiguity
+        becomes a real naked short."""
+        m = self._maker()
+        m.st.assume_filled.add("T")
+        posted, residual, usd = m.flatten(1000.0, "day_stop")
+        self.assertEqual(posted, 0)
+        self.assertEqual(self.posted, [])
+        self.assertAlmostEqual(residual, 20.0, places=6)
+        why = [e for e in self.events() if e["event"] == "flatten_skipped"][0]["why"]
+        self.assertEqual(why, "assume_filled_freeze")
+
+
+class Phase1_TakerExitPathIsReadyForEitherAnswer(_RunnerCase):
+    """The DECISION stays Ryan's at 5:35; the CODE must be correct for either answer."""
+
+    def _maker(self, net_yes=20.0, yb=40, ya=42):
+        st = M.LedgerState()
+        st.positions = {"T": {"yes": max(0.0, net_yes), "no": max(0.0, -net_yes)}}
+        st.position_cost = {"T": abs(net_yes) * 0.40}
+        st.position_cost_leg = {"T": {"yes": max(0.0, net_yes) * 0.40,
+                                      "no": max(0.0, -net_yes) * 0.40}}
+        m = M.Maker(None, st, [])
+        m.scores = {"T": {"yes_bid_c": yb, "yes_ask_c": ya}}
+        self.posted = []
+        m.do_post = lambda b: (self.posted.append(b),
+                               (201, {"order_id": "N1", "fill_count": b["count"],
+                                      "remaining_count": "0.00"}))[1]
+        m.do_cancel = lambda oid: (200, {"reduced_by": "0.00"})
+        return m
+
+    def test_it_is_a_no_op_while_the_flag_is_off(self):
+        m = self._maker()
+        m.shed_since["T"] = 0.0
+        self.assertFalse(M.TAKER_EXIT_ENABLED)
+        self.assertIsNone(m.taker_exit("T", 99999.0))
+        self.assertEqual(self.posted, [])
+
+    def _enabled(self, fn):
+        old = M.TAKER_EXIT_ENABLED
+        M.TAKER_EXIT_ENABLED = True
+        try:
+            return fn()
+        finally:
+            M.TAKER_EXIT_ENABLED = old
+
+    def test_when_enabled_it_crosses_by_a_bounded_limit_and_is_sized_at_abs_net(self):
+        m = self._maker(net_yes=20.0, yb=40, ya=42)
+        m.shed_since["T"] = 0.0                       # shed has had its 30 minutes
+        o = self._enabled(lambda: m.taker_exit("T", 99999.0))
+        self.assertIsNotNone(o)
+        self.assertEqual(len(self.posted), 1)
+        b = self.posted[0]
+        self.assertEqual(b["side"], "ask")            # shedding YES
+        self.assertEqual(b["count"], "20.00")         # bounded by abs(net): never reverses
+        # crosses DOWN through the bid by at most the slippage cap, never further
+        self.assertAlmostEqual(float(b["price"]), (40 - M.TAKER_EXIT_MAX_SLIPPAGE_C) / 100.0,
+                               places=6)
+        self.assertEqual(M.TAKER_EXIT_MAX_SLIPPAGE_C, 3)
+
+    def test_it_waits_the_full_thirty_shed_minutes(self):
+        """§5.4(ii) -- escalation only after the maker shed has had its chance."""
+        m = self._maker()
+        m.shed_since["T"] = 99999.0 - (M.SHED_PATIENCE_S - 1)
+        self.assertIsNone(self._enabled(lambda: m.taker_exit("T", 99999.0)))
+        m.shed_since["T"] = 99999.0 - M.SHED_PATIENCE_S
+        self.assertIsNotNone(self._enabled(lambda: m.taker_exit("T", 99999.0)))
+
+    def test_it_aborts_on_a_crossed_book_per_8_8(self):
+        m = self._maker(yb=50, ya=48)                 # our_bid >= our_ask
+        m.shed_since["T"] = 0.0
+        self.assertIsNone(self._enabled(lambda: m.taker_exit("T", 99999.0)))
+        self.assertIn("T", m.st.poisoned)
+        ev = [e["event"] for e in self.events()]
+        self.assertIn("taker_exit_abort", ev)
+
+    def test_it_never_touches_a_frozen_market_or_a_flat_one(self):
+        m = self._maker()
+        m.shed_since["T"] = 0.0
+        m.st.assume_filled.add("T")
+        self.assertIsNone(self._enabled(lambda: m.taker_exit("T", 99999.0)))
+        m2 = self._maker(net_yes=0.0)
+        m2.shed_since["T"] = 0.0
+        self.assertIsNone(self._enabled(lambda: m2.taker_exit("T", 99999.0)))
+
+    def test_the_limit_stays_inside_the_legal_tick_range(self):
+        m = self._maker(net_yes=20.0, yb=2, ya=4)
+        m.shed_since["T"] = 0.0
+        self._enabled(lambda: m.taker_exit("T", 99999.0))
+        self.assertGreaterEqual(float(self.posted[0]["price"]) * 100,
+                                M.MIN_LEGAL_PRICE_C)
+
+    def test_the_300_flip_is_one_coordinated_change(self):
+        """The morning commit flips ceiling AND flag together; the startup assertion is what
+        makes forgetting either one impossible."""
+        self.assertFalse(M.TAKER_EXIT_ENABLED)
+        self.assertLess(M.MAX_TOTAL_COLLATERAL_USD, M.TAKER_EXIT_REQUIRED_ABOVE_USD)
+        ok, _ = M.unit_assertion_check(unit_progs(40))
+        self.assertTrue(ok)
+
+
+class Phase1_ReleaseAndHousekeeping(_RunnerCase):
+
+    def test_C5_scores_are_pruned_on_release_so_marks_cannot_freeze(self):
+        st = M.LedgerState()
+        m = M.Maker(None, st, [{"program_id": "P1", "market_ticker": "T", "series": "KX",
+                                "period_reward": 1e6, "target_size_fp": 1000.0,
+                                "discount_factor_bps": 5000.0, "start_ts": 0.0,
+                                "end_ts": 1000.0, "paid_out": False}])
+        m.scores["T"] = {"yes_bid_c": 40, "yes_ask_c": 42}
+        m.classified["T"] = {"rho": 6.25, "pinned": False, "denied": False, "sides": []}
+        m.do_cancel = lambda oid: (200, {"reduced_by": "0"})
+        m.release_out_of_window(1001.0)
+        self.assertNotIn("T", m.scores)
+        self.assertNotIn("T", m.classified)
+        # NEW-2 then marks the position AT COST rather than off a book we stopped watching
+        self.assertEqual(M.unpriced_positions({"T": {"yes": 5.0, "no": 0.0}}, {}), ["T"])
+
+    def test_C7_a_partially_closing_order_is_trimmed_to_its_closing_size(self):
+        st = M.LedgerState()
+        st.positions = {"T": {"yes": 20.0, "no": 0.0}}
+        st.position_cost = {"T": 8.0}
+        st.position_cost_leg = {"T": {"yes": 8.0, "no": 0.0}}
+        big = M.OrderState("A", "v4-c", "T", "ask", 0.42, 30, 0.0, 30.0)   # 20 close/10 open
+        st.orders["A"] = big
+        m = M.Maker(None, st, [{"program_id": "P1", "market_ticker": "T", "series": "KX",
+                                "period_reward": 1e6, "target_size_fp": 1000.0,
+                                "discount_factor_bps": 5000.0, "start_ts": 0.0,
+                                "end_ts": 1000.0, "paid_out": False}])
+        m.live_by_slot[("T", "ask")] = big
+        posted = []
+        m.do_post = lambda b: (posted.append(b["count"]),
+                               (201, {"order_id": "N1", "fill_count": "0.00",
+                                      "remaining_count": b["count"]}))[1]
+        m.do_cancel = lambda oid: (200, {"reduced_by": "30.00"})
+        m.release_out_of_window(1001.0)
+        self.assertEqual(posted, ["20.00"])          # reposted at exactly the closing size
+        row = [e for e in self.events() if e["event"] == "out_of_window_release"][0]
+        self.assertEqual(row["trimmed"][0]["closing"], 20)
+
+    def test_C6_a_kept_shed_keeps_requoting_after_the_window_ends(self):
+        st = M.LedgerState()
+        st.positions = {"T": {"yes": 20.0, "no": 0.0}}
+        st.position_cost = {"T": 8.0}
+        st.position_cost_leg = {"T": {"yes": 8.0, "no": 0.0}}
+        m = M.Maker(None, st, [])
+        m.flatten_only.add("T")
+        old_get = M.public_get
+        posted = []
+        try:
+            M.public_get = lambda path, params=None: (200, {"orderbook": {
+                "orderbook_fp": {"yes_dollars": [["0.4100", "50"]],
+                                 "no_dollars": [["0.5700", "50"]]}}})
+            m.do_post = lambda b: (posted.append((b["side"], b["price"], b["count"])),
+                                   (201, {"order_id": "N1", "fill_count": "0.00",
+                                          "remaining_count": b["count"]}))[1]
+            m.do_cancel = lambda oid: (200, {"reduced_by": "0.00"})
+            m.requote_orphan_sheds(1000.0)
+            self.assertEqual(posted, [("ask", "0.4300", "20.00")])   # joined the NO best
+            m.requote_orphan_sheds(1001.0)                # throttled to SAFETY_RESYNC_S
+            self.assertEqual(len(posted), 1)
+        finally:
+            M.public_get = old_get
+        # once flat it stops chasing
+        m.st.positions["T"] = {"yes": 0.0, "no": 0.0}
+        m.requote_orphan_sheds(1000.0 + M.SAFETY_RESYNC_S + 1)
+        self.assertNotIn("T", m.flatten_only)
+
+    def test_C10_terminal_orders_are_pruned_and_live_views_are_unaffected(self):
+        st = M.LedgerState()
+        for i in range(M.ORDER_RETENTION + 50):
+            o = M.OrderState("O%04d" % i, "c", "T", "bid", 0.40, 10, 0.0, 10.0)
+            o.reduced_by = 10.0
+            o.state = M.ST_CLOSED
+            st.orders[o.order_id] = o
+        live = M.OrderState("ZLIVE", "c", "T", "bid", 0.40, 10, 0.0, 10.0)
+        st.orders["ZLIVE"] = live
+        before = st.resting_collateral
+        dropped = st.prune_terminal_orders()
+        self.assertEqual(dropped, 50)
+        self.assertEqual(len(st.orders), M.ORDER_RETENTION + 1)
+        self.assertIn("ZLIVE", st.orders)             # a RESTING order is never pruned
+        self.assertAlmostEqual(st.resting_collateral, before, places=9)
+        self.assertEqual(st.prune_terminal_orders(), 0)   # idempotent
+
+    def test_D5_the_plan_is_feasible_against_held_positions(self):
+        """Planning against the raw ceiling produced an infeasible plan that place() then
+        rationed first-come, so what reached the book was not what ALLOCATE computed."""
+        held = M.MAX_TOTAL_COLLATERAL_USD * 0.5
+        budget = max(0.0, M.MAX_TOTAL_COLLATERAL_USD - held)
+        self.assertAlmostEqual(budget, M.MAX_TOTAL_COLLATERAL_USD - held, places=9)
+        s = M.Slot("T", "bid", 6.25, 50.0, 0.02, phi=0.0, d=0.0)
+        al, spent = M.allocate([s], budget, BIG, lambda_min=0.0)
+        self.assertLessEqual(spent + held, M.MAX_TOTAL_COLLATERAL_USD + 1e-9)
+
+    def test_D7_a_stuck_unknown_order_is_retried_then_booked_conservatively(self):
+        st = M.LedgerState()
+        o = M.OrderState("O1", "v4-c", "T", "bid", 0.40, 10, 0.0, 10.0)
+        o.state = M.ST_UNKNOWN
+        st.orders["O1"] = o
+        m = M.Maker(None, st, [])
+        m.do_cancel = lambda oid: (410, {"error": "gone"})
+        m.do_fills = lambda **kw: (M.FillsRead(True, 0.0), [])
+        t = 1000.0
+        for i in range(M.UNKNOWN_MAX_RETRIES):
+            m.sweep_unknown_orders(t)
+            t += M.UNKNOWN_RETRY_S
+        self.assertEqual(o.state, M.ST_CLOSED)
+        self.assertAlmostEqual(m.st.filled("T", "bid"), 10.0)   # conservative, never zero
+        self.assertIn("T", m.st.poisoned)
+        self.assertIn("unknown_order_expired", [e["event"] for e in self.events()])
+
+    def test_D7_does_not_fire_before_the_retry_cadence(self):
+        st = M.LedgerState()
+        o = M.OrderState("O1", "v4-c", "T", "bid", 0.40, 10, 0.0, 10.0)
+        o.state = M.ST_UNKNOWN
+        st.orders["O1"] = o
+        m = M.Maker(None, st, [])
+        calls = []
+        m.do_cancel = lambda oid: (calls.append(oid), (410, {}))[1]
+        m.sweep_unknown_orders(1000.0)
+        m.sweep_unknown_orders(1000.0 + M.UNKNOWN_RETRY_S - 1)
+        self.assertEqual(len(calls), 1)
+
+    def test_D8_remaining_count_is_refreshed_from_the_cancel_response(self):
+        """Believing the stale placement number makes filled = remaining - reduced_by
+        overstate the fill."""
+        st = M.LedgerState()
+        o = M.OrderState("O1", "v4-c", "T", "bid", 0.40, 10, 0.0, 10.0)
+        st.orders["O1"] = o
+        m = M.Maker(None, st, [])
+        m.do_cancel = lambda oid: (200, {"reduced_by": "4.00", "remaining_count": "6.00"})
+        m.cancel(o)
+        self.assertAlmostEqual(o.remaining_count, 6.0, places=9)
+        self.assertAlmostEqual(o.filled, 2.0, places=9)          # 6 - 4, not 10 - 4
+        self.assertIn("remaining_count_refreshed", [e["event"] for e in self.events()])
+
+    def test_D6_a_settled_market_is_not_marked_at_all(self):
+        """C2 zeroes the position, so there is nothing left to mis-mark."""
+        recs = [rec_place("O1", "T", "bid", 0.40, 20, fill=20, rem=0),
+                {"k": "settlement", "t": 9000.0, "ticker": "T", "result": "yes",
+                 "released_yes": 20.0, "released_no": 0.0, "cost_released": 8.0,
+                 "realized_pnl": 12.0}]
+        st = M.ledger_replay(recs)
+        self.assertEqual(M.unpriced_positions(st.positions, {}), [])
+        self.assertAlmostEqual(M.mark_to_market_pnl(st.positions, st.position_cost, {}),
+                               0.0, places=9)
+
+
+class Phase1_NtfyNeverPagesFromTests(unittest.TestCase):
+
+    def test_the_env_guard_blocks_the_send(self):
+        """The unit suite fired a REAL push to a phone tonight (a fixture ticker tripping
+        the day stop).  A test that can reach a human is a test nobody will run."""
+        self.assertTrue(os.environ.get("NTFY_DISABLE"))
+        sent = []
+        old = M._SESSION
+        try:
+            M._SESSION = type("S", (), {"post": lambda self, *a, **k: sent.append(a)})()
+            M.ntfy("title", "some message about REALTICKER-26JUL28")
+            self.assertEqual(sent, [])
+        finally:
+            M._SESSION = old
+
+    def test_the_fixture_ticker_guard_is_independent_of_the_env_guard(self):
+        sent = []
+        old_env = os.environ.pop("NTFY_DISABLE", None)
+        old_dry, old_sess = M.DRY, M._SESSION
+        try:
+            M.DRY = False
+            M._SESSION = type("S", (), {"post": lambda self, *a, **k: sent.append(a)})()
+            M.ntfy("LIP v4 cancel anomaly", "T http=410 - order may be LIVE")
+            self.assertEqual(sent, [])                # fixture ticker: suppressed
+            M.ntfy("real", "KXAAAGASD-26JUL28-4.100 http=410")
+            self.assertEqual(len(sent), 1)            # a real ticker still pages
+        finally:
+            M.DRY, M._SESSION = old_dry, old_sess
+            if old_env is not None:
+                os.environ["NTFY_DISABLE"] = old_env
 
 
 class StartupAssertions(unittest.TestCase):

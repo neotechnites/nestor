@@ -260,6 +260,13 @@ TAKER_EXIT_ENABLED = False
 # False.  Deliberately NOT an auto-enable: crossing the spread is a human decision and this
 # forces it to be taken explicitly at the rung, not inherited from a smaller one.
 TAKER_EXIT_REQUIRED_ABOVE_USD = 300.0
+# When TAKER_EXIT_ENABLED is True the exit is a MARKETABLE LIMIT, never a market order:
+# §8.8 aborts on "a fill at a price we did not intend", and only a limit price makes that
+# statement checkable BEFORE the order is sent.  The limit crosses the opposing best by at
+# most this much, so the worst fill is bounded and known.  3c is the observed spread on the
+# qualifying rungs (verify-lip-gas §3c: median 1-2c, 6c on the widest), so it clears a
+# normal book in one shot without reaching for depth we cannot see.
+TAKER_EXIT_MAX_SLIPPAGE_C = 3
 
 # ---- risk caps (§8) ---------------------------------------------------------------------
 INV_CAP_USD = 10.00                     # §8.1 n_cap = floor($10/p) on NET.  A slot's max
@@ -307,6 +314,16 @@ BOOK_SNAPSHOT_S = 30                    # §12.4 sample the window's OWN book ev
 # ---- restart / recovery (§9) ------------------------------------------------------------
 FILLS_REQUERY_DELAY_S = 36              # §9.4a 3x the ~12s worst observed index lag
 CRASH_GAP_LOOKBACK_S = 60               # §9.4(4) fills query over [last_ledger_ts-60s, now]
+# C10: in-memory retention of TERMINAL orders.  closing_room()/resting_collateral() walk
+# st.orders on every placement, so an unbounded dict makes a multi-day run quadratic.  400
+# is ~2 days of placements at the observed cadence and far more than the restart sweep or
+# the §9.4a disambiguation ever reach back for; the ledger keeps everything regardless.
+ORDER_RETENTION = 400
+# D7: an order left ST_UNKNOWN holds collateral forever.  Retry its cancel on this cadence,
+# and after this many attempts book it as filled (the §9.4a conservative direction) so the
+# ceiling is not hostage to one ambiguous order.
+UNKNOWN_RETRY_S = 300
+UNKNOWN_MAX_RETRIES = 3
 
 # ---- scanner (§7) -----------------------------------------------------------------------
 SCAN_PAGE_LIMIT = 1000                  # §7.1 cursor-paged, ~120 pages at limit=1000
@@ -1635,6 +1652,27 @@ class LedgerState(object):
                 out.setdefault(o.ticker, []).append(o)
         return out
 
+    def prune_terminal_orders(self, keep=ORDER_RETENTION):
+        """C10 — `st.orders` grew without bound, and `closing_room` / `resting_collateral`
+        walk it on EVERY placement, so a multi-day run degrades quadratically in the number
+        of orders ever placed.  A TERMINAL order (cancelled or fully resolved, nothing
+        resting) contributes to no live view: its fills are already folded into filled_cum,
+        positions and cost.  Drop the oldest of them beyond `keep`.
+
+        The LEDGER still holds every one of them — this bounds working memory, it does not
+        discard history, and a replay reconstructs the full set.  The most recent `keep` are
+        retained so the restart sweep and 404 disambiguation still see recent context.
+        """
+        terminal = [o for o in self.orders.values()
+                    if o.resting <= 0 and o.reduced_by is not None
+                    and o.state == ST_CLOSED]
+        if len(terminal) <= keep:
+            return 0
+        terminal.sort(key=lambda o: str(o.order_id))
+        for o in terminal[:len(terminal) - keep]:
+            self.orders.pop(o.order_id, None)
+        return len(terminal) - keep
+
     def closing_room(self, ticker, side):
         """FIX-A-1 — closing capacity on (ticker, side) NOT already consumed by resting
         orders.  This is what a new order may net against; anything beyond it opens."""
@@ -2095,8 +2133,28 @@ def signed(auth, method, path, body=None, params=None):
     return http(method, url, headers=hdrs, body=body)
 
 
+FIXTURE_TICKERS = ("T", "T2", "M1", "M2", "M3", "M4", "DXY", "OTHER", "PIN1", "PIN2",
+                   "SEEN", "BLIND", "GOOD", "REVIVE", "RICH-MKT", "CHEAP-MKT", "A-MKT",
+                   "B-MKT", "C-MKT", "W-MKT", "X-MKT", "Z-MKT", "EMPTY-MKT", "FROZEN-MKT",
+                   "P", "P1", "P2")
+
+
 def ntfy(title, message):
-    """§13.6 alerts."""
+    """§13.6 alerts.
+
+    The unit suite fired a REAL push to a phone tonight (a fixture ticker "T" tripping the
+    day stop).  A test that can reach a human is a test nobody will run.  Two independent
+    guards, because either alone is forgettable: NTFY_DISABLE in the environment (set by the
+    test runner), and a refusal to page about anything whose ticker looks like a fixture.
+    Both fail CLOSED for alerting only — never for trading.
+    """
+    if os.environ.get("NTFY_DISABLE"):
+        print("[ntfy-disabled] %s - %s" % (title, message))
+        return
+    if any(("%s " % t) in message or message.endswith(" %s" % t) or
+           (" %s " % t) in (" " + message + " ") for t in FIXTURE_TICKERS):
+        print("[ntfy-suppressed: fixture ticker] %s - %s" % (title, message))
+        return
     if DRY:
         print("[dry] would ntfy: %s - %s" % (title, message))
         return
@@ -2320,6 +2378,10 @@ class Maker(object):
         self.qual_ref = {}              # (ticker, side) -> qualifies at last ALLOCATE
         self.shed_since = {}            # ticker -> ts the shed quote went up
         self.shed_target = {}           # (ticker, side) -> contracts the shed must cover
+        self.flatten_only = set()       # C6: tickers whose only remaining job is unwinding
+        self.unknown_retry_ts = {}      # D7: order_id -> last cancel-retry ts
+        self.unknown_retries = {}       # D7: order_id -> attempts
+        self.last_orphan_poll = 0.0     # C6: orphan-shed poll throttle
         self.refilled = {}              # (ticker, side) -> contracts re-posted this window
         self.mbb_degraded = set()       # slots automatically on cancel-first (§4.2)
         # S3: seeded FROM THE LEDGER, so a restart preserves A and does not refire
@@ -2415,9 +2477,13 @@ class Maker(object):
     # -- placement ------------------------------------------------------------------------
     def place(self, ticker, side, price_c, size, expiration_ts):
         self.last_place_skip = None
-        if self.halted:
+        if self.halted and not self._closing_exempt(ticker, side, size):
             self.last_place_skip = "halted"
-            # §8.4/§8.5: a halted process posts NOTHING, on every path into placement.
+            # §8.4/§8.5: a halted process posts nothing that could OPEN exposure.  C3: a
+            # fully-CLOSING order is exempt, because the whole point of the day stop is to
+            # flatten — halting before the sheds were posted meant the stop cancelled
+            # everything and then held the inventory to settlement, the exact opposite of
+            # §8.4's "cancel-all -> flatten -> alert -> exit".
             return None
         if ticker in self.st.poisoned or ticker in self.st.assume_filled:
             return None
@@ -2523,6 +2589,19 @@ class Maker(object):
             http=status, reduced_by=rb,
             body=None if status in (200, 404) else json.dumps(body, default=str)[:200])
         if status == 200 and rb is not None:
+            # D8: the cancel response is a synchronous truth about the order's CURRENT
+            # remaining size, which may have shrunk since placement.  Believing the stale
+            # placement number makes `filled = remaining - reduced_by` overstate the fill.
+            rem_now = dig(body, "remaining_count")
+            if rem_now is None:
+                rem_now = dig(body, "remaining_count_fp")
+            if rem_now is not None:
+                fresh = num(rem_now, order.remaining_count)
+                if 0.0 <= fresh <= order.size + 1e-9:
+                    if abs(fresh - order.remaining_count) > 1e-9:
+                        log("remaining_count_refreshed", order_id=order.order_id,
+                            was=order.remaining_count, now=fresh)
+                    order.remaining_count = fresh
             order.reduced_by = max(0.0, min(order.remaining_count, num(rb, 0.0)))
             learned = max(0.0, order.remaining_count - order.reduced_by)
             order.state = ST_CLOSED
@@ -2740,6 +2819,107 @@ class Maker(object):
             self.placed_ts[key] = _now()
         return new
 
+    def _closing_exempt(self, ticker, side, size):
+        """C3 — True iff this order is ENTIRELY closing, so it cannot open exposure."""
+        room = self.st.closing_room(ticker, side)
+        return closing_qty(side, size, room=room) >= float(size) - 1e-9
+
+    def shed_price_c(self, ticker, held_side):
+        """The opposing side's best, on the YES axis (§5.4: a YES ask IS a NO bid)."""
+        info = self.scores.get(ticker) or {}
+        return info.get("yes_ask_c") if held_side == "bid" else info.get("yes_bid_c")
+
+    def flatten(self, now, reason):
+        """§8.4 / C3 — actually flatten.  Posts a fully-closing maker shed for every net
+        position, sized at exactly abs(net) so it can never reverse (C8).
+
+        Returns (n_posted, residual_contracts, residual_usd).  Whatever cannot be shed is
+        reported HONESTLY rather than left implicit: with TAKER_EXIT_ENABLED False there is
+        no second mechanism, so the process can and does exit still holding inventory, and
+        the operator must be told in those words.
+        """
+        posted, residual_n, residual_usd = 0, 0.0, 0.0
+        for ticker in sorted(self.st.positions.keys()):
+            net = self.st.net_position(ticker)
+            if abs(net) < 1e-9:
+                continue
+            cost = self.st.position_cost.get(ticker, 0.0)
+            if ticker in self.st.assume_filled:
+                residual_n += abs(net); residual_usd += cost
+                log("flatten_skipped", ticker=ticker, net=net,
+                    why="assume_filled_freeze")     # §9.4b/§5.6: never act unverified
+                continue
+            held = "bid" if net > 0 else "ask"
+            shed_side = shed_slot(held)
+            px = self.shed_price_c(ticker, held)
+            if px is None:
+                residual_n += abs(net); residual_usd += cost
+                log("flatten_skipped", ticker=ticker, net=net, why="no_book")
+                continue
+            size = int(abs(net))
+            o = self.place(ticker, shed_side, int(px), size, int(now + 3600))
+            if o is None:
+                residual_n += abs(net); residual_usd += cost
+                log("flatten_failed", ticker=ticker, net=net, side=shed_side,
+                    price_c=px, skip=self.last_place_skip)
+                continue
+            posted += 1
+            self.live_by_slot[(ticker, shed_side)] = o
+            self.shed_since.setdefault(ticker, now)
+            self.shed_target[(ticker, shed_side)] = size
+            self.flatten_only.add(ticker)          # C6: keep requoting it after the window
+            log("flatten_shed_posted", ticker=ticker, side=shed_side, size=size,
+                price_c=px, net=net)
+        log("flatten_summary", reason=reason, sheds_posted=posted,
+            residual_contracts=round(residual_n, 4),
+            residual_cost_usd=round(residual_usd, 4),
+            taker_exit_enabled=TAKER_EXIT_ENABLED,
+            note=("exited holding %.0f contracts, $%.2f - no further mechanism, "
+                  "TAKER_EXIT_ENABLED is False" % (residual_n, residual_usd))
+            if residual_n > 0 else "flat")
+        return posted, residual_n, residual_usd
+
+    def taker_exit(self, ticker, now):
+        """§5.4(iii) escalation, live only when TAKER_EXIT_ENABLED.  A MARKETABLE LIMIT
+        bounded by abs(net) and by TAKER_EXIT_MAX_SLIPPAGE_C, so §8.8's "a fill at a price
+        we did not intend" is checkable rather than hoped for.  Never reverses."""
+        if not TAKER_EXIT_ENABLED:
+            return None
+        net = self.st.net_position(ticker)
+        if abs(net) < 1e-9 or ticker in self.st.assume_filled:
+            return None
+        if now - self.shed_since.get(ticker, now) < SHED_PATIENCE_S:
+            return None                     # §5.4(ii): the shed gets its 30 minutes first
+        held = "bid" if net > 0 else "ask"
+        side = shed_slot(held)
+        info = self.scores.get(ticker) or {}
+        yb, ya = info.get("yes_bid_c"), info.get("yes_ask_c")
+        if yb is None or ya is None:
+            log("taker_exit_skipped", ticker=ticker, why="no_two_sided_book")
+            return None
+        if yb >= ya:
+            # §8.8: crossed or locked — abort rather than trade into it.
+            log("taker_exit_abort", ticker=ticker, yes_bid=yb, yes_ask=ya,
+                why="crossed_or_locked_book")
+            self.st.poisoned.add(ticker)
+            return None
+        if side == "bid":
+            limit_c = min(MAX_LEGAL_PRICE_C, ya + TAKER_EXIT_MAX_SLIPPAGE_C)
+        else:
+            limit_c = max(MIN_LEGAL_PRICE_C, yb - TAKER_EXIT_MAX_SLIPPAGE_C)
+        size = int(abs(net))
+        log("taker_exit_attempt", ticker=ticker, side=side, size=size, limit_c=limit_c,
+            yes_bid=yb, yes_ask=ya, slippage_cap_c=TAKER_EXIT_MAX_SLIPPAGE_C)
+        o = self.place(ticker, side, limit_c, size, int(now + 60))
+        if o is None:
+            log("taker_exit_failed", ticker=ticker, skip=self.last_place_skip)
+            return None
+        if o.resting > 0:
+            self.cancel(o)          # never leave a taker order resting
+        log("taker_exit_done", ticker=ticker, filled=o.filled,
+            net_after=self.st.net_position(ticker))
+        return o
+
     def cancel_all(self, reason):
         live = [o for o in self.st.orders.values()
                 if o.state in (ST_LIVE, ST_UNKNOWN) and o.reduced_by is None]
@@ -2869,18 +3049,42 @@ class Maker(object):
             orders = [o for o in self.st.orders.values()
                       if o.ticker == tk and o.resting > 0]
             _, _, closing = allocate_closing_room(orders, self.st.net_position(tk))
-            cancelled, kept = [], []
+            cancelled, kept, trimmed = [], [], []
             for o in sorted(orders, key=lambda x: str(x.order_id)):
-                if closing.get(str(o.order_id), 0.0) > 0:
-                    kept.append(o.order_id)          # inventory outlives the program
+                c = closing.get(str(o.order_id), 0.0)
+                if c <= 0:
+                    self.cancel(o)
+                    self.live_by_slot.pop((tk, o.side), None)
+                    cancelled.append(o.order_id)
                     continue
-                self.cancel(o)
-                self.live_by_slot.pop((tk, o.side), None)
-                cancelled.append(o.order_id)
+                if c < o.resting - 1e-9:
+                    # C7: a PARTIALLY closing order keeps an OPENING tail alive on a market
+                    # that is no longer earning — the tail is pure fill risk against zero
+                    # reward.  Cancel and repost at exactly the closing size.
+                    size = int(c)
+                    px_c = int(round(o.price * 100))
+                    self.cancel(o)
+                    self.live_by_slot.pop((tk, o.side), None)
+                    if size > 0:
+                        rep = self.place(tk, o.side, px_c, size, int(now + 3600))
+                        if rep is not None:
+                            self.live_by_slot[(tk, o.side)] = rep
+                            kept.append(rep.order_id)
+                    trimmed.append({"order_id": o.order_id, "was": o.resting,
+                                    "closing": size})
+                    continue
+                kept.append(o.order_id)              # inventory outlives the program
             self.released.add(pid)
             self.classified.pop(tk, None)            # and it leaves the §4.6 poll ranking
+            # C5: drop the stale score too.  A mark computed from a book we stopped polling
+            # is worse than no mark: NEW-2 marks an unpriceable position AT COST, which is
+            # honest, whereas a stale mid quietly freezes the day stop's evidence at
+            # whatever the book looked like when we walked away.
+            self.scores.pop(tk, None)
+            if abs(self.st.net_position(tk)) > 0:
+                self.flatten_only.add(tk)            # C6: it still needs unwinding
             log("out_of_window_release", program_id=pid, ticker=tk, reason=reason,
-                cancelled=cancelled, kept_closing=kept,
+                cancelled=cancelled, kept_closing=kept, trimmed=trimmed,
                 net_position=self.st.net_position(tk))
 
     def sweep_settlements(self, now):
@@ -2913,6 +3117,78 @@ class Maker(object):
             self.st.position_cost[ticker] = 0.0
             self.st.position_cost_leg[ticker] = {"yes": 0.0, "no": 0.0}
 
+    def requote_orphan_sheds(self, now):
+        """C6 — a closing order KEPT past its program's window end (or through a day stop)
+        still has to track the book.  Nothing else requotes it: its market has no live
+        program, so it builds no slots and the main loop never sees it.  Left alone it sits
+        at a stale price and never fills, which turns "inventory outlives the program" into
+        "inventory outlives everything"."""
+        # Rate budget (§4.6): these markets are outside the 1 Hz clamp, so poll them on the
+        # safety-resync cadence rather than every cycle — an unwinding shed does not need
+        # second-by-second tracking, and the REST budget is shared.
+        if now - self.last_orphan_poll < SAFETY_RESYNC_S:
+            return
+        self.last_orphan_poll = now
+        for ticker in sorted(self.flatten_only):
+            net = self.st.net_position(ticker)
+            if abs(net) < 1e-9:
+                self.flatten_only.discard(ticker)
+                self.shed_since.pop(ticker, None)
+                log("orphan_shed_done", ticker=ticker)
+                continue
+            if ticker in self.st.assume_filled or ticker in self.st.poisoned:
+                continue
+            st_code, body = public_get("/markets/%s/orderbook" % ticker, {"depth": "10"})
+            if st_code != 200:
+                continue
+            yb, ya = best_from_book(body)
+            self.scores[ticker] = {"yes_bid_c": yb, "yes_ask_c": ya, "pinned": False}
+            held = "bid" if net > 0 else "ask"
+            side = shed_slot(held)
+            px = self.shed_price_c(ticker, held)
+            if px is None:
+                continue
+            cur = self.live_by_slot.get((ticker, side))
+            size = int(abs(net))
+            if cur is not None and int(round(cur.price * 100)) == int(px) \
+                    and cur.resting >= size - 1e-9:
+                continue                                   # already at the right quote
+            self.requote(ticker, side, int(px), size, int(now + 3600))
+            log("orphan_shed_requote", ticker=ticker, side=side, size=size, price_c=px)
+            self.taker_exit(ticker, now)                   # §5.4(iii), if enabled
+
+    def sweep_unknown_orders(self, now):
+        """D7 — an order stuck ST_UNKNOWN holds collateral and blocks its market forever.
+        Retry the cancel on a cadence; after UNKNOWN_MAX_RETRIES give up and book the
+        remainder as FILLED, which is §9.4a's conservative direction (never book zero).
+        The market stays poisoned either way, so this frees the ceiling without freeing the
+        market to be quoted again."""
+        for o in list(self.st.orders.values()):
+            if o.state != ST_UNKNOWN or o.reduced_by is not None:
+                continue
+            last = self.unknown_retry_ts.get(o.order_id, 0.0)
+            if now - last < UNKNOWN_RETRY_S:
+                continue
+            self.unknown_retry_ts[o.order_id] = now
+            n = self.unknown_retries.get(o.order_id, 0) + 1
+            self.unknown_retries[o.order_id] = n
+            log("unknown_order_retry", order_id=o.order_id, ticker=o.ticker, attempt=n)
+            self.cancel(o)
+            if o.reduced_by is not None:
+                continue
+            if n >= UNKNOWN_MAX_RETRIES:
+                rem = max(0.0, o.remaining_count)
+                o.reduced_by = 0.0
+                o.state = ST_CLOSED
+                self.st._credit_fill(o, rem)
+                self.st.poisoned.add(o.ticker)
+                log("unknown_order_expired", k="assume_filled", order_id=o.order_id,
+                    ticker=o.ticker, side=o.side, booked_filled=rem, attempts=n,
+                    why="unresolvable after %d cancels; booked FILLED (conservative)" % n)
+                ntfy("LIP v4 unknown order booked as filled",
+                     "%s %s: %d cancel attempts failed; %0.f contracts booked as filled"
+                     % (o.ticker, o.order_id, n, rem))
+
     def check_day_stop(self, slots, alloc, now):
         """§8.4 global day stop.  Reads the ledger-reconstructed positions and cost (§9.3)
         marked against the current books — never an exchange index (§8.6)."""
@@ -2940,10 +3216,16 @@ class Maker(object):
         ntfy("LIP v4 DAY STOP",
              "pnl $%.2f breached the $%.2f stop - cancelling all, flattening, exiting"
              % (pnl, day_stop_usd(proj_day)))
-        self.halted = True                       # §8.4: no further posts, on any path
+        # §8.4 ORDER MATTERS: cancel-all -> FLATTEN -> alert -> exit.  Halting first meant
+        # place() refused the sheds, so "flatten" was a log line and the process exited
+        # holding everything (cold-audit C2/C3 are the same defect).
         self.cancel_all("day_stop")
-        for tk in list(self.st.positions.keys()):
-            self.run_recycler(tk, alloc, slots, now)      # §5.4 flatten via maker shed
+        posted, residual_n, residual_usd = self.flatten(now, "day_stop")
+        self.halted = True                       # no OPENING posts from here on
+        if residual_n > 0:
+            ntfy("LIP v4 DAY STOP left inventory",
+                 "exited holding %.0f contracts, $%.2f of cost - no further mechanism"
+                 % (residual_n, residual_usd))
         self.stopping = True
         return True
 
@@ -2969,6 +3251,9 @@ class Maker(object):
         # §4.6 CLASSIFY-THEN-CLAMP (B1).  The 1 Hz REST budget covers 6 markets; WHICH 6 is
         # decided by the classification sweep, not by rho (degenerate inside one event —
         # see the CLASSIFY_* block).  Pinned markets are excluded outright.
+        self.sweep_unknown_orders(now)                # D7
+        self.st.prune_terminal_orders()               # C10
+        self.requote_orphan_sheds(now)                # C6
         if now - self.last_classify >= CLASSIFY_REFRESH_S:
             self.sweep_settlements(now)               # C2, before re-ranking
             self.classify_sweep(progs, now)
@@ -3020,17 +3305,25 @@ class Maker(object):
             log("p7_revival_cap", n_candidates=len(rev_tickers), allowed=sorted(allowed))
 
         # §2.4 budget reservation (B3): two passes to the max-slot fixpoint.
-        budget = MAX_TOTAL_COLLATERAL_USD
+        # D5: held positions ALREADY consume the ceiling, so planning against the raw
+        # ceiling produces an infeasible plan and place() then rations it first-come — the
+        # allocation that actually reaches the book is whatever the loop happened to reach
+        # first, not the one ALLOCATE computed.  Plan against what is genuinely available.
+        held = self.st.position_collateral
+        budget = max(0.0, MAX_TOTAL_COLLATERAL_USD - held)
+        if held > 0:
+            log("budget_after_positions", ceiling=MAX_TOTAL_COLLATERAL_USD,
+                position_collateral=round(held, 4), available=round(budget, 4))
         alloc, spent, dropped, max_slot = ({}, 0.0, set(), 0.0)
         for _ in range(4):
             alloc, spent, dropped = allocate_with_forfeit_gate(slots, budget)
             max_slot = max([alloc.get(s.key, 0) * s.p for s in slots] or [0.0])
-            newb = min(budget, reserve_budget(MAX_TOTAL_COLLATERAL_USD, max_slot))
+            newb = min(budget, reserve_budget(MAX_TOTAL_COLLATERAL_USD - held, max_slot))
             if abs(newb - budget) < 1e-9:
                 break
             budget = newb                       # monotone down: the fixpoint is reachable
         # §2.4 hard invariant: the make-before-break double of the LARGEST slot must fit.
-        if spent + max_slot > MAX_TOTAL_COLLATERAL_USD + 1e-9:
+        if spent + max_slot + held > MAX_TOTAL_COLLATERAL_USD + 1e-9:
             log("budget_reserve_violation", spent=round(spent, 4),
                 max_slot=round(max_slot, 4), ceiling=MAX_TOTAL_COLLATERAL_USD)
             alloc = {k: 0 for k in alloc}
@@ -3241,7 +3534,29 @@ def main(argv):
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--check", action="store_true",
                     help="run the startup assertions and exit")
+    ap.add_argument("--clear-freeze", metavar="TICKER",
+                    help="C11: operator record clearing a §9.4b assume_filled freeze on "
+                         "one market, after reconciling its position BY HAND")
+    ap.add_argument("--operator", default=os.environ.get("USER", "operator"),
+                    help="who is clearing the freeze (recorded in the ledger)")
     args = ap.parse_args(argv[1:])
+    if args.clear_freeze:
+        # C11 — §9.4b: the freeze "clears ONLY on an explicit operator record".  This is
+        # that record, and it is deliberately a separate invocation rather than a flag on a
+        # running process: clearing it means a human has reconciled the position, and a
+        # human action should look like one in the ledger.
+        st = replay_ledger_file(LEDGER_PATH)
+        if args.clear_freeze not in st.assume_filled:
+            print("%s is not frozen (frozen: %s)"
+                  % (args.clear_freeze, sorted(st.assume_filled) or "none"))
+            return 1
+        log("assume_filled_clear", k="assume_filled_clear", ticker=args.clear_freeze,
+            operator=args.operator,
+            why="operator reconciled the position by hand")
+        print("cleared assume_filled on %s (operator=%s). Restart the service to pick it "
+              "up." % (args.clear_freeze, args.operator))
+        return 0
+
     if not (args.live or args.dry or args.check):
         print(__doc__.split("USAGE")[1])
         return 2
