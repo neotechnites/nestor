@@ -253,9 +253,24 @@ PRESENCE_COMPACT_DAYS = 7                    # spec §6.2 — DERIVED: exactly t
                                              # median require.  (Daily rotation granularity
                                              # is UNDERIVED §9.4.)
 SHRINK_PSEUDO_DOLLAR_H = 2.0                 # spec §2.3 pseudo-weight k
-SHRINK_PRIOR_DEFAULT = 0.5                   # spec §2.3 T₀ fallback.  UNDERIVED §9.4 —
-                                             # affects probe ORDER only, never exposure,
-                                             # because rung-0 caps bind first.
+# T̂ PRIOR.  T̂ is the fraction of a committed dollar-hour that survives AT BEST — 1.0 means
+# presence is never interrupted, 0 means we are filled the moment we quote.
+#
+# The old note here said 0.5 "affects probe ORDER only, never exposure, because rung-0 caps
+# bind first".  That was true while rung 0 was a $2 probe.  It is FALSE now: since the ratchet
+# was generalized, T̂ multiplies gross inside (★) and therefore gates ADMISSION — measured
+# live, only ~4% of 368 slots cleared the hurdle and the book deployed $5.80 of $300.  An
+# underived constant quietly became load-bearing in a role it was never derived for.
+#
+# 0.5 describes a BUSY venue: half our capital-time eaten before we have a single observation.
+# The median Kalshi market is the opposite — thin, rarely traded, which is exactly why
+# presence pays there at all (note 43 §4: the absent market-maker is the fish, and presence
+# itself is the product).  0.8 is the prior for "mostly undisturbed, some interruption",
+# still strictly below the 1.0 a truly dead book would show.
+# This is a PRIOR only: `t_hat_shrunk` moves to the measured value at a 2 $·h pseudo-weight,
+# so one venue-hour of real tape overrides it.  Still UNDERIVED as a distribution — the honest
+# fix is to measure T̂ per venue class from our own presence log and set this to the median.
+SHRINK_PRIOR_DEFAULT = 0.8
 PSDH_MAX = 3600.0                            # every committed dollar resting at best every
                                              # second.  T̂ = PSDH/3600 needs NO threshold.
 
