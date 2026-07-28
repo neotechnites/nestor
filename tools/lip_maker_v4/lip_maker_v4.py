@@ -244,7 +244,7 @@ MIN_RANK_POLL_SLOTS = 2
 # is on and the socket is actually CONNECTED, the poll clamp lifts to ws_feed.MAX_WS_MARKETS;
 # any market whose WS book is missing, stale, gapped or corrupt falls back to its REST poll,
 # so the failure mode is slower, never wrong.
-WS_ENABLED = False
+WS_ENABLED = True
 # W2 — WS-vs-REST DIVERGENCE GATE.  A websocket book is a RECONSTRUCTION; a REST book is the
 # exchange's own statement.  Until the reconstruction has been shown to match the statement,
 # it may not price a quote.  While gating (and periodically after), the market is REST-polled
