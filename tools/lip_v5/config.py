@@ -120,6 +120,26 @@ FLOOR_RATE_PER_H = LAMBDA_MIN / LAMBDA_MIN_WINDOW_HOURS      # = 0.00625 /h, spe
 # extra contracts buy fill risk, not score (test_a_rung_where_share_saturates...).
 # The old 0.00625 was ~2x ABOVE the measured rate: it refused everything that really pays.
 ADMIT_FLOOR_RATE_PER_H = 0.002
+# THE PAYOUT HORIZON.  (★) maximises RATE and is blind to WHEN a window closes, so it cannot
+# tell "earn $16 by Saturday" from "earn $16 by tomorrow" — and it kept buying weeklies.
+# Measured 2026-07-28 from Ryan's own popovers: a treasury DAILY earned $0.44 on a $4.99 order
+# while a Trump WEEKLY earned $0.10 on a $30 order — ~40x the return per capital-hour, purely
+# because a daily packs its pool into ~20 h (rho ≈ $5/h) where a weekly spreads $100 over
+# 86-166 h (rho ≈ $1/h).
+#
+# The economics the rate misses: capital committed to a 166-hour program is capital that
+# CANNOT be redeployed into the six dailies that open in the meantime.  So accrual beyond the
+# horizon is not worth its face value to us — it is worth what the same dollars would earn
+# recycling through nearer windows.  Projecting only the accrual that lands INSIDE the horizon
+# is the conservative form of that: a weekly is judged on the day of it we can actually
+# collect, a daily is unaffected.
+#
+# 24 h is the redeployment cycle: it is how often a fresh set of dailies opens, and it is the
+# interval at which we can act on a credit.  MIRROR (horizon too SHORT ↔ too long): too short
+# refuses genuinely good multi-day venues (bounded — they are still admitted, just projected
+# on one day's worth); too long is what we measured, a book full of week-long accrual while
+# the operator needed money tomorrow.
+PAYOUT_HORIZON_H = 24.0
 STEP_FRACTION = 0.02                         # v1 §2.5 coarsest step landing within 2%
 D_SEED_USD = 0.07                            # spec §2.4 / v1 §15.4, UNDERIVED §9.4
 DRIFT_HORIZON_S = 60.0                       # spec §2.4 (v3's 5-9¢ cross-cycle horizon),

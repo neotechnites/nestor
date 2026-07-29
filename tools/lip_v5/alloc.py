@@ -704,7 +704,10 @@ def cliff_clearing_q(slot, target_usd=None):
     # to exactly $1.00 leaves zero headroom for any of them, and a rung that lands at $0.95
     # pays the same as a rung that lands at zero.
     target_usd = C.ENTRY_FLOOR_USD if target_usd is None else float(target_usd)
-    avail = (float(slot.rho) / 2.0) * max(0.0, float(slot.hours_left))
+    # Same horizon: a rung that only clears $2 by Saturday has not cleared it for a book that
+    # is judged tomorrow, and sizing it as if it had is how capital ends up parked in weeklies.
+    avail = (float(slot.rho) / 2.0) * min(max(0.0, float(slot.hours_left)),
+                                          C.PAYOUT_HORIZON_H)
     need = max(0.0, float(target_usd) - float(getattr(slot, "accrued", 0.0) or 0.0))
     if need <= 0:
         return 0
@@ -730,7 +733,11 @@ def projected_period_payout(program_slots, alloc):
         q = alloc.get(s.key, 0)
         if q <= 0:
             continue
-        total += our_share(q, s.S) * (s.rho / 2.0) * max(0.0, s.hours_left)
+        # ONLY THE ACCRUAL WE CAN COLLECT INSIDE THE HORIZON COUNTS (config.PAYOUT_HORIZON_H):
+        # a 166-hour weekly is judged on the day of it we can actually bank, because the
+        # capital behind it cannot be recycled into nearer windows meanwhile.
+        h_eff = min(max(0.0, s.hours_left), C.PAYOUT_HORIZON_H)
+        total += our_share(q, s.S) * (s.rho / 2.0) * h_eff
     return accrued + total
 
 
