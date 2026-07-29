@@ -997,8 +997,15 @@ class Maker(object):
                     q_c = alloc.cliff_clearing_q(sl)
                     if q_c:
                         need = max(need, q_c * sl.p)
-                cap, status = RT.rung0_cap(max(floor_usd * C.RUNG0_FLOOR_MULT, need),
-                                           self.slot_cap_usd, per_market)
+                # A VENUE HOLDS SEVERAL RUNGS.  `4 x probe-floor` is ~$1.20 on a cheap
+                # rung — exactly ONE cliff-sized order — so 40 venues x ~$1.50 = the $60 this
+                # book has been stuck at.  The probe floor answers "can this venue measure
+                # anything"; it was never meant to be the venue's whole budget.  Size the
+                # venue for RUNGS_PER_VENUE cliff-sized orders, still bounded by the
+                # per-market cap, with the cluster cap bounding the correlated group and the
+                # per-rung cap bounding any single order.
+                want = max(floor_usd * C.RUNG0_FLOOR_MULT, need * C.RUNGS_PER_VENUE)
+                cap, status = RT.rung0_cap(want, per_market, per_market)
                 # A VENUE HOLDS SEVERAL RUNGS.  The probe-sized cap above answers "can this
                 # venue measure anything" — keep its STATUS, but once probeable the venue's
                 # budget is the per-market bound, because the thing that must bound a
@@ -1052,7 +1059,11 @@ class Maker(object):
             self.venue_status[venue] = status
             if status in (RT.ADMITTED, RT.OVERSIZED):
                 self.venues[venue] = vs
-                expo += cap
+                # `expo` is COMMITTED DOLLARS.  Adding the new venue's CAP re-mixed the two
+                # currencies, so a workable cap size made the accumulator hit the ceiling
+                # after a few admissions.  Admitting a venue commits nothing; ALLOCATE's
+                # budget is what spends, and the cluster/rung/day-stop caps are what bound
+                # the risk.  The unverified COUNT still binds breadth.
                 n_unver += 1
                 n_oversized += 1 if vs.oversized else 0
 

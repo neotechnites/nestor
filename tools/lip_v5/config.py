@@ -260,6 +260,11 @@ N_UNVERIFIED_MAX = 40                        # breadth is the strategy (note 43 
 # distinguishable from the $1 forfeit cliff — a probe that can only just clear the floor
 # cannot tell "this venue pays" from "we barely qualified".
 RUNG0_FLOOR_MULT = 4.0
+# How many cliff-sized rungs one venue may hold.  A venue is a SERIES and a series carries a
+# ladder of strikes, each strike its own pool with its own $1 cliff — so the earning shape is
+# several rungs per venue, not one.  4 keeps a venue's budget meaningfully below the cluster
+# cap (which bounds the correlated group) while letting the ladder actually be occupied.
+RUNGS_PER_VENUE = 4.0
 OVERSIZED_PROBE_FRAC = 0.02                  # spec §9.3: now a CLASSIFICATION threshold, not
                                              # a cap
 OVERSIZED_PROBE_MAX = 2                      # spec §1.4 concurrent oversized-probe slots
