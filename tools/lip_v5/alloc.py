@@ -196,11 +196,110 @@ class Slot(object):
 
 
 def n_cap(p, caps=None):
-    """v1 §8.1 — floor($10/p) on NET.  Scales as 1/p: 25 at 40c, 500 at 2c."""
+    """v1 §8.1 — floor($10/p) on NET.  Scales as 1/p: 25 at 40c, 500 at 2c.
+
+    ⚠ THIS IS A DOLLAR CAP, NOT A SIZING RULE, AND IT MUST NOT BE USED AS ONE.
+    Read `floor_clearing_size` below before adding a call site.  As a sizing rule this
+    function is the trap expressed in code: it buys MORE contracts as price falls, so it
+    deliberately buys the most of the least likely thing, with no reference to the pool it is
+    trying to earn from or to the rivals it is competing with.  Measured against what the
+    $1.00 payout floor actually required, it was 32x oversized in one rung (3,000 posted
+    against 93 needed) and 0.3x UNDER-sized in another (12 posted against 40) — i.e. random
+    with respect to the objective, in both directions at once.  It survives only as the
+    per-rung DOLLAR bound (`inv_cap_usd`, itself derived from the day stop), which is the one
+    thing it is dimensionally honest about.
+    """
     caps = caps or Caps()
     if float(p) <= 0:
         return 0
     return int(math.floor(caps.inv_cap_usd / float(p)))
+
+
+# =============================================================================================
+# THE SIZING RULE (2026-07-29) — derived from the payout floor, not from a dollar budget.
+#
+# WHAT WE ARE PAID.  Per market per program period, from the CFTC filing:
+#     credit = pool × (our_score / total_score) ÷ 2 × presence
+# The ÷2 is NOT optional and was missing from every earlier estimate in this program: scores
+# normalise WITHIN EACH SIDE, so a one-sided quote can earn at most half a pool.  Below $1.00
+# the accrual is forfeited ENTIRELY — it is a cliff, not a taper, and 43 of 67 rungs on the
+# live tape fell off it, burning 167 dollar-hours of capital for exactly zero.
+#
+# SOLVING FOR SIZE.  At the touch (0 ticks, DF^0 = 1) our score is our resting size, so with
+# rival score Q the share needed for a target credit T is `s = 2T/pool`, and:
+#     q = Q · s/(1 − s)          s = 2·T/pool
+# Note what is ABSENT: the price.  Score is denominated in contracts and the floor is
+# denominated in dollars, so the contracts required to clear it do not depend on what a
+# contract costs.  The price enters only when converting q to collateral (q·p), which is why
+# the same $1.00 costs ~$1 of capital at 3c and ~$30 at 90c — and why `floor($10/p)` had the
+# relationship exactly backwards.
+#
+# WHY A MARGIN, AND WHY IT IS THE ONLY JOB SIZE HAS.  Sizing to exactly $1.00 is sizing to
+# exactly the cliff edge: any shortfall in presence, any rival arriving mid-period, any error
+# in Q, and the whole rung pays zero.  The margin is what buys the difference between "earns
+# $1.00 in expectation" and "earns at least $1.00 in practice", and it is the reason this is a
+# TARGET rather than a minimum.
+# MIRROR (margin too SMALL ↔ too large): too small forfeits the rung entirely — the measured
+# failure, 64% of rungs.  Too large buys credit at a declining rate (share is concave) while
+# buying loss at a linear one, and is bounded by the per-rung dollar cap above.
+# UNDERIVED: the 1.5 multiplier itself.  It is a judgement that one half of headroom is worth
+# more than the marginal credit it displaces, and it should be recalibrated to
+# `$1.00 / q05(actual/projected)` once a per-market accrual reading exists — which today it
+# does not, because credits are labelled by EVENT and the bot's own accrual model was measured
+# 2.27x off the receipt.
+# =============================================================================================
+def floor_clearing_size(rival_S, pool_usd, target_usd=None, margin=None,
+                        sides=C.SCORE_SIDES):
+    """Contracts needed at the touch for `target_usd` of credit against rival score `rival_S`.
+
+    Returns 0 when the target is unreachable — share ≥ 1 is not a size, it is a refusal, and
+    the caller must skip the rung rather than post an unbounded order at it.
+    """
+    pool = float(pool_usd or 0.0)
+    target = float(C.CREDIT_TARGET_USD if target_usd is None else target_usd)
+    mult = float(C.CREDIT_TARGET_MARGIN if margin is None else margin)
+    if pool <= 0.0:
+        return 0
+    share = (float(sides) * target * mult) / pool
+    if share >= 1.0:
+        return 0                      # even owning the whole side cannot reach the target
+    Q = max(0.0, float(rival_S))
+    if Q <= 0.0:
+        return 1                      # uncontested: one contract takes the whole side's share
+    return int(math.ceil(Q * share / (1.0 - share)))
+
+
+def slot_target_q(slot, caps=None):
+    """STAGED-INERT as of 2026-07-29 — DERIVED AND TESTED, NOT WIRED.  Zero call sites.
+
+    Wiring it as a hard cap inside the water-fill STOPPED THE BOOK: 10 tests failed and
+    `test_orders_appear_within_three_cycles` went to zero orders on the exchange, because the
+    target also feeds the forfeit gate's `q_min` eligibility test and the rescue path, so
+    shrinking the cap silently changed which slots are ADMITTED rather than only how large they
+    are.  That is the same plan/rail class of defect this commit set out to remove, so it is not
+    going in behind a green-looking suite.  The correct integration makes the floor-clearing size
+    a TARGET the water level aims at, not a bound the hurdle sees — one more pass.
+
+    The binding per-slot contract cap: the dollar bound AND the floor-clearing target.
+
+    `n_cap` is a dollar bound and says nothing about earning; `floor_clearing_size` is what the
+    $1.00 payout floor actually requires against this slot's rivals.  The cap is the MINIMUM of
+    the two, because they refuse for different reasons and both refusals are real:
+      * above the floor-clearing target, share is concave and the marginal dollar buys a
+        declining slice of a capped pool while buying loss at a linear rate — so the target is
+        where the objective stops paying for size;
+      * above the dollar bound we exceed the per-rung risk the day stop permits.
+    A slot whose pool cannot reach the target at ANY size returns 0 and must be skipped, not
+    posted small: sub-floor accrual is forfeited entirely, so a rung that cannot clear the floor
+    is capital at risk for a guaranteed zero.
+    """
+    caps = caps or Caps()
+    dollar_cap = n_cap(slot.p, caps)
+    pool = float(getattr(slot, "rho", 0.0)) * float(getattr(slot, "window_h", 0.0) or 0.0)
+    target = floor_clearing_size(slot.S, pool)
+    if target <= 0:
+        return 0
+    return int(min(dollar_cap, target))
 
 
 def market_cap_usd(slot, budget_usd, caps=None):

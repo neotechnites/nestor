@@ -826,6 +826,27 @@ PER_MARKET_BUDGET_FRAC = 0.25                # v1 §8.2 no single-market concent
 # shows up as `market_cap` refusals with accrual left on the table — bounded and recoverable
 # next period.  Too high is the -$587: an unbounded one-sided position with no exit.
 MARKET_CAP_FRAC = 0.10
+
+# --- THE PAYOUT FLOOR AND THE SIZING TARGET (2026-07-29) ---
+# SCORE_SIDES: scores normalise WITHIN EACH SIDE (CFTC filing, KalshiEX 2026-02-11), so the sum
+# of every participant's Snapshot LP Score is 1 per side = 2 per qualifying snapshot, and a
+# ONE-SIDED quote can earn at most `pool / 2`.  Every credit estimate this program produced
+# before this line omitted the divisor and was therefore 2x hot.  It is a property of the
+# filing, not a tunable: it is 2 because a binary has two sides.
+SCORE_SIDES = 2.0
+# CREDIT_TARGET_USD: the $1.00 minimum payout per market per program period.  Below it the
+# accrual is forfeited ENTIRELY — visible in the receipt itself, whose smallest line item is
+# exactly $1.00 and whose next three are $1.01, $1.06, $1.11.  Measured cost of ignoring it:
+# 43 of 67 rungs earned something under a dollar and were paid nothing, burning 167 dollar-hours.
+CREDIT_TARGET_USD = 1.00
+# CREDIT_TARGET_MARGIN: size for 1.5x the floor, not 1.0x.  Sizing to exactly the floor is
+# sizing to exactly the cliff edge — presence shortfall, a rival arriving mid-period, or an
+# error in the rival-score estimate all send the rung to zero rather than to slightly less.
+# UNDERIVED as a distribution; derived as "half a floor of headroom is worth more than the
+# marginal credit it displaces".  Recalibrate to $1.00/q05(actual/projected) once a per-market
+# accrual reading exists — it does not today: credits are labelled by EVENT, and the bot's own
+# accrual model measured 2.27x off the receipt.
+CREDIT_TARGET_MARGIN = 1.5
 MAX_TOTAL_COLLATERAL_USD = 300.0             # R168 ladder rung.  G5 owns changes to this: one
                                              # constant, one commit, funded by the PREVIOUS
                                              # window's OBSERVED print, never the model.

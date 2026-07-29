@@ -504,3 +504,77 @@ class TestPrunedCapitalIsRedeployed(LipTestCase):
         a, spent, _ = alloc.allocate(slots, 300.0, 0.0625, caps=caps, cluster_cap_usd=75.0)
         self.assertEqual(sum(a.values()), 0)
         self.assertAlmostEqual(spent, 0.0, places=6)
+
+
+class TestFloorClearingSize(LipTestCase):
+    """The sizing rule, derived from the payout floor rather than from a dollar budget.
+
+    STAGED-INERT: `floor_clearing_size` / `slot_target_q` have no call site yet (wiring them as
+    a hard cap inside the water-fill stopped the book -- see the docstring on `slot_target_q`).
+    Tested now because the arithmetic is what the next pass will wire, and because an untested
+    derivation is how `floor($10/p)` survived for two versions."""
+
+    def test_the_price_is_absent_from_the_rule(self):
+        """Score is denominated in CONTRACTS and the floor in DOLLARS, so the contracts needed
+        to clear it cannot depend on what a contract costs.  This is the whole reason
+        floor($10/p) had the relationship backwards."""
+        a = alloc.floor_clearing_size(500.0, 100.0)
+        self.assertEqual(a, alloc.floor_clearing_size(500.0, 100.0))
+        self.assertGreater(a, 0)
+
+    def test_it_scales_with_the_rivals_and_inversely_with_the_pool(self):
+        self.assertLess(alloc.floor_clearing_size(100.0, 100.0),
+                        alloc.floor_clearing_size(1000.0, 100.0))
+        self.assertLess(alloc.floor_clearing_size(500.0, 200.0),
+                        alloc.floor_clearing_size(500.0, 100.0))
+
+    def test_an_uncontested_side_needs_exactly_one_contract(self):
+        """At Q = 0 our share is 1 for any positive size, so the minimum legal post takes the
+        whole side's half-pool.  Sizing up there buys fill risk and no score (v1 D2)."""
+        self.assertEqual(alloc.floor_clearing_size(0.0, 100.0), 1)
+
+    def test_a_pool_too_small_to_reach_the_target_returns_ZERO_not_a_size(self):
+        """share >= 1 is not a size, it is a refusal.  Posting small into a rung that cannot
+        clear the floor is capital at risk for a guaranteed zero -- the mechanism that burned
+        167 dollar-hours across 43 forfeited rungs."""
+        self.assertEqual(alloc.floor_clearing_size(500.0, 2.0), 0)
+        self.assertEqual(alloc.floor_clearing_size(500.0, 0.0), 0)
+
+    def test_the_PER_SIDE_HALVING_is_applied(self):
+        """Scores normalise within each side, so a one-sided quote earns at most pool/2 and
+        needs TWICE the share a naive model would ask for.  Every credit estimate this program
+        produced before 2026-07-29 omitted this divisor and was 2x hot."""
+        self.assertEqual(C.SCORE_SIDES, 2.0)
+        one_side = alloc.floor_clearing_size(1000.0, 100.0, sides=2.0)
+        whole_pool = alloc.floor_clearing_size(1000.0, 100.0, sides=1.0)
+        self.assertGreater(one_side, whole_pool)
+
+    def test_the_margin_sizes_above_the_cliff_not_at_it(self):
+        at_floor = alloc.floor_clearing_size(1000.0, 100.0, margin=1.0)
+        with_margin = alloc.floor_clearing_size(1000.0, 100.0)
+        self.assertGreater(with_margin, at_floor)
+        self.assertAlmostEqual(C.CREDIT_TARGET_MARGIN, 1.5)
+        self.assertAlmostEqual(C.CREDIT_TARGET_USD, 1.00)
+
+    def test_realistic_boards_cost_a_couple_of_dollars_not_ten(self):
+        """Sanity against the receipt: a paying rung cost a median $9.70 at ~9% presence.  At
+        full presence the same $1.00 should cost on the order of $1-2 of collateral."""
+        for Q, pool, px in ((500.0, 100.0, 0.10), (1826.0, 100.0, 0.03), (123.0, 100.0, 0.20)):
+            q = alloc.floor_clearing_size(Q, pool)
+            self.assertLess(q * px, 3.00, "Q=%s pool=%s px=%s cost %.2f" % (Q, pool, px, q * px))
+
+    def test_slot_target_q_is_the_MINIMUM_of_the_dollar_bound_and_the_target(self):
+        s = alloc.Slot("KXX-26JUL29-T1", "bid", rho=6.25, S=500.0, p=0.02, window_h=16.0)
+        caps = alloc.Caps(inv_cap_usd=10.0)
+        self.assertEqual(alloc.slot_target_q(s, caps),
+                         min(alloc.n_cap(0.02, caps),
+                             alloc.floor_clearing_size(500.0, 6.25 * 16.0)))
+
+    def test_slot_target_q_has_NO_call_site_yet(self):
+        """The pair is staged-inert on purpose.  If you wire it, delete this test in the same
+        commit and prove the book still places orders -- wiring it as a hard cap took
+        test_orders_appear_within_three_cycles to zero."""
+        import inspect
+        src = inspect.getsource(alloc)
+        body = src.split("def slot_target_q", 1)[1]
+        self.assertNotIn("slot_target_q(", body.split("return int(min", 1)[1])
