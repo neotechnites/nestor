@@ -1052,15 +1052,7 @@ class Maker(object):
             self.venue_status[venue] = status
             if status in (RT.ADMITTED, RT.OVERSIZED):
                 self.venues[venue] = vs
-                # `expo` is COMMITTED DOLLARS (see its construction above).  Adding the new
-                # venue's CAP here mixed the two currencies again: the accumulator reached the
-                # ceiling after a handful of admissions and refused every remaining venue, so
-                # admission crawled at a few per cycle and the book took an hour to rebuild
-                # after each restart while 20% of capital sat idle.  A cap is permission to
-                # spend, not spending — ALLOCATE's budget is what binds the money, and the
-                # per-cluster, per-rung and day-stop caps bound the risk.  Admitting a venue
-                # commits nothing, so it costs the exposure bound nothing.
-                # The COUNT still binds (N_UNVERIFIED_MAX), which is the real breadth control.
+                expo += cap
                 n_unver += 1
                 n_oversized += 1 if vs.oversized else 0
 
