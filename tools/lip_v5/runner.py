@@ -326,6 +326,16 @@ class Runner(object):
         seg = self.m.presence_log.read_segment(now)
         l_shed = {k: M.l_shed_median_h(v)
                   for k, v in self.m.shed_completed_h.items()}
+        # Tickers whose PROGRAM the scanner now refuses (window too long, denied family) are
+        # retired: the requoter recalls any order resting on them so the capital returns to a
+        # venue that is still eligible.
+        live_tk = set()
+        for prog in programs:
+            live_tk.update(prog.get("tickers") or [])
+        self.m.retired_tickers = {t for t in list(self.m.orders and
+                                                  {o["ticker"] for o in self.m.orders.values()}
+                                                  or set())
+                                  if t not in live_tk}
         self.slots = scan.build_slots(programs, self.classifier, now,
                                       presence_rows=seg, frozen=self.m.frozen,
                                       l_shed=l_shed, p6=self.classifier.p6_ok,

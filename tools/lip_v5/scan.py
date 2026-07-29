@@ -184,6 +184,14 @@ class Classifier:
             hours_to_start = max(0.0, (float(prog["start_ts"]) - float(now)) / 3600.0)
             if not preposition_ok(hours_to_start):
                 continue                       # not open yet — a pre-start quote earns zero
+            # CAPITAL EFFICIENCY, not profitability: a long window spreads the same pool over
+            # many more hours, so its return per capital-DAY is a fraction of a daily's, and
+            # under a binding ceiling the dollars it locks cannot recycle.  Refused before a
+            # request is spent on it.
+            if float(prog.get("window_h") or 0) > C.MAX_WINDOW_MULT * C.PAYOUT_HORIZON_H:
+                R.log("window_too_long", program_id=prog.get("program_id"),
+                      window_h=round(float(prog["window_h"]), 1))
+                continue
             # NO RUNWAY CHECK HERE, deliberately.  Accrual is per (market, side) and unknown
             # until `build_slots`; a program sitting at $0.87 needs only $0.23 more to clear the
             # cliff, so ANY from-scratch floor applied here would starve the rescue of exactly

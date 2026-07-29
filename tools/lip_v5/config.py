@@ -140,6 +140,16 @@ ADMIT_FLOOR_RATE_PER_H = 0.002
 # on one day's worth); too long is what we measured, a book full of week-long accrual while
 # the operator needed money tomorrow.
 PAYOUT_HORIZON_H = 24.0
+# ...and a program whose WINDOW is far longer than the horizon is refused outright, not merely
+# sized down.  Measured per capital-dollar per DAY: a treasury daily returned ~$12/day on
+# $4.99 while a Trump weekly returned ~$3.6/day on $16.68 — ~11x.  A weekly is not unprofitable,
+# it is CAPITAL-INEFFICIENT, and with a $300 ceiling every dollar parked in one is a dollar not
+# recycling through dailies.  2x the horizon keeps 2-day programs (still bankable inside the
+# decision cycle) and refuses the 86-166 h weeklies.
+# MIRROR (refusing long windows ↔ refusing all breadth): breadth comes from MORE DAILIES across
+# more clusters, not from longer windows; the diversity ranking already finds them.  If dailies
+# ever run out this is the first constant to relax, and the `window_too_long` count says so.
+MAX_WINDOW_MULT = 2.0
 STEP_FRACTION = 0.02                         # v1 §2.5 coarsest step landing within 2%
 D_SEED_USD = 0.07                            # spec §2.4 / v1 §15.4, UNDERIVED §9.4
 DRIFT_HORIZON_S = 60.0                       # spec §2.4 (v3's 5-9¢ cross-cycle horizon),

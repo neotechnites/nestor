@@ -114,7 +114,8 @@ class Maker(object):
         self.readings_line = 0               # SF-4: v5_readings.jsonl lines consumed
         self._readings_stat = None           # (mtime, size) — skip unchanged files
         self.close_cache = {}                # ticker -> close_ts (halted closing pass)
-        self.resolved = set()                # tickers whose market is determined/settled:
+        self.resolved = set()
+        self.retired_tickers = set()         # windows the scanner refuses (too long, closed)                # tickers whose market is determined/settled:
                                              # outcome fixed, no variance left, so they hold
                                              # no CLUSTER risk — only pending cash
 
@@ -1061,6 +1062,15 @@ class Maker(object):
             caps[venue] = st.cap_usd(per_market, self.ceiling_usd) if st else 0.0
         return caps
 
+    def venue_retired(self, ticker):
+        """True when a ticker is one the strategy has decided against — denied family, or a
+        program whose window the scanner now refuses.  Distinct from "not in this cycle's
+        table", which is usually just classify cadence: only a REASON to be gone counts, so a
+        cadence gap can never cancel a healthy quote."""
+        if C.series_denied(ticker):
+            return True
+        return ticker in self.retired_tickers
+
     def venue_of(self, ticker):
         """A venue is the SERIES (spec §1.1) — the coarsest key at which settlements
         accumulate.  Derived from the ticker so it works for held inventory and resting
@@ -1458,6 +1468,19 @@ class Maker(object):
                 continue
             last = self.slot_examined.get(key, min(o.get("placed_ts", now)
                                                    for o in orders_))
+            # AN ORDER WHOSE VENUE IS NO LONGER ELIGIBLE MUST COME HOME.  A slot vanishes from
+            # the table when its program is denied, its window is refused as too long, or it
+            # closed — and until now the order simply rested on, unmanaged, holding capital in
+            # a venue the strategy has decided against.  Cancelling releases it to a venue that
+            # is still eligible; the cancel lane is never refused, and a cancel cannot increase
+            # exposure.  (Held INVENTORY is different — it is the shed path's business, not
+            # this one.)
+            if self.venue_retired(key[0]):
+                ok, _ = self.cancel(orders_[0]["order_id"], now, lane="exit_cancel")
+                if ok:
+                    stats["cancelled"] += 1
+                    R.log("retired_venue_recalled", ticker=key[0], side=key[1])
+                    continue
             if now - last >= C.SAFETY_RESYNC_S:
                 self.slot_examined[key] = now                 # log once per lapse, not 1 Hz
                 R.log("resync_overdue", ticker=key[0], side=key[1],
