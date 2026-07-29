@@ -420,7 +420,7 @@ def rescue(A, rate_now, h, rho, S, q, p, r_star, C_slot, phi, d,
 # =============================================================================================
 def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE_PER_H,
              venue_caps=None, step_fraction=C.STEP_FRACTION, held=None, resting=None,
-             cluster_cap_usd=None):
+             cluster_cap_usd=None, cluster_seed=None):
     """Marginal-rate water-filling under (★).  Returns (alloc, spent, marginal_at_stop).
 
     `venue_caps`: {venue: cap_usd} from the ratchet (spec §1.4).  MIRROR (ratchet raises venue
@@ -453,15 +453,33 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
     # positions plus RESTING orders), so the running tally starts there — otherwise a filled
     # rung would be invisible to the plan and visible to the rails, which is the same
     # plan-refuses-plan defect one step later.
-    per_cluster = {}
+    # NEW-1c (2026-07-29) — THE SEED MUST NOT BE KEYED OFF THE SLOT LIST.
+    # The loop below walks `slots`, so a cluster's exposure was only counted when that exact
+    # (ticker, side) still PRODUCED a slot this cycle.  Any market we hold but no longer quote —
+    # frozen, denied, past its window, P6-refused, or (as of FREE_RIDE_ONLY) not qualifying on
+    # rival depth — became invisible to the plan while remaining fully visible to the rails,
+    # which read the whole positions/resting book and not the slot list.
+    # MEASURED: arming FREE_RIDE_ONLY dropped one rung of a four-rung ladder, and the plan then
+    # concentrated into the survivors and breached the cluster cap 61 times in 90 cycles while
+    # DEPLOYING LESS ($56.16 resting where 4 slots rested $75.00).  Worse on both axes.
+    # This also falsifies the claim in this module's header that "Gross >= worst-case ALWAYS, so
+    # the allocator ... can never plan an order place() refuses": the inequality holds only when
+    # both sides measure the SAME SET of positions.  The defect was never the measure, it was
+    # the domain.
+    # `cluster_seed` is the caller's own book — the identical positions + resting_basis it hands
+    # `guards.PlaceContext` — so plan and rail cannot disagree by construction.  It carries its
+    # own basis, which is why it must come from the caller: a market with no slot has no `s.p`
+    # for the plan to price it with.
+    per_cluster = dict(cluster_seed or {})
     seen_cluster_held = set()
     for s in slots:
-        # RESTING ORDERS COUNT TOO.  `place()` measures the cluster over OPEN POSITIONS PLUS
-        # RESTING ORDERS; seeding the plan from held inventory alone made the planner see an
-        # empty cluster every cycle while the rails saw a full one — so it planned a second
-        # order and place() refused it, 180 times a minute per rung, with $4.71 deployed of a
-        # $300 ceiling.  The comment above this loop already SAID place() reads both; the code
-        # read one.  Plan and rail must measure the same book or the plan is fiction.
+        if cluster_seed is not None:
+            break            # the caller's book is authoritative; do not double-count it
+        # LEGACY PATH (no cluster_seed supplied).  RESTING ORDERS COUNT TOO: `place()` measures
+        # the cluster over OPEN POSITIONS PLUS RESTING ORDERS; seeding the plan from held
+        # inventory alone made the planner see an empty cluster every cycle while the rails saw
+        # a full one — so it planned a second order and place() refused it, 180 times a minute
+        # per rung, with $4.71 deployed of a $300 ceiling.
         h_q = float((held or {}).get(s.key, 0.0)) + float((resting or {}).get(s.key, 0.0))
         if h_q > 0 and s.key not in seen_cluster_held:
             seen_cluster_held.add(s.key)
@@ -773,7 +791,7 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
                                floor_usd=C.ENTRY_FLOOR_USD, floor_rate=C.ADMIT_FLOOR_RATE_PER_H,
                                venue_caps=None, max_passes=C.MAX_GATE_PASSES, held=None,
                                resting=None,
-                               cluster_cap_usd=None):
+                               cluster_cap_usd=None, cluster_seed=None):
     """v1 §2.4 lines 12-15 — the forfeit gate is per PROGRAM-PERIOD, applied AFTER
     water-filling, and a dropped program's dollars are RE-WATER-FILLED.
 
@@ -794,7 +812,8 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
         live = [s for s in slots if s.program_id not in dropped]
         alloc, spent, marginal = allocate(live, budget_usd, r_star, caps, floor_rate,
                                           venue_caps, held=held, resting=resting,
-                                          cluster_cap_usd=cluster_cap_usd)
+                                          cluster_cap_usd=cluster_cap_usd,
+                                          cluster_seed=cluster_seed)
         by_prog = {}
         for s in live:
             by_prog.setdefault(s.program_id, []).append(s)
@@ -866,7 +885,7 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
 def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
                         floor_rate=C.ADMIT_FLOOR_RATE_PER_H, venue_caps=None, held=None,
                         resting=None,
-                        cluster_cap_usd=None):
+                        cluster_cap_usd=None, cluster_seed=None):
     """The full cycle: solve spec §1.3's r* fixpoint around ALLOCATE — the FORFEIT-GATED
     ALLOCATE, because the allocation the requoter diffs against must be the post-gate one
     (finish-round charter A): quoting a program the gate would drop posts collateral into a
@@ -886,7 +905,8 @@ def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
     def run(r_star):
         a, sp, marg, dropped = allocate_with_forfeit_gate(
             slots, budget_usd, r_star, caps, floor_rate=floor_rate, venue_caps=venue_caps,
-            held=held, resting=resting, cluster_cap_usd=cluster_cap_usd)
+            held=held, resting=resting, cluster_cap_usd=cluster_cap_usd,
+            cluster_seed=cluster_seed)
         return (a, sp, dropped), (marg if marg > 0 else floor_rate)
 
     res = M.solve_rstar(lambda r: run(r), r0)

@@ -262,17 +262,25 @@ class TestLandGrabAppears(EngineCase):
         m = self.maker(ex=ex)
         return RUN.Runner(m, sleep=lambda _s: None)
 
-    def test_the_land_grab_order_appears(self):
+    def test_NO_land_grab_order_reaches_the_exchange(self):
+        """REPLACES test_the_land_grab_order_appears (FREE_RIDE_ONLY armed 2026-07-29).
+
+        This test used to assert that a 990-contract order at 1c REACHED THE WIRE and to fail
+        loudly if it did not.  It is now inverted: the 1c path is the single most direct
+        surviving link between the live code and the measured loss, and size beyond the
+        target-size walk scores zero, so nothing should arrive at that price at all."""
         r = self._runner()
         ok, refusals = r.init(NOW, nestor_state=NESTOR)
         self.assertTrue(ok, refusals)
         for i in range(2):
             r.iteration(NOW + 1 + i)
         grabs = [b for b in r.m.ex.placed
-                 if b["side"] == "bid" and abs(float(b["price"]) - 0.01) < 1e-9]
-        self.assertTrue(grabs, "NO LAND-GRAB ORDER REACHED THE EXCHANGE")
-        self.assertAlmostEqual(float(grabs[0]["count"]), 990.0, places=6)
-        self.assertTrue(self.logs_of("land_grab"))
+                 if abs(float(b["price"]) - 0.01) < 1e-9
+                 or abs(float(b["price"]) - 0.99) < 1e-9]
+        self.assertEqual(grabs, [], "a 1c/99c land-grab order reached the exchange")
+        self.assertFalse(self.logs_of("land_grab"))
+        self.assertTrue(self.logs_of("free_ride_refused"),
+                        "the refusal must be INSTRUMENTED, not silent")
 
     def test_the_grab_respects_the_venue_rung0_cap(self):
         r = self._runner()

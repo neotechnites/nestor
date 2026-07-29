@@ -818,10 +818,24 @@ class Maker(object):
                 if o.get("remaining", 0) > 0 and not o.get("gone_404"):
                     k = (o["ticker"], o["side"])
                     resting_by_slot[k] = resting_by_slot.get(k, 0.0) + float(o["remaining"])
+            # NEW-1c: the plan's cluster tally is seeded from THE SAME BOOK the rails read, not
+            # from the slot list.  `place_context()` builds `positions + resting_basis` for
+            # `guards.PlaceContext`; reuse exactly that, so a market we hold but no longer quote
+            # (frozen, denied, out of window, P6-refused, or not free-ride-qualifying) is counted
+            # by both or by neither.  Measured: without this, arming FREE_RIDE_ONLY dropped one
+            # rung of a ladder and the plan breached the cluster cap 61 times in 90 cycles while
+            # resting $56.16 where four slots had rested $75.00.
+            _pc = self.place_context()
+            cluster_seed = {}
+            for _p in list(_pc.positions) + list(_pc.resting_basis):
+                _ck = CL.cluster_of(_p["ticker"])
+                cluster_seed[_ck] = cluster_seed.get(_ck, 0.0) + \
+                    float(_p.get("n", 0)) * float(_p.get("basis", 0.0))
             a, spent, res = alloc.allocate_with_rstar(slots, budget, caps=caps,
                                                       venue_caps=venue_caps, held=held,
                                                       resting=resting_by_slot,
-                                                      cluster_cap_usd=cluster_cap)
+                                                      cluster_cap_usd=cluster_cap,
+                                                      cluster_seed=cluster_seed)
             self.last_alloc = dict(a)
             out["allocate"] = {"spent": spent, "r_star": res.r_star,
                                "converged": res.converged, "slots": len(slots),

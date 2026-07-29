@@ -36,7 +36,10 @@ STAGED_INERT_NAMES = (
     "BAND_OUR_LEG_MIN_C",
     "BAND_OUR_LEG_MAX_C",
     "DAILIES_ONLY_WINDOW_MULT",
-    "FREE_RIDE_ONLY",
+    # FREE_RIDE_ONLY was ARMED 2026-07-29 and removed from this tuple in the same commit, per
+    # the instruction in test_no_staged_constant_has_a_call_site.  Its mirror's fear -- "no
+    # market qualifies without us" -- was measured and refuted: 5,681 of 5,695 live book-sides
+    # reach target_size on rival size alone.  See TestFreeRideIsArmed below.
 )
 
 # The two rules the tape measured as harmful.  These must not exist AT ALL -- an unused constant
@@ -106,10 +109,41 @@ class TestTheFateBlockIsInert(LipTestCase):
         self.assertEqual(C.DAILIES_ONLY_WINDOW_MULT, 1.0)
         self.assertNotEqual(C.MAX_WINDOW_MULT, C.DAILIES_ONLY_WINDOW_MULT)
 
-    def test_free_ride_is_off_as_well_as_unwired(self):
-        """Belt and braces, and they are independent: unwired means no code reads it; False
-        means that if something ever does, the read yields today's behaviour."""
-        self.assertIs(C.FREE_RIDE_ONLY, False)
+
+class TestFreeRideIsArmed(LipTestCase):
+    """Replaces test_free_ride_is_off_as_well_as_unwired (armed 2026-07-29).
+
+    WHY IT FLIPPED.  The staged note asked for the mirror to be measured before arming: the
+    fear was that nothing qualifies without us and the book deploys nothing.  Measured on the
+    live board -- 5,681 of 5,695 book-sides (99.75%) reach target_size on RIVAL size alone, and
+    99.3% of sides with a competing score of 3 or less qualify.  And the CFTC filing settles
+    what the funded size was worth: the qualifying walk stops once cumulative size reaches
+    target, so contracts posted beyond it score EXACTLY ZERO.  The 999-contract 1c gas rung and
+    the 1,500/3,000-contract TRUEV rungs were the largest objects in the whole tape and earned
+    nothing at all."""
+
+    def test_it_is_on(self):
+        self.assertIs(C.FREE_RIDE_ONLY, True)
+
+    def test_it_is_wired_in_scan(self):
+        """Armed AND read.  A True constant nothing consults is worse than a False one: it
+        reads as shipped."""
+        import inspect
+        from .. import scan
+        src = inspect.getsource(scan)
+        self.assertIn("FREE_RIDE_ONLY", src)
+        self.assertIn("free_ride_refused", src)
+
+    def test_the_land_grab_price_is_now_unreachable_from_build_slots(self):
+        """LAND_GRAB_PRICE_C = 1 is the geometry of the -100% cohort.  Under free-ride the
+        funding branch is dead: every non-qualifying side is refused before it, and the
+        empty-book branch (which set p = 1c) is a non-qualifying side by definition."""
+        import inspect
+        from .. import scan
+        src = inspect.getsource(scan.build_slots)
+        i = src.index("FREE_RIDE_ONLY")
+        j = src.index("land_grab = alloc.t0_qualification_size")
+        self.assertLess(i, j, "the free-ride gate must precede the funding branch")
 
 
 if __name__ == "__main__":

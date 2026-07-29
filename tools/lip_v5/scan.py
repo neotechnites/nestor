@@ -523,6 +523,46 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             key = (ticker, side)
             # SF-5: S is the RIVAL score — the classified book contains our own orders.
             S_riv = rival_S(sd["S"], p, (own_orders or {}).get(key))
+            # -------------------------------------------------------------------------------
+            # FREE-RIDE ON DEPTH, NEVER FUND IT  (C.FREE_RIDE_ONLY, armed 2026-07-29)
+            # The 1,000-contract target is a DISCRETE precondition: short of it the snapshot
+            # qualifies nobody.  v5 FUNDED the gap at LAND_GRAB_PRICE_C — the cheapest possible
+            # proximity, at the price where a contract is worth nothing, in the size that
+            # maximises count.  That path bought the 999-contract 1c gas rung and the 1,500- and
+            # 3,000-contract TRUEV rungs; those postings are the largest single objects in the
+            # whole tape and they score EXACTLY ZERO, because sizes beyond the target-size walk
+            # are outside the qualifying set (CFTC filing: "If the Qualifying Yes Total Size is
+            # greater than or equal to the target size, the procedure is stopped here").
+            # DERIVATION OF THE REPLACEMENT: qualification is worth the same to us whether WE
+            # created it or a rival did, and a rival's costs nothing.  So enter only where the
+            # book ALREADY clears target WITHOUT our size.  The test must deduct our own resting
+            # size (SF-5, applied to `qualifies` and not only to `S`) or it certifies our own
+            # land grab back to us.
+            # MIRROR (never funding ↔ never entering): the fear is that nothing qualifies without
+            # us and the book deploys nothing.  MEASURED on the live board: 5,681 of 5,695
+            # book-sides (99.75%) already reach target on rival size alone, and of the sides with
+            # a competing score at or below 3, 99.3% qualify.  The fear is refuted; the
+            # instrument if it ever bites is the `free_ride_refused` count below.
+            # THE GATE IS ON ENTRY, NOT ON TENURE.  First cut of this refused any side whose
+            # rival depth was short of target — including sides we were ALREADY resting in, and
+            # there the test caught it: our own size is inside `cum_size`, so deducting it makes
+            # `rival_cum` fall as our presence GROWS, and the slot count decayed 4 -> 2 over 90
+            # cycles while four orders still rested unrefreshed.  That is the sole-qualifier case
+            # `rival_S` already documents ("when we ARE the whole qualifying side ... the
+            # requoter's sole-qualifier hold keeps the minimum presence instead"), and evicting
+            # there is strictly worse than holding: accrual is per PERIOD, so abandoning mid-period
+            # forfeits everything earned so far in exchange for nothing.
+            # So: refuse to ENTER a book that does not qualify without us; once resting, hand the
+            # decision to the requoter, which already prices staying.
+            if C.FREE_RIDE_ONLY:
+                own_qty = sum(float(q) for _, q in ((own_orders or {}).get(key) or []))
+                rival_cum = max(0.0, float(sd["cum_size"]) - own_qty)
+                if own_qty <= 0 and rival_cum < float(rec["target_size"]):
+                    R.log("free_ride_refused", ticker=ticker, side=side,
+                          rival_cum=round(rival_cum, 2),
+                          target=float(rec["target_size"]),
+                          own=round(own_qty, 2))
+                    continue
             rows = [r for r in presence_rows
                     if (r.get("ticker"), r.get("side")) == key]
             t = tape.get(key, {})
@@ -557,7 +597,15 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             # at 1c, an instantly-marketable CROSS wearing a land grab's name).
             lg_px_c = C.LAND_GRAB_PRICE_C if side == "bid" \
                 else (100 - C.LAND_GRAB_PRICE_C)
-            if not sd["qualifies"] and not rec["pinned"]:
+            # FREE_RIDE_ONLY makes the funding path unreachable: the rival-qualification test
+            # above already `continue`d on every side that does not clear target without us, so
+            # this branch can only be entered when we are ALREADY inside a qualifying book —
+            # where there is by definition no gap to fund.  Kept explicit rather than deleted so
+            # the flag remains one constant in either direction (config's own instruction), and
+            # asserted here so a future edit cannot silently re-open the 1c path.
+            if C.FREE_RIDE_ONLY:
+                land_grab = 0
+            elif not sd["qualifies"] and not rec["pinned"]:
                 land_grab = alloc.t0_qualification_size(sd["cum_size"], rec["target_size"])
                 # Never cross the OTHER side (v4, kept): a bid grab must sit below the yes
                 # ask; an ask grab above the yes bid.

@@ -630,12 +630,15 @@ class TestTheEmptyBookIsEnterable(FixRoundCase if 'FixRoundCase' in dir() else _
                                   "p": None, "legal": False}}}}
 
         slots = scan.build_slots([prog], C0(), now, p6=lambda t: True)
-        self.assertTrue(slots, "an empty book must still be enterable — it is the cheapest presence")
-        for s in slots:
-            self.assertTrue(s.is_land_grab, "empty side must enter via the qualification pass")
-            self.assertEqual(s.land_grab_size, 1000)
-            self.assertAlmostEqual(s.p, C.LAND_GRAB_PRICE_C / 100.0)
-            self.assertEqual(s.S, 0.0)
+        # INVERTED 2026-07-29 (FREE_RIDE_ONLY).  This asserted that an empty book IS enterable
+        # via the qualification pass at LAND_GRAB_PRICE_C, on the reasoning that an empty side is
+        # the cheapest presence on the board.  The reasoning has a hole the CFTC filing closes:
+        # an empty side cannot reach target_size, and a side whose book cannot reach target
+        # scores ZERO for the snapshot.  So the "cheapest presence" was no presence -- we were
+        # buying 1,000 contracts of a worthless contract to qualify a side that still would not
+        # have paid.  An empty side is by definition a side that does not qualify without us.
+        self.assertEqual(slots, [],
+                         "an empty side cannot reach target_size, so it scores zero: refuse it")
 
     def test_a_pinned_empty_book_is_still_refused(self):
         import time

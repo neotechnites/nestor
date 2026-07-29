@@ -681,7 +681,17 @@ BAND_OUR_LEG_MAX_C = 50                      # staged-inert: REFUTED AS SPECIFIE
 # the −100% cohort's own geometry (note 43 §7).  Nothing in this commit changes that; it is the
 # single most direct surviving link between the live code and the measured loss, and it is
 # flagged upward as the next thing to price.
-FREE_RIDE_ONLY = False                       # staged-inert: unwired AND off
+# ARMED 2026-07-29.  Wired in `scan.build_slots` as a RIVAL-qualification gate (our own
+# resting size deducted per SF-5) plus a hard zero on `land_grab`.  What changed since the
+# staged-inert note above: the mirror's fear -- "no market qualifies without us and the book
+# deploys nothing" -- was MEASURED and refuted.  5,681 of 5,695 live book-sides (99.75%) reach
+# target_size on rival size alone; among sides with a competing score of 3 or less, 99.3%
+# qualify.  And the CFTC filing settles what the funded size was ever worth: the qualifying
+# walk STOPS once cumulative size reaches target, so contracts posted beyond it score exactly
+# zero -- the 999-contract 1c gas rung and the 1,500/3,000-contract TRUEV rungs were the
+# largest objects in the tape and earned nothing at all.  `free_ride_refused` is the instrument
+# if the fear ever becomes real.
+FREE_RIDE_ONLY = True
 
 # UNDERIVED (note 23 §II), flagged upward rather than shipped silently:
 #   * THE FATE SENTENCE ITSELF.  "A position acquired by this system ends by ____" has no

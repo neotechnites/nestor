@@ -196,9 +196,18 @@ class TestSlotTable(LipTestCase):
         slots, _, _ = self._slots()
         self.assertTrue(all(s.land_grab_size == 0 for s in slots))
 
-    def test_an_unqualified_side_gets_the_qualification_size(self):
-        """§4.5 — at S≈0 ALLOCATE correctly assigns nothing; the qualification path is what
-        creates the side, and its size is `target_size − cum_size`."""
+    def test_an_unqualified_side_is_REFUSED_not_funded(self):
+        """REPLACES test_an_unqualified_side_gets_the_qualification_size (FREE_RIDE_ONLY armed
+        2026-07-29).
+
+        The old contract: a side short of target_size gets FUNDED to reach it, at
+        LAND_GRAB_PRICE_C.  That path posted 990 contracts at 1c here, and on the live account it
+        posted 999 in gas and 1,500/3,000 in TRUEV -- the largest objects in the whole tape.
+        The CFTC filing says what they were worth: the qualifying walk stops once cumulative size
+        reaches target, so size beyond it scores EXACTLY ZERO.  We were buying the -100% cohort's
+        geometry in exchange for nothing.
+        The new contract: qualification is worth the same to us whether we or a rival created it,
+        and a rival's is free -- so a side that does not clear target WITHOUT us is skipped."""
         from .. import ratelimit as RL
 
         class Thin(ScanExchange):
@@ -210,8 +219,13 @@ class TestSlotTable(LipTestCase):
         c = scan.Classifier()
         c.sweep(ex, RL.Bucket(NOW), progs, NOW)
         slots = scan.build_slots(progs, c, NOW)
-        bid = [s for s in slots if s.side == "bid"][0]
-        self.assertEqual(bid.land_grab_size, 990)          # 1000 target − 10 resting
+        # bid side has 10 resting against a 1000 target -> does not qualify without us -> gone
+        self.assertEqual([s for s in slots if s.side == "bid"], [],
+                         "a side short of target must be REFUSED, never funded at 1c")
+        # and the ask side, which DOES clear target on rival size alone (1200 >= 1000), survives
+        asks = [s for s in slots if s.side == "ask"]
+        self.assertTrue(asks, "a side that already qualifies on rival depth must still be quoted")
+        self.assertEqual(asks[0].land_grab_size, 0, "free-riding never funds a grab")
 
     def test_P6_the_pre_entry_filter_seam_exists_and_its_ABSENCE_is_logged(self):
         """note 43 §5's mirror: "zero fills forever means either the perfect rewards venue or a
