@@ -998,6 +998,15 @@ class Maker(object):
                         need = max(need, q_c * sl.p)
                 cap, status = RT.rung0_cap(max(floor_usd * C.RUNG0_FLOOR_MULT, need),
                                            self.slot_cap_usd, per_market)
+                # A VENUE HOLDS SEVERAL RUNGS.  The probe-sized cap above answers "can this
+                # venue measure anything" — keep its STATUS, but once probeable the venue's
+                # budget is the per-market bound, because the thing that must bound a
+                # correlated GROUP is the cluster cap and the thing that bounds one rung is
+                # the per-rung cap.  A per-venue cap sized for a single probe made $75 of
+                # treasury impossible: five UST series at ~$8 each is $40, spread over eight
+                # rungs, which is exactly the sub-cliff dust this book has been earning.
+                if status != RT.UNPROBEABLE:
+                    cap = max(cap, min(per_market, self.slot_cap_usd * 3.0))
                 st.rung0_cap_usd = cap        # tracks floor_q up; 0.0 when UNPROBEABLE
                 if status == RT.UNPROBEABLE:
                     self.venue_status[venue] = RT.UNPROBEABLE
@@ -1007,7 +1016,27 @@ class Maker(object):
         # have room, the best queued venue is admitted.
         unverified = [st for st in self.venues.values()
                       if not st.verified and not st.stood_down]
-        expo = sum(st.rung0_cap_usd * (2.0 ** st.rung) for st in unverified)
+        # EXPOSURE IS MONEY, NOT PERMISSION.  This summed venue CAPS against the ceiling, so
+        # every generous cap throttled how many venues could be admitted — raising the cap to
+        # a workable size cut admissions from 39 to 15 and deployment to zero.  ratchet.py's
+        # own note says it: "Σ caps MAY exceed the ceiling; Σ ALLOCATED never does, because
+        # ALLOCATE's budget binds independently.  Caps are permissions, the budget is the
+        # money."  So the unverified bound counts committed dollars — held inventory plus
+        # resting collateral — which is the thing that can actually be lost.
+        committed = {}
+        for t, p_ in self.positions.items():
+            for leg in ("yes", "no"):
+                n = abs(p_.get(leg, 0.0))
+                if n > 0:
+                    v = self.venue_of(t)
+                    committed[v] = committed.get(v, 0.0) + n * self.entry_basis.get(
+                        (t, leg), 0.0)
+        for o in self.orders.values():
+            if o.get("remaining", 0) > 0 and not o.get("gone_404"):
+                v = self.venue_of(o["ticker"])
+                committed[v] = committed.get(v, 0.0) + float(o["remaining"]) * \
+                    R.unit_collateral(o["side"], o["price"])
+        expo = sum(committed.get(st.venue, 0.0) for st in unverified)
         n_unver = len(unverified)
         n_oversized = sum(1 for st in unverified if st.oversized)
         for venue, floor_usd, _net0 in sorted(candidates, key=lambda kv: (-kv[2], kv[0])):
@@ -1031,6 +1060,12 @@ class Maker(object):
             st = self.venues.get(venue)
             caps[venue] = st.cap_usd(per_market, self.ceiling_usd) if st else 0.0
         return caps
+
+    def venue_of(self, ticker):
+        """A venue is the SERIES (spec §1.1) — the coarsest key at which settlements
+        accumulate.  Derived from the ticker so it works for held inventory and resting
+        orders alike, without needing a slot to be present in this cycle's table."""
+        return str(ticker or "").split("-", 1)[0].upper()
 
     def venue_floor_usd(self, venue_slots):
         """The venue's probe floor in dollars — with BLOCKER-2's RESCUE_TARGET exemption.
