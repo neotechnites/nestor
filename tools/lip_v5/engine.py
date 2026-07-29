@@ -1004,8 +1004,15 @@ class Maker(object):
                 # venue for RUNGS_PER_VENUE cliff-sized orders, still bounded by the
                 # per-market cap, with the cluster cap bounding the correlated group and the
                 # per-rung cap bounding any single order.
-                want = max(floor_usd * C.RUNG0_FLOOR_MULT, need * C.RUNGS_PER_VENUE)
-                cap, status = RT.rung0_cap(want, per_market, per_market)
+                # PROBEABILITY and BUDGET are separate questions.  rung0_cap marks a venue
+                # UNPROBEABLE when the binding minimum falls below what was asked for — so
+                # asking for a multi-rung budget made every venue whose ladder wants more than
+                # the per-market bound report UNPROBEABLE, cap 0, and reject all its slots.
+                # Ask the probe question with the PROBE floor, then set the budget.
+                cap, status = RT.rung0_cap(floor_usd * C.RUNG0_FLOOR_MULT,
+                                           self.slot_cap_usd, per_market)
+                if status != RT.UNPROBEABLE:
+                    cap = min(per_market, max(cap, need * C.RUNGS_PER_VENUE))
                 # A VENUE HOLDS SEVERAL RUNGS.  The probe-sized cap above answers "can this
                 # venue measure anything" — keep its STATUS, but once probeable the venue's
                 # budget is the per-market bound, because the thing that must bound a
