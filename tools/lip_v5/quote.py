@@ -60,6 +60,28 @@ def requote_triggers(our_price_c, best_price_c, remaining, target_q, S_now, S_re
         trig.append(TRIG_RESYNC)                                     # (e)
     if float(resting_age_s) < float(min_life_s):
         trig = [t for t in trig if t in (TRIG_OFF_BEST, TRIG_QUALIFIES)]
+    # -----------------------------------------------------------------------------------------
+    # NO-CHANGE SUPPRESSION (2026-07-29).  A requote that alters neither our PRICE nor our SIZE
+    # cannot alter our score, and it is not free: cancel-then-place surrenders queue position,
+    # opens a coverage gap in a metric sampled once per second, and spends a rate-budget round
+    # trip.  MEASURED on the live tape: median order lifetime 1.9 SECONDS, and 73.9% of 4,267
+    # re-posts were at the SAME PRICE as the post they replaced.  The book had an order actually
+    # resting 10.6% of the time, and since accrual is proportional to presence that alone capped
+    # earnings at a tenth of the same capital's potential before any other decision was made.
+    # WHICH TRIGGERS THIS TOUCHES.  (c) S_MOVED and (e) RESYNC are the two that can fire while
+    # nothing about our order needs to differ — (c) reacts to a 25% move in the RIVAL score,
+    # which changes the share landscape but not our own quote, and (e) is a staleness timer.
+    # (a) OFF_BEST changes the price, (b) REFILL changes the size and (d) QUALIFIES changes
+    # whether the side exists at all: those must never be suppressed.
+    # MIRROR (suppressing too much ↔ churning): the stale end is still guarded, because (a) and
+    # (d) are exempt and both are book events — a quote that has drifted off best or whose side
+    # vanished is requoted immediately regardless of age.  What is removed is only the
+    # cancel-and-replace-identically path, which by construction cannot improve anything.
+    at_touch = at_best(our_price_c, best_price_c)
+    refill_needed = bool(target_q) and \
+        float(remaining) < float(refill_frac) * float(target_q) - 1e-12
+    if at_touch and not refill_needed:
+        trig = [t for t in trig if t not in (TRIG_S_MOVED, TRIG_RESYNC)]
     return trig
 
 
