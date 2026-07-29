@@ -149,7 +149,24 @@ PAYOUT_HORIZON_H = 24.0
 # MIRROR (refusing long windows ↔ refusing all breadth): breadth comes from MORE DAILIES across
 # more clusters, not from longer windows; the diversity ranking already finds them.  If dailies
 # ever run out this is the first constant to relax, and the `window_too_long` count says so.
+#
 MAX_WINDOW_MULT = 2.0
+# DAILIES ONLY — DERIVED, STAGED-INERT, NOT SWITCHED ON (2026-07-28).  The argument for 1.0:
+# 2.0 was derived when the only cost of a long window was capital EFFICIENCY ("2x the horizon
+# keeps 2-day programs, still bankable inside the decision cycle").  Deriving the LOSING path
+# makes the horizon a SOLVENCY term instead — settlement is the guaranteed close of an un-netted
+# position (note 43 §1, "settlement is the only truth"), so the program window is the worst-case
+# time-to-exit for every contract we buy, and at 48 h a position nobody takes rents its
+# collateral for two days with no other terminal event.  The efficiency evidence points the same
+# way: a $100 daily packs its pool into ~20 h (rho ≈ $5/h) where a $345 monthly spreads it over
+# ~730 h (rho ≈ $0.47/h) — ~13x per capital-hour, the same statement the treasury-daily vs
+# Trump-weekly measurement above makes at a shorter tenor (~11x per capital-day).
+# WHY IT IS NOT LIVE: tonight's backtest covered the quoting rules, not the window filter, so
+# switching it on would put an UNMEASURED change on the money path in the same commit that
+# reverts two MEASURED-BAD ones.  It is one constant, one commit, whenever the coordinator wants
+# it — and the `window_too_long` count is already the instrument that says whether dailies alone
+# can fill the book.
+DAILIES_ONLY_WINDOW_MULT = 1.0               # staged-inert: assign to MAX_WINDOW_MULT to arm
 STEP_FRACTION = 0.02                         # v1 §2.5 coarsest step landing within 2%
 D_SEED_USD = 0.07                            # spec §2.4 / v1 §15.4, UNDERIVED §9.4
 DRIFT_HORIZON_S = 60.0                       # spec §2.4 (v3's 5-9¢ cross-cycle horizon),
@@ -514,6 +531,169 @@ COVERAGE_ALERT_WINDOW_S = 600
 MAX_SHADE_TICKS = 1                          # spec §4.3 "NEVER consider k ≥ 2": score ≤25%
                                              # and those dollars beat it at the water level in
                                              # another venue
+
+# =============================================================================================
+# (★★) THE FATE OF WHAT WE BUY  (note 23 Part V; note 43 §1, §5, §7 — 2026-07-28)
+#
+# *** EVERY CONSTANT IN THIS BLOCK IS STAGED-INERT.  ZERO CALL SITES, BY DESIGN. ***
+# It changes no behaviour.  It is the DERIVATION RECORD plus the MEASUREMENT that judged it,
+# committed together so the next reader inherits both halves and not just the argument.
+# `grep -n BAND_ FREE_RIDE_ONLY DAILIES_ONLY_WINDOW_MULT` across the package must return this
+# file and nothing else; `test_config.TestTheFateBlockIsInert` asserts it.
+#
+# WHAT PROMPTED IT.  v5 maximised REWARD RATE and never derived the losing path.  Measured on
+# real money (work/audit-2026-07-28.md): −$74.52 on $928.70 deployed, of which 84% came from
+# fifteen markets holding ~5.6c inventory that returned EXACTLY −100.0% (1,123 contracts,
+# $0.00 recovered); only 28.1% of acquired inventory ever netted; and 47% of the pairs that
+# DID form cost MORE than $1.00 combined.
+#
+# THE STRUCTURAL HAZARD, named (note 43 §7): scoring is denominated in CONTRACT COUNT, count
+# is cheapest exactly where contracts are worthless, so the rung that maximises the subsidy is
+# BY CONSTRUCTION the rung that maximises capital destruction.  Two denominators, one
+# optimiser.  That hazard is REAL and remains unaddressed in live code.
+#
+# NO FATE SENTENCE IS ASSERTED HERE.  The draft one — "ends by netting against its own resting
+# sell leg or settling within 24 h, worth ~$1.00 per completed pair against ≤98c paid" — named
+# a mechanism (the sell leg) that the backtest then measured at −$40.30 against doing nothing.
+# A fate sentence whose mechanism has been refuted is not a partial answer, it is a wrong one,
+# and note 23 Part V is explicit that the blanks must come from MEASUREMENT.  The blank
+# "a position acquired by this system ends by ____" is therefore still UNDERIVED and is flagged
+# upward, unfilled.  No acquiring behaviour may ship until it is filled.
+#
+# THE BACKTEST that judged this design: 66 settled markets, 27,181 one-minute bars, pipeline
+# validated to $0.000.  Full design −$23.70 (t = −2.24), and −$28.70 (t = −2.92) with the top 3
+# markets removed — a loss that STRENGTHENS under outlier removal is a real loss, not variance.
+# =============================================================================================
+
+# --- 1. THE PRICE BAND -----------------------------------------------------------------------
+# MEASURED (note 43 §1): "Below roughly 15c neither an exit nor an offsetting fill exists at
+# any price, so the position has one fate."  15c is therefore not a preference, it is the
+# observed boundary of the region in which our own fate sentence is UNWRITEABLE — there is no
+# blank to fill because there is no exit to name.
+#
+# THE MARKET BAND [15, 85].  BOTH sides of the market must live inside it.  Its ceiling is the
+# floor's exact mirror: YES + NO = $1 always, so a market whose YES trades at 90c is a market
+# whose NO trades at 10c — the SAME dead zone, entered from the other end.  A guard on one end
+# only would have refused the 5.6c rungs and admitted their 94.4c twins, which are the same
+# rungs.
+#
+# THE OUR-LEG BAND [20, 50], strictly inside it.  Two derivations, both from the fate sentence:
+#   (a) FLOOR = 15 + 5.  A position bought AT the market floor and then walked against by the
+#       book is a position whose exit has to exist at a WORSE price than the entry.  The buffer
+#       is one observed round-trip: TAKER_EXIT_MAX_SLIPPAGE_C = 3c is the measured spread on
+#       qualifying rungs, rounded up to the next 5c so the buffer survives one spread of adverse
+#       movement and still lands at or above the measured 15c boundary.  (The DIRECTION is
+#       derived from measurement; the 5-vs-3 rounding is a convention — see UNDERIVED below.)
+#   (b) CEILING = 50, and it is the JOINT-SUM guard's shadow, not an independent number.  A pair
+#       may cost at most 98c; our leg at c forces the completing leg to ≤ (98 − c).
+#       At c = 50 the completing leg must be ≤48c — comfortably inside the market band.  At
+#       c = 85 the completing leg would have to be bought at ≤13c, i.e. BELOW the dead-zone
+#       floor: an expensive leg is a cheap leg wearing a disguise, and the pair can never close.
+#   (c) claimed: IT COSTS NO MARKETS, only sides — YES + NO = 100 − spread ≤ 99, so on ANY
+#       market at least one leg is ≤49c, and the band merely chooses which SIDE we may be on.
+# MIRROR (band too NARROW ↔ too wide): too narrow forgoes rungs whose fate we could in fact
+# have named; too wide is what we measured and it costs PRINCIPAL: 84% of all losses.
+#
+# *** CLAIM (c) IS FALSE FOR TWO-SIDED QUOTING, AND THE BACKTEST FOUND IT. ***
+# (c) is true of ONE leg and false of the PAIR.  Requiring BOTH legs ≤50c on a binary is not a
+# constraint on the legs at all — since they sum to (100 − spread), it is a constraint on the
+# MID, and it demands a market sitting within a couple of ticks of 50/50.  Measured on the
+# tape: satisfied in 2.16% of bar-minutes.  As written, the band makes two-sided quoting
+# structurally unreachable, which is a different system from the one that was specified.
+# WHAT SURVIVES THE REFUTATION, and it is the important half: the MARKET band [15, 85] is
+# independent of (c) and rests directly on measurement (note 43 §1 — below ~15c neither an exit
+# nor an offsetting fill exists at any price; the −100% cohort averaged 5.6c).  Its ceiling is
+# its own mirror, since a 90c YES is a 10c NO — the same dead zone from the other end.
+# WHAT MUST BE RE-DERIVED before anything ships: the OUR-LEG band, which needs to be a
+# per-side rule that a two-sided quoter can actually satisfy, not a disguised mid filter.
+BAND_MARKET_MIN_C = 15                       # staged-inert: measured, unrefuted, unwired
+BAND_MARKET_MAX_C = 85                       # staged-inert: mirror of the floor, unwired
+BAND_OUR_LEG_MIN_C = 20                      # staged-inert: REFUTED AS SPECIFIED — see above
+BAND_OUR_LEG_MAX_C = 50                      # staged-inert: REFUTED AS SPECIFIED — see above
+
+# --- 2. JOIN BEST, NEVER IMPROVE PAST IT -----------------------------------------------------
+# DERIVED FROM THE SCORING FUNCTION ITSELF, which is already in this file: score contribution is
+# `size × DISCOUNT_FACTOR_DEFAULT^(ticks behind reference)` = size × 0.5^k.  Therefore:
+#   * at-best (k = 0) scores 2× one-tick-back (k = 1) at IDENTICAL capital, so joining the best
+#     is the whole of the cheap score;
+#   * improving PAST the best (paying a tick more as a bid, accepting a tick less as an ask)
+#     moves the reference price with us — k is still 0 — so it buys ZERO extra score and costs
+#     a cent of entry price on every contract.  It is a strictly dominated action.
+# VERIFIED AGAINST THE LIVE CODE, NO CHANGE REQUIRED — this is the one design item that was
+# already true.  `engine.requote_pass` prices at `s.p if side == "bid" else (1.0 - s.p)`, and
+# `s.p` is the SAME-SIDE BEST in its own collateral currency (`scan.build_slots` fills it from
+# `alloc.score_side(...).ref_c`), so the quote joins the best exactly and never improves past
+# it.  `quote.at_best` is the same statement, and requote trigger (a) `TRIG_OFF_BEST` is what
+# keeps it true as the book moves.  Nothing to build; recorded here so the next reader does not
+# re-derive it, and so a future edit that starts shading has to argue with this paragraph.
+# MIRROR (improving past best ↔ resting behind best): resting BEHIND is legal, and
+# MAX_SHADE_TICKS = 1 bounds it, because 0.5^2 = 25% of the score is worth less than the same
+# dollars at the water level in another venue.
+
+# --- 3. THE JOINT SUM GUARD — REFUTED, NOT IMPLEMENTED ---------------------------------------
+# The design called for "our YES bid + our NO bid ≤ 98c, enforced on every reprice", on the
+# reasoning that a pair acquired for ≤98c is profit by construction.  The reasoning is sound and
+# the guard is still NOT BUILT, because the backtest (66 settled markets, 27,181 one-minute
+# bars, pipeline validated to $0.000) measured its effect at approximately ZERO: no pair in the
+# tape exceeded $1.00 with or without it.  The 47%-over-$1.00 disaster it was designed against
+# did not come from the two legs of ONE market; it came from LADDER rungs repricing
+# independently, which the at-best invariant and the requote triggers already prevent.
+# A guard whose measured effect is zero is not free: it is a refusal path on the money path,
+# it must be reasoned about forever, and it makes the thing it does not fix look fixed.
+# NO CONSTANT IS DEFINED HERE ON PURPOSE — an unused constant is how a dormant guard gets
+# switched on later by someone who reads the derivation and not the measurement.
+
+# --- 4. THE RESTING SELL LEG — REFUTED AND REVERTED ------------------------------------------
+# The design called for resting the sell of the position at fill + 2c instead of buying the
+# opposing side, billed as simultaneously the exit and the netting leg at zero new capital.
+# THE TAPE SAYS IT IS THE LOSS, and it is the largest single term in the measurement:
+#     with it     −$23.70   (t = −2.24; −$28.70, t = −2.92 with the top 3 markets removed)
+#     without it  +$16.60
+#     delta       −$40.30
+# THE MECHANISM, measured: it netted ZERO contracts against 230 without it.  It fires BEFORE the
+# opposing side can fill, so it is neither the exit nor the netting leg it was billed as — it
+# pre-empts the very netting it was supposed to cause.  Its breakeven exit rate is 94.4% and the
+# realised rate is 87.4%; the 12 fills that did not exit lost 33.6c each.
+# This is a derivation-scope failure of exactly the class note 23 Part V names, one level down:
+# the fate sentence was written, and the mechanism chosen to make it true was never measured
+# against the alternative of doing nothing.  NOT IMPLEMENTED, and no constant is left behind.
+
+# --- 6. FREE-RIDE ON DEPTH, NEVER FUND IT -----------------------------------------------------
+# The 1000-contract qualification is a DISCRETE precondition: if a side is short of target the
+# snapshot is excluded and nobody is paid.  v5 therefore FUNDED it — `qualification_pass` posts
+# `target_size − cum_size` contracts at LAND_GRAB_PRICE_C = 1c.  Read against note 43 §7 that is
+# the structural hazard in its purest form: the cheapest possible proximity, at the price where
+# a contract is worth nothing, in the size that maximises count.  It is the machine that bought
+# the −100% cohort.
+# The derivation of the replacement: qualification is worth exactly the same to us whether WE
+# created it or someone else did, and someone else's costs nothing.  So enter only where the
+# rival book ALREADY clears target WITHOUT our size — free-ride on depth, never fund it.  The
+# test must deduct our own resting size, because the public book reflects it (SF-5's finding,
+# applied to `qualifies` instead of only to `S`); without the deduction the check certifies our
+# own land grab back to us.
+# MIRROR (never funding ↔ never entering): the fear is that no market qualifies without us and
+# the book deploys nothing.  That fear is NOT yet measured — the backtest priced the quoting
+# rules, not this one — which is exactly why the flag is inert.  Arming it means gating
+# `scan.build_slots` on a RIVAL qualification (our own resting size deducted, per SF-5) and
+# zeroing `alloc.qualification_pass`; the machinery stays in the tree so the decision remains
+# one constant in either direction, and `free_ride_refused` would be the instrument.
+# ALSO STILL TRUE AND UNADDRESSED: `LAND_GRAB_PRICE_C = 1` is live today, and a 1c land grab is
+# the −100% cohort's own geometry (note 43 §7).  Nothing in this commit changes that; it is the
+# single most direct surviving link between the live code and the measured loss, and it is
+# flagged upward as the next thing to price.
+FREE_RIDE_ONLY = False                       # staged-inert: unwired AND off
+
+# UNDERIVED (note 23 §II), flagged upward rather than shipped silently:
+#   * THE FATE SENTENCE ITSELF.  "A position acquired by this system ends by ____" has no
+#     measured answer.  The mechanism proposed for it (the resting sell leg) was measured and
+#     is worse than nothing (−$40.30).  This is the blocking item: note 23 Part V says no
+#     acquiring system ships without it, and v5 acquires.
+#   * BAND_OUR_LEG_*: refuted as specified (2.16% of bar-minutes).  Needs a per-side formulation
+#     that a two-sided quoter can satisfy.
+#   * BAND_MARKET_*: derived from measurement and unrefuted, but never itself backtested — the
+#     15c boundary is read off the loss cohort, not off a controlled comparison.
+#   * DAILIES_ONLY_WINDOW_MULT: derived, unmeasured.
+#   * FREE_RIDE_ONLY: derived, unmeasured.
 
 # =============================================================================================
 # RISK CAPS  (spec §4.4 table)
