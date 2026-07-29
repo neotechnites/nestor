@@ -463,7 +463,8 @@ class PlaceContext(object):
     def __init__(self, halt_state=None, positions=None, resting_basis=None,
                  nestor_orders=None, nestor_positions=None, available_cash_usd=None,
                  cluster_cap_usd=None, frozen=None, denied_ok=True, refill=None,
-                 n_cap_fn=None, day_stopped=False, skew_ok=True):
+                 n_cap_fn=None, day_stopped=False, skew_ok=True,
+                 ceiling_usd=None, market_cap_usd=None):
         self.halt_state = halt_state
         self.positions = positions or []          # [{ticker, side, n, basis}] OPEN inventory
         self.resting_basis = resting_basis or []  # [{ticker, side, n, basis}] RESTING orders
@@ -476,6 +477,8 @@ class PlaceContext(object):
         self.n_cap_fn = n_cap_fn
         self.day_stopped = day_stopped
         self.skew_ok = skew_ok
+        self.ceiling_usd = ceiling_usd            # B15 — the PLACEMENT-time ceiling
+        self.market_cap_usd = market_cap_usd      # B16 — per-market acquisition cap
 
 
 def place_allowed(ctx, order):
@@ -536,5 +539,52 @@ def place_allowed(ctx, order):
         ok, reason, detail = CL.cluster_admits(existing, order, ctx.cluster_cap_usd)
         if not ok:
             return False, reason, detail
+
+    # -----------------------------------------------------------------------------------------
+    # B16 — THE PER-MARKET ACQUISITION CAP.  (2026-07-29)
+    # WHY IT EXISTS: we do not exit.  Measured on the full operation's tape, 149 of 6,149
+    # acquired contracts were ever closed (2.4%), across SEVEN closing orders in the whole
+    # history, all of them takers.  With no exit, NET exposure equals GROSS, so the only
+    # instrument that bounds directional risk in a market is refusing to acquire more of it.
+    # The cluster cap above bounds a SETTLE SOURCE (correlated group); this bounds ONE market,
+    # which is what the unmatched-leg loss was denominated in — decomposing the settled book,
+    # matched pairs earned +$39.63 (+6.88c/pair) and the unmatched residual lost -$587.42.
+    # Breadth cannot fix that: thirty markets each fully net-long is thirty directional bets.
+    # MIRROR (cap too LOW ↔ too high): too low forfeits credit by refusing to reach the $1.00
+    # payout floor in a market that would have paid — bounded, visible as `market_cap` refusals
+    # against the accrual, and recoverable next period.  Too high is the -$587: an unbounded
+    # one-sided position in a single market with no way out of it.
+    if not fully_closing and ctx.market_cap_usd is not None:
+        held = sum(float(p.get("n", 0)) * float(p.get("basis", 0.0))
+                   for p in list(ctx.positions) + list(ctx.resting_basis)
+                   if p.get("ticker") == ticker)
+        add = float(order.get("n", 0)) * float(order.get("basis", 0.0))
+        if held + add > float(ctx.market_cap_usd) + 1e-9:
+            return False, "market_cap", {"held": round(held, 4), "add": round(add, 4),
+                                         "cap": float(ctx.market_cap_usd)}
+
+    # -----------------------------------------------------------------------------------------
+    # B15 — THE COLLATERAL CEILING, ENFORCED AT PLACEMENT.  (2026-07-29)
+    # The ceiling was previously a PLAN-TIME budget only: `engine` computes
+    # `reserve_budget(ceiling - inventory_basis, slot_cap)` once per allocation cycle and the
+    # allocator plans inside it.  Nothing downstream re-checked it, so the authorised number was
+    # only as accurate as `cash.inventory_basis` — and measured on the tape, resting notional
+    # reached p99 $1,358 and a peak of $6,077 against a ledger-declared ceiling of $45.  A limit
+    # that binds a plan and not an order is not a limit; it is an intention.
+    # DERIVATION OF THE PLACE: last, because it is the only guard denominated in the WHOLE
+    # book — every cheaper refusal above should fire first so the ledger reason names the
+    # specific cause rather than the aggregate one.
+    # MIRROR (ceiling too tight ↔ too loose): too tight starves the book and is visible as
+    # `ceiling` refusals while `idle_capital` alerts — the exact failure we measured on
+    # 2026-07-28 when $5.84 of $300 deployed.  Too loose is unbounded exposure on a shared
+    # account, which is what this closes.  The fully-closing exemption is mandatory: a book at
+    # its ceiling must always be able to LEAVE.
+    if not fully_closing and ctx.ceiling_usd is not None:
+        committed = sum(float(p.get("n", 0)) * float(p.get("basis", 0.0))
+                        for p in list(ctx.positions) + list(ctx.resting_basis))
+        add = float(order.get("n", 0)) * float(order.get("basis", 0.0))
+        if committed + add > float(ctx.ceiling_usd) + 1e-9:
+            return False, "ceiling", {"committed": round(committed, 4), "add": round(add, 4),
+                                      "ceiling": float(ctx.ceiling_usd)}
 
     return True, "ok", {}

@@ -451,3 +451,80 @@ class TestOrderedGate(LipTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestB15TheCeilingBindsAtPlacement(LipTestCase):
+    """The ceiling was a PLAN-TIME budget only.  Measured on the tape: resting notional p99
+    $1,358 and a peak of $6,077 against a ledger-declared ceiling of $45.  These tests exist
+    because 601 tests passed while the guard did not exist -- absence of a refusal path is
+    invisible to a suite that never constructs the breach."""
+
+    def test_it_refuses_when_committed_plus_the_order_exceeds_the_ceiling(self):
+        ctx = G.PlaceContext(
+            ceiling_usd=100.0,
+            positions=[{"ticker": "A-1", "side": "yes", "n": 100, "basis": 0.50}],   # $50
+            resting_basis=[{"ticker": "B-1", "side": "yes", "n": 80, "basis": 0.50}])  # $40
+        ok, reason, d = G.place_allowed(ctx, order(ticker="C-1", n=40, basis=0.50))   # +$20
+        self.assertFalse(ok)
+        self.assertEqual(reason, "ceiling")
+        self.assertAlmostEqual(d["committed"], 90.0)
+        self.assertAlmostEqual(d["add"], 20.0)
+
+    def test_it_allows_the_order_that_lands_exactly_ON_the_ceiling(self):
+        ctx = G.PlaceContext(
+            ceiling_usd=100.0,
+            positions=[{"ticker": "A-1", "side": "yes", "n": 100, "basis": 0.50}])
+        ok, reason, _ = G.place_allowed(ctx, order(ticker="C-1", n=100, basis=0.50))
+        self.assertTrue(ok, reason)
+
+    def test_a_FULLY_CLOSING_order_is_exempt_so_a_book_at_its_ceiling_can_LEAVE(self):
+        ctx = G.PlaceContext(
+            ceiling_usd=10.0,
+            positions=[{"ticker": "A-1", "side": "yes", "n": 1000, "basis": 0.50}])
+        ok, reason, _ = G.place_allowed(ctx, order(ticker="A-1", n=100, basis=0.50, closing=True))
+        self.assertTrue(ok, reason)
+
+    def test_no_ceiling_configured_is_a_no_op_not_a_refusal(self):
+        ctx = G.PlaceContext(positions=[{"ticker": "A-1", "side": "yes", "n": 1e6, "basis": 0.99}])
+        ok, reason, _ = G.place_allowed(ctx, order())
+        self.assertTrue(ok, reason)
+
+
+class TestB16ThePerMarketAcquisitionCap(LipTestCase):
+    """We do not exit -- 149 of 6,149 acquired contracts were ever closed (2.4%), across seven
+    closing orders, all takers.  With no exit NET equals GROSS, so refusing to acquire is the
+    only control on one market's directional exposure.  Matched pairs earned +$39.63; the
+    unmatched residual lost -$587.42."""
+
+    def test_it_counts_only_the_SAME_market(self):
+        ctx = G.PlaceContext(market_cap_usd=10.0,
+                             positions=[{"ticker": "OTHER-1", "side": "yes", "n": 1000, "basis": 0.50}])
+        ok, reason, _ = G.place_allowed(ctx, order(ticker="MINE-1", n=10, basis=0.50))
+        self.assertTrue(ok, reason)            # $500 elsewhere is irrelevant to MINE-1
+
+    def test_it_refuses_once_one_market_would_exceed_its_cap(self):
+        ctx = G.PlaceContext(market_cap_usd=10.0,
+                             positions=[{"ticker": "MINE-1", "side": "yes", "n": 16, "basis": 0.50}])
+        ok, reason, d = G.place_allowed(ctx, order(ticker="MINE-1", n=6, basis=0.50))
+        self.assertFalse(ok)
+        self.assertEqual(reason, "market_cap")
+        self.assertAlmostEqual(d["held"], 8.0)
+
+    def test_RESTING_size_counts_too_not_just_open_positions(self):
+        """A resting order is a commitment to acquire.  Counting only positions would let the
+        book queue up unbounded exposure and discover it on the fills."""
+        ctx = G.PlaceContext(market_cap_usd=10.0,
+                             resting_basis=[{"ticker": "MINE-1", "side": "yes", "n": 20, "basis": 0.50}])
+        ok, reason, _ = G.place_allowed(ctx, order(ticker="MINE-1", n=2, basis=0.50))
+        self.assertFalse(ok)
+        self.assertEqual(reason, "market_cap")
+
+    def test_a_FULLY_CLOSING_order_is_exempt(self):
+        ctx = G.PlaceContext(market_cap_usd=1.0,
+                             positions=[{"ticker": "MINE-1", "side": "yes", "n": 1000, "basis": 0.50}])
+        ok, reason, _ = G.place_allowed(ctx, order(ticker="MINE-1", n=100, basis=0.50, closing=True))
+        self.assertTrue(ok, reason)
+
+    def test_the_cap_derives_from_the_ceiling_and_is_strictly_inside_v1s_inherited_bound(self):
+        self.assertLess(C.MARKET_CAP_FRAC, C.PER_MARKET_BUDGET_FRAC)
+        self.assertAlmostEqual(C.MARKET_CAP_FRAC * 300.0, 30.0)

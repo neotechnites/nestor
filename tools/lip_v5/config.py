@@ -792,6 +792,30 @@ def slot_cap_usd(day_stop_threshold_usd, floor_usd=None):
 
 PER_MARKET_POOL_MULT = 4.0                   # v1 §8.2 never risk 4× a market's own max prize
 PER_MARKET_BUDGET_FRAC = 0.25                # v1 §8.2 no single-market concentration
+
+# --- B16: THE PER-MARKET ACQUISITION CAP (2026-07-29) ---
+# WHY A SECOND, TIGHTER PER-MARKET BOUND.  `PER_MARKET_BUDGET_FRAC = 0.25` was inherited from
+# v1 and permits $75 of one market at a $300 ceiling — which is not a concentration limit, it is
+# a rounding error away from the -$80.60 gas ladder.  This constant replaces it as the binding
+# one, and unlike v1's it is derived from the RISK MODEL rather than from a round number.
+#
+# THE DERIVATION.  We do not exit: 149 of 6,149 acquired contracts were ever closed (2.4%),
+# across 7 closing orders in the operation's entire history, all takers.  So NET exposure equals
+# GROSS, and the only control on directional risk is refusing to acquire.  The whole reason for
+# breadth is variance: with N equally-weighted independent markets the book's SD scales as
+# 1/sqrt(N), and with UNEQUAL weights the effective count is the inverse Herfindahl
+# `N_eff = 1/sum(w_i^2)`.  Sizing is deliberately unequal (more capital where the pool is large
+# and the rivals thin), so the cap's job is to stop one weight from collapsing N_eff.  At a
+# maximum weight of 0.10 with the remainder spread, N_eff stays above ~20 — i.e. the cap buys
+# the variance reduction that the whole strategy rests on, and 0.25 does not (one market at 0.25
+# caps N_eff near 10 no matter how many markets are open).
+# It is also strictly inside the cluster cap, which bounds the correlated GROUP; this bounds one
+# MARKET, because the measured loss was denominated per market: matched pairs earned +$39.63
+# (+6.88c/pair) while the unmatched residual lost -$587.42.
+# MIRROR (too LOW ↔ too high): too low refuses size a market's pool would have paid for and
+# shows up as `market_cap` refusals with accrual left on the table — bounded and recoverable
+# next period.  Too high is the -$587: an unbounded one-sided position with no exit.
+MARKET_CAP_FRAC = 0.10
 MAX_TOTAL_COLLATERAL_USD = 300.0             # R168 ladder rung.  G5 owns changes to this: one
                                              # constant, one commit, funded by the PREVIOUS
                                              # window's OBSERVED print, never the model.

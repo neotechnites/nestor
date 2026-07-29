@@ -277,7 +277,15 @@ class Maker(object):
                                               ceiling_usd=self.ceiling_usd),
             frozen=self.frozen, refill=self.refill,
             n_cap_fn=lambda p: alloc.n_cap(p, caps),
-            day_stopped=self.day_stopped, skew_ok=self.skew_ok)
+            day_stopped=self.day_stopped, skew_ok=self.skew_ok,
+            # B15/B16 — the ceiling and the per-market cap now bind at PLACEMENT, not only in
+            # the allocator's plan.  `ceiling_usd` is the same number the plan uses, so a
+            # correct plan is unaffected and only a plan that has drifted from the book is
+            # refused.  The per-market cap derives from the ceiling rather than being a fresh
+            # constant: with no exit, one market's worst case must not be able to consume the
+            # whole book, and MARKET_CAP_FRAC is the fraction that bound is set at.
+            ceiling_usd=self.ceiling_usd,
+            market_cap_usd=C.MARKET_CAP_FRAC * self.ceiling_usd)
 
     def place(self, ticker, side, price, count, expiration_ts, now,
               fully_closing=False, available_cash_usd=None, lane="place",
