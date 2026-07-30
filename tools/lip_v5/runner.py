@@ -43,11 +43,6 @@ class Runner(object):
         self.degrade_steps = ()              # last applied §3.4 ladder (logged on change)
         self.coverage_bad_since = None       # spec §11: coverage <90% for 10 min pages
         self.coverage_alerted = False
-        # --- SF-4d: the reinstate queue is STATE, not a one-shot at init (see `reinstate`) ---
-        self.pending_reinstate = []          # rungs with no verdict yet
-        self.reinstate_deadline = None       # snapshot ts + REINSTATE_MAX_AGE_S
-        self.reinstate_snap_ts = 0.0
-        self.reinstate_why = {}              # the running tally, across passes
 
     # =========================================================================================
     # INIT
@@ -87,8 +82,7 @@ class Runner(object):
         return True, []
 
     def reinstate(self, now):
-        """SF-4d — LOAD the last-known-healthy book into the pending queue and take the first
-        pass at it.  The passes continue from `iteration` until every rung is adjudicated.
+        """SF-4d — put the last-known-healthy book BACK on the wire in seconds.
 
         THE CONCEPT (Ryan, 2026-07-30): the resting book is state.  Re-DERIVING it after
         every restart runs the whole discovery chain — built for finding NEW rungs — and
@@ -103,21 +97,6 @@ class Runner(object):
         Then place through `Maker.place` — halt, day stop, caps, variance, ceiling all
         still refuse exactly as they would any order.  ~2 requests per rung: a 25-rung
         book is back in under 30 s at the startup burst rate.
-
-        ── IT ASKED AT THE ONE MOMENT THE ANSWER MUST BE NO (2026-07-30, 0 of 40). ──────────
-        This ran ONCE, from `init`, ~10 s after boot, and raced two things it depends on:
-        the programs feed was still paginating, so `live_prog` was half-empty and 16 healthy
-        rungs read `no_live_program`; and discovery had already drained the rate bucket, so
-        the loop hit `rate_budget_exhausted` and BROKE, leaving 21 rungs never even
-        evaluated.  Both are states of the CLOCK, not judgements about a rung — and the
-        single-shot design converted "ask again in a second" into "gone until the next
-        restart", for a book that had just been cancelled to zero.
-        So the queue is now STATE (`pending_reinstate`) and a rung leaves it only on a REAL
-        VERDICT: placed, or refused by a gate that has actually decided.  An empty bucket, a
-        program map still arriving, a close not yet learned — none of those are verdicts, and
-        the rung waits for the pass that can answer it.  Bounded by the snapshot's own
-        freshness deadline (`REINSTATE_MAX_AGE_S`), because a book old enough to be re-derived
-        honestly is exactly what that constant already means.
         """
         m = self.m
         if m.halt.halted:
@@ -125,31 +104,9 @@ class Runner(object):
         snap = R.read_json(C.BOOK_SNAPSHOT_PATH, default=None)
         if not isinstance(snap, dict) or not snap.get("rungs"):
             return 0
-        snap_ts = float(snap.get("ts") or 0)
-        age = float(now) - snap_ts
+        age = float(now) - float(snap.get("ts") or 0)
         if age > C.REINSTATE_MAX_AGE_S:
             R.log("reinstate_stale", age_s=round(age, 1))
-            return 0
-        self.pending_reinstate = list(snap["rungs"])
-        # The deadline is the SNAPSHOT's, not this pass's: the book stays reinstatable for
-        # exactly as long as it would have been had we adjudicated it on the first attempt.
-        self.reinstate_deadline = snap_ts + C.REINSTATE_MAX_AGE_S
-        self.reinstate_snap_ts = snap_ts
-        self.reinstate_why = {}
-        return self.reinstate_pass(now)
-
-    def reinstate_pass(self, now):
-        """One pass over the pending rungs, spending only what the rate lane allows."""
-        m = self.m
-        if m.halt.halted or not self.pending_reinstate:
-            return 0
-        if self.reinstate_deadline is not None and float(now) > self.reinstate_deadline:
-            # The snapshot has aged past the point where replaying it is honest.  Whatever is
-            # still pending is dropped LOUDLY: the alternative is reinstating a book whose
-            # board has moved, which is the thing REINSTATE_MAX_AGE_S exists to refuse.
-            R.log("reinstate_stale", age_s=round(float(now) - self.reinstate_snap_ts, 1),
-                  dropped=len(self.pending_reinstate))
-            self.pending_reinstate = []
             return 0
         programs = self.scanner.scan(m.ex, m.bucket, now)
         live_prog = {}
@@ -163,21 +120,11 @@ class Runner(object):
         # No silent caps (Ryan, 2026-07-30, third instance of this disease today): a
         # reinstate that replays 0 of 40 rungs must say WHICH gate ate each one, or the
         # book's recovery is an archaeology project instead of a grep.
-        why = self.reinstate_why
+        why = {}
 
         def _skip(reason):
             why[reason] = why.get(reason, 0) + 1
-        # A PARTIAL PROGRAM MAP CANNOT CONVICT.  The scan paginates and may defer mid-way
-        # (rate) or fail; `no_live_program` is a verdict only against a map that finished
-        # arriving.  This is the gate that ate 16 of the 40.
-        map_complete = bool(getattr(self.scanner, "last_scan_complete", False))
-        still = []                            # rungs with no verdict yet: they ride on
-
-        def _wait(rung, reason):
-            why[reason] = why.get(reason, 0) + 1
-            still.append(rung)
-        queue = list(self.pending_reinstate)
-        for i, rung in enumerate(queue):
+        for rung in snap["rungs"]:
             tk, side = rung.get("ticker"), rung.get("side")
             if side not in ("bid", "ask") or (tk, side) in resting_now:
                 _skip("already_resting")
@@ -187,33 +134,21 @@ class Runner(object):
                 continue
             prog = live_prog.get(tk)
             if prog is None:
-                if map_complete:
-                    _skip("no_live_program")  # a FULL map says no: that is a verdict
-                else:
-                    _wait(rung, "program_map_incomplete")
+                _skip("no_live_program")
                 continue
             close = self.classifier.close_ts.get(tk)
-            if close is None:
-                # Not yet LEARNED, which is not the same as too far: the classify sweep
-                # fetches closes continuously and the persisted cache warms in one read.
-                _wait(rung, "close_not_yet_known")
-                continue
-            if (float(close) - float(now)) / 3600.0 > C.SETTLE_HORIZON_H:
-                _skip("close_horizon")        # known and too far: the D4 gate, decided
-                continue
+            if close is None or (float(close) - float(now)) / 3600.0 > C.SETTLE_HORIZON_H:
+                _skip("close_unknown_or_horizon")
+                continue                      # unknown close refuses, same as the D4 gate
             admitted, _ = m.bucket.admit("book_poll", now)
             if not admitted:
-                # The lane is empty THIS pass.  Everything not yet looked at rides on —
-                # including this rung.  (Pre-fix this `break` stranded 21 of 40 rungs for
-                # the life of the process.)
-                for r_ in queue[i:]:
-                    _wait(r_, "rate_budget_exhausted")
-                break
+                _skip("rate_budget_exhausted")
+                break                         # out of budget: the loop finds the rest
             status, body = m.ex.book(tk)
             m.note_http(status, now)
             if status != 200:
-                _wait(rung, "book_http_%d" % status)
-                continue                      # a failed READ is not a judgement of the rung
+                _skip("book_http_%d" % status)
+                continue
             rec = self.classifier.classify_one(tk, body, prog, now)
             sd = rec["sides"][side]
             if not sd.get("qualifies") or sd.get("p") in (None, 0) or not sd.get("legal"):
@@ -244,9 +179,7 @@ class Runner(object):
                 placed += 1
             else:
                 _skip("place_%s" % (_reason or "refused"))
-        self.pending_reinstate = still
-        R.log("reinstated", rungs=placed, pending=len(still),
-              snapshot_age_s=round(float(now) - self.reinstate_snap_ts, 1),
+        R.log("reinstated", rungs=placed, snapshot_age_s=round(age, 1),
               refused=why or None)
         return placed
 
@@ -564,18 +497,6 @@ class Runner(object):
         # (2) scan → classify → slots.  Each is cadence-gated and rate-laned inside.
         programs = self.scanner.scan(self.m.ex, self.m.bucket, now)
         self.classifier.sweep(self.m.ex, self.m.bucket, programs, now, books=books)
-
-        # (2a′) SF-4d — the reinstate queue drains HERE, not once at init.  Placed after the
-        # scan and the classify sweep on purpose: those are the two things the first attempt
-        # raced (a half-paginated program map, an unlearned close), so by this line the pass
-        # has the best answers the cycle can give it.  Costs nothing when the queue is empty,
-        # which is every cycle after the book is back.
-        if self.pending_reinstate:
-            try:
-                self.reinstate_pass(now)
-            except Exception as exc:                          # noqa: BLE001 - a failed
-                R.log("reinstate_error",                      # replay never costs the cycle
-                      err="%s: %s" % (type(exc).__name__, exc))
 
         # (2b) BLOCKER-3: the book_poll lane — held/ordered markets ALWAYS, best-ranked
         # rest up to breadth, refreshing the classification so the requoter's price
