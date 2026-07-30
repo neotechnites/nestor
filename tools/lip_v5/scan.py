@@ -14,7 +14,8 @@ DEGENERATE INSIDE ONE EVENT — every rung of a gas daily carries the identical 
 the identical window, so ρ cannot separate them and the ticker tie-break decides.  Measured live:
 a ρ-ranked clamp picked six deep-ITM rungs of which FOUR were pinned and could never pay, and
 never polled the three best slots on the board.  So: classify first (cheap, low cadence, learns
-pinned/qualifies/S/p), then rank by the ALLOCATOR'S OWN first-dollar rate.
+pinned/qualifies/S/p), then rank by the ALLOCATOR'S OWN need formula (the owner's
+law, 2026-07-30: capital needed to earn $1.50 in the next 24 hours, cheapest first).
 
 Pinned-ness changes only when a 99c/1c tick-boundary order moves, which is a 15-minute
 timescale — far slower than the 1 Hz quoting loop.  That is the cadence's derivation, and it is
@@ -526,19 +527,20 @@ def _warn_p6_unwired():
 
 def runway_ok(rho, hours_left, accrued_usd=0.0, floor_usd=C.ENTRY_FLOOR_USD,
               share=C.ENTRY_SHARE_ASSUMPTION):
-    """The window-END guard.  ALLOCATE optimises a RATE and is blind to how many hours remain to
-    earn it, so a dying program looks identical to a fresh one — measured live as 735 lots posted
-    with under 25 minutes left.  Entering is only rational if the entry floor is still REACHABLE:
+    """The window-END guard — a REQUEST-FREE approximation of the law's own unreachability
+    skip (owner's law §5, 2026-07-30): a window whose pool cannot reach the floor by its end
+    is not worth a book read.  `alloc.law_need` re-derives the same refusal exactly (with
+    the pro-rated-but-clamped target) once the slot exists; this filter only saves the rate
+    budget on markets the formula would skip anyway.  Measured origin: 735 lots posted with
+    under 25 minutes left, by an allocator blind to the remaining hours.
 
         share · (ρ/2) · h ≥ floor − accrued
 
-    with a CONSERVATIVE share, because assuming we take the whole side is exactly the optimism
-    that produces late entries.
-
-    SECOND AMENDMENT (b): with accrual AT STAKE the reachability target is the forfeit CLIFF
-    ($1.10), not the entry floor ($2.00) — this is an EXIT question, and excluding a program
-    whose 70¢ could still be rescued is the runway guard confiscating the very accrual the
-    rescue exists to recover (v4 carried the same exemption).
+    with a CONSERVATIVE share, because assuming we take the whole side is exactly the
+    optimism that produces late entries.  With accrual AT STAKE the reachability target
+    drops to the forfeit cliff — the accrued pot is recoverable arithmetic (the law
+    subtracts it from the need), and a prefilter must never refuse a market the formula
+    would fund.
 
     MIRROR (window END ↔ window START): `preposition_ok` below.
     """
@@ -614,7 +616,7 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
     WHICH EXCLUSIONS ARE ENTRY-ONLY, and why each is skipped rather than kept: `hours_left <= 0`,
     `preposition_ok`, `runway_ok`, P6, the entry price band and the free-ride gate ALL answer "is
     it worth ENTERING here", which is not the question a market we are already inside asks.
-    Skipping them yields a slot with `hours_left = 0`, which `alloc.allocate` refuses for NEW
+    Skipping them yields a slot with `hours_left = 0`, which `alloc.allocate_law` skips for NEW
     allocation on its own line — so the slot buys a MARK and a requote of what already rests, and
     cannot buy exposure.
     WHAT IS NOT SKIPPED: `series_denied` and `frozen`.  Those are kill switches, not opportunity

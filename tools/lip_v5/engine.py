@@ -24,7 +24,7 @@ import os
 import signal
 
 from . import alloc, cashfeed, clusters as CL, config as C, cutover
-from . import guards as G, ledger as LG, money as M, presence as P
+from . import guards as G, ledger as LG, presence as P
 from . import quote as Q
 from . import ratchet as RT, ratelimit as RL, runtime as R, wsgate
 # `scan` left with the halted closing pass: its only use here was `scan._book_levels`,

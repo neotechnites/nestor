@@ -773,7 +773,8 @@ BAND_OUR_LEG_MAX_C = 50                      # staged-inert: REFUTED AS SPECIFIE
 # `scan.build_slots` on a RIVAL qualification (our own resting size deducted, per SF-5) and
 # zeroing `alloc.qualification_pass`; the machinery stays in the tree so the decision remains
 # one constant in either direction, and `free_ride_refused` would be the instrument.
-# ALSO STILL TRUE AND UNADDRESSED: `LAND_GRAB_PRICE_C = 1` is live today, and a 1c land grab is
+# (2026-07-30: ADDRESSED — LAND_GRAB_PRICE_C is deleted; self-qualification prices at the band
+# floor.  Kept as written below for the record of what it was.)  It was live then, and it was
 # the −100% cohort's own geometry (note 43 §7).  Nothing in this commit changes that; it is the
 # single most direct surviving link between the live code and the measured loss, and it is
 # flagged upward as the next thing to price.
@@ -918,7 +919,8 @@ ENTRY_BAND_ARMED = True
 #   * BAND_MARKET_*: derived from measurement and unrefuted, but never itself backtested — the
 #     15c boundary is read off the loss cohort, not off a controlled comparison.
 #   * DAILIES_ONLY_WINDOW_MULT: derived, unmeasured.
-#   * FREE_RIDE_ONLY: derived, unmeasured.
+#   * FREE_RIDE_ONLY: derived, unmeasured — and DELETED 2026-07-30 into `alloc.law_need`'s
+#     qualification pricing (owner's law §7a).
 
 # =============================================================================================
 # RISK CAPS  (spec §4.4 table)

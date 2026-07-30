@@ -135,6 +135,61 @@ class TestTheBookIsAPureFunctionOfTheWorld(ConvergenceCase):
             self.assertFalse(hasattr(r.m, gone), gone)
 
 
+class TestTheMultiMarketBookIsAPureFunctionOfTheWorld(ConvergenceCase):
+    """The spine, EXTENDED per the owner's law §10 (2026-07-30): a steady MULTI-market book
+    — two programs, two clusters, different prices so the law sizes them differently — is
+    cancelled exchange-side and the SAME book re-emerges from the ranking alone.  This is
+    the law's determinism doing the work: same world ⇒ same needs ⇒ same cheapest-first
+    ranking ⇒ same orders, with no discovery-order dependence and no replay path."""
+
+    def runner2(self):
+        def prog(pid, series, tk, reward):
+            from datetime import datetime, timezone
+            iso = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+            return {"id": pid, "series_ticker": series, "market_tickers": [tk],
+                    "period_reward": reward, "start_date": iso(NOW - 3600),
+                    "end_date": iso(NOW + 16 * 3600), "target_size_fp": 1000}
+
+        def book(px, npx):
+            return {"orderbook": {"orderbook_fp": {
+                "yes_dollars": [[px, "1200"]], "no_dollars": [[npx, "1200"]]}}}
+
+        programs = {"incentive_programs": [
+            prog("prog-1", "KXAAAGASD", TK_A, 1_000_000),
+            prog("prog-2", "KXCONVB", TK_B, 800_000),
+        ]}
+        ex = ConvergenceExchange(programs, {TK_A: book("0.06", "0.93"),
+                                            TK_B: book("0.11", "0.88")})
+        for tk in (TK_A, TK_B):
+            ex.market_closes[tk] = NOW + 16 * 3600
+        m = self.maker(ex=ex)
+        r = RUN.Runner(m, sleep=lambda _s: None)
+        for tk in (TK_A, TK_B):
+            r.classifier.close_ts[tk] = NOW + 16 * 3600
+        return r, ex
+
+    def test_two_clusters_come_back_at_the_same_sizes(self):
+        r, ex = self.runner2()
+        ok, refusals = r.init(NOW, nestor_state=NESTOR)
+        self.assertTrue(ok, refusals)
+        t = self.settle(r, NOW, n=20)
+        before = self.fingerprint(ex)
+        self.assertGreaterEqual(len({k[0] for k in before}), 2,
+                                "the fixture never funded both clusters: %s" % before)
+
+        killed = ex.cancel_all_exchange_side()
+        self.assertGreaterEqual(killed, 2)
+        budget_s = C.RECON_POSITIONS_S + 2 * C.FILLS_REQUERY_DELAY_S + 4 * C.BOOK_SNAPSHOT_S
+        t = self.settle(r, t, n=int(budget_s / 5.0) + 4, step=5.0)
+        after = self.fingerprint(ex)
+        self.assertEqual(sorted(after), sorted(before),
+                         "a different SET of rungs came back")
+        for key, q in before.items():
+            self.assertAlmostEqual(after[key], q, delta=max(1.0, 0.10 * q),
+                                   msg="rung %s came back at a different size" % (key,))
+
+
 class TestTheRiskRailsSurviveConvergence(ConvergenceCase):
     """Convergence may not be bought by removing a rail.  Every one of these bounds the book
     in DOLLARS and none of them remembers a decision."""
