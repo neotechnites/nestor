@@ -804,6 +804,14 @@ class Maker(object):
 
         # --- SF-4: the operator's venue readings (credits ritual → ratchet) ---
         self.consume_readings(now)
+        # --- SF-4b: accrued overrides — the exchange's displayed pot outranks the model ---
+        try:
+            _ov = R.read_json(C.ACCRUED_OVERRIDES_PATH, default=None)
+            if isinstance(_ov, dict):
+                for _pid, _usd in _ov.items():
+                    self.accrued[str(_pid)] = float(_usd)
+        except Exception:
+            pass
 
         # --- day stop (B2) ---
         pnl = G.mark_to_market_pnl(self.positions, self.position_cost, yes_mids or {},

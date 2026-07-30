@@ -1441,8 +1441,19 @@ FILLS_POLL_S = 15.0
 # SF-4: the operator's venue-reading entry point — a WATCHED FILE, mirror of v5_go.json's
 # hand-written pattern: the credits ritual appends rows, the live process consumes them.
 # Rows: {"venue","reading_usd","projection_usd","settlement_day"?,"program_id"?,"paid"?}.
+# SF-4b — THE ACCRUED OVERRIDE (2026-07-30, the 1.155/1.153 inversion).  Kalshi's UI shows
+# per-market earned rewards; the trade API does not serve them (23 endpoints probed 404
+# across two rounds), and our own accrual MODEL was measured INVERTED against the display
+# (model: 1.153=$0.186 / 1.155=$0.063; exchange: 1c / 26c).  Until the web endpoint is
+# captured, the operator may pin a program's pot to the exchange's displayed number:
+#     {"<program_id>": usd, ...}
+# Hand-written operator artifact (the v5_go.json pattern), consumed every cycle, REPLACES
+# the model value while present — the exchange's number is the payable truth and a wrong
+# model must not out-vote it in either direction.  Remove entries when stale.
+ACCRUED_OVERRIDES_NAME = "v5_accrued_overrides.json"
 READINGS_NAME = "v5_readings.jsonl"
 READINGS_PATH = os.path.join(DATA_DIR, READINGS_NAME)
+ACCRUED_OVERRIDES_PATH = os.path.join(DATA_DIR, ACCRUED_OVERRIDES_NAME)
 # SF-3: the halted closing pass posts fully-closing sheds so a halted book can LEAVE.  When
 # the market's close is UNKNOWN (halt before the classify sweep learned it) the expiration
 # backstop cannot discharge its real job, so the order's life is bounded by the halt's own
