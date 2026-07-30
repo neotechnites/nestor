@@ -1484,10 +1484,23 @@ FILLS_POLL_S = 15.0
 KALSHI_USER_ID = os.environ.get("KALSHI_USER_ID")
 ESTIMATES_PATH = "/v1/incentives/users/%s/estimates"
 ESTIMATES_POLL_S = 60.0
+# ── SF-4d — THE BOOK SNAPSHOT (Ryan, 2026-07-30: "reinstate orders that had no issues;
+# capital deployed in 5 minutes, not 5 hours").  THE BOOK IS STATE.  Every restart was
+# re-DERIVING it through the full discovery chain — scan, classify, admission, scoring —
+# which is the machinery for finding NEW rungs; a rung that was healthy 30 s before the
+# restart needs only the cheap safety re-checks (live program, settle horizon, deny list,
+# quotable book) and the normal placement rails, which enforce every cap regardless.
+# Snapshot every 30 s; reinstate on init; discovery runs behind it for new rungs.
+BOOK_SNAPSHOT_NAME = "v5_book_snapshot.json"
+BOOK_SNAPSHOT_S = 30.0
+# Stale-book bound: past this age the board has moved enough that re-derivation is the
+# honest path (a full program period could have rolled).  2 h ≈ several classify sweeps.
+REINSTATE_MAX_AGE_S = 2 * 3600.0
 ACCRUED_OVERRIDES_NAME = "v5_accrued_overrides.json"
 READINGS_NAME = "v5_readings.jsonl"
 READINGS_PATH = os.path.join(DATA_DIR, READINGS_NAME)
 ACCRUED_OVERRIDES_PATH = os.path.join(DATA_DIR, ACCRUED_OVERRIDES_NAME)
+BOOK_SNAPSHOT_PATH = os.path.join(DATA_DIR, BOOK_SNAPSHOT_NAME)
 # SF-3: the halted closing pass posts fully-closing sheds so a halted book can LEAVE.  When
 # the market's close is UNKNOWN (halt before the classify sweep learned it) the expiration
 # backstop cannot discharge its real job, so the order's life is bounded by the halt's own

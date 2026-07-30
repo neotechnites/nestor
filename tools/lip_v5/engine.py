@@ -108,6 +108,7 @@ class Maker(object):
         self.accrued = {}                    # program_id -> $ accrued (model, conditional)
         self.last_accrual_ts = None
         self.last_estimates_poll = None      # SF-4c cadence clock
+        self.last_book_snapshot = 0.0        # SF-4d cadence clock
         self.last_accrual_write = 0.0
         self._accrual_written = {}           # program_id -> last persisted value
         # --- FINAL FIX ROUND state ---
@@ -976,6 +977,19 @@ class Maker(object):
             # scales the NEXT cycle's stop with what is genuinely at risk.
             self.projected_day_reward = self.project_day_reward(slots, a)
             out["projected_day_reward"] = self.projected_day_reward
+
+        # --- SF-4d: the book snapshot (30 s) — the resting book is REINSTATABLE state ---
+        if now - self.last_book_snapshot >= C.BOOK_SNAPSHOT_S:
+            self.last_book_snapshot = now
+            rungs = [{"ticker": o["ticker"], "side": o["side"],
+                      "price": float(o["price"]), "q": float(o.get("remaining", 0))}
+                     for o in self.orders.values()
+                     if o.get("remaining", 0) > 0 and not o.get("gone_404")
+                     and not o.get("fully_closing")]
+            try:
+                R.atomic_write_json(C.BOOK_SNAPSHOT_PATH, {"ts": float(now), "rungs": rungs})
+            except Exception as exc:                      # noqa: BLE001 - snapshot is an
+                R.log_once("book_snapshot_failed", err=str(exc)[:80])   # optimization
 
         # --- cash feed cadence (30 s heartbeat; every wire call publishes anyway) ---
         if self.publisher.due(now):
