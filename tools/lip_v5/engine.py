@@ -819,7 +819,8 @@ class Maker(object):
                                    self.cash.fees_paid)
         out["pnl"] = pnl
         out["unpriced"] = G.unpriced_positions(self.positions, yes_mids or {})
-        if G.day_stop_breached(pnl, self.projected_day_reward):
+        if G.day_stop_breached(pnl, self.projected_day_reward,
+                               ceiling_usd=self.ceiling_usd):
             self.day_stopped = True
             self.halt.halt("day_stop", now, {"pnl": pnl})
             self.flatten(now)

@@ -652,8 +652,11 @@ class TestPlumbingWakes(RunnerCase):
         classified books trips it through the loop, with no caller-supplied prices."""
         r = self.runner()
         r.init(NOW, nestor_state=self.NESTOR)
-        r.m.positions[self.TICKER] = {"yes": 100.0, "no": 0.0}
-        r.m.position_cost[self.TICKER] = 90.0             # marked ~0.41 ⇒ ~$49 of loss
+        r.m.positions[self.TICKER] = {"yes": 200.0, "no": 0.0}
+        r.m.position_cost[self.TICKER] = 150.0            # marked ~0.41 ⇒ ~$68 of loss —
+                                                          # past the ceiling-scaled floor
+                                                          # ($60 at $300), which the breach
+                                                          # check now honors
         out = r.iteration(NOW + 1)
         self.assertTrue(out.get("day_stop"))
         self.assertTrue(r.m.halt.halted)

@@ -506,7 +506,13 @@ DENY_SERIES = {
 #   Trump-says market resolves off a news event exactly as an earnings mention does; the
 #   family is denied for the same one mechanism (note 43 §4), by substring so MONTH/COMPANY
 #   and future variants are all covered.
-DENY_SUBSTRINGS = ("MENTION", "KXRAIN", "KXTRUMPSAY")
+# ── KXTRUMPSAY LIFTED (Ryan, 2026-07-30: measure, don't ban).  It was denied by me
+# mid-incident, before the structural fixes existed.  What now covers the mechanism: the
+# post-fill cooldown (the burst loop is unreachable), measured per-fill fees, measured φ
+# ((★) refuses a rung whose lot gets eaten), and the cluster rail.  The two families that
+# REMAIN denied carry real-dollar tape: EARNINGSMENTION (−$16 PYPL/BA, fills-on-news) and
+# KXRAIN (v4-measured toxic, 40 markets) — they lift on Ryan's word, not silently.
+DENY_SUBSTRINGS = ("MENTION", "KXRAIN")
 
 
 def family_denied(ticker):
