@@ -403,7 +403,7 @@ class CheapScanExchange(ScanExchange):
 
     def book(self, ticker):
         self.book_calls += 1
-        return 200, book(yes=(("0.02", "1200"),), no=(("0.97", "1200"),))
+        return 200, book(yes=(("0.06", "1200"),), no=(("0.93", "1200"),))
 
 
 class TestOnePathToTheWireAssembled(RunnerCase):

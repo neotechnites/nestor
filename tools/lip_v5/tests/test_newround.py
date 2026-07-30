@@ -32,7 +32,7 @@ RUNGS = ["KXAAAGASD-26JUL29-T%d.0" % i for i in range(1, 5)]
 NESTOR = {"open_order_tickers": [], "position_tickers": []}
 
 
-def bk(yes_px="0.02", yes_sz="1200", no_px="0.97", no_sz="1200"):
+def bk(yes_px="0.06", yes_sz="1200", no_px="0.93", no_sz="1200"):
     return {"orderbook": {"orderbook_fp": {"yes_dollars": [[yes_px, yes_sz]],
                                            "no_dollars": [[no_px, no_sz]]}}}
 
@@ -86,21 +86,21 @@ class TestRequoteAtTheNewBestReachesTheWire(NewRoundCase):
         """THE ADVERSARIAL TEST.  Pre-fix this asserts nothing at 3c ever reaches the wire."""
         r, ex = self._armed()
         old = list(r.m.orders.values())[0]
-        self.assertAlmostEqual(float(old["price"]), 0.02, places=6)
-        ex.books[TK] = bk("0.03", "3000", "0.96", "1200")     # rivals lift the best
+        self.assertAlmostEqual(float(old["price"]), 0.06, places=6)
+        ex.books[TK] = bk("0.07", "3000", "0.92", "1200")     # rivals lift the best
         t = NOW + 40
         for _ in range(6):
             r.iteration(t)
             t += 1.0
         prices = sorted({round(float(b["price"]), 4) for b in ex.placed})
-        self.assertIn(0.03, prices,
+        self.assertIn(0.07, prices,
                       "NO order at the NEW best ever reached the exchange: %s" % (prices,))
 
     def test_the_deadlock_leaves_no_cluster_refusal_behind(self):
         """The refusal is the deadlock's own fingerprint: a make-before-break REPLACEMENT is
         not an addition, so it must never be measured against the cluster as one."""
         r, ex = self._armed()
-        ex.books[TK] = bk("0.03", "3000", "0.96", "1200")
+        ex.books[TK] = bk("0.07", "3000", "0.92", "1200")
         t = NOW + 40
         for _ in range(6):
             r.iteration(t)
@@ -112,14 +112,14 @@ class TestRequoteAtTheNewBestReachesTheWire(NewRoundCase):
         """MBB's other half: once the replacement rests, the old one is cancelled — the slot
         must not end with two live orders (or with only the stale one)."""
         r, ex = self._armed()
-        ex.books[TK] = bk("0.03", "3000", "0.96", "1200")
+        ex.books[TK] = bk("0.07", "3000", "0.92", "1200")
         t = NOW + 40
         for _ in range(6):
             r.iteration(t)
             t += 1.0
         live = [o for o in r.m.orders.values() if o.get("remaining", 0) > 0]
         self.assertEqual(len(live), 1, "expected exactly one live quote, got %s" % (live,))
-        self.assertAlmostEqual(float(live[0]["price"]), 0.03, places=6)
+        self.assertAlmostEqual(float(live[0]["price"]), 0.07, places=6)
 
 
 # =============================================================================================

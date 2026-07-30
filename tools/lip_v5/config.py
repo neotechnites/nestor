@@ -738,8 +738,36 @@ FREE_RIDE_ONLY = True
 # staying.  MIRROR (band too NARROW ↔ too wide): too narrow starves the book and shows up as
 # `entry_band_refused` counts with idle capital — the instrument is in place; too wide is the
 # 2c cohort, which is a measured −100% on 765 markets.
-ENTRY_BAND_LO_C = 7
-ENTRY_BAND_HI_C = 20
+# ── CORRECTED 2026-07-29 night (Ryan).  THE BAND IS A BIAS FLOOR, NOT A VARIANCE INSTRUMENT. ──
+# The first cut of this was a 7-20c BAND and it was justified on two grounds at once: measured
+# bias, and ruin.  The ruin half was wrong, and the specification asked for the right thing:
+# "instead of a hard cap just track our average variance and make sure its above that".
+# WHY A PRICE CAP CANNOT BE THE VARIANCE INSTRUMENT.  Portfolio variance per deployed dollar is
+# `V = Σ wᵢ²(1−pᵢ)/pᵢ` and `CV = √V`.  At the 0.25 tolerance below, EVERY one of these books
+# passes — computed, not asserted:
+#     30 markets @ 12c → V = 0.244, CV 49%, P(zero winners) 2.2%
+#     50 markets @  8c → V = 0.230, CV 48%, P(zero winners) 1.6%
+#    100 markets @  4c → V = 0.240, CV 49%, P(zero winners) 1.7%
+#    200 markets @  2c → V = 0.245, CV 49%, P(zero winners) 1.8%
+# A book made ENTIRELY of 2c rungs is inside tolerance at N = 200.  So price carries no
+# variance information on its own — only price TOGETHER WITH breadth does, which is exactly what
+# V measures and what a per-rung price cap cannot see.  Any price floor derived from ruin is
+# `p_min = k/bankroll` again (note 47 §5/§6, "do not rediscover"), and it fails the same way: at
+# a fixed budget cheap rungs cost less, so N rises as p falls and `E[hits] = B/Q` is
+# price-independent.  Tracking the realised book sidesteps the error entirely, because it never
+# assumes N — it reads it.  See `PORTFOLIO_VAR_MAX` and `guards.portfolio_variance`.
+# WHAT SURVIVES, ON A DIFFERENT GROUND ENTIRELY: BIAS.  Note 47 §3, n = 8,240 settled markets,
+# real two-sided quotes at close−60min — realised frequency against posted price: 1c −94.8%
+# (n=3,205), 2c **0.00% realised on 765 markets** (−100%), 3–5c −64.6% (n=333), and 6–20c −13%
+# to −19% NOT SIGNIFICANT.  A −100% cohort is not a variance problem and no amount of breadth
+# diversifies it away; it is a losing bet at every weight.  6c is where the measured bias stops
+# being distinguishable from zero, and that — not ruin — is the whole content of this floor.
+# THERE IS NO UPPER BOUND.  The old 20c ceiling was capital efficiency ("81–99c is the worst
+# reward real estate on the board", note 47 §4), which the objective already prices through
+# `gross ∝ 1/p`: an expensive rung simply loses the water-filling comparison.  A hard ceiling
+# added nothing and it is what emptied the book.
+ENTRY_BAND_LO_C = 6
+ENTRY_BAND_HI_C = 99                         # no ceiling: MAX_LEGAL_PRICE_C already bounds it
 # ── STAGED INERT.  THE BAND IS DERIVED AND CORRECT AND CANNOT BE ARMED YET. ─────────────────
 # MEASURED, on arming it: the band's intersection with the (★) ADMISSION GATE IS EMPTY, so the
 # book rests NOTHING AT ALL.  Not a fixture artifact — the cause is a single input:
@@ -772,7 +800,14 @@ ENTRY_BAND_HI_C = 20
 # by whichever value makes the current change look good.  Arming this band therefore REQUIRES
 # the λ measurement (note 50 §5's classify-sweep field), not a choice.
 # Instrument if this is ever armed: `entry_band_refused` against `idle_capital`.
-ENTRY_BAND_ARMED = False
+# ARMED 2026-07-29 night, together with the one-seed phi (`money.seed_phi`).  THE TWO MUST SHIP
+# TOGETHER AND NEITHER IS CORRECT ALONE: the phi step was price discipline wearing a fill-hazard
+# estimate's name, so removing it without the band leaves NO price discipline at all — and
+# `ACQUIRE_FLOOR_C` is still in `git stash`, `n_cap` still buys MORE contracts as price falls, so
+# the unbanded book's cheapest rung gets its biggest order.  That is the 999-contract 1c gas rung.
+# Armed, the band is the floor the phi step was crudely proxying, derived from measurement
+# instead: bias (n = 8,240) and competition, both in the note above.
+ENTRY_BAND_ARMED = True
 
 # UNDERIVED (note 23 §II), flagged upward rather than shipped silently:
 #   * THE FATE SENTENCE ITSELF.  "A position acquired by this system ends by ____" has no
@@ -914,6 +949,27 @@ PER_MARKET_POOL_MULT = 4.0                   # v1 §8.2 never risk 4× a market'
 # MIRROR (too LOW ↔ too high): too low refuses size a market's pool would have paid for and
 # shows up as `market_cap` refusals with accrual left on the table — bounded and recoverable
 # next period.  Too high is the -$587: an unbounded one-sided position with no exit.
+# --- THE TRACKED PORTFOLIO VARIANCE (2026-07-29 night, Ryan's specification) ---
+# "instead of a hard cap just track our average variance and make sure its above that".
+# THE QUANTITY.  A binary held to settlement pays $1 or $0, so one dollar at price p has payoff
+# variance `(1−p)/p`.  Across a book with weights wᵢ (each cluster's share of deployed capital):
+#     V = Σ wᵢ²(1−pᵢ)/pᵢ        CV = √V        N_eff = 1/Σ wᵢ²
+# V is variance PER DEPLOYED DOLLAR, so it is scale-free: the same number governs a $45 book and
+# a $300 one, which is why it can be a standing rail rather than a constant that needs re-deriving
+# every time the ceiling moves.
+# THE THRESHOLD.  0.25 ⇒ CV = 50%: a one-standard-deviation day moves half the deployed capital.
+# Chosen because at N ≈ 30 it is also where `P(zero winners)` — the quantity that actually ruins a
+# held-to-settlement book, since with no winners every stake is lost — falls to ~2%, and because
+# it is satisfiable in many shapes rather than only one (30@12c, 50@8c, 100@4c, 200@2c all pass).
+# UNDERIVED as a utility statement: 50% is a tolerance, not a theorem, and it is Ryan's to set.
+# WHY PER CLUSTER AND NOT PER MARKET.  Independence is the unit variance is denominated in, and
+# note 43 §3 / note 47 §5 settle what the unit is: a threshold ladder is ONE bet wearing many
+# tickers (gas gave nine rungs on one settle number).  Weighting by market would report N_eff = 30
+# for thirty rungs of one ladder — the exact error that produced the −$587 unmatched residual.
+# Intra-cluster netting is deliberately IGNORED (it can only reduce true variance), so V is an
+# upper bound and errs toward refusing.
+PORTFOLIO_VAR_MAX = 0.25
+
 MARKET_CAP_FRAC = 0.10
 # ONE FRACTION, TWO CONSUMERS.  The plan (`alloc.market_cap_usd`) and the rail (B16) must not
 # hold separate opinions about how much of the book one market may be; see the plan ⊆ rail proof

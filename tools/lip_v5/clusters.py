@@ -232,7 +232,25 @@ def by_cluster(positions):
 # re-measured: L from our own worst cluster-day, M from how often two clusters draw down
 # together.  Until then this is one observation and a stress assumption, and it is written
 # here so the next revision argues with the numbers rather than the feel.
-MAX_CLUSTER_FRAC = 1.0 / 4.0
+# ── CORRECTED 2026-07-29 night.  THE CONSTANT DID NOT MATCH ITS OWN DERIVATION. ──────────────
+# `cluster_cap_usd`'s capital-floor paragraph reads "no single settle-source may hold more than
+# 1/6 of the book, i.e. a total loss in one cluster costs at most ~17% of the ceiling".  The
+# constant was 1/4 — 25%, not 17% — so the number the comment justified was never the number the
+# code used.  Same defect class as B16's "replaces it": a derivation is only binding if an
+# assignment enforces it.
+# AND 1/6 WAS ITSELF TOO LOOSE FOR THE PLAN IT SERVES.  The strategy is one rung per settle
+# source, ~$10 of a $300 ceiling — a weight of 3.3%.  A backstop at 25% is 7.5x anything the plan
+# ever wants, and against the tracked variance tolerance (`PORTFOLIO_VAR_MAX = 0.25`) it is a
+# BREACH at every price we actually quote: one cluster at 25% gives V = 0.458 at 12c and V = 0.979
+# at 6c, i.e. four times tolerance.  It only satisfies 0.25 at exactly 20c, which is where it was
+# implicitly calibrated.
+# SO: the same 0.10 the per-market cap uses.  At a $300 ceiling that is $30 = three rungs of the
+# planned size, which leaves headroom without permitting a ladder.  Note this cap does NOT on its
+# own deliver the variance tolerance — ten clusters at $30 each is still V = 0.73 — which is
+# exactly why the binding instrument is the tracked measure and this is only a backstop.
+# The COLD-START floor is unaffected: `max(INV_CAP_USD, ...)` keeps $10 available at any ceiling,
+# which is the failure ("EVERY placement refused for five minutes") that floor exists for.
+MAX_CLUSTER_FRAC = C.MARKET_CAP_FRAC
 
 
 def cluster_cap_usd(day_stop_threshold_usd, inv_cap_usd=C.INV_CAP_USD,

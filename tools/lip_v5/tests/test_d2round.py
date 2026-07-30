@@ -145,34 +145,90 @@ class TestTheLiveProgramFilter(LipTestCase):
 # =============================================================================================
 # The entry band — STAGED INERT, and the inertness must be detectable.
 # =============================================================================================
-class TestTheEntryBandIsStagedInert(LipTestCase):
+class TestTheEntryBandIsABiasFloor(LipTestCase):
+    """CORRECTED: was `TestTheEntryBandIsStagedInert`, asserting a 7-20c band staged inert.
 
-    def test_the_band_is_NOT_armed(self):
-        """Armed, its intersection with the (★) admission gate is EMPTY: `phi` is seeded by
-        PRICE with an 80x step at 5c, and every in-band price lands on the refusing side."""
-        self.assertFalse(C.ENTRY_BAND_ARMED)
+    Ryan's specification was "instead of a hard cap just track our average variance and make sure
+    its above that", and the first cut shipped a hard per-rung price band instead.  A price cap
+    cannot BE the variance instrument: 200 markets at 2c and 30 at 12c sit at the SAME V ~ 0.245,
+    so price only carries variance information together with breadth.  What survives is a floor on
+    measured BIAS — 2c realised 0.00% on 765 markets (note 47 §3, n = 8,240) — which no amount of
+    diversification fixes.  Hence: floor at 6c, NO ceiling, and `PORTFOLIO_VAR_MAX` does the ruin
+    work (see TestTheTrackedPortfolioVariance).
+    """
 
-    def test_INERT_an_out_of_band_price_is_admitted(self):
-        slots = scan.build_slots([prog()], Table(bid_p=0.02, ask_p=0.95), NOW)
-        self.assertEqual(sides(slots), ["ask", "bid"])
+    def test_the_floor_is_where_the_MEASURED_bias_stops_and_there_is_no_ceiling(self):
+        self.assertTrue(C.ENTRY_BAND_ARMED)
+        self.assertEqual(C.ENTRY_BAND_LO_C, 6)
+        self.assertGreaterEqual(C.ENTRY_BAND_HI_C, C.MAX_LEGAL_PRICE_C - 1,
+                                "a hard upper bound is capital efficiency, which the objective "
+                                "already prices through gross prop 1/p")
 
-    def test_ARMED_an_out_of_band_price_is_refused_and_an_in_band_one_is_not(self):
-        self.arm_band()
-        self.assertEqual(scan.build_slots([prog()], Table(bid_p=0.02, ask_p=0.95), NOW), [])
-        # 12c bid is in band; 85c ask is not — on a binary the sides sum to ~$1, so the band
-        # admits exactly ONE side per market.  That is the design, not a defect.
-        self.assertEqual(sides(scan.build_slots([prog()], Table(), NOW)), ["bid"])
+    def test_a_sub_floor_price_is_refused_and_only_that_side(self):
+        """A binary's two sides sum to ~$1, so the floor bites ONE side: the 2c bid goes, the
+        95c ask stays.  With no upper bound that is the whole effect of the floor."""
+        self.assertEqual(sides(scan.build_slots([prog()], Table(bid_p=0.02, ask_p=0.95), NOW)),
+                         ["ask"])
 
-    def test_ARMED_a_held_ticker_is_still_exempt(self):
-        self.arm_band()
+    def test_an_expensive_side_is_NOT_refused(self):
+        """The old 20c ceiling deleted these, and it is what emptied the book."""
+        self.assertEqual(sides(scan.build_slots([prog()], Table(bid_p=0.12, ask_p=0.85), NOW)),
+                         ["ask", "bid"])
+
+    def test_a_held_ticker_is_exempt_from_the_floor(self):
         self.assertTrue(scan.build_slots([prog()], Table(bid_p=0.02, ask_p=0.95), NOW,
-                                         held={TK}))
+                                        held={TK}))
 
-    def arm_band(self):
-        for name, val in (("ENTRY_BAND_ARMED", True),):
-            old = getattr(C, name)
-            setattr(C, name, val)
-            self.addCleanup(setattr, C, name, old)
+
+class TestTheTrackedPortfolioVariance(LipTestCase):
+    """Ryan's instrument: V = sum wi^2 (1-pi)/pi over CLUSTERS, weights against the CEILING."""
+
+    def leg(self, tk, n, b):
+        return {"ticker": tk, "side": "yes", "n": n, "basis": b}
+
+    def test_the_target_book_passes_and_a_single_ladder_does_not(self):
+        thirty = [self.leg("C%02d-1" % i, 83.3, 0.12) for i in range(30)]
+        v, n_eff = G.portfolio_variance(thirty, denominator_usd=300.0)
+        self.assertLessEqual(v, C.PORTFOLIO_VAR_MAX)
+        self.assertGreater(n_eff, 25)
+        # the gas geometry: nine rungs, ONE settle source, one bet
+        ladder = [self.leg("KXAAAGASD-26JUL29-T%d" % i, 278, 0.12) for i in range(9)]
+        v2, n2 = G.portfolio_variance(ladder, denominator_usd=300.0)
+        self.assertGreater(v2, C.PORTFOLIO_VAR_MAX)
+        self.assertLess(n2, 1.5, "nine rungs of one ladder is ONE bet, not nine")
+
+    def test_a_book_of_2c_rungs_passes_AT_BREADTH(self):
+        """The result that kills the price floor as a variance instrument."""
+        book = [self.leg("C%03d-1" % i, 75, 0.02) for i in range(200)]
+        v, _ = G.portfolio_variance(book, denominator_usd=300.0)
+        self.assertLessEqual(v, C.PORTFOLIO_VAR_MAX)
+
+    def test_the_FIRST_order_is_admitted_which_is_why_the_denominator_is_the_ceiling(self):
+        """Against DEPLOYED capital the first order is one cluster at w = 1.0, V = 7.33, and a
+        variance rail would refuse every book's first order forever."""
+        first = [self.leg("AAA-1", 83.3, 0.12)]
+        v_ceiling, _ = G.portfolio_variance(first, denominator_usd=300.0)
+        v_deployed, _ = G.portfolio_variance(first)
+        self.assertLess(v_ceiling, C.PORTFOLIO_VAR_MAX)
+        self.assertGreater(v_deployed, C.PORTFOLIO_VAR_MAX)
+
+    def test_an_empty_book_has_no_variance(self):
+        self.assertEqual(G.portfolio_variance([], denominator_usd=300.0), (0.0, 0.0))
+
+    def test_the_rail_refuses_a_concentrating_order_and_ALWAYS_admits_a_diluting_one(self):
+        heavy = [self.leg("AAA-1", 4000, 0.06)]              # $240 of a $300 ceiling, one cluster
+        ctx = G.PlaceContext(portfolio_var_max=C.PORTFOLIO_VAR_MAX, ceiling_usd=300.0,
+                             positions=heavy)
+        ok, reason, _ = G.place_allowed(ctx, {"ticker": "AAA-2", "side": "yes", "n": 100,
+                                              "basis": 0.06, "fully_closing": False})
+        self.assertFalse(ok)
+        self.assertEqual(reason, "portfolio_var")
+        # THERE IS NO DILUTING ORDER.  Ceiling-denominated weights rise with every added dollar,
+        # so a second cluster raises V too — which is why the guard has no "only if it worsens V"
+        # clause: that condition could never be false.  What must still work is LEAVING:
+        ok2, reason2, _ = G.place_allowed(ctx, {"ticker": "AAA-1", "side": "no", "n": 100,
+                                                "basis": 0.06, "fully_closing": True})
+        self.assertTrue(ok2, "a book above tolerance must always be able to LEAVE: %s" % reason2)
 
 
 # =============================================================================================
@@ -225,12 +281,20 @@ class TestB15B16FireThroughTheRealPlaceContext(EngineCase):
                                               "n": 4, "basis": 0.50,
                                               "fully_closing": False})
         self.assertFalse(ok)
-        self.assertEqual(reason, "market_cap")
-        # ...and the OPPOSING leg is untouched (D2: exactly one outcome pays)
-        ok2, reason2, _ = G.place_allowed(ctx, {"ticker": "MINE-1", "side": "no",
-                                                "n": 4, "basis": 0.50,
-                                                "fully_closing": False})
-        self.assertTrue(ok2, reason2)
+        # B16 IS SHADOWED BY THE CLUSTER CAP for a single-market cluster, and that is expected
+        # rather than a defect: `MARKET_CAP_FRAC == MAX_CLUSTER_FRAC` (the plan puts ONE rung per
+        # settle source, so market and cluster coincide), and the cluster check runs first because
+        # cheaper refusals should name the specific cause.  B16 survives as the belt for the
+        # MULTI-market cluster, where `worst_case_loss_usd` nets the ladder and would otherwise
+        # let one market inside it run unbounded.  The per-leg semantics are asserted directly in
+        # test_guards.TestB16...test_the_cap_is_PER_LEG...; what this test owns is the PLUMBING.
+        self.assertIn(reason, ("market_cap", "cluster_worst_case_cap"), reason)
+        # The opposing-leg admission is NOT asserted here: for an unparseable ticker
+        # `clusters.worst_case_loss_usd` cannot net the two legs, so it charges both at full basis
+        # and the CLUSTER cap refuses the ask for a reason that has nothing to do with B16.  The
+        # per-leg property is asserted against a hand-built context in
+        # test_guards.TestB16ThePerMarketAcquisitionCap, which is the right place for a unit
+        # property; this test owns only that the real `place_context` plumbs the cap through.
 
     def test_D5_a_gone_404_order_is_NOT_charged_as_collateral(self):
         """The exchange said the id does not exist; six other consumers of `self.orders` already

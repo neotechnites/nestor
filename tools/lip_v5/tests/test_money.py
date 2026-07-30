@@ -140,17 +140,28 @@ class TestPhiAndD(LipTestCase):
     def test_rule_of_three_replaces_the_guessed_seeds(self):
         """§2.4 — zero-fill venues use `φ_ub = 3 / Σ rest_contract_hours` at 95%, and the
         seeds survive only as the CEILING at zero exposure."""
-        self.assertAlmostEqual(M.phi_estimate(0, 300.0, p=0.50), 0.01, places=9)
-        self.assertAlmostEqual(M.phi_estimate(0, 0.0, p=0.50), C.PHI_SEED_MID)
+        # THE SEED IS THE CEILING AT ALL EXPOSURES, not only at zero (spec §2.4), so with
+        # ONE seed a zero-fill venue sits at PHI_SEED_CHEAP until 3/E drops below it — i.e.
+        # "assume a resting order is rarely eaten until one actually is".  That is the
+        # bootstrap escape: without the cap a venue at E = 1 would read phi = 3.0 and be
+        # refused, so it could never accumulate the exposure that would lower it.
+        self.assertAlmostEqual(M.phi_estimate(0, 300.0, p=0.50), C.PHI_SEED_CHEAP, places=9)
+        self.assertAlmostEqual(M.phi_estimate(0, 6000.0, p=0.50), 0.0005, places=9)
+        # ONE SEED, NO PRICE STEP (2026-07-29).  The step was a bootstrap deadlock: at 12c
+        # the 0.08 seed refused the venue AND capped phi_ub, so E never left 0 and the
+        # Rule of Three — the actual estimator — could never run.  See money.seed_phi.
+        self.assertAlmostEqual(M.phi_estimate(0, 0.0, p=0.50), C.PHI_SEED_CHEAP)
         self.assertAlmostEqual(M.phi_estimate(0, 0.0, p=0.02), C.PHI_SEED_CHEAP)
-        # a bound WIDER than the seed is capped by the seed at low exposure
-        self.assertAlmostEqual(M.phi_estimate(0, 1.0, p=0.50), C.PHI_SEED_MID)
+        self.assertAlmostEqual(M.seed_phi(0.50), M.seed_phi(0.02),
+                               "the seed must not step on price")
+        # a bound WIDER than the seed is still capped by the seed at low exposure
+        self.assertAlmostEqual(M.phi_estimate(0, 1.0, p=0.50), C.PHI_SEED_CHEAP)
         # with fills, it is the plain rate
         self.assertAlmostEqual(M.phi_estimate(12, 150.0), 0.08, places=9)
 
     def test_rule_of_three_tightens_with_evidence(self):
         prev = None
-        for e in (10.0, 100.0, 1000.0):
+        for e in (6e3, 6e4, 6e5):          # past the seed cap, where 3/E is the binding bound
             ub = M.phi_estimate(0, e, p=0.50)
             if prev is not None:
                 self.assertLess(ub, prev)

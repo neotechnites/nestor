@@ -114,10 +114,47 @@ def phi_estimate(fills_ct, rest_contract_hours, p=None, rule_of_three=C.RULE_OF_
 
 
 def seed_phi(p):
-    """v1 §2.2 seeds, retained ONLY as the zero-exposure ceiling (spec §2.4)."""
-    if p is None:
-        return C.PHI_SEED_MID
-    return C.PHI_SEED_CHEAP if float(p) < C.PHI_CHEAP_PRICE_CUT else C.PHI_SEED_MID
+    """The zero-exposure ceiling on φ_ub (spec §2.4).  ONE seed, no price step.
+
+    ── 2026-07-29: THE PRICE STEP WAS A BOOTSTRAP DEADLOCK.  THE MEASUREMENT. ────────────────
+    v1 §2.2 stepped this seed by price: `PHI_SEED_CHEAP = 0.001` below 5c, `PHI_SEED_MID = 0.08`
+    at or above.  An 80x step at a cutoff, and the docstring above `phi_estimate` is explicit
+    that a seed is only ever the CEILING on the Rule-of-Three bound, "never the estimate".  But
+    the ceiling decided everything, because the estimator can only run on exposure the gate has
+    to permit first:
+
+        φ_ub = min(3/E, seed).  At p = 12c the seed is 0.08, so E must exceed 37.5
+        contract-hours for 3/E to bind at all — and the (★) gate REFUSES at φ = 0.08, so no
+        order ever rests, so E stays at 0, so the seed stays at 0.08.  FOREVER.
+
+    Measured, holding everything else fixed (pool $100, rival score 1,200, q = 100): φ = 0.001
+    admits every price from 1c to 40c; φ = 0.08 admits 1c ONLY.  So the step was not a prior on
+    one venue, it was a GLOBAL ON/OFF SWITCH, and the 5c cut was the router that decided which
+    side of it each venue landed on.  THAT is the mechanism behind "98.4% of contracts placed at
+    <=5c" — admission, never sizing — and the cohort it admitted is the one note 47 §3 measured
+    at −94.8% (1c, n=3,205) and −100% (2c, 0 of 765 markets ever paid).  A gate whose binding
+    input selects, by construction, the only prices whose realised EV is measured to be total
+    loss, is not a gate; it is the loss with a derivation attached.
+
+    WHY ONE SEED IS NOT "PICKING THE NUMBER THAT MAKES IT WORK".  The choice is not between two
+    fill-rate beliefs; it is between letting the DERIVED estimator run and letting an UNDERIVED
+    constant pre-empt it.  The Rule of Three is a closed form, it is an UPPER bound (so it errs
+    toward refusing — the direction that fails toward the lesson), and it tightens with every
+    contract-hour: at E = 100 it is already 0.030.  One venue-hour of our own tape replaces this
+    number entirely.  Keeping a step that prevents that hour from ever existing preserves a guess
+    at the cost of the measurement, which is backwards.
+    AND THE PRICE QUESTION IS NOW ANSWERED WHERE IT HAS EVIDENCE: `config.ENTRY_BAND_LO_C..HI_C`
+    is derived from measured BIAS (n = 8,240) and measured COMPETITION, not from a fill-rate
+    proxy.  The step was price discipline wearing a hazard estimate's name; the band is price
+    discipline with the measurement behind it.  Two mechanisms for one job, and this was the
+    guessed one.
+    MIRROR (seed too LOW ↔ too high): too low under-charges fill cost on a venue we have never
+    rested in — bounded to the FIRST observation, because the Rule of Three overrides it the
+    moment exposure exists, and bounded in dollars by the per-leg cap, the cluster cap and the
+    ceiling.  Too high is the deadlock above: the gate refuses the venue AND destroys the
+    evidence that would have cleared it, which is unbounded in time.
+    """
+    return C.PHI_SEED_CHEAP
 
 
 def d_estimate(drift_samples, p, seed=C.D_SEED_USD, trailing=C.D_TRAILING_FILLS):

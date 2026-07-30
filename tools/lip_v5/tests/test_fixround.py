@@ -76,7 +76,7 @@ class TestFakeFidelity(LipTestCase):
 
     def test_the_public_book_reflects_our_own_resting_orders(self):
         ex = X.FakeExchange(books={"T": cheap_book()})
-        ex.place({"ticker": "T", "side": "bid", "count": "50.00", "price": "0.0200",
+        ex.place({"ticker": "T", "side": "bid", "count": "50.00", "price": "0.0600",
                   "client_order_id": "v5-x-1"})
         _, body = ex.book("T")
         yes = body["orderbook"]["orderbook_fp"]["yes_dollars"]
@@ -129,10 +129,10 @@ class TestFillReplenishAtOneHz(FixRoundCase):
             t += 1.0
             r.iteration(t)
         # the filled order's collateral became inventory basis; only the REPLENISH rests
-        live = sum(o["remaining"] * 0.02 for o in r.m.orders.values()
+        live = sum(o["remaining"] * 0.06 for o in r.m.orders.values()
                    if not o.get("gone_404"))
         self.assertAlmostEqual(r.m.cash.resting_collateral, live, places=6)
-        self.assertAlmostEqual(r.m.cash.inventory_basis, n * 0.02, places=6)
+        self.assertAlmostEqual(r.m.cash.inventory_basis, n * 0.06, places=6)
 
     def test_a_fill_NEVER_freezes_its_own_market(self):
         """The reviewer's exact repro, inverted: 1 Hz through the whole recon window and
@@ -399,14 +399,14 @@ class TestHaltedClosingPass(FixRoundCase):
         r = self.runner(ex)
         r.init(NOW, nestor_state=NESTOR)
         r.m.positions[TK] = {"yes": 20.0, "no": 0.0}
-        r.m.entry_basis[(TK, "yes")] = 0.02
+        r.m.entry_basis[(TK, "yes")] = 0.06
         r.m.halt.halt("day_stop", NOW + 1)
         out = r.iteration(NOW + 2)
         self.assertTrue(out["halted"])
         sheds = [b for b in ex.placed if b["side"] == "ask"]
         self.assertTrue(sheds, "halted book cannot leave: no shed posted")
-        # joins the opposing best (1 − 0.97 = 0.03), never crossing the 0.02 bid
-        self.assertAlmostEqual(float(sheds[0]["price"]), 0.03, places=6)
+        # joins the opposing best (1 − 0.93 = 0.07), never crossing the 0.06 bid
+        self.assertAlmostEqual(float(sheds[0]["price"]), 0.07, places=6)
         self.assertAlmostEqual(float(sheds[0]["count"]), 20.0, places=6)
         # and it is not re-posted while one rests
         r.iteration(NOW + 3)
@@ -561,15 +561,15 @@ class TestBooksWired(FixRoundCase):
         r = self.runner(ex)
         r.init(NOW, nestor_state=NESTOR)
         r.iteration(NOW + 1)
-        self.assertAlmostEqual(float(ex.placed[0]["price"]), 0.02, places=6)
-        # rivals move the best bid to 3c
+        self.assertAlmostEqual(float(ex.placed[0]["price"]), 0.06, places=6)
+        # rivals move the best bid to 7c
         ex.books[TK] = {"orderbook": {"orderbook_fp": {
-            "yes_dollars": [["0.03", "1200"]], "no_dollars": [["0.96", "1200"]]}}}
+            "yes_dollars": [["0.07", "1200"]], "no_dollars": [["0.92", "1200"]]}}}
         t = NOW + 1
         for _ in range(5):
             t += 1.0
             r.iteration(t)
-        self.assertTrue(any(abs(float(b["price"]) - 0.03) < 1e-9 for b in ex.placed),
+        self.assertTrue(any(abs(float(b["price"]) - 0.07) < 1e-9 for b in ex.placed),
                         "the price reference never followed the book: books unwired")
 
     def test_held_and_ordered_markets_are_always_in_the_poll_set(self):

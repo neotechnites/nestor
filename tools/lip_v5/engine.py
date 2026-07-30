@@ -300,7 +300,9 @@ class Maker(object):
             ceiling_usd=self.ceiling_usd,
             market_cap_usd=C.market_leg_cap_usd(
                 self.ceiling_usd,
-                G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd)))
+                G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd)),
+            # B18 — the tracked variance tolerance.  Scale-free, so it needs no ceiling term.
+            portfolio_var_max=C.PORTFOLIO_VAR_MAX)
 
     def place(self, ticker, side, price, count, expiration_ts, now,
               fully_closing=False, available_cash_usd=None, lane="place",

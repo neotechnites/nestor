@@ -39,6 +39,75 @@ def day_stop_usd(projected_day_reward_usd,
     return min(float(cap), max(eff_floor, float(frac) * float(projected_day_reward_usd)))
 
 
+def portfolio_variance(positions, resting_basis=None, extra=None, denominator_usd=None):
+    """`V = Σ wᵢ²(1−pᵢ)/pᵢ` over CLUSTERS, and `N_eff = 1/Σ wᵢ²`.  Returns `(V, N_eff)`.
+
+    ── `denominator_usd` — THE WEIGHTS ARE FRACTIONS OF THE CEILING, NOT OF WHAT IS DEPLOYED. ──
+    This is the difference between a rail that works and one that cannot start.  Against DEPLOYED
+    capital the first order in an empty book is one cluster at w = 1.0, so V = (1−p)/p = 7.33 at
+    12c — over any sane tolerance — and a variance rail would refuse EVERY first order and the
+    book could never reach the breadth that satisfies it.  Measured: gating on deployed weights
+    broke 59 tests, all of them "nothing reached the exchange".
+    Against the CEILING the same order is w = 1/30 and V = 0.008, and V rises as the book fills,
+    reaching tolerance exactly when the capital is fully deployed:
+        30 clusters × $10 of a $300 ceiling, all at 12c → V = 0.244  (the target book)
+        1 cluster × $300                                → V = 7.33   (refused, correctly:
+                                                                      that is one bet)
+    So the same threshold that describes the finished book also admits the path to it, and the
+    constraint is FORWARD-LOOKING — it asks "is the book we are building diversified", not "is
+    the book we have so far diversified", which is the question that has no useful answer at
+    N = 1.  Falls back to deployed capital when no ceiling is supplied.
+
+    V is variance per CEILING dollar of a held-to-settlement book, so it is scale-free — the
+    same number governs a $45 book and a $300 one.  `(1−p)/p` is the payoff variance of one
+    dollar at price p on a binary that pays $1 or $0; `basis` IS that price, which is why this
+    needs no extra input beyond the book the caps already read.
+
+    CLUSTERS, not markets: a threshold ladder is one bet wearing many tickers (note 43 §3), so
+    weighting by ticker would report N_eff = 30 for thirty rungs of one gas ladder — the error
+    that produced the −$587 unmatched residual.  Intra-cluster netting is IGNORED, so V is an
+    upper bound and errs toward refusing.
+
+    `extra` — an order under consideration, counted as though it had filled.  A resting order is
+    contingent, but with no exit NET exposure equals GROSS the moment it fills, and a variance
+    rail that only sees positions learns about concentration from the fills.
+
+    An EMPTY book has V = 0 and N_eff = 0: no deployed dollars, no variance.  A leg whose basis
+    is outside (0, 1) contributes nothing and is logged, because a price we cannot read is a
+    variance we cannot compute and silently treating it as zero is the dangerous direction.
+    """
+    rows = list(positions or []) + list(resting_basis or [])
+    if extra is not None:
+        rows = rows + [extra]
+    by_cluster = {}
+    for p in rows:
+        n = abs(float(p.get("n", 0) or 0.0))
+        b = float(p.get("basis", 0.0) or 0.0)
+        usd = n * b
+        if usd <= 0:
+            continue
+        if not (0.0 < b < 1.0):
+            R.log_once("portfolio_var_unpriced_leg", ticker=p.get("ticker"), basis=b,
+                       note="basis outside (0,1): excluded from V")
+            continue
+        ck = CL.cluster_of(p.get("ticker"))
+        agg = by_cluster.setdefault(ck, [0.0, 0.0])
+        agg[0] += usd
+        agg[1] += usd * b                     # capital-weighted price, for the cluster's own p
+    deployed = sum(a[0] for a in by_cluster.values())
+    if deployed <= 0:
+        return 0.0, 0.0
+    total = max(float(denominator_usd or 0.0), deployed) or deployed
+    v = 0.0
+    sw2 = 0.0
+    for usd, usd_px in by_cluster.values():
+        w = usd / total
+        p = usd_px / usd                      # capital-weighted mean price in the cluster
+        sw2 += w * w
+        v += w * w * (1.0 - p) / p
+    return v, (1.0 / sw2 if sw2 > 0 else 0.0)
+
+
 def unpriced_positions(positions, yes_mids):
     """Tickers holding inventory for which NO two-sided mid exists."""
     return sorted(t for t, pos in (positions or {}).items()
@@ -464,7 +533,8 @@ class PlaceContext(object):
                  nestor_orders=None, nestor_positions=None, available_cash_usd=None,
                  cluster_cap_usd=None, frozen=None, denied_ok=True, refill=None,
                  n_cap_fn=None, day_stopped=False, skew_ok=True,
-                 ceiling_usd=None, market_cap_usd=None):
+                 ceiling_usd=None, market_cap_usd=None,
+                 portfolio_var_max=None):
         self.halt_state = halt_state
         self.positions = positions or []          # [{ticker, side, n, basis}] OPEN inventory
         self.resting_basis = resting_basis or []  # [{ticker, side, n, basis}] RESTING orders
@@ -479,6 +549,9 @@ class PlaceContext(object):
         self.skew_ok = skew_ok
         self.ceiling_usd = ceiling_usd            # B15 — the PLACEMENT-time ceiling
         self.market_cap_usd = market_cap_usd      # B16 — per-market acquisition cap
+        # B18 — the TRACKED variance tolerance (Ryan's spec): a rail on the aggregate,
+        # replacing the per-rung price floor that was standing in for one.
+        self.portfolio_var_max = portfolio_var_max
 
 
 def place_allowed(ctx, order):
@@ -554,6 +627,32 @@ def place_allowed(ctx, order):
     # payout floor in a market that would have paid — bounded, visible as `market_cap` refusals
     # against the accrual, and recoverable next period.  Too high is the -$587: an unbounded
     # one-sided position in a single market with no way out of it.
+    # ── B18 — THE TRACKED PORTFOLIO VARIANCE (Ryan's specification, 2026-07-29 night). ──────
+    # "instead of a hard cap just track our average variance and make sure its above that."
+    # This is the ruin instrument, and it REPLACES the price floor that was standing in for one.
+    # A per-rung price cap cannot see variance: 200 markets at 2c and 30 at 12c sit at the SAME
+    # V ≈ 0.245, so price only carries variance information together with breadth.  V reads the
+    # breadth off the actual book instead of assuming it, which is also why it does not
+    # rediscover `p_min = k/bankroll` (note 47 §6) — that error came from fixing N.
+    # NO "ONLY IF IT WORSENS V" CLAUSE, and the first cut had one — it was DEAD CODE.  With
+    # weights denominated in the CEILING, every added dollar raises Σwᵢ² and therefore raises V:
+    # there is no such thing as a diluting ORDER, only a diluting SETTLEMENT or shed.  A condition
+    # that can never be false is not a safeguard, it is a comment that reads like one.
+    # SO CAN THE BOOK GET STUCK ABOVE TOLERANCE?  No: `fully_closing` is exempt above, so the shed
+    # path always runs, and a position that settles leaves the book on its own.  The rail stops us
+    # ADDING to a concentrated book, which is the whole ask.
+    if not fully_closing and ctx.portfolio_var_max is not None:
+        _den = ctx.ceiling_usd
+        v_now, _ = portfolio_variance(ctx.positions, ctx.resting_basis,
+                                      denominator_usd=_den)
+        v_next, n_eff = portfolio_variance(ctx.positions, ctx.resting_basis, order,
+                                           denominator_usd=_den)
+        if v_next > float(ctx.portfolio_var_max) + 1e-12:
+            return False, "portfolio_var", {"v_now": round(v_now, 4),
+                                            "v_next": round(v_next, 4),
+                                            "n_eff": round(n_eff, 2),
+                                            "max": float(ctx.portfolio_var_max)}
+
     # ── D2: THE CAP IS PER LEG, NOT PER MARKET-GROSS.  THE DERIVATION. ──────────────────────
     # First cut summed BOTH legs of a ticker with no side test.  That is the wrong measure, and
     # it is wrong in the direction that contradicts this guard's own stated purpose.

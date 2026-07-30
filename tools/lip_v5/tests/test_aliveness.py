@@ -29,7 +29,7 @@ def cheap_book():
     """A qualifying cheap side: the gas geometry, the venue (★) ADMITS on spec §0.4's own
     numbers (gross ≈ 0.12/h per $, carry and drift negligible at φ_seed_cheap)."""
     return {"orderbook": {"orderbook_fp": {
-        "yes_dollars": [["0.02", "1200"]], "no_dollars": [["0.97", "1200"]]}}}
+        "yes_dollars": [["0.06", "1200"]], "no_dollars": [["0.93", "1200"]]}}}
 
 
 def treasury_book():
@@ -80,7 +80,7 @@ class TestOrdersAppear(EngineCase):
         body = r.m.ex.placed[0]
         self.assertEqual(body["ticker"], ALIVE_TICKER)
         self.assertEqual(body["side"], "bid")
-        self.assertAlmostEqual(float(body["price"]), 0.02, places=6)   # joins the best
+        self.assertAlmostEqual(float(body["price"]), 0.06, places=6)   # joins the best
         alloc_q = out["alloc"][(ALIVE_TICKER, "bid")]
         self.assertGreater(alloc_q, 0)
         self.assertAlmostEqual(float(body["count"]), float(alloc_q), places=6)
@@ -109,7 +109,7 @@ class TestOrdersAppear(EngineCase):
         r.init(NOW, nestor_state=NESTOR)
         out = r.iteration(NOW + 1)
         q = out["alloc"][(ALIVE_TICKER, "bid")]
-        spent = q * 0.02
+        spent = q * 0.06
         self.assertGreaterEqual(q, 1)
         self.assertLessEqual(spent, 0.20 * r.m.ceiling_usd + 1e-9)   # unverified bound
         st = r.m.venues["KXAAAGASD"]
@@ -245,7 +245,7 @@ def thin_book():
     ALLOCATE is right about size and wrong about entry — qualification is a DISCRETE
     precondition, created by the land grab."""
     return {"orderbook": {"orderbook_fp": {
-        "yes_dollars": [["0.01", "10"]], "no_dollars": [["0.50", "1200"]]}}}
+        "yes_dollars": [["0.06", "10"]], "no_dollars": [["0.50", "1200"]]}}}
 
 
 class TestLandGrabAppears(EngineCase):
