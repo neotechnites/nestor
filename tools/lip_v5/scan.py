@@ -103,6 +103,13 @@ class Scanner(object):
         self.refresh_s = float(refresh_s)
         self.last_scan = None
         self.programs = []
+        # DID THE MAP FINISH ARRIVING?  A scan that deferred on rate, errored, or ran out of
+        # pages with a cursor still open returns a PARTIAL table — correct-but-narrow, which
+        # is fine for discovery (we simply see fewer venues) and NOT fine for anyone reading
+        # absence as a judgement.  `reinstate` does exactly that, and read 16 healthy rungs as
+        # `no_live_program` 10 s after boot while the feed was still paginating.  So the scan
+        # states its own completeness rather than leaving callers to infer it.
+        self.last_scan_complete = False
 
     def due(self, now):
         return self.last_scan is None or (float(now) - self.last_scan) >= self.refresh_s
@@ -111,6 +118,7 @@ class Scanner(object):
         if not self.due(now):
             return self.programs
         pages, cursor, collected = 0, None, []
+        complete = False
         while pages < int(max_pages):
             ok, _ = bucket.admit("classify_sweep", now)
             if not ok:
@@ -129,10 +137,12 @@ class Scanner(object):
             cursor = (body or {}).get("next_cursor") or (body or {}).get("cursor")
             pages += 1
             if not cursor:
+                complete = True               # the feed drained: this map is the whole board
                 break
         if collected:
             self.programs = collected
             self.last_scan = float(now)
+            self.last_scan_complete = complete
         return self.programs
 
 
