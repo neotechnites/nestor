@@ -540,7 +540,13 @@ class Maker(object):
         self.rollback.note_fill(ticker, leg, now)
         self.ledger.write("fill_obs", ticker=ticker, side=side, count=count,
                           price_c=int(round(price * 100)), fill_id=fill_id,
-                          order_id=order_id, fee_usd=round(float(fee_usd), 6))
+                          order_id=order_id, fee_usd=round(float(fee_usd), 6),
+                          # REPLAY NEEDS THE DIRECTION (2026-07-30, the -$78 Skubal short):
+                          # without it every closing sell replayed as an OPENING short,
+                          # both legs stacked, inventory_basis hit $315 of a $300 ceiling
+                          # and the budget starved to zero.  One boolean.
+                          closing=bool(closing),
+                          closed_leg=(leg if closing else None))
         return True
 
     def pay_fee(self, usd):

@@ -605,3 +605,35 @@ class TestBookReinstatement(LipTestCase):
 
 
 from .. import runtime as R_
+
+
+class TestClosingFillsReplayAsClosing(LipTestCase):
+    """The −$78 Skubal short: a shed's fill replayed as OPENING the order's side, so a
+    closing sell of held YES became a fresh NO short, both legs stacked, inventory_basis
+    hit $315 of a $300 ceiling and the budget starved to zero.  fill_obs rows now carry
+    closing/closed_leg and the replay reduces the held leg."""
+
+    def test_a_closing_fill_row_reduces_the_held_leg(self):
+        from .. import cutover as CU
+        rows = [
+            {"k": "adopt", "ticker": "T", "side": "yes", "net": 26.0, "basis": 0.16},
+            {"k": "fill_obs", "ticker": "T", "side": "ask", "count": 26.0,
+             "price_c": 3, "fill_id": "f1", "order_id": "o9",
+             "closing": True, "closed_leg": "yes"},
+        ]
+        st = CU.V4Positions().replay(rows)
+        got = {(r["ticker"], r["side"]): r["net"] for r in st.rows()}
+        self.assertNotIn(("T", "no"), got, "the closing sell replayed as a NO short")
+        self.assertLessEqual(got.get(("T", "yes"), 0.0), 1e-9)
+
+    def test_a_plain_opening_fill_still_opens(self):
+        from .. import cutover as CU
+        rows = [
+            {"k": "place_resp", "order_id": "o1", "ticker": "T", "side": "bid",
+             "price": 0.06, "size": 40, "remaining_count": "40.00"},
+            {"k": "fill_obs", "ticker": "T", "side": "bid", "count": 40.0,
+             "price_c": 6, "fill_id": "f2", "order_id": "o1", "closing": False},
+        ]
+        st = CU.V4Positions().replay(rows)
+        got = {(r["ticker"], r["side"]): r["net"] for r in st.rows()}
+        self.assertAlmostEqual(got.get(("T", "yes"), 0.0), 40.0, places=6)

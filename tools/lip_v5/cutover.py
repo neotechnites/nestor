@@ -148,7 +148,20 @@ class V4Positions(object):
                 oid = rec.get("order_id")
                 o = self.orders.get(str(oid)) if oid else None
                 n = float(rec.get("count") or 0.0)
-                if o is not None:
+                # ── CLOSING FILLS REDUCE THE HELD LEG (2026-07-30, the −$78 Skubal short).
+                # A shed's fill used to replay as OPENING the order's side — a closing sell
+                # of held YES became a fresh NO short, both legs stacked, and the phantom
+                # basis starved the budget to zero.  v5-era rows carry `closing`/`closed_leg`.
+                if rec.get("closing"):
+                    _cl = rec.get("closed_leg") or "yes"
+                    _side_for_leg = "bid" if _cl == "yes" else "ask"
+                    if o is not None:
+                        o["extra_fills"] += n
+                        if o["reduced_by"] is None:
+                            o["reduced_by"] = 0.0
+                    self._apply(rec.get("ticker"), _side_for_leg, n,
+                                float(rec.get("price_c") or 0.0) / 100.0, sign=-1.0)
+                elif o is not None:
                     o["extra_fills"] += n
                     # v4 does exactly this: an order the fills API has spoken about is no
                     # longer resting, so a later cancel cannot also claim its remainder.

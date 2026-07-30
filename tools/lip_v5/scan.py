@@ -698,8 +698,7 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             unmeasured = fills <= 0 and rest_ch <= 0.0
             if C.ENTRY_BAND_ARMED and not is_held and unmeasured and \
                     not (C.ENTRY_BAND_LO_C <= p_c <= C.ENTRY_BAND_HI_C):
-                R.log("entry_band_refused", ticker=ticker, side=side, p_c=p_c,
-                      lo=C.ENTRY_BAND_LO_C, hi=C.ENTRY_BAND_HI_C)
+                R.log_once("entry_band_refused", ticker=ticker, side=side)
                 continue
             # SF-5: S is the RIVAL score — the classified book contains our own orders.
             S_riv = rival_S(sd["S"], p, (own_orders or {}).get(key))
