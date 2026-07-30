@@ -90,9 +90,59 @@ class TestNoChangeSuppression(LipTestCase):
         self.assertEqual(sorted(got), sorted([Q.TRIG_OFF_BEST, Q.TRIG_QUALIFIES]))
 
     def test_after_min_life_everything_fires(self):
+        # six since (f) TARGET_MOVED (grafted 2026-07-30): remaining 1 != target 100
         got = self._trig(resting_age_s=30.0, our_price_c=39, remaining=1.0, S_now=100.0,
                          qualifies_now=False, since_resync_s=100.0)
-        self.assertEqual(len(got), 5)
+        self.assertEqual(len(got), 6)
+        self.assertIn(Q.TRIG_TARGET_MOVED, got)
+
+
+class TestTargetMovedTrigger(LipTestCase):
+    """(f) TARGET_MOVED — grafted 2026-07-30 from the allocator-law branch after
+    adjudication.  The refill trigger is one-directional (fires when eaten DOWN past half
+    the target, silent when the PLAN grows), so a plan that grew <= 2x while the book sat
+    still never reached the wire: the rival's spine measured 83 -> 166 contracts stalled
+    forever (83 < 0.5 x 166 is false).  Equality is the test, the 30 s minimum resting
+    life is the pacing."""
+
+    def _trig(self, **kw):
+        args = dict(our_price_c=40, best_price_c=40, remaining=10, target_q=10,
+                    S_now=50.0, S_ref=50.0, qualifies_now=True, qualifies_ref=True,
+                    resting_age_s=120.0, since_resync_s=0.0)
+        args.update(kw)
+        return Q.requote_triggers(**args)
+
+    def test_f_fires_when_the_plan_moves_and_the_book_is_still(self):
+        got = self._trig(remaining=83, target_q=166)
+        self.assertIn(Q.TRIG_TARGET_MOVED, got)
+
+    def test_the_measured_boundary_case_83_of_166_no_longer_stalls(self):
+        """83 is exactly half of 166: the refill inequality sits ON its boundary and stays
+        silent; (f) is what reaches the wire.  Mutation: remove (f) and this list is []."""
+        got = self._trig(remaining=83, target_q=166)
+        self.assertNotIn(Q.TRIG_REFILL, got)
+        self.assertEqual(got, [Q.TRIG_TARGET_MOVED])
+
+    def test_f_respects_the_minimum_resting_life(self):
+        """(f) is a PLAN event, not a book event: it holds no claim against anti-gaming P1.
+        Inside 30 s only (a)/(d) survive."""
+        got = self._trig(remaining=83, target_q=166, resting_age_s=5.0)
+        self.assertNotIn(Q.TRIG_TARGET_MOVED, got)
+
+    def test_a_matching_size_does_not_fire(self):
+        self.assertEqual(self._trig(remaining=166, target_q=166), [])
+
+    def test_a_SHRUNK_plan_fires_too(self):
+        """Equality cuts both ways: dollars the plan moved elsewhere must come home."""
+        got = self._trig(remaining=166, target_q=83)
+        self.assertIn(Q.TRIG_TARGET_MOVED, got)
+
+    def test_no_change_suppression_uses_the_same_equality(self):
+        """The suppression's size test is now the equality (f) fires on — a plan that grew
+        while we rest at the touch is NOT a no-change requote."""
+        got = self._trig(remaining=83, target_q=166, S_now=100.0, since_resync_s=100.0)
+        self.assertIn(Q.TRIG_S_MOVED, got)
+        self.assertIn(Q.TRIG_RESYNC, got)
 
 
 class TestTheShedGeometryIsGone(LipTestCase):

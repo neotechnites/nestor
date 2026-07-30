@@ -15,9 +15,11 @@ requoter is a metering appliance.
 from . import config as C
 
 
-# §4.3's five triggers, v4's names kept so the two tapes read alike.
+# §4.3's five triggers, v4's names kept so the two tapes read alike — plus (f), grafted
+# 2026-07-30 from the allocator-law branch after adjudication (see `requote_triggers`).
 TRIG_OFF_BEST, TRIG_REFILL, TRIG_S_MOVED, TRIG_QUALIFIES, TRIG_RESYNC = (
     "a_off_best", "b_refill", "c_S_moved", "d_qualifies_flipped", "e_safety_resync")
+TRIG_TARGET_MOVED = "f_target_moved"
 
 
 def at_best(our_price_c, best_price_c):
@@ -40,6 +42,8 @@ def requote_triggers(our_price_c, best_price_c, remaining, target_q, S_now, S_re
         (c) S moved > 25%                (the share landscape changed)
         (d) qualification flipped        (the side appeared/vanished — overrides min life)
         (e) safety resync at 60 s        (catches missed stream events; doubles as WS re-proof)
+        (f) the PLAN moved               (remaining != target — the allocator re-sized while
+                                          the book sat still; grafted 2026-07-30)
 
     §4.4 / anti-gaming P1: the 30 s MINIMUM RESTING LIFE suppresses every trigger except
     (a) and (d) — a voluntary requote inside 30 s is indistinguishable from cancel-on-
@@ -58,6 +62,22 @@ def requote_triggers(our_price_c, best_price_c, remaining, target_q, S_now, S_re
         trig.append(TRIG_QUALIFIES)                                  # (d)
     if float(since_resync_s) >= float(resync_s):
         trig.append(TRIG_RESYNC)                                     # (e)
+    # ── (f) THE PLAN MOVED (grafted 2026-07-30 from the allocator-law branch, with its
+    # measurement).  The five triggers above are all BOOK events; not one fires when the
+    # ALLOCATOR changes its mind about size while the book sits still — and under the law it
+    # does exactly that: a market whose phi crosses from unmeasured to measured re-sizes from
+    # the lot tranche to its full allocation without a tick moving.  (b) REFILL is
+    # ONE-DIRECTIONAL — it fires when we have been eaten DOWN past half the target and is
+    # silent when the target rises above what rests.  MEASURED on the rival's spine: the plan
+    # moved 83 -> 166 contracts and the wire never moved (83 < 0.5 x 166 is false — the
+    # boundary sat exactly on the case), so a rung cancelled exchange-side came back at 166
+    # while its untouched twin sat at 83: same world, two books, the disease convergence
+    # names.  Equality, not a band: the plan is a deterministic function of the world, so it
+    # only moves when the world moves, and one requote makes remaining == target again.
+    # SUBJECT TO THE 30 s MINIMUM RESTING LIFE, deliberately: this is not a book event, so it
+    # has no claim to override anti-gaming P1.
+    if int(float(remaining)) != int(target_q):
+        trig.append(TRIG_TARGET_MOVED)                               # (f)
     if float(resting_age_s) < float(min_life_s):
         trig = [t for t in trig if t in (TRIG_OFF_BEST, TRIG_QUALIFIES)]
     # -----------------------------------------------------------------------------------------
@@ -77,10 +97,14 @@ def requote_triggers(our_price_c, best_price_c, remaining, target_q, S_now, S_re
     # (d) are exempt and both are book events — a quote that has drifted off best or whose side
     # vanished is requoted immediately regardless of age.  What is removed is only the
     # cancel-and-replace-identically path, which by construction cannot improve anything.
+    # ── "NEITHER OUR PRICE NOR OUR SIZE" WAS ONLY TESTING THE PRICE AND THE REFILL HALF OF
+    # THE SIZE (the rival branch's convergence spine found it, 2026-07-30).  The suppression's
+    # own sentence is "a requote that alters neither our PRICE nor our SIZE cannot alter our
+    # score", but the size test was `refill_needed`, one-directional — silent when the PLAN
+    # grew above what rests.  The honest size test is the same equality (f) fires on.
     at_touch = at_best(our_price_c, best_price_c)
-    refill_needed = bool(target_q) and \
-        float(remaining) < float(refill_frac) * float(target_q) - 1e-12
-    if at_touch and not refill_needed:
+    size_matches = int(float(remaining)) == int(target_q)
+    if at_touch and size_matches:
         trig = [t for t in trig if t not in (TRIG_S_MOVED, TRIG_RESYNC)]
     return trig
 
