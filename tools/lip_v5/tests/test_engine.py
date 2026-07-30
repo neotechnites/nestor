@@ -820,6 +820,62 @@ class TestTheSoleQualifierNeedsNoPermission(EngineCase):
         self.assertGreater(n.total_usd, 0.0)
 
 
+class TestFillSelectionTripwire(EngineCase):
+    """Owner, 2026-07-30: fills are adverse-selected samples of orders (cheap orders fill
+    more), so average POSITION price runs below average ORDER price; the bucket phis already
+    price the skew, and this line is the instrument that says when the buckets are too
+    coarse.  The arithmetic is asserted exactly — the log is the deliverable."""
+
+    def _wired(self):
+        m = self.maker()
+        # two resting bids: $10 at 10c and $5 at 50c
+        m.orders["o1"] = {"order_id": "o1", "ticker": "KXTW-1", "side": "bid",
+                          "price": 0.10, "remaining": 100.0, "placed_ts": NOW}
+        m.orders["o2"] = {"order_id": "o2", "ticker": "KXTW-2", "side": "bid",
+                          "price": 0.50, "remaining": 10.0, "placed_ts": NOW}
+        m.phi_by_key = {("KXTW-1", "bid"): 0.20, ("KXTW-2", "bid"): 0.05}
+        # one position: 50 YES at an 8c entry basis
+        m.positions["KXTW-3"] = {"yes": 50.0, "no": 0.0}
+        m.entry_basis[("KXTW-3", "yes")] = 0.08
+        return m
+
+    def test_the_three_numbers_and_their_arithmetic(self):
+        m = self._wired()
+        out = m.fill_selection_tripwire(NOW)
+        rec = self.logs_of("fill_selection_tripwire")
+        self.assertEqual(len(rec), 1)
+        # capital weights: w1 = 100 x 0.10 = $10, w2 = 10 x 0.50 = $5
+        self.assertAlmostEqual(out["avg_order_price_usd"],
+                               (10.0 * 0.10 + 5.0 * 0.50) / 15.0, places=6)
+        self.assertAlmostEqual(out["avg_position_price_usd"], 0.08, places=6)
+        # fill-rate weights: w·phi = 2.0 and 0.25; predicted position price
+        # = (2.0 x 0.10 + 0.25 x 0.50) / 2.25; gap = avg_order − predicted
+        pred = (2.0 * 0.10 + 0.25 * 0.50) / 2.25
+        self.assertAlmostEqual(out["predicted_gap_usd"],
+                               (10.0 * 0.10 + 5.0 * 0.50) / 15.0 - pred, places=6)
+        self.assertEqual(rec[0]["avg_order_price_usd"], out["avg_order_price_usd"])
+
+    def test_an_ask_weighs_its_own_collateral_not_the_yes_price(self):
+        """A NO-side order at a 0.84 yes-price costs 0.16 — the tripwire must weigh what
+        the capital IS, the same lesson every cap already paid for."""
+        m = self.maker()
+        m.orders["o1"] = {"order_id": "o1", "ticker": "KXTW-1", "side": "ask",
+                          "price": 0.84, "remaining": 10.0, "placed_ts": NOW}
+        out = m.fill_selection_tripwire(NOW)
+        self.assertAlmostEqual(out["avg_order_price_usd"], 0.16, places=6)
+
+    def test_it_rides_the_recon_cadence(self):
+        m = self._wired()
+        m.cycle(NOW + C.RECON_POSITIONS_S + 1, yes_mids={})
+        self.assertTrue(self.logs_of("fill_selection_tripwire"),
+                        "the tripwire must fire with the successful recon read")
+
+    def test_empty_books_stay_silent(self):
+        m = self.maker()
+        self.assertIsNone(m.fill_selection_tripwire(NOW))
+        self.assertEqual(self.logs_of("fill_selection_tripwire"), [])
+
+
 class TestNothingIsCapExempt(EngineCase):
     """LAW CHANGE (owner decision, 2026-07-30: "it's either running and placing orders, or
     it's not running").  `Maker.place` used to take `fully_closing=`, and that argument turned

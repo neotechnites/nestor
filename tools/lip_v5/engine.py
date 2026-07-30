@@ -88,6 +88,9 @@ class Maker(object):
         self.last_recon = 0.0
         self.last_orders_sync = 0.0   # the wire's resting book vs ours (see sync_orders)
         self.cycles = 0
+        # phi per (ticker, side) from the LAST slot table (the law §6 chain, resolved in
+        # scan.build_slots) — the fill_selection_tripwire's model input.
+        self.phi_by_key = {}
 
         # --- requoter state (charter A) ---
         self.S_ref = {}                      # (ticker, side) -> S at last requote (§4.3(c))
@@ -921,6 +924,7 @@ class Maker(object):
             # may carry the whole $10 — "we will put all 10").  B9's turnover cap and the
             # cluster rail still bound what fills may accumulate.
             self.slot_cap_usd = C.ALLOC_PER_MARKET_USD
+            self.phi_by_key = {s.key: s.phi for s in slots}
             for s in slots:
                 if s.program_id is not None:
                     self.ticker_program[s.ticker] = s.program_id
@@ -1014,6 +1018,10 @@ class Maker(object):
         if now - self.last_recon >= C.RECON_POSITIONS_S:
             if self.reconcile(now) is not None:
                 self.last_recon = now
+                # The adverse-selection tripwire rides the recon cadence (owner, 2026-07-30:
+                # reuse a cadence, don't invent one) — and rides the SUCCESSFUL read, so its
+                # numbers describe books the wire just verified.
+                self.fill_selection_tripwire(now)
         # …and the other half of the same question: does the wire still hold our ORDERS?
         self.sync_orders(now)
 
@@ -1857,6 +1865,55 @@ class Maker(object):
                 k = (o["ticker"], o["side"])
                 resting[k] = resting.get(k, 0.0) + float(o["remaining"])
         return resting
+
+    def fill_selection_tripwire(self, now):
+        """One log line against adverse selection in FILLS (owner, 2026-07-30).
+
+        Fills are adverse-selected samples of our orders — cheap orders fill more — so the
+        capital-weighted average PRICE of positions runs below that of resting orders.  The
+        skew is already PRICED when every rung carries its own price-bucket phi (law §6):
+        orders fill at rate phi_i x size_i, so the model's own predicted average position
+        price is Σ(w_i·phi_i·p_i) / Σ(w_i·phi_i) over the resting book (w_i = collateral,
+        p_i = per-contract basis), and the predicted gap is avg_order_price minus that.
+        THE TRIPWIRE: a realized gap (avg_order − avg_position) persistently WIDER than the
+        predicted one means the phi buckets are too coarse and the position book is rotting
+        faster than modeled — refine `scan.phi_bucket`.  Three numbers, no refusal, at the
+        recon cadence."""
+        ow = ov = 0.0                 # resting orders: Σw, Σw·p
+        fw = fv = 0.0                 # fill-rate-weighted: Σw·phi, Σw·phi·p
+        for o in self.orders.values():
+            if o.get("remaining", 0) <= 0 or o.get("gone_404"):
+                continue
+            basis = R.unit_collateral(o["side"], o["price"])
+            w = float(o["remaining"]) * basis
+            ow += w
+            ov += w * basis
+            phi = float(self.phi_by_key.get((o["ticker"], o["side"]), 0.0) or 0.0)
+            fw += w * phi
+            fv += w * phi * basis
+        pw = pv = 0.0                 # positions: Σw, Σw·p at ENTRY basis
+        for t, p in self.positions.items():
+            for leg in ("yes", "no"):
+                n = abs(float(p.get(leg, 0.0)))
+                if n <= 0:
+                    continue
+                basis = float(self.entry_basis.get((t, leg), 0.0))
+                w = n * basis
+                pw += w
+                pv += w * basis
+        if ow <= 0 and pw <= 0:
+            return None               # nothing resting, nothing held: nothing to compare
+        avg_order = (ov / ow) if ow > 0 else None
+        avg_position = (pv / pw) if pw > 0 else None
+        predicted = (fv / fw) if fw > 0 else avg_order
+        gap = (avg_order - predicted) if (avg_order is not None
+                                          and predicted is not None) else None
+        out = {"avg_order_price_usd": None if avg_order is None else round(avg_order, 6),
+               "avg_position_price_usd": None if avg_position is None
+               else round(avg_position, 6),
+               "predicted_gap_usd": None if gap is None else round(gap, 6)}
+        R.log("fill_selection_tripwire", **out)
+        return out
 
     def project_day_reward(self, slots, alloc_map):
         """SF-1 — OUR projected day accrual: `share(q,S) × ρ/2 × min(24h, hours_left)` over
