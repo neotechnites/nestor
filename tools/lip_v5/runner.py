@@ -178,7 +178,11 @@ class Runner(object):
         against an empty book and freeze everything.
         """
         rows = self.m.ledger.read()
-        st = cutover.V4Positions().replay(rows)               # same arithmetic, v5's own tape
+        # v5's OWN tape: positions are the SUM OF fill_obs ROWS, not v4's inference over
+        # order responses (which double-counts every fill v5 also wrote a row for — see
+        # V4Positions.replay's four cases).  `v4_tape=False` is the default; passed
+        # explicitly here because this is the call the doubling was measured on.
+        st = cutover.V4Positions().replay(rows, v4_tape=False)
         # Positions/costs are ASSIGNED from replay, never accumulated onto whatever startup
         # already staged (BLOCKER-2: adoption writes `adopt` rows, replay rebuilds them, and
         # adding on top would double `position_cost` on every restart).

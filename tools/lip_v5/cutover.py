@@ -88,9 +88,39 @@ class V4Positions(object):
         pos[leg] += sign * n
         legs[leg] = max(0.0, legs[leg] + sign * n * unit)
 
-    def replay(self, records):
-        """Mirror v4's `ledger_replay` ARITHMETIC EXACTLY (SF-D).
+    def replay(self, records, v4_tape=False):
+        """Rebuild positions from a ledger.  TWO TAPES, TWO ARITHMETICS.
 
+        `v4_tape=True` mirrors v4's `ledger_replay` INFERENCE exactly (documented below);
+        `v4_tape=False` — the default, because every caller inside v5 except `gen_adopt`
+        reads V5's OWN ledger — sums the `fill_obs` rows and nothing else.
+
+        WHY THE INFERENCE IS WRONG ON A V5 TAPE.  v4 had to INFER fills, because it did not
+        write a row for every one: `filled = fill_count + max(0, remaining_count − reduced_by)
+        + extra_fills` reconstructs what the order responses imply.  v5 writes a `fill_obs`
+        row for EVERY fill — book_fill is the single door into state and it always writes —
+        so the inference and the rows count the SAME contracts twice.  Four cases, all on
+        real v5 paths, all doubling in the direction that manufactures phantom inventory
+        (the class §6.3 refused option B over):
+
+          (a) partial fill + cancel with `reduced_by`: engine.cancel books the learned
+              remainder as a fill_obs (`fill_id="cancel:<oid>"`) AND writes the cancel_resp;
+              the inference adds `remaining − reduced_by` on top of the row.
+          (b) cancel-404 → `assume_404_filled`: book_fill (`assume404:<oid>`) writes the row,
+              then the `assume_filled` row re-applies the whole remainder.
+          (c) the B10 UNKNOWN-exhausted path: book_fill (`assume:<oid>`) then `assume_filled`.
+          (d) `place_resp` carrying `fill_count > 0` (an immediate cross) and the fills poll's
+              own `fill_obs` for the same contracts.
+
+        Measured consequence of the same class of double-count: ~$198 of phantom
+        assume_filled inventory and an inventory_basis of $315 against a $300 ceiling, which
+        starves the budget to zero and quotes NOTHING.  MIRROR (counting twice ↔ not
+        counting at all): the rows are the complete record precisely BECAUSE book_fill is the
+        only door — the crash-gap re-read is deduped by fill_id at both layers (here via
+        `seen_fill_ids`, and in the live engine by guards.FillDedupe, seeded from these same
+        rows since the 2026-07-30 recovery fix) — so dropping the inference drops no fill.
+
+        ── v4's invariant, kept verbatim for `v4_tape=True` ──────────────────────────────
         v4's per-order filled invariant (v1 §9.2) is
 
             filled = fill_count + max(0, remaining_count − reduced_by) + extra_fills
@@ -126,9 +156,15 @@ class V4Positions(object):
                      "reduced_by": None,
                      "extra_fills": 0.0}
                 self.orders[str(oid)] = o
-                if fc > 0:
+                # The order is registered on BOTH tapes — a v5 fill_obs is attributed
+                # through it (side, price, closing).  Only the INFERENCE is v4-only: case
+                # (d), an immediate cross reported in place_resp AND polled as a fill_obs.
+                if fc > 0 and v4_tape:
                     self._apply(o["ticker"], o["side"], fc, o["price"])
             elif kind == "cancel_resp":
+                if not v4_tape:
+                    continue                 # case (a): engine.cancel already wrote the
+                                             # learned remainder as `fill_id=cancel:<oid>`
                 o = self.orders.get(str(rec.get("order_id")))
                 if o is None or int(rec.get("http", 0) or 0) != 200:
                     continue
@@ -174,6 +210,12 @@ class V4Positions(object):
                                 float(rec.get("price_c") or 0.0) / 100.0,
                                 float(rec.get("sign", sign)))
             elif kind == "assume_filled":
+                if not v4_tape:
+                    continue                 # cases (b)/(c): assume_404_filled and the B10
+                                             # exhausted path BOOK the fill first
+                                             # (`assume404:<oid>` / `assume:<oid>`) and only
+                                             # then write this row, which is a FREEZE record
+                                             # on a v5 tape, not a quantity
                 o = self.orders.get(str(rec.get("order_id"))) if rec.get("order_id") else None
                 if o is not None:
                     n = max(0.0, o["remaining_count"])
@@ -217,8 +259,12 @@ class V4Positions(object):
 
 
 def gen_adopt(v4_ledger_records, now):
-    """`lip_v5 --gen-adopt` — the whole of step 1.  Pure; the caller writes the file."""
-    rows = V4Positions().replay(v4_ledger_records).rows()
+    """`lip_v5 --gen-adopt` — the whole of step 1.  Pure; the caller writes the file.
+
+    THE ONE CALLER THAT READS V4's TAPE, hence the only `v4_tape=True`: v4 did not write a
+    row per fill, so its positions exist only as the §9.2 inference.  v5's own ledger does,
+    which is why every other caller takes the default (see `replay`)."""
+    rows = V4Positions().replay(v4_ledger_records, v4_tape=True).rows()
     return {"schema": "lip_v5_adopt/1", "ts": float(now), "source": "v4_ledger",
             "positions": rows}
 

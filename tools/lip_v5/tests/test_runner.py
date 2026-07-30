@@ -296,8 +296,13 @@ class TestRunnerInit(RunnerCase):
 
     def test_RECOVERY_rebuilds_positions_from_v5s_own_ledger(self):
         r = self.runner()
+        # v5's OWN dialect: a fill is a fill_obs row.  engine.place records `fill_count` and
+        # books nothing from it — the immediate cross is learned by the fills poll — so the
+        # position on a v5 tape is the SUM OF THE ROWS, never v4's order-response inference.
         r.m.ledger.write("place_resp", order_id="1", ticker="T", side="bid", price=0.40,
                          size=10, fill_count=10, remaining_count=0)
+        r.m.ledger.write("fill_obs", order_id="1", ticker="T", side="bid", count=10,
+                         price_c=40, fill_id="f1")
         r.init(NOW, nestor_state=self.NESTOR)
         self.assertAlmostEqual(r.m.positions["T"]["yes"], 10.0, places=9)
         self.assertAlmostEqual(r.m.entry_basis[("T", "yes")], 0.40, places=9)
@@ -308,6 +313,8 @@ class TestRunnerInit(RunnerCase):
         r = self.runner()
         r.m.ledger.write("place_resp", order_id="1", ticker="T", side="bid", price=0.40,
                          size=10, fill_count=10, remaining_count=0)
+        r.m.ledger.write("fill_obs", order_id="1", ticker="T", side="bid", count=10,
+                         price_c=40, fill_id="f1")
         r.m.ex._positions = [{"ticker": "T", "position": 10}]
         r.init(NOW, nestor_state=self.NESTOR)
         self.assertNotIn("T", r.m.frozen)                     # agrees, so no freeze

@@ -345,9 +345,17 @@ class TestBinaryWiring(LipTestCase):
         C.ADOPT_PATH = self.path("v5_adopt.json")
         C.HANDBACK_PATH = self.path("v5_handback.json")
         try:
+            # A V5 TAPE, in v5's own dialect: the immediate cross reported by place_resp is
+            # learned through the fills poll, which writes the fill_obs row.  v5 never
+            # applies `fill_count` itself (engine.place records it and books nothing), so a
+            # fixture without the fill_obs row is a tape no v5 could write.
             R.append_jsonl(C.LEDGER_PATH, {"k": "place_resp", "order_id": "1",
                                            "ticker": "LEDGER", "side": "bid", "price": 0.4,
-                                           "size": 10, "fill_count": 10})
+                                           "size": 10, "fill_count": 10,
+                                           "remaining_count": 0})
+            R.append_jsonl(C.LEDGER_PATH, {"k": "fill_obs", "order_id": "1",
+                                           "ticker": "LEDGER", "side": "bid", "count": 10,
+                                           "price_c": 40, "fill_id": "f1"})
             R.atomic_write_json(C.ADOPT_PATH, {"positions": [
                 {"ticker": "ADOPT", "side": "yes", "net": 5.0, "basis": 0.4}]})
             obj = BIN.run_handback(now=1.0)

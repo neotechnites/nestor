@@ -153,6 +153,74 @@ class TestGenAdopt(LipTestCase):
         self.assertEqual(obj["schema"], "lip_v5_adopt/1")
 
 
+class TestV5TapeIsTheSumOfItsFillRows(LipTestCase):
+    """v4 had to INFER fills from order responses because it did not write a row per fill.
+    v5 does — book_fill is the single door and it always writes fill_obs — so running v4's
+    inference over a v5 tape counts the same contracts TWICE.  Four cases, every one on a
+    real v5 path, every one doubling toward phantom inventory (the $315-of-a-$300-ceiling
+    budget starvation).  Truth here is always the sum of the fill_obs rows."""
+
+    def net(self, recs, **kw):
+        rows = CU.V4Positions().replay(recs, **kw).rows()
+        return rows[0]["net"] if rows else 0.0
+
+    def test_a_partial_fill_plus_its_cancel_reduced_by(self):
+        # (a) engine.cancel books the learned remainder as fill_id="cancel:<oid>" AND writes
+        # the cancel_resp; the inference adds `remaining − reduced_by` on top of the row.
+        recs = [place("o1", "T", "bid", 0.40, 10),
+                {"k": "fill_obs", "order_id": "o1", "ticker": "T", "side": "bid",
+                 "count": 5, "price_c": 40, "fill_id": "cancel:o1"},
+                {"k": "cancel_resp", "order_id": "o1", "http": 200, "reduced_by": 5.0}]
+        self.assertAlmostEqual(self.net(recs), 5.0)
+        self.assertAlmostEqual(self.net(recs, v4_tape=True), 10.0)   # the double
+
+    def test_a_fill_plus_the_cancel_404_assume_path(self):
+        # (b) assume_404_filled books the whole remainder (fill_id="assume404:<oid>") and
+        # THEN writes assume_filled, which the inference re-applies in full.
+        recs = [place("o2", "T", "bid", 0.40, 10),
+                {"k": "fill_obs", "order_id": "o2", "ticker": "T", "side": "bid",
+                 "count": 10, "price_c": 40, "fill_id": "assume404:o2"},
+                {"k": "assume_filled", "order_id": "o2", "ticker": "T",
+                 "why": "fills_query_error"}]
+        self.assertAlmostEqual(self.net(recs), 10.0)
+        self.assertAlmostEqual(self.net(recs, v4_tape=True), 20.0)
+
+    def test_an_assume_filled_row_and_its_OWN_fill_obs(self):
+        # (c) the B10 UNKNOWN-exhausted path: book_fill (fill_id="assume:<oid>") then the
+        # assume_filled row.  On a v5 tape that row is a FREEZE record, not a quantity.
+        recs = [place("o3", "T", "bid", 0.40, 10),
+                {"k": "fill_obs", "order_id": "o3", "ticker": "T", "side": "bid",
+                 "count": 10, "price_c": 40, "fill_id": "assume:o3"},
+                {"k": "assume_filled", "order_id": "o3", "ticker": "T"}]
+        self.assertAlmostEqual(self.net(recs), 10.0)
+        self.assertAlmostEqual(self.net(recs, v4_tape=True), 20.0)
+
+    def test_a_place_resp_fill_count_and_the_polled_fill_obs(self):
+        # (d) an immediate cross: engine.place RECORDS fill_count and books nothing from it —
+        # the cross is learned by the fills poll, which writes the row.
+        recs = [place("o4", "T", "bid", 0.40, 3, fill_count=3),
+                {"k": "fill_obs", "order_id": "o4", "ticker": "T", "side": "bid",
+                 "count": 3, "price_c": 40, "fill_id": "f4"}]
+        self.assertAlmostEqual(self.net(recs), 3.0)
+        self.assertAlmostEqual(self.net(recs, v4_tape=True), 6.0)
+
+    def test_gen_adopt_still_reads_V4s_tape_with_V4s_inference(self):
+        """The flag's other end: v4's ledger has no fill_obs for these, so the inference is
+        the ONLY thing that knows the position — dropping it there would adopt ZERO."""
+        recs = [place("1", "T", "bid", 0.40, 100, fill_count=20),
+                {"k": "cancel_resp", "order_id": "1", "http": 200, "reduced_by": 50.0}]
+        self.assertAlmostEqual(CU.gen_adopt(recs, 0.0)["positions"][0]["net"], 50.0)
+
+    def test_a_closing_fill_row_still_reduces_the_held_leg_on_a_v5_tape(self):
+        """The closing/closed_leg flags added for the −$78 Skubal short are honored by the
+        v5 path too — the sum of the rows is SIGNED."""
+        recs = [{"k": "adopt", "ticker": "T", "side": "yes", "net": 26.0, "basis": 0.16},
+                {"k": "fill_obs", "ticker": "T", "side": "ask", "count": 26.0,
+                 "price_c": 3, "fill_id": "f1", "order_id": "o9",
+                 "closing": True, "closed_leg": "yes"}]
+        self.assertEqual(CU.V4Positions().replay(recs).rows(), [])
+
+
 class TestAdoptionGate(LipTestCase):
     ROWS = [{"ticker": "TSY", "side": "yes", "net": 50.0, "basis": 0.40},
             {"ticker": "BAD", "side": "yes", "net": 10.0, "basis": 1.50},
