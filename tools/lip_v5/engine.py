@@ -910,6 +910,13 @@ class Maker(object):
                         _score == _prev[0] and _key < _prev[1]):
                     _cand[_ck] = (_score, _key)
             owner_seed = {ck: k for ck, (_sc, k) in _cand.items()}
+            # displacement input: the owner's accrued dollars per cluster
+            owner_accrued = {}
+            for _ck, (_sc, _k) in _cand.items():
+                _acc = float(self.accrued.get(
+                    self.ticker_program.get(_k[0]), 0.0) or 0.0)
+                if _acc > 0.0:
+                    owner_accrued[_ck] = _acc
             cluster_seed = {}
             cluster_seed_px = {}              # D11 — Σ usd·basis, the variance ledger's
                                               # price side, from the SAME book as the rail
@@ -926,7 +933,8 @@ class Maker(object):
                                                       cluster_seed=cluster_seed,
                                                       cluster_seed_px=cluster_seed_px,
                                                       ceiling_usd=self.ceiling_usd,
-                                                      owner_seed=owner_seed)
+                                                      owner_seed=owner_seed,
+                                                      owner_accrued=owner_accrued)
             self.last_alloc = dict(a)
             out["allocate"] = {"spent": spent, "r_star": res.r_star,
                                "converged": res.converged, "slots": len(slots),

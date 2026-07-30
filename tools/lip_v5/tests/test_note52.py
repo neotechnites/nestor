@@ -386,3 +386,33 @@ class TestClusterOwnershipSeed(LipTestCase):
                                  owner_seed={"KXEUR": bid.key})
         self.assertGreater(a[bid.key], 0)
         self.assertEqual(a[ask.key], 0)
+
+
+class TestOwnerDisplacement(LipTestCase):
+    """Ryan, 2026-07-30: "1.153 has earned one cent, 1.155 has earned 26 — cancel 1.153 and
+    open 1.155."  Accrued credit is banked EV and outranks a sibling's resting order: the
+    displaced rung's seed is withheld so the requoter's q=0 path recalls it."""
+
+    def test_a_resting_sibling_is_displaced_by_an_accrued_owner(self):
+        sib = _slot("KXEUR-1-T1153", accrued=0.01)
+        a, _, _ = alloc.allocate([sib], 300.0, RSTAR, cluster_cap_usd=10.0,
+                                 resting={sib.key: 62.0},
+                                 owner_seed={"KXEUR": ("KXEUR-1-T1155", "bid")},
+                                 owner_accrued={"KXEUR": 0.26})
+        self.assertEqual(a[sib.key], 0, "the displaced rung must be recalled, not kept")
+
+    def test_no_displacement_without_owner_accrual(self):
+        """An owner with nothing banked does not evict a funded sibling (D12 holds)."""
+        sib = _slot("KXEUR-1-T1153")
+        a, _, _ = alloc.allocate([sib], 300.0, RSTAR, cluster_cap_usd=10.0,
+                                 resting={sib.key: 62.0},
+                                 owner_seed={"KXEUR": ("KXEUR-1-T1155", "bid")})
+        self.assertGreaterEqual(a[sib.key], 62)
+
+    def test_no_displacement_when_the_sibling_banked_more(self):
+        sib = _slot("KXEUR-1-T1153", accrued=0.50)
+        a, _, _ = alloc.allocate([sib], 300.0, RSTAR, cluster_cap_usd=10.0,
+                                 resting={sib.key: 62.0},
+                                 owner_seed={"KXEUR": ("KXEUR-1-T1155", "bid")},
+                                 owner_accrued={"KXEUR": 0.26})
+        self.assertGreaterEqual(a[sib.key], 62)

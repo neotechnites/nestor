@@ -541,7 +541,7 @@ def rescue(A, rate_now, h, rho, S, q, p, r_star, C_slot, phi, d,
 def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE_PER_H,
              venue_caps=None, step_fraction=C.STEP_FRACTION, held=None, resting=None,
              cluster_cap_usd=None, cluster_seed=None, cluster_seed_px=None,
-             ceiling_usd=None, owner_seed=None):
+             ceiling_usd=None, owner_seed=None, owner_accrued=None):
     """Marginal-rate water-filling under (★).  Returns (alloc, spent, marginal_at_stop).
 
     ── NOTE 52 (2026-07-29 night): three strategy rules now live INSIDE the plan. ───────────
@@ -686,6 +686,15 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
 
     elig = []
     for s in slots:
+        # ── OWNER DISPLACEMENT (Ryan, 2026-07-30: "1.153 has earned one cent, 1.155 has
+        # earned 26 — cancel 1.153, open 1.155").  Accrued credit is BANKED expected value:
+        # a cluster whose owner holds strictly more accrued credit than a resting non-owner
+        # rung RECALLS that rung — its resting seed is withheld, the requoter's q=0 path
+        # cancels it, and the reserve points at the owner.  This deliberately overrides the
+        # period lock for the displaced rung: forfeiting 1c of accrual to keep presence
+        # compounding a 26c pot is the trade, every time.  Displacement requires the owner's
+        # accrual to STRICTLY exceed the sibling's (no flapping: the ordering only deepens).
+        _own_acc = owner_accrued or {}
         # A RESTING ORDER IS ALREADY THIS SLOT'S ALLOCATION, not a rival for it.  Seeding the
         # cluster tally from resting orders (so the plan stops over-planning) without ALSO
         # crediting the slot that owns them makes the plan oscillate: cycle 1 plans and
@@ -694,8 +703,15 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
         # burst breaker (it halted the four-rung ladder at iteration 33).  Starting the slot
         # at what it already rests makes "keep it" the plan's default and leaves the water
         # level to decide only about the MARGIN.
-        alloc[s.key] = max(int(q_alloc.get(s.key, 0)),
-                           int(float((resting or {}).get(s.key, 0.0))))
+        _ck0 = _cluster_key(s)
+        _owner0 = cluster_owner.get(_ck0)
+        if _owner0 is not None and _owner0 != s.key and \
+                float(_own_acc.get(_ck0, 0.0)) > float(getattr(s, "accrued", 0.0) or 0.0) + 1e-9:
+            alloc[s.key] = int(q_alloc.get(s.key, 0))     # displaced: no resting seed ⇒
+                                                          # the requoter recalls the order
+        else:
+            alloc[s.key] = max(int(q_alloc.get(s.key, 0)),
+                               int(float((resting or {}).get(s.key, 0.0))))
         if s.pinned or s.denied or not s.legal_price_exists:
             continue
         if not s.p6_ok or s.assume_filled:
@@ -1030,7 +1046,8 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
                                venue_caps=None, max_passes=C.MAX_GATE_PASSES, held=None,
                                resting=None,
                                cluster_cap_usd=None, cluster_seed=None,
-                               cluster_seed_px=None, ceiling_usd=None, owner_seed=None):
+                               cluster_seed_px=None, ceiling_usd=None, owner_seed=None,
+                               owner_accrued=None):
     """v1 §2.4 lines 12-15 — the forfeit gate is per PROGRAM-PERIOD, applied AFTER
     water-filling, and a dropped program's dollars are RE-WATER-FILLED.
 
@@ -1060,7 +1077,8 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
                                           cluster_cap_usd=cluster_cap_usd,
                                           cluster_seed=cluster_seed,
                                           cluster_seed_px=cluster_seed_px,
-                                          ceiling_usd=ceiling_usd, owner_seed=owner_seed)
+                                          ceiling_usd=ceiling_usd, owner_seed=owner_seed,
+                                          owner_accrued=owner_accrued)
         by_prog = {}
         for s in live:
             by_prog.setdefault(s.program_id, []).append(s)
@@ -1150,7 +1168,8 @@ def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
                         floor_rate=C.ADMIT_FLOOR_RATE_PER_H, venue_caps=None, held=None,
                         resting=None,
                         cluster_cap_usd=None, cluster_seed=None,
-                        cluster_seed_px=None, ceiling_usd=None, owner_seed=None):
+                        cluster_seed_px=None, ceiling_usd=None, owner_seed=None,
+                        owner_accrued=None):
     """The full cycle: solve spec §1.3's r* fixpoint around ALLOCATE — the FORFEIT-GATED
     ALLOCATE, because the allocation the requoter diffs against must be the post-gate one
     (finish-round charter A): quoting a program the gate would drop posts collateral into a
@@ -1172,7 +1191,7 @@ def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
             slots, budget_usd, r_star, caps, floor_rate=floor_rate, venue_caps=venue_caps,
             held=held, resting=resting, cluster_cap_usd=cluster_cap_usd,
             cluster_seed=cluster_seed, cluster_seed_px=cluster_seed_px,
-            ceiling_usd=ceiling_usd, owner_seed=owner_seed)
+            ceiling_usd=ceiling_usd, owner_seed=owner_seed, owner_accrued=owner_accrued)
         return (a, sp, dropped), (marg if marg > 0 else floor_rate)
 
     res = M.solve_rstar(lambda r: run(r), r0)
