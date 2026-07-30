@@ -80,18 +80,45 @@ class Runner(object):
         return True, []
 
     def recover(self, now):
-        """v1 §9.4's restart procedure, in the order that makes each step's evidence available
-        to the next.
+        """RECOVER THE WORLD, NOT THE BOOK.  (Owner decision, 2026-07-30.)
 
-        The ORDER is the derivation.  Replay first, because it is the only source that knows
-        what we INTENDED — positions AND resting orders (BLOCKER-1: the earlier build rebuilt
-        positions only, so every pre-crash resting order became invisible: uncancellable,
-        unfilled-in-our-books, and its collateral vanished from the cash feed).  Then the
-        step-4 coid-prefix sweep against the exchange's own order list, because it can only
-        be DIFFED against a book we have already reconstructed.  Then the crash-gap fills
-        window, bounded by the ledger's last timestamp.  Then positions, the exchange's
-        statement, compared last — reconciling before replay would compare the exchange
-        against an empty book and freeze everything.
+        What a restart rebuilds is MONEY TRUTH: positions, entry basis, position cost, the
+        persisted freezes, settlements, the readings watermark, the coid sequence, and the
+        fill-dedupe seed.  Every one of those is a fact about the world that exists whether
+        this process runs or not, and losing it is how a restart mis-states inventory.
+
+        **WHAT IT NO LONGER REBUILDS IS `self.orders`.**  The order book starts EMPTY and only
+        orders THIS PROCESS places enter it.  `recover_orders` is deleted — both halves:
+
+          * the REPLAY half, which resurrected pre-crash orders from `place_resp` rows, and
+          * the step-4 coid-prefix SWEEP, which adopted whatever wore our prefix on the wire.
+
+        WHY, measured 2026-07-30.  The halted closing pass put GTC closing orders on the wire
+        sized from broken books.  They then survived EVERY restart, because the sweep adopted
+        whatever rested there as legitimately ours and the requoter reasoned from it.  An
+        adopted order is a decision this process never made, admitted without any of the rails
+        that would have refused making it — the same defect as the deleted `reinstate`, one
+        layer down: the book became a function of what the book used to be.
+
+        AND THE ACCOUNT IS SHARED.  nestor and other systems place orders here.  "Not ours" is
+        the correct reading of everything on the wire at startup, including things wearing an
+        old prefix of ours: they are not this process's concern, and this process will not
+        adopt them, re-judge them or cancel them.
+
+        THE COST, STATED PLAINLY (and flagged for review).  A pre-crash order still resting
+        holds real exchange collateral that `resting_by_order` no longer counts, so published
+        expected-cash sits ABOVE the dollars actually free — the direction §5.3 exists to
+        prevent.  Two things bound it: `reconcile` reads the exchange's own BALANCE on its
+        cadence (the truth, not our memory), and the expiration backstop on every order we
+        ever place is `close_ts − CLOSE_MARGIN_S`, so nothing rests indefinitely.  The
+        alternative — adopting the orders to make the arithmetic tidy — is exactly the
+        behaviour that put a 98-contract $93 buy back on the wire after every restart.
+
+        The ORDER of what remains is still the derivation: replay first (the only source that
+        knows what we intended), then the crash-gap fills window bounded by the ledger's last
+        timestamp, then positions — the exchange's statement — compared last, because
+        reconciling before replay would compare the exchange against an empty book and freeze
+        everything.
         """
         rows = self.m.ledger.read()
         # v5's OWN tape: positions are the SUM OF fill_obs ROWS, not v4's inference over
@@ -180,8 +207,6 @@ class Runner(object):
                 if r.get("src") == "readings_file" and r.get("line_no"):
                     self.m.readings_line = max(self.m.readings_line, int(r["line_no"]))
 
-        self.recover_orders(rows, now)
-
         last_ts = max([float(x.get("ts", 0.0)) for x in rows] or [0.0])
         self.m.coid_seq = max(self.m.coid_seq, LG.coid_seq_load())
 
@@ -218,143 +243,20 @@ class Runner(object):
               orders=len(self.m.orders), coid_seq=self.m.coid_seq, last_ledger_ts=last_ts)
         return st
 
-    def recover_orders(self, rows, now):
-        """BLOCKER-1 — rebuild `self.orders` from replay, then the v1 §9.4 step-4 sweep.
-
-        Replay half: an order is live iff its `place_resp` succeeded and no terminal row
-        (cancel_resp 200 / expired / assume_filled) followed; `fill_obs` rows carrying its
-        order_id reduce its remaining.  Every rebuilt order's collateral is re-counted into
-        the cash feed (keyed by its coid, exactly as `place()` counted it) — the invariant
-        "published never above truth" REQUIRES counting it, because the exchange is still
-        holding those dollars.
-
-        Sweep half: every exchange resting order carrying our coid prefix that replay does
-        NOT know is registered, its collateral counted (same invariant), and handed to the
-        B10 UNKNOWN machinery — which retries its cancel and, exhausted, books it FILLED and
-        freezes the market (the conservative direction).  Replay-live orders the exchange no
-        longer shows go to the SAME machinery: their cancel either confirms (reduced_by → a
-        learned fill or a clean release) or 404s into assume_filled.  Symmetric treatment,
-        one resolution path.
-        """
-        live = {}
-        for rec in rows:
-            kind = rec.get("k") or rec.get("kind")
-            oid = str(rec.get("order_id")) if rec.get("order_id") is not None else None
-            if kind == "place_resp" and oid and not rec.get("err"):
-                size = float(rec.get("size") or 0.0)
-                rc = rec.get("remaining_count")
-                live[oid] = {"order_id": oid, "coid": rec.get("coid"),
-                             "ticker": rec.get("ticker"), "side": rec.get("side"),
-                             "price": float(rec.get("price") or 0.0), "size": size,
-                             "remaining": float(size if rc is None else rc),
-                             "fully_closing": bool(rec.get("fully_closing")),
-                             "expiration_ts": rec.get("expiration_ts"),
-                             "placed_ts": float(rec.get("ts") or 0.0)}
-            elif kind in ("cancel_resp", "expired") and oid:
-                if kind == "cancel_resp" and int(rec.get("http", 0) or 0) != 200:
-                    continue                  # a failed cancel is not terminal (B10 owns it)
-                live.pop(oid, None)
-            elif kind == "assume_filled" and oid:
-                live.pop(oid, None)
-            elif kind == "fill_obs" and oid and oid in live:
-                live[oid]["remaining"] -= float(rec.get("count") or 0.0)
-                if live[oid]["remaining"] <= 1e-9:
-                    live.pop(oid, None)
-        for oid, o in sorted(live.items()):
-            exp = o.get("expiration_ts")
-            if exp is not None and float(exp) <= float(now):
-                continue                      # the backstop already fired; nothing rests
-            self.m.orders[oid] = o
-            if not o.get("fully_closing") and o.get("coid"):
-                self.m.cash.resting_by_order[o["coid"]] = \
-                    o["remaining"] * R.unit_collateral(o["side"], o["price"])
-
-        # --- step-4 sweep against the exchange ---
-        # (the wire's dialect for a resting order is parsed by `parse_order_row` below)
-        admitted, _ = self.m.bucket.admit("verify", now)
-        if not admitted:
-            return
-        status, body = self.m.ex.orders()
-        self.m.note_http(status, now)                         # SF-2
-        if status != 200:
-            R.log("recovery_sweep_failed", http=status)
-            return
-        exch = {}
-        for row in (body or {}).get("orders") or []:
-            coid = row.get("client_order_id") or ""
-            if not R.owns_coid(coid):
-                continue                      # never touch another process's orders
-            exch[str(row.get("order_id"))] = row
-        for oid, row in sorted(exch.items()):
-            if oid in self.m.orders:
-                continue
-            remaining, price, side = self.parse_order_row(row)
-            o = {"order_id": oid, "coid": row.get("client_order_id"),
-                 "ticker": row.get("ticker"), "side": side, "price": price,
-                 "size": remaining, "remaining": remaining, "placed_ts": 0.0}
-            self.m.orders[oid] = o
-            if o["coid"]:
-                self.m.cash.resting_by_order[o["coid"]] = \
-                    remaining * R.unit_collateral(side, price)
-            self.m.unknown.note(oid, o["ticker"], side, remaining, now)
-            R.log("recovery_unknown_order", order_id=oid, ticker=o["ticker"],
-                  why="exchange shows our prefix; replay does not know it")
-        for oid in sorted(set(self.m.orders) - set(exch)):
-            o = self.m.orders[oid]
-            if o.get("placed_ts", 0.0) == 0.0:
-                continue
-            self.m.unknown.note(oid, o["ticker"], o["side"], o.get("remaining", 0.0), now)
-            R.log("recovery_order_gone", order_id=oid, ticker=o["ticker"],
-                  why="replay says live; exchange does not show it")
-
-    @staticmethod
-    def parse_order_row(row):
-        """One resting-order row from `GET /portfolio/orders` → (remaining, yes_price, side).
-
-        THE SWEEP WAS READING A DIALECT THE WIRE DOES NOT SPEAK.  It parsed a bare `price`
-        key, and there is no such key: the 2026-07-30 wire states an order's price as
-        `yes_price_dollars` / `no_price_dollars` (the same shift that made `count_fp` replace
-        `count` on fills — see engine.book_fill_row's captured-payload note).  So EVERY swept
-        order recovered at price 0.0, and the consequences all run through that zero:
-
-          * its collateral registered as `remaining × unit_collateral(side, 0)` — $0 for a
-            bid — so the cash feed published delta_dollars ABOVE truth while the exchange
-            held the real dollars (the §5.3 invariant, inverted);
-          * B10's ladder later books it as filled at a ZERO BASIS, which mis-states
-            inventory cost, the caps sized from it, and the P&L that feeds the day stop.
-
-        And the side derivation ignored `action`, so a SELL of YES — our ask — recovered as
-        a bid: the collateral is then taken as p instead of 1−p, and the requoter believes it
-        holds presence on the side it does not.  Parsed here with the same ladders
-        book_fill_row uses: `*_fp` and `*_dollars` FIRST, the legacy cents/floats second, and
-        `book_side` honored ahead of the (side, action) derivation because it states OUR side
-        of the book directly.  MIRROR: `remaining_count_fp` and `remaining_count` are both
-        read (v4's `do_cancel` refresh reads the same pair), fp first, because a fractional
-        remainder truncated to the int field would under-count collateral — the same
-        direction as the zero.
-        """
-        rfp = row.get("remaining_count_fp")
-        remaining = float(rfp) if rfp is not None else float(row.get("remaining_count") or 0.0)
-        ypd, npd, ypc = (row.get("yes_price_dollars"), row.get("no_price_dollars"),
-                         row.get("yes_price"))
-        if ypd is not None:
-            price = float(ypd)
-        elif npd is not None:
-            price = 1.0 - float(npd)              # the YES axis is the one we book on
-        elif ypc is not None:
-            price = float(ypc) / 100.0            # legacy cents
-        else:
-            price = float(row.get("price") or 0.0)
-        bs = row.get("book_side")
-        if bs in ("bid", "ask"):
-            side = bs
-        elif row.get("side") in ("bid", "ask"):
-            side = row["side"]
-        else:
-            leg_, sign_ = cutover.normalize_fill(row.get("side"), row.get("action", "buy"))
-            ask_like = (leg_ == "bid" and sign_ < 0) or (leg_ == "ask" and sign_ > 0)
-            side = "ask" if ask_like else "bid"
-        return remaining, price, side
+    # ── `recover_orders` AND `parse_order_row` ARE GONE (owner decision, 2026-07-30). ────
+    # `recover_orders` rebuilt `self.orders` from `place_resp` replay AND ran the v1 §9.4
+    # step-4 coid-prefix sweep against `GET /portfolio/orders`, registering every resting
+    # order wearing our prefix that replay did not know, counting its collateral, and handing
+    # it to B10's UNKNOWN ladder.  `parse_order_row` existed only to read those swept rows.
+    #
+    # Both are deleted because ADOPTION IS THE DEFECT.  See `recover`'s docstring for the
+    # derivation; the short form is that the 2026-07-30 closing orders outlived every restart
+    # by being re-adopted, and that an order this process did not place is an order this
+    # process's rails never approved.  Startup is now identical to steady state: zero special
+    # paths, an empty order book, and orders enter it only through `Maker.place`.
+    #
+    # The runtime counterpart is `engine.sync_orders`, which reconciles in ONE direction only
+    # (drop what the wire says is gone) and can never import.
 
     # =========================================================================================
     # THE LOOP

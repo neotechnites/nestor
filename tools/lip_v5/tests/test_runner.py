@@ -566,137 +566,129 @@ class TestOnePathToTheWireAssembled(RunnerCase):
         self.assertEqual(r.m.ex.placed, [])                   # and quoted nothing
 
 
-class TestRecoveryOrders(RunnerCase):
-    """BLOCKER-1 — resting orders survive a restart: replay rebuilds them, the cash feed
-    counts their collateral, and the §9.4 step-4 prefix sweep reconciles both directions."""
+class TestStartupAdoptsNoOrders(RunnerCase):
+    """LAW CHANGE (owner decision, 2026-07-30: "it's either running and placing orders, or
+    it's not running").  **STARTUP IS IDENTICAL TO STEADY STATE: THE ORDER BOOK STARTS EMPTY.**
+
+    THIS CLASS WAS `TestRecoveryOrders`, and its docstring read: "BLOCKER-1 — resting orders
+    survive a restart: replay rebuilds them, the cash feed counts their collateral, and the
+    §9.4 step-4 prefix sweep reconciles both directions."  Every one of those behaviours is
+    now forbidden, and the tests below are the same fixtures with the assertions inverted.
+
+    WHY.  The 2026-07-30 halted closing pass put GTC closing orders on the wire, sized from
+    books the halt had already declared wrong.  They survived EVERY restart, because the sweep
+    adopted whatever wore our prefix as legitimately ours and the requoter then reasoned from
+    it.  An adopted order is a decision this process never made, admitted without any of the
+    rails that would have refused making it — the same defect as the deleted `reinstate`, one
+    layer down.  And the account is SHARED: nestor and other systems place orders here, so
+    "not ours" is the correct reading of everything resting at startup.
+
+    Note the deliberate asymmetry: startup neither adopts NOR cancels what it finds.  Those
+    orders are not this process's concern.
+
+    ALSO DELETED HERE: `TestRecoveryOrders`'s rebuild-selection cases
+    (`..._a_cancelled_or_expired_order_is_not_rebuilt`, `..._past_its_expiration_backstop_...`,
+    `..._fill_obs_rows_shrink_the_rebuilt_remaining`) and the whole
+    `TestTheSweepSpeaksTheWiresDialect` class, which asserted that the SWEEP parsed the wire's
+    `*_fp` / `*_dollars` / `book_side` dialect correctly.  All of them described how to adopt
+    an order well; none has a subject any more.  (`book_fill_row` still owns that dialect for
+    FILLS, and `test_the_fake_emits_no_invented_price_key`'s contract survives there.)
+    """
 
     NESTOR = {"open_order_tickers": [], "position_tickers": []}
 
-    def test_replay_rebuilds_a_live_order_and_counts_its_collateral(self):
+    def test_replay_does_NOT_rebuild_a_live_order(self):
+        """Was `test_replay_rebuilds_a_live_order_and_counts_its_collateral`."""
         r = self.runner()
         r.m.ledger.write("place_resp", order_id="o1", coid="v5-lipm-T-y-1", ticker="T",
                          side="bid", price=0.40, size=10, fill_count=0, remaining_count=10,
-                         expiration_ts=int(NOW + 3600), fully_closing=False)
-        r.init(NOW, nestor_state=self.NESTOR)
-        self.assertIn("o1", r.m.orders)
-        self.assertAlmostEqual(r.m.orders["o1"]["remaining"], 10.0, places=9)
-        # THE INVARIANT: the exchange still holds these dollars, so the feed counts them.
-        self.assertAlmostEqual(r.m.cash.resting_collateral, 4.0, places=9)
-
-    def test_a_cancelled_or_expired_order_is_not_rebuilt(self):
-        r = self.runner()
-        for oid, terminal in (("o1", ("cancel_resp", {"http": 200, "reduced_by": 10})),
-                              ("o2", ("expired", {}))):
-            r.m.ledger.write("place_resp", order_id=oid, coid="v5-lipm-T-y-9", ticker="T",
-                             side="bid", price=0.40, size=10, remaining_count=10,
-                             expiration_ts=int(NOW + 3600))
-            r.m.ledger.write(terminal[0], order_id=oid, ticker="T", **terminal[1])
-        r.init(NOW, nestor_state=self.NESTOR)
-        self.assertEqual(r.m.orders, {})
-        self.assertEqual(r.m.cash.resting_collateral, 0.0)
-
-    def test_fill_obs_rows_shrink_the_rebuilt_remaining(self):
-        r = self.runner()
-        r.m.ledger.write("place_resp", order_id="o1", coid="v5-lipm-T-y-1", ticker="T",
-                         side="bid", price=0.40, size=10, remaining_count=10,
                          expiration_ts=int(NOW + 3600))
-        r.m.ledger.write("fill_obs", order_id="o1", ticker="T", side="bid", count=6,
-                         price_c=40)
         r.init(NOW, nestor_state=self.NESTOR)
-        self.assertAlmostEqual(r.m.orders["o1"]["remaining"], 4.0, places=9)
-        self.assertAlmostEqual(r.m.cash.resting_collateral, 1.6, places=9)
+        self.assertEqual(r.m.orders, {}, "a previous process's order entered our book")
+        self.assertAlmostEqual(r.m.cash.resting_collateral, 0.0, places=9)
 
-    def test_an_order_past_its_expiration_backstop_is_not_rebuilt(self):
-        r = self.runner()
-        r.m.ledger.write("place_resp", order_id="o1", coid="v5-lipm-T-y-1", ticker="T",
-                         side="bid", price=0.40, size=10, remaining_count=10,
-                         expiration_ts=int(NOW - 10))
-        r.init(NOW, nestor_state=self.NESTOR)
-        self.assertNotIn("o1", r.m.orders)
-
-    def test_the_prefix_sweep_finds_exchange_orders_replay_never_saw(self):
-        """An exchange order wearing OUR prefix that replay does not know holds collateral
-        and may fill: it enters `self.orders` (so it can be cancelled), the feed counts it,
-        and B10's UNKNOWN machinery owns its resolution."""
+    def test_the_prefix_sweep_is_gone_the_wire_is_left_alone(self):
+        """Was `test_the_prefix_sweep_finds_exchange_orders_replay_never_saw`.  An order
+        wearing our own old prefix is treated exactly like nestor's: not adopted, not
+        cancelled, not handed to B10 — not ours."""
         r = self.runner()
         r.m.ex.resting["x9"] = {"ticker": "T", "side": "bid", "count": 7,
                                 "price": "0.5000", "client_order_id": "v5-lipm-T-y-99"}
         r.m.ex.resting["theirs"] = {"ticker": "T", "side": "bid", "count": 3,
                                     "price": "0.5000", "client_order_id": "v4-lipm-T-y-1"}
         r.init(NOW, nestor_state=self.NESTOR)
-        self.assertIn("x9", r.m.orders)
-        self.assertIn("x9", r.m.unknown.pending)
-        self.assertNotIn("theirs", r.m.orders)            # never touch another's orders
-        self.assertAlmostEqual(r.m.cash.resting_collateral, 3.5, places=9)
-        self.assertTrue(self.logs_of("recovery_unknown_order"))
+        self.assertEqual(r.m.orders, {})
+        self.assertEqual(dict(r.m.unknown.pending), {})
+        self.assertAlmostEqual(r.m.cash.resting_collateral, 0.0, places=9)
+        self.assertFalse(self.logs_of("recovery_unknown_order"))
+        self.assertEqual(r.m.ex.cancelled, [], "startup cancelled an inherited order")
+        self.assertEqual(sorted(r.m.ex.resting), ["theirs", "x9"])   # both still resting
 
-    def test_a_replay_live_order_the_exchange_no_longer_shows_goes_to_UNKNOWN(self):
+    def test_a_replayed_order_the_exchange_does_not_show_is_a_NON_EVENT(self):
+        """Was `test_a_replay_live_order_the_exchange_no_longer_shows_goes_to_UNKNOWN`.  With
+        no replayed order book there is nothing to diff against the wire, so there is no
+        UNKNOWN to open."""
         r = self.runner()
         r.m.ledger.write("place_resp", order_id="gone", coid="v5-lipm-T-y-1", ticker="T",
                          side="bid", price=0.40, size=10, remaining_count=10,
                          expiration_ts=int(NOW + 3600))
         r.init(NOW, nestor_state=self.NESTOR)
-        self.assertIn("gone", r.m.unknown.pending)
-        self.assertTrue(self.logs_of("recovery_order_gone"))
+        self.assertEqual(dict(r.m.unknown.pending), {})
+        self.assertFalse(self.logs_of("recovery_order_gone"))
+
+    def test_the_world_is_still_recovered(self):
+        """The half that MUST survive: money truth.  A restart still rebuilds positions,
+        basis and cost from the fill tape — only the ORDER book is refused."""
+        r = self.runner()
+        r.m.ledger.write("fill_obs", order_id="o1", ticker="T", side="bid", count=10,
+                         price_c=40, fill_id="f1", closing=False)
+        r.m.ex._positions = [{"ticker": "T", "position": 10}]
+        r.init(NOW, nestor_state=self.NESTOR)
+        self.assertAlmostEqual(r.m.positions["T"]["yes"], 10.0, places=9)
+        self.assertAlmostEqual(r.m.entry_basis[("T", "yes")], 0.40, places=9)
+        self.assertAlmostEqual(r.m.position_cost["T"], 4.0, places=9)
+        self.assertIn("f1", r.m.dedupe.seen)              # crash-gap dedupe still seeded
+        self.assertEqual(r.m.orders, {})
+
+    def test_the_adoption_machinery_itself_is_gone(self):
+        """Structural, so a later edit cannot half-revive it."""
+        self.assertFalse(hasattr(RUN.Runner, "recover_orders"))
+        self.assertFalse(hasattr(RUN.Runner, "parse_order_row"))
 
 
-class TestTheSweepSpeaksTheWiresDialect(RunnerCase):
-    """The recovery sweep parsed a bare `price` key that no payload carries, so every swept
-    order recovered at $0.00 — collateral published ABOVE truth, and a later assume-fill
-    booked at a zero basis.  It also ignored `action`, recovering a sell-YES as a bid."""
+class TestSyncOrdersReconcilesOneDirectionOnly(RunnerCase):
+    """`sync_orders` runs on the reconcile cadence and its MEANING changed with the law
+    (2026-07-30): it may drop from our books what the wire says is gone, and it may NEVER
+    import a wire order this process did not place.  That is the runtime counterpart of the
+    deleted startup sweep — without this end, adoption simply returns 120 seconds later."""
 
     NESTOR = {"open_order_tickers": [], "position_tickers": []}
 
-    def test_the_fake_emits_no_invented_price_key(self):
-        """Structural: the fake is the engine's contract with the wire.  A `price` key here
-        would let the old parser pass a green suite against a wire that has none."""
-        ex = ScanExchange(balance_cents=1_000_000)
-        ex.resting["x9"] = {"ticker": "T", "side": "bid", "count": 7, "price": "0.4000",
-                            "client_order_id": "v5-lipm-T-y-99"}
-        _, body = ex.orders()
-        row = body["orders"][0]
-        self.assertNotIn("price", row)
-        self.assertNotIn("remaining_count", row)
-        self.assertEqual(row["yes_price_dollars"], "0.4000")
-
-    def test_a_swept_bid_recovers_at_the_TRUE_price_and_collateral(self):
+    def test_a_foreign_or_inherited_wire_order_is_never_imported(self):
         r = self.runner()
-        r.m.ex.resting["x9"] = {"ticker": "T", "side": "bid", "count": 7, "price": "0.4000",
-                                "client_order_id": "v5-lipm-T-y-99"}
         r.init(NOW, nestor_state=self.NESTOR)
-        o = r.m.orders["x9"]
-        self.assertEqual(o["side"], "bid")
-        self.assertAlmostEqual(o["price"], 0.40, places=9)
-        self.assertAlmostEqual(o["remaining"], 7.0, places=9)
-        self.assertAlmostEqual(r.m.cash.resting_collateral, 2.8, places=9)
+        r.m.ex.resting["x9"] = {"ticker": "T", "side": "bid", "count": 7, "price": "0.5000",
+                                "client_order_id": "v5-lipm-T-y-99"}   # our OWN old prefix
+        r.m.last_orders_sync = 0.0
+        r.m.sync_orders(NOW + 10_000.0)
+        self.assertEqual(r.m.orders, {})
+        self.assertAlmostEqual(r.m.cash.resting_collateral, 0.0, places=9)
 
-    def test_a_swept_sell_of_YES_recovers_as_an_ASK(self):
-        """(side="yes", action="sell") is an ask-shaped order: its collateral is 1−p, and the
-        requoter must not believe it holds presence on the bid."""
+    def test_an_order_WE_placed_that_vanished_from_the_wire_is_still_dropped(self):
+        """The direction that survives: our own order gone from the exchange's complete list
+        goes through §9.4a disambiguation rather than resting in our books as phantom
+        presence (the convergence finding — the requoter declines to re-place forever)."""
         r = self.runner()
-        r.m.ex.resting["x9"] = {"ticker": "T", "side": "ask", "count": 10, "price": "0.4000",
-                                "client_order_id": "v5-lipm-T-n-99"}
         r.init(NOW, nestor_state=self.NESTOR)
-        o = r.m.orders["x9"]
-        self.assertEqual(o["side"], "ask")
-        self.assertAlmostEqual(r.m.cash.resting_collateral, 6.0, places=9)   # 10 × (1−0.40)
-
-    def test_the_parser_ladder_takes_fp_and_dollars_first(self):
-        parse = RUN.Runner.parse_order_row
-        # the 2026-07-30 dialect, fractional remainder
-        self.assertEqual(parse({"remaining_count_fp": "2.97", "remaining_count": 2,
-                                "yes_price_dollars": "0.1300", "side": "yes",
-                                "action": "sell"}), (2.97, 0.13, "ask"))
-        # no_price_dollars alone still lands on the YES axis
-        self.assertEqual(parse({"remaining_count": 5, "no_price_dollars": "0.8700",
-                                "side": "no", "action": "buy"}), (5.0, 0.13, "ask"))
-        # book_side, when the wire states it, wins outright
-        self.assertEqual(parse({"remaining_count": 5, "yes_price_dollars": "0.1300",
-                                "book_side": "bid", "side": "no",
-                                "action": "buy"}), (5.0, 0.13, "bid"))
-        # legacy cents/floats remain the last rung of the ladder
-        self.assertEqual(parse({"remaining_count": 5, "yes_price": 13,
-                                "side": "bid"}), (5.0, 0.13, "bid"))
+        ok, why, _ = r.m.place("T", "bid", 0.40, 10, int(NOW + 3600), NOW,
+                               available_cash_usd=100_000.0)
+        self.assertTrue(ok, why)
+        oid = sorted(r.m.orders)[0]
+        r.m.ex.resting.clear()                            # a hand flatten, exchange-side
+        r.m.last_orders_sync = 0.0
+        r.m.sync_orders(NOW + 10_000.0)
+        self.assertTrue(self.logs_of("order_gone_from_wire"))
+        self.assertTrue(r.m.orders[oid].get("gone_404") or oid not in r.m.orders)
 
 
 class TestCrashGapDoesNotReBookTheTape(RunnerCase):
@@ -739,14 +731,25 @@ class TestCrashGapDoesNotReBookTheTape(RunnerCase):
                if (x.get("k") or x.get("kind")) == "fill_obs" and x.get("fill_id") == "t-1"]
         self.assertEqual(len(obs), 1)
 
-    def test_the_still_resting_order_survives_recovery_with_its_collateral(self):
+    def test_the_still_resting_order_is_NOT_adopted_and_the_dedupe_still_holds(self):
+        """LAW CHANGE (2026-07-30).  Was
+        `test_the_still_resting_order_survives_recovery_with_its_collateral`, asserting the
+        pre-crash order came back into `self.orders` with its 4 × $0.40 of collateral counted.
+        Startup adopts no orders now, so that assertion inverts — and the FINDING this class
+        actually owns, that the crash-gap window must not re-book the tape's fills, is
+        unaffected and is re-asserted here on the same fixture.
+
+        THE ACKNOWLEDGED COST, flagged rather than papered over: that resting order does hold
+        $1.60 of real exchange collateral which `resting_collateral` no longer counts, so
+        published expected-cash sits above the free dollars until `reconcile` reads the
+        exchange's own balance.  The alternative is adoption, which is what put the 2026-07-30
+        closing orders back on the wire after every restart."""
         r = self.runner()
         self.tape(r)
         r.init(NOW + 30, nestor_state=self.NESTOR)
-        self.assertIn("o1", r.m.orders)                        # popped ⇒ uncancellable forever
-        self.assertAlmostEqual(r.m.orders["o1"]["remaining"], 4.0, places=9)
-        # published expected-cash NEVER above truth: the exchange still holds 4 × $0.40.
-        self.assertAlmostEqual(r.m.cash.resting_collateral, 1.6, places=9)
+        self.assertEqual(r.m.orders, {})
+        self.assertAlmostEqual(r.m.cash.resting_collateral, 0.0, places=9)
+        self.assertAlmostEqual(r.m.positions["T"]["yes"], 6.0, places=9)   # not 12
 
 
 class TestAdoptionIdempotent(RunnerCase):

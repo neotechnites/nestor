@@ -1184,7 +1184,16 @@ class Maker(object):
         return True
 
     def sync_orders(self, now):
-        """THE WIRE'S RESTING BOOK IS THE TRUTH ABOUT WHAT RESTS.
+        """THE WIRE IS THE TRUTH ABOUT WHICH OF *OUR* ORDERS STILL REST — AND ONLY THAT.
+
+        **ONE DIRECTION ONLY (owner decision, 2026-07-30).**  This pass may DROP from
+        `self.orders` what the exchange's complete list no longer carries.  It may NEVER add:
+        a wire order this process did not place is not ours, whatever prefix it wears.  That
+        is the same law the deleted startup sweep broke, and without this end the law would
+        simply be re-broken one reconcile cadence after boot — the shared account carries
+        nestor's orders and our own pre-restart leftovers, and neither is a decision this
+        process made.  Structurally it holds because the only loop below iterates
+        `set(self.orders) - seen`; `seen` is used to SUBTRACT and is never a source of rows.
 
         Found by the convergence acceptance test, 2026-07-30: cancel every order
         exchange-side and the book NEVER CAME BACK.  Not because re-derivation was wrong —
@@ -1986,7 +1995,14 @@ class Maker(object):
         return round(sum(self.accrued.values()), 6)
 
     def flatten(self, now):
-        """Cancel-all on the EXIT lane — never refused, never counted against the cancel share."""
+        """Cancel-all on the EXIT lane — never refused, never counted against the cancel share.
+
+        "ALL" MEANS ALL OF OURS, AND IT IS SCOPED BY CONSTRUCTION: the loop walks
+        `self.orders`, which — since the startup order-adoption sweep was deleted on
+        2026-07-30 — contains exactly the orders THIS PROCESS placed.  There is no
+        account-wide cancel endpoint call anywhere in this program, and there must not be:
+        nestor and other systems trade this same account and their orders are untouchable.
+        This is the ONE action a halt performs, and the one shutdown performs first."""
         for oid in list(self.orders):
             self.cancel(oid, now, lane="exit_cancel")
 
