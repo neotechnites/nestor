@@ -1763,9 +1763,10 @@ class Maker(object):
                 price = s.p if s.side == "bid" else (1.0 - s.p)
             price = round(price, 4)
             # A MAKER NEVER TAKES (quote.would_cross).  Checked against the OPPOSING slot's
-            # best on the YES axis, for every path — entry, replenish, land grab and shed
-            # alike — because the exit path was the only one that had this guard, and the
-            # entry path is what paid the spread.  Skipping costs one cycle of presence;
+            # best on the YES axis, for every remaining path — entry, replenish and land grab.
+            # (Historically the EXIT path was the only one that carried this guard, via
+            # `shed_price`'s crossed-book refusal, and the entry path is what paid the spread;
+            # the exit is gone and the guard stayed where it was needed.)  Skipping costs one cycle of presence;
             # crossing costs the spread AND the presence, since a fully-taken order leaves
             # nothing resting and the next cycle re-posts into the same trap.
             _bid_s = slot_by_key.get((s.ticker, "bid"))

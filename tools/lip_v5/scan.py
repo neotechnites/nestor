@@ -557,18 +557,30 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
     A set of tickers we hold a position in or rest an order in.  `rank_for_poll` has always
     carried this guarantee ("a de-polled held market is never requoted, never cancelled, and its
     fills are never learned"), but it guaranteed only that a held market gets POLLED — and a poll
-    with no SLOT is nearly as blind, because `engine.update_shed_targets` reads
-    `by_key = {s.key: s for s in slots}` and on a miss can only KEEP a previous verdict
-    (`held_from_last_reading`), never START a shed, and `requote_pass` has no `s.p` to price one
-    with.  So every entry-only exclusion below is skipped for a held ticker.
-    HOW THE BLOCKER ARRIVED: the free-ride gate's exemption was `own_qty > 0` read from LIVE
-    ORDERS, and `book_fill` pops an order at `remaining <= 0` — so the exemption vanished at
-    exactly the moment a fill first gave us inventory to shed.  The gate deleted the exit.
+    with no SLOT is nearly as blind.  So every entry-only exclusion below is skipped for a held
+    ticker.
+    WHY IT IS STILL WORTH SKIPPING THEM, re-derived after the 2026-07-30 exit rip-out.  The
+    original reason was that `update_shed_targets` needed a slot to judge a shed and
+    `requote_pass` needed `s.p` to price one; both are deleted, and no slot can produce an exit
+    any more.  Two reasons survive and are sufficient:
+      * A RESTING ORDER on a held market still has to be requoted, recalled when its venue
+        retires, and examined against §4.3(e) — all of which read the SLOT TABLE, not the poll
+        set.  A held-with-order market that vanishes from the table is the `resync_overdue`
+        state, i.e. capital resting unmanaged.
+      * The MARK.  `s.p` and the classifier's `yes_mid` feed `mark_to_market_pnl`, which is what
+        the DAY STOP reads.  A held position whose market stops classifying marks at COST, so a
+        book that is losing money looks flat — the stop cannot fire on a position it cannot
+        price, and with no exit the position is going nowhere until settlement either way.
+    HOW THE ORIGINAL BLOCKER ARRIVED (kept, because the trap it names is generic): the free-ride
+    gate's exemption was `own_qty > 0` read from LIVE ORDERS, and `book_fill` pops an order at
+    `remaining <= 0` — so the exemption vanished at exactly the moment a fill first gave us
+    inventory.  A gate keyed on orders cannot see a position.
     WHICH EXCLUSIONS ARE ENTRY-ONLY, and why each is skipped rather than kept: `hours_left <= 0`,
     `preposition_ok`, `runway_ok`, P6, the entry price band and the free-ride gate ALL answer "is
     it worth ENTERING here", which is not the question a market we are already inside asks.
     Skipping them yields a slot with `hours_left = 0`, which `alloc.allocate` refuses for NEW
-    allocation on its own line — so the slot buys a shed and a requote and cannot buy exposure.
+    allocation on its own line — so the slot buys a MARK and a requote of what already rests, and
+    cannot buy exposure.
     WHAT IS NOT SKIPPED: `series_denied` and `frozen`.  Those are kill switches, not opportunity
     tests; a frozen ticker is frozen because our books and the wire disagree about it, and
     quoting into that disagreement is the emergency, not the cure.
@@ -718,9 +730,10 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                 # i.e. a YES ask at 94c — cheap in its OWN collateral currency, which is the
                 # axis the band is indexed by.  NEVER-CROSS is trivially satisfied: there is
                 # nothing in the book to cross.
-                # CARRIED SCOPE — this `p` is also what a HELD empty-book market is priced,
-                # sized and shed at (both gates below are entry-only, D1), so held rungs on an
-                # empty book move from a 1c basis to a 6c one.  Neither is a market price:
+                # CARRIED SCOPE — this `p` is also what a HELD empty-book market is priced and
+                # MARKED at (both gates below are entry-only, D1), so held rungs on an empty book
+                # move from a 1c basis to a 6c one.  (It used to size a shed too; there are no
+                # sheds as of 2026-07-30, and the mark is the surviving consumer.)  Neither is a market price:
                 # there is no best on an empty side, and `p` is a fiction chosen by us either
                 # way.  6c is the fiction we are willing to trade at.
                 if rec["pinned"]:
@@ -904,9 +917,9 @@ def rank_for_poll(slots, r_star=C.FLOOR_RATE_PER_H, limit=None):
     MIRROR (rank picks the best ↔ inventory we already hold): the INVENTORY-SLOT GUARANTEE.  A
     market with a nonzero position or a non-terminal order is ALWAYS polled, whatever it ranks:
     fills are learned from cancels and polls, so a de-polled market is never requoted, never
-    cancelled, and its fills are never learned — the position becomes invisible to our own books
-    and no shed is ever posted.  Callers pass those tickers in `always`; `rank_for_poll` only
-    orders the rest.
+    cancelled, and its fills are never learned — the position becomes invisible to our own books,
+    and it marks at COST, which blinds the day stop.  Callers pass those tickers in `always`;
+    `rank_for_poll` only orders the rest.
     """
     scored = [(s.net_at(0, r_star), s) for s in slots]
     scored.sort(key=lambda kv: (-kv[0], kv[1].ticker, kv[1].side))

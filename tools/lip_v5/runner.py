@@ -399,8 +399,10 @@ class Runner(object):
 
         This is the SAME SET `book_poll_pass` builds for the inventory-slot guarantee, and that
         is the point: the guarantee that a held market is always polled is worth little if the
-        same market can fail to produce a SLOT, because the shed and the requote both read the
-        slot table and not the poll set.  One definition, two consumers.
+        same market can fail to produce a SLOT, because the requoter and the MARK both read the
+        slot table and not the poll set.  One definition, two consumers.  (It used to say "the
+        shed and the requote"; the shed is deleted, 2026-07-30, and the mark — which the day
+        stop's mark-to-market reads — is what took its place in the argument.)
         """
         m = self.m
         out = {t for t, p in m.positions.items()
@@ -427,8 +429,9 @@ class Runner(object):
         """BLOCKER-3 — the book_poll lane.
 
         THE SET: every market we hold or rest an order in, ALWAYS (the inventory-slot
-        guarantee — a de-polled held market is never requoted, never shed, and its fills
-        arrive as surprises), plus the best-ranked rest up to `MAX_REST_MARKETS`.
+        guarantee — a de-polled held market is never requoted, marks at COST so the day stop
+        goes blind on it, and its fills arrive as surprises), plus the best-ranked rest up to
+        `MAX_REST_MARKETS`.
 
         THE CADENCE, derived with the §3.4 ladder: demand = classify (amortized) + fills
         (1/15) + recon (1/600) + one poll per market at BOOK_POLL_HZ.  When demand exceeds
