@@ -375,16 +375,17 @@ class TestCycle(EngineCase):
         m.cycle(NOW, server_epoch=NOW - 5.0, yes_mids={})
         self.assertTrue(m.skew_ok)
 
-    def test_the_cycle_derives_the_slot_cap_from_the_day_stop(self):
-        """SUPERSEDED IN DERIVATION (note 52 D6): the per-order cap is the LOT CONTAINER
-        (ceiling/(N×(1+refills)) = $2.50 at $300) and does NOT move with the day stop — a
-        bigger reward day buys more RUNGS, never bigger lots."""
+    def test_the_cycle_sets_the_per_order_bound_to_the_allocation(self):
+        """SUPERSEDED AGAIN (owner's law §3/§4, 2026-07-30; was note 52 D6's lot container).
+        The per-order bound IS the per-market allocation — a single order may carry the
+        whole $10 ("we will put all 10") — and it moves with NOTHING: not the day stop, not
+        the projected reward.  The two strategy constants are the law's own."""
         m = self.maker()
         m.projected_day_reward = 300.0
         out = m.cycle(NOW, slots=[slot()], yes_mids={})
-        want = C.slot_cap_usd(0.0, ceiling_usd=m.ceiling_usd)
-        self.assertAlmostEqual(out["allocate"]["slot_cap_usd"], want, places=9)
-        self.assertAlmostEqual(m.slot_cap_usd, want, places=9)
+        self.assertAlmostEqual(out["allocate"]["alloc_cap_usd"], C.ALLOC_PER_MARKET_USD,
+                               places=9)
+        self.assertAlmostEqual(m.slot_cap_usd, C.ALLOC_PER_MARKET_USD, places=9)
 
     def test_the_cash_feed_heartbeat_fires(self):
         m = self.maker()
@@ -598,16 +599,19 @@ class TestShadowReadout(EngineCase):
     def test_G2_produces_venue_rank_psdh_coverage_and_a_zeroed_feed(self):
         m = self.maker(shadow=True)
         out = m.shadow_readout(NOW, slots=[
-            slot("KXAAAGASD-1"),
-            slot("KXPYPLX-1", rho=0.439, S=50, p=0.30, phi=0.50, l_eff=3744.0),
+            slot("KXAAAGASD-1", cum_size=2000.0),
+            slot("KXPYPLX-1", rho=0.439, S=50, p=0.30, phi=0.50, l_eff=3744.0,
+                 cum_size=2000.0),
         ])
         self.assertEqual(out["quoted"], 0)
         self.assertEqual(out["cash_feed"], "zeroed")
         self.assertEqual(len(out["venue_rank"]), 2)
-        # ranked by net: the healthy gas rung above the PayPal-shaped one
+        # ranked by the LAW: cheapest capital-need first.  The PayPal-shaped venue's phi
+        # (0.50/h ⇒ ~12 turnovers over its window) multiplies its need past the healthy
+        # rung's, so the gas rung leads and the toxic one reads unaffordable.
         self.assertEqual(out["venue_rank"][0]["ticker"], "KXAAAGASD-1")
-        self.assertTrue(out["venue_rank"][0]["admits"])
-        self.assertFalse(out["venue_rank"][1]["admits"])
+        self.assertTrue(out["venue_rank"][0]["affordable"])
+        self.assertFalse(out["venue_rank"][1]["affordable"])
         self.assertTrue(self.logs_of("venue_rank"))
 
     def test_shadow_publishes_a_ZEROED_feed_not_a_live_one(self):
@@ -804,13 +808,16 @@ class TestTheSoleQualifierNeedsNoPermission(EngineCase):
         for gone in ("admit_venues", "venue_floor_usd", "venues", "venue_status"):
             self.assertFalse(hasattr(m, gone), gone)
 
-    def test_a_sole_qualifier_slot_is_sized_by_the_CLIFF_in_the_allocator(self):
-        """The surviving half, at the layer that owns it: with S=0 our share is the whole
-        side, so one contract clears the floor and the rung is sized from the cliff — no
-        venue state is consulted to reach that number."""
+    def test_a_sole_qualifier_slot_is_sized_by_the_LAW_in_the_allocator(self):
+        """The surviving half, at the layer that owns it (rewritten under the owner's law,
+        2026-07-30): with S=0 our share is the whole side, and `law_need` prices the slot —
+        including its qualifying walk, the step the old cliff model could not see — with no
+        venue state consulted to reach the number."""
         s = slot("KXAAAGASD-1", S=0.0, venue="KXAAAGASD")
         self.assertEqual(alloc.our_share(1, s.S), 1.0)
-        self.assertIsNotNone(alloc.cliff_clearing_q(s))
+        n = alloc.law_need(s)
+        self.assertIn(n.reason, ("", "unaffordable"))
+        self.assertGreater(n.total_usd, 0.0)
 
 
 class TestNothingIsCapExempt(EngineCase):

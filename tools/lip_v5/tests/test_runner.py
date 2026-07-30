@@ -285,19 +285,15 @@ class TestSlotTable(LipTestCase):
         slots, _, _ = self._slots()
         self.assertTrue(all(s.land_grab_size == 0 for s in slots))
 
-    def test_an_unqualified_side_is_REFUSED_not_funded(self):
-        """REPLACES test_an_unqualified_side_gets_the_qualification_size (FREE_RIDE_ONLY armed
-        2026-07-29).
+    def test_an_unqualified_side_is_PRICED_and_ranked_unaffordable(self):
+        """REWRITTEN under the owner's law §7a (2026-07-30; was ..._REFUSED_not_funded under
+        FREE_RIDE_ONLY, and before that ..._gets_the_qualification_size at 1c).
 
-        The old contract: a side short of target_size gets FUNDED to reach it, at
-        LAND_GRAB_PRICE_C.  That path posted 990 contracts at 1c here, and on the live account it
-        posted 999 in gas and 1,500/3,000 in TRUEV -- the largest objects in the whole tape.
-        The CFTC filing says what they were worth: the qualifying walk stops once cumulative size
-        reaches target, so size beyond it scores EXACTLY ZERO.  We were buying the -100% cohort's
-        geometry in exchange for nothing.
-        The new contract: qualification is worth the same to us whether we or a rival created it,
-        and a rival's is free -- so a side that does not clear target WITHOUT us is skipped."""
-        from .. import ratelimit as RL
+        The law's contract: a side short of target WITHOUT us is neither funded at 1c (the
+        -100% cohort's geometry) nor refused by a gate — it is PRICED.  The slot carries its
+        self-qualifying walk at the band floor, and the allocator skips it as unaffordable
+        with the arithmetic in the log ($10/market cannot buy a 990-contract walk)."""
+        from .. import alloc, ratelimit as RL
 
         class Thin(ScanExchange):
             def book(self, ticker):
@@ -308,37 +304,29 @@ class TestSlotTable(LipTestCase):
         c = scan.Classifier()
         c.sweep(ex, RL.Bucket(NOW), progs, NOW)
         slots = scan.build_slots(progs, c, NOW)
-        # bid side has 10 resting against a 1000 target -> does not qualify without us -> gone
-        self.assertEqual([s for s in slots if s.side == "bid"], [],
-                         "a side short of target must be REFUSED, never funded at 1c")
-        # and the ask side, which DOES clear target on rival size alone (1200 >= 1000), survives
+        bids = [s for s in slots if s.side == "bid"]
+        self.assertTrue(bids, "the law prices the thin side; it does not delete it")
+        self.assertEqual(bids[0].land_grab_size, 990)     # the walk gap, carried
+        own_axis = bids[0].land_grab_price_c
+        self.assertEqual(own_axis, C.ENTRY_BAND_LO_C, "never 1c again")
+        a2, spent, rep = alloc.allocate_law(bids, 300.0)
+        self.assertEqual(spent, 0.0)
+        self.assertEqual(rep["reasons"].get("unaffordable"), 1)
+        # and the ask side, which DOES clear target on rival size alone, rides free
         asks = [s for s in slots if s.side == "ask"]
-        self.assertTrue(asks, "a side that already qualifies on rival depth must still be quoted")
-        self.assertEqual(asks[0].land_grab_size, 0, "free-riding never funds a grab")
+        self.assertTrue(asks)
+        self.assertEqual(asks[0].land_grab_size, 0, "free-riding costs nothing")
 
     def test_P6_the_pre_entry_filter_seam_exists_and_its_ABSENCE_is_logged(self):
-        """note 43 §5's mirror: "zero fills forever means either the perfect rewards venue or a
-        market nobody wants — the difference is whether ANYONE EVER TRADES THERE AT ALL."
-
-        The filter needs the public trade tape, which this build does not pull.  An unwired
-        filter that LOOKS wired is the same defect class as a constant with no call site, so the
-        absence is logged once per process and the seam is a real parameter.
-        """
+        """note 43 §5's mirror, under the owner's law §7 (2026-07-30): p6 informs PHI ONLY,
+        never refuses.  The seam still exists (the absence of a tape source is logged once),
+        and a supplied p6 OBSERVES — `p6_quiet` — with no refusal end left to toggle."""
         scan._P6_WARNED = False
         slots, progs, c = self._slots()
         self.assertTrue(self.logs_of("p6_pre_entry_filter_UNWIRED"))
-        # ...and when it IS supplied it OBSERVES rather than excludes (config.P6_ADVISORY):
-        # Kalshi's own docs pay for resting "even if your orders don't get filled", so an
-        # untraded market is an UNCONTESTED one, not a worthless one.
         none_traded = scan.build_slots(progs, c, NOW, p6=lambda t: False)
-        self.assertTrue(none_traded, "advisory P6 must not delete the quiet long tail")
-        self.assertTrue(self.logs_of("p6_would_refuse"))
-        # ...and the refusal end still works when the flag is turned off.
-        try:
-            C.P6_ADVISORY = False
-            self.assertEqual(scan.build_slots(progs, c, NOW, p6=lambda t: False), [])
-        finally:
-            C.P6_ADVISORY = True
+        self.assertTrue(none_traded, "p6 must not delete the quiet long tail")
+        self.assertTrue(self.logs_of("p6_quiet"))
         all_traded = scan.build_slots(progs, c, NOW, p6=lambda t: True)
         self.assertTrue(all_traded)
 
@@ -1008,7 +996,7 @@ class TestPlumbingWakes(RunnerCase):
         r.init(NOW, nestor_state=self.NESTOR)
         out = r.iteration(NOW + 1)
         self.assertTrue(out["slots"], "the quiet long tail must remain quotable")
-        self.assertTrue(self.logs_of("p6_would_refuse"))
+        self.assertTrue(self.logs_of("p6_quiet"))
 
     def test_P6_a_traded_market_is_admitted(self):
         r = self.runner()                                 # default fake: one recent trade

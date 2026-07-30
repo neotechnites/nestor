@@ -476,6 +476,42 @@ def _mid(yes_bid_c, yes_ask_c):
 # =============================================================================================
 # STAGE 3 — the slot table.
 # =============================================================================================
+def measured_phi(fills_ct, rest_contract_hours):
+    """Law §6's "measured", from OUR OWN tape.  Returns None when unmeasured.
+
+    fills > 0 with exposure is the estimate itself, n/E.  Zero fills over at least
+    DECISIVE_COMMITTED_H of exposure is ALSO a measurement — of QUIETNESS — and it is
+    carried as the point estimate 0.0, NOT as the Rule-of-Three upper bound.  The bound was
+    right when phi was a COST term (err toward charging more); under the law phi MULTIPLIES
+    the capital need (turnovers), so 3/E grades every quiet market as a hot one — measured
+    on the convergence fixture: 2.07 exposure-hours with zero fills made T = 23 turnovers
+    and a $1.56 rung "need" $35.90, i.e. the book un-funded itself for having rested
+    quietly, the bootstrap deadlock of `money.seed_phi` arriving through the new door.
+    MIRROR (phi too LOW here ↔ too high): too low under-reserves the requote budget, and
+    the loss is bounded in DOLLARS by the market's own $10 allocation — the rail is the
+    allocation itself; too high refuses the venue AND destroys the evidence that would
+    clear it, unbounded in time.  Anything thinner than DECISIVE_COMMITTED_H is not a
+    measurement and falls through the chain (bucket average → global average → seed)."""
+    n = max(0, int(fills_ct))
+    e = max(0.0, float(rest_contract_hours))
+    if n > 0 and e > 0.0:
+        return n / e
+    if n == 0 and e >= C.DECISIVE_COMMITTED_H:
+        return 0.0
+    return None
+
+
+def phi_bucket(p):
+    """The law §6 price bucket: decile of the price axis (10c per bucket).
+
+    Fill hazard varies with price (cheap contracts sit where retail flow chases longshots),
+    so the average that stands in for an unmeasured market must come from its own price
+    neighborhood.  Deciles are the coarsest partition finer than the entry band itself;
+    UNDERIVED as a width — recalibrate when the tape supports finer (the
+    `fill_selection_tripwire` line is the instrument that will say so)."""
+    return min(9, max(0, int(round(float(p) * 100)) // 10))
+
+
 _P6_WARNED = False
 
 
@@ -609,6 +645,33 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
     slots = []
     by_prog = {p["program_id"]: p for p in programs}
 
+    # ── THE PHI-CHAIN PRE-PASS (law §6). ────────────────────────────────────────────────────
+    # Collect every MEASURED phi on the board with its price, so an unmeasured market can
+    # borrow the average of its price bucket (then the global average) instead of a seed.
+    # Runs over the whole classify table — evidence is evidence whether or not the market
+    # produces a slot this cycle — and over the same tape/presence rows the per-slot numbers
+    # below read, so the chain and the market can never disagree about the same key.
+    _phi_buckets, _phi_global = {}, [0.0, 0]
+    for _tk, _rec in sorted(classifier.table.items()):
+        for _sd_side in ("bid", "ask"):
+            _p = _rec["sides"][_sd_side]["p"]
+            if _p is None or _p <= 0:
+                continue
+            _key = (_tk, _sd_side)
+            _rows = [r for r in presence_rows if (r.get("ticker"), r.get("side")) == _key]
+            _t = tape.get(_key, {})
+            _f = int(_t.get("fills_ct", P.fills_ct(_rows, _key) if _rows else 0))
+            _e = float(_t.get("rest_contract_hours",
+                              P.rest_contract_hours(_rows, _key) if _rows else 0.0))
+            _m = measured_phi(_f, _e)
+            if _m is None:
+                continue
+            _b = _phi_buckets.setdefault(phi_bucket(_p), [0.0, 0])
+            _b[0] += _m
+            _b[1] += 1
+            _phi_global[0] += _m
+            _phi_global[1] += 1
+
     for ticker, rec in sorted(classifier.table.items()):
         prog = by_prog.get(rec["program_id"])
         if prog is None or C.series_denied(ticker) or ticker in frozen:
@@ -655,15 +718,13 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                 R.log("program_no_pool", ticker=ticker, program_id=prog.get("program_id"))
                 continue
 
+        # P6 IS NOT A GATE (owner's law §7, 2026-07-30: "p6 trade-evidence may inform phi
+        # only, never refuse").  A market nobody trades is an uncontested one — rewards pay
+        # for RESTING — and its quietness enters the formula as a cheaper phi seed below,
+        # never as a refusal.  The observation is still logged so the first payout can
+        # settle the question with evidence.
         if not is_held and p6 is not None and not p6(ticker):
-            # ADVISORY by default (config.P6_ADVISORY, derivation there): rewards are paid for
-            # RESTING, not for trading, so an untraded market is an uncontested one.  The
-            # observation is still recorded per ticker so the first payout settles the question
-            # with evidence — if quiet venues turn out not to credit, the forfeit gate and the
-            # ratchet refuse them on measurement.
-            R.log("p6_would_refuse", ticker=ticker, advisory=bool(C.P6_ADVISORY))
-            if not C.P6_ADVISORY:
-                continue
+            R.log("p6_quiet", ticker=ticker)
         # Charter B: `close_ts` is the MARKET's settlement close; `program_end_ts` is the
         # reward window's end.  They differ on exactly the markets the horizon exclusion and
         # the carry term exist for (PYPL settles months after its window).  Fallback to the
@@ -791,72 +852,32 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                 continue
             # SF-5: S is the RIVAL score — the classified book contains our own orders.
             S_riv = rival_S(sd["S"], p, (own_orders or {}).get(key))
-            # -------------------------------------------------------------------------------
-            # FREE-RIDE ON DEPTH, NEVER FUND IT  (C.FREE_RIDE_ONLY, armed 2026-07-29)
-            # The 1,000-contract target is a DISCRETE precondition: short of it the snapshot
-            # qualifies nobody.  v5 FUNDED the gap at LAND_GRAB_PRICE_C — the cheapest possible
-            # proximity, at the price where a contract is worth nothing, in the size that
-            # maximises count.  That path bought the 999-contract 1c gas rung and the 1,500- and
-            # 3,000-contract TRUEV rungs; those postings are the largest single objects in the
-            # whole tape and they score EXACTLY ZERO, because sizes beyond the target-size walk
-            # are outside the qualifying set (CFTC filing: "If the Qualifying Yes Total Size is
-            # greater than or equal to the target size, the procedure is stopped here").
-            # DERIVATION OF THE REPLACEMENT: qualification is worth the same to us whether WE
-            # created it or a rival did, and a rival's costs nothing.  So enter only where the
-            # book ALREADY clears target WITHOUT our size.  The test must deduct our own resting
-            # size (SF-5, applied to `qualifies` and not only to `S`) or it certifies our own
-            # land grab back to us.
-            # MIRROR (never funding ↔ never entering): the fear is that nothing qualifies without
-            # us and the book deploys nothing.  MEASURED on the live board: 5,681 of 5,695
-            # book-sides (99.75%) already reach target on rival size alone, and of the sides with
-            # a competing score at or below 3, 99.3% qualify.  The fear is refuted; the
-            # instrument if it ever bites is the `free_ride_refused` count below.
-            # THE GATE IS ON ENTRY, NOT ON TENURE.  First cut of this refused any side whose
-            # rival depth was short of target — including sides we were ALREADY resting in, and
-            # there the test caught it: our own size is inside `cum_size`, so deducting it makes
-            # `rival_cum` fall as our presence GROWS, and the slot count decayed 4 -> 2 over 90
-            # cycles while four orders still rested unrefreshed.  That is the sole-qualifier case
-            # `rival_S` already documents ("when we ARE the whole qualifying side ... the
-            # requoter's sole-qualifier hold keeps the minimum presence instead"), and evicting
-            # there is strictly worse than holding: accrual is per PERIOD, so abandoning mid-period
-            # forfeits everything earned so far in exchange for nothing.
-            # So: refuse to ENTER a book that does not qualify without us; once resting, hand the
-            # decision to the requoter, which already prices staying.
-            # D3 — WHAT THIS TEST IS AND IS NOT.  The first cut subtracted our own resting size
-            # from `cum_size` "per SF-5" and then guarded the whole test on `own_qty <= 0`, so
-            # the subtraction was UNREACHABLE — inside that branch our own size is zero by
-            # definition and `rival_cum == cum_size` always.  Worse, the deduction could not have
-            # been right even where it ran: `cum_size` is the TARGET-SIZE QUALIFYING WALK, which
-            # STOPS at `target_size` (CFTC filing), so it is not side depth and subtracting from
-            # it understates rival depth by up to 2x — verified, a side with 1,800 of depth
-            # against a 1,000 target reports `cum_size = 1,200`, not 1,800.  SF-5's deduction is
-            # correct for `S` (a sum over levels, which our order really is inside) and wrong for
-            # a walk that terminates.  So the honest statement of this gate is the one written
-            # below: **does the walk reach target at all** — with our own orders exempted by
-            # `is_held`/`own_qty` rather than by arithmetic on a truncated cumulant.
-            if C.FREE_RIDE_ONLY and not is_held:
-                own_qty = sum(float(q) for _, q in ((own_orders or {}).get(key) or []))
-                if own_qty <= 0 and not sd["qualifies"]:
-                    R.log("free_ride_refused", ticker=ticker, side=side,
-                          cum_size=round(float(sd["cum_size"]), 2),
-                          target=float(rec["target_size"]))
-                    continue
-            # THE FILL-RATE SEED MUST REFLECT THE EVIDENCE WE ALREADY HAVE.  With no tape of
-            # our own, phi falls back to PHI_SEED_MID = 0.08 fills/hour/resting-contract —
-            # a v1 guess, flagged UNDERIVED, describing a BUSY book.  Since the ratchet was
-            # generalized that seed gates admission, and it prices every fresh venue out:
-            # measured live, gross 0.005-0.02 against carry 0.012 + drift 0.011-0.062, so
-            # every unmeasured venue was pre-judged unprofitable before a single observation.
+            # ── FREE_RIDE_ONLY IS DEAD (owner's law §7a, 2026-07-30). ─────────────────────
+            # The gate refused any side whose rival depth was short of the qualifying walk.
+            # Under the law that refusal is a PRICE, not a permission: where rivals' depth
+            # qualifies the side our quote rides free (qualify cost $0), and where it does
+            # not, `alloc.law_need` charges the self-qualifying walk — (target − cum) at the
+            # band-floor price — which at $10/market practically ranks empty sides
+            # unaffordable, with the numbers in the skip log instead of a silent refusal.
             #
-            # But P6 already asked the exchange "does ANYONE trade here?", and a venue with no
-            # public trades in P6_LOOKBACK_DAYS cannot be filling us at 0.08/h — that is the
-            # definition of a quiet book, and note 43 §4 says a quiet book is where presence
-            # is the product.  So the seed follows the tape: untraded ⇒ the CHEAP seed.
-            # This is still a seed: one venue-hour of our OWN fills overrides it via the
-            # Rule of Three, which is an upper bound and errs toward refusing.
+            # THE PHI CHAIN (law §6): per-market measured → price-bucket average of measured
+            # phis → global measured average → the seed.  The chain is resolved here because
+            # this is where every market's tape and price meet; the bucket/global tables are
+            # built in the pre-pass above from the SAME evidence.  P6's quietness still
+            # informs the seed (an untraded market cannot be filling anyone at the busy
+            # rate) — phi only, never a refusal.
             quiet = (p6 is not None and not p6(ticker))
-            phi = M.phi_estimate(fills, rest_ch,
-                                 p=(C.PHI_CHEAP_PRICE_CUT / 2.0) if quiet else p)
+            m_phi = measured_phi(fills, rest_ch)
+            if m_phi is not None:
+                phi = m_phi
+            elif _phi_buckets.get(phi_bucket(p)):
+                _b = _phi_buckets[phi_bucket(p)]
+                phi = _b[0] / _b[1]
+            elif _phi_global[1] > 0:
+                phi = _phi_global[0] / _phi_global[1]
+            else:
+                phi = M.phi_estimate(fills, rest_ch,
+                                     p=(C.PHI_CHEAP_PRICE_CUT / 2.0) if quiet else p)
             d = M.d_estimate(t.get("drift_samples"), p)
             l_eff = M.l_eff_h(close_ts, now,
                               (l_shed or {}).get(key), settled=False)
@@ -864,26 +885,18 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                      else (prior_t_hat if prior_t_hat is not None
                            else C.SHRINK_PRIOR_DEFAULT))
             land_grab = 0
-            # Cheapest legal price ON THE SIDE BEING CREATED, on the YES axis: 1c for a bid,
-            # 99c for an ask (v4's shape, kept — the default-1c-for-both form would sell YES
-            # at 1c, an instantly-marketable CROSS wearing a land grab's name).
-            lg_px_c = C.LAND_GRAB_PRICE_C if side == "bid" \
-                else (100 - C.LAND_GRAB_PRICE_C)
-            # D4 — THIS ZERO IS LOAD-BEARING, AND THE COMMENT THAT SAID OTHERWISE WAS FALSE.
-            # The previous note here claimed the `elif` was unreachable under FREE_RIDE_ONLY
-            # because the gate above had already `continue`d every non-qualifying side.  It had
-            # not: the gate exempts sides we already rest in (`own_qty > 0`) and, since D1, every
-            # ticker we hold (`is_held`) — and BOTH exemptions can carry a side whose walk does
-            # NOT reach target.  So `not sd["qualifies"]` is reachable with FREE_RIDE_ONLY armed,
-            # and without this branch those sides would fund the 1c land grab: the exact geometry
-            # of the 999-contract 1c gas rung and the 1,500/3,000-contract TRUEV rungs, the
-            # largest objects in the whole tape, which scored ZERO because the qualifying walk
-            # stops at target.  `test_fixround.TestLandGrabIsDeadUnderFreeRide` now fails if this
-            # line is deleted; before D4 the whole suite passed without it, which is note 45's
-            # thesis arriving inside our own tests — green meant self-consistent, not correct.
-            if C.FREE_RIDE_ONLY:
-                land_grab = 0
-            elif not sd["qualifies"] and not rec["pinned"]:
+            # ── SELF-QUALIFICATION IS PRICED, NOT FUNDED-AT-1c AND NOT REFUSED (law §7a). ──
+            # The walk gap (target − cum) is what a side short of qualification costs to
+            # create; `alloc.law_need` charges it into the market's capital need, and at
+            # $10/market that practically ranks it unaffordable — logged with the numbers.
+            # THE PRICE IS THE BAND FLOOR, on the side's own collateral axis (a bid at 6c of
+            # YES; an ask at 6c of NO = a 94c YES ask).  1c — the old LAND_GRAB_PRICE_C —
+            # is the price the preserved entry band exists to refuse (n = 8,240: 2c realised
+            # 0.00% on 765 markets; the 999-contract 1c gas rung was this exact geometry),
+            # and a module cannot both price a thing and refuse its own price.
+            lg_px_c = C.ENTRY_BAND_LO_C if side == "bid" \
+                else (100 - C.ENTRY_BAND_LO_C)
+            if not sd["qualifies"] and not rec["pinned"]:
                 land_grab = alloc.t0_qualification_size(sd["cum_size"], rec["target_size"])
                 # Never cross the OTHER side (v4, kept): a bid grab must sit below the yes
                 # ask; an ask grab above the yes bid.
@@ -909,9 +922,18 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
     return slots
 
 
-def rank_for_poll(slots, r_star=C.FLOOR_RATE_PER_H, limit=None):
+def law_poll_key(slot):
+    """The LAW's own ordering for a slot, cheapest capital-need first (law §1), with
+    done/unreachable candidates last and deterministic (ticker, side) ties — so the poll
+    clamp, the shadow read-out and the allocator all rank by the ONE formula, and a restart
+    reproduces the same order from the same world (law §10)."""
+    n = alloc.law_need(slot)
+    return (n.reason != "", n.total_usd, slot.ticker, slot.side)
+
+
+def rank_for_poll(slots, limit=None):
     """The §4.6 clamp: which markets get the 1 Hz book poll.  Ranked by the ALLOCATOR'S OWN
-    first-dollar rate under (★), so the clamp and the allocator agree — the whole point of the
+    need formula, so the clamp and the allocator agree — the whole point of the
     classify-then-rank ordering.
 
     MIRROR (rank picks the best ↔ inventory we already hold): the INVENTORY-SLOT GUARANTEE.  A
@@ -921,18 +943,16 @@ def rank_for_poll(slots, r_star=C.FLOOR_RATE_PER_H, limit=None):
     and it marks at COST, which blinds the day stop.  Callers pass those tickers in `always`;
     `rank_for_poll` only orders the rest.
     """
-    scored = [(s.net_at(0, r_star), s) for s in slots]
-    scored.sort(key=lambda kv: (-kv[0], kv[1].ticker, kv[1].side))
-    out = [s for _, s in scored]
+    out = sorted(slots, key=law_poll_key)
     return out[:int(limit)] if limit else out
 
 
-def poll_set(slots, always_tickers, connected, r_star=C.FLOOR_RATE_PER_H):
+def poll_set(slots, always_tickers, connected):
     """The tickers to poll this cycle: every market we hold or have an order in, plus the best
     of the rest up to the breadth the connection supports (6 REST, 32 while the WS is up)."""
     breadth = C.MAX_WS_MARKETS if connected else C.MAX_REST_MARKETS
     held = [t for t in sorted(always_tickers)]
-    ranked = [s.ticker for s in rank_for_poll(slots, r_star)]
+    ranked = [s.ticker for s in rank_for_poll(slots)]
     out = list(held)
     for t in ranked:
         if len(out) >= breadth:

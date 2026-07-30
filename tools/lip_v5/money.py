@@ -290,94 +290,11 @@ def _clip01(x):
 
 
 # =============================================================================================
-# THE r* FIXED POINT  (spec §1.3) — it is circular: r* prices carry, carry decides the
-# allocation, the allocation sets r*.  Precedent: v4's budget-reserve fixpoint.
+# THE r* FIXED POINT IS DELETED (owner's law, 2026-07-30).  The law's ranking is capital
+# needed for a fixed dollar target, not a marginal rate, so there is no circular quantity
+# left to solve for.  `solve_rstar`/`rstar_seed`/`RStarResult` died with the water-filling
+# core; cutover's triage prices opportunity cost at the reference floor directly.
 # =============================================================================================
-class RStarResult(object):
-    __slots__ = ("r_star", "iters", "converged", "trace", "alloc", "dropped")
-
-    def __init__(self, r_star, iters, converged, trace, alloc=None, dropped=None):
-        self.r_star = r_star
-        self.iters = iters
-        self.converged = converged
-        self.trace = trace
-        self.alloc = alloc
-        self.dropped = dropped               # forfeit-gate drops, set by allocate_with_rstar
-
-    def __repr__(self):
-        return "RStar(%.6f iters=%d conv=%s)" % (self.r_star, self.iters, self.converged)
-
-
-def rstar_seed(trailing_achieved_rate, floor_rate=C.FLOOR_RATE_PER_H):
-    """`r*_0 = max( trailing-7d achieved marginal rate , λ_min/16 )` — never seed below the
-    floor.  COLD START (truly empty history) ⇒ the floor itself: seeding low makes carry look
-    cheap, which is the PayPal direction, and §1.4's unverified cap is what bounds the damage
-    in that one case."""
-    if trailing_achieved_rate is None:
-        return float(floor_rate)
-    return max(float(trailing_achieved_rate), float(floor_rate))
-
-
-def solve_rstar(allocate_fn, r0, max_iters=C.RSTAR_MAX_ITERS, damping=C.RSTAR_DAMPING,
-                tol=C.RSTAR_CONVERGE_FRAC):
-    """spec §1.3's fixpoint, verbatim.
-
-        repeat k = 1..4:  A_k := ALLOCATE(r*_{k-1});  r_new := marginal rate of A_k at its
-                          stopping point
-                          r*_k := 0.5·r*_{k-1} + 0.5·r_new      # damped, prevents 2-cycles
-                          stop when |r*_k − r*_{k-1}| / r*_k < 0.05
-
-    `allocate_fn(r_star)` → (alloc, marginal_rate_at_stop).
-
-    Damped iteration on a monotone scalar map halves the residual per step.  5% because
-    ALLOCATE's own step resolution is 2% and chasing below its own noise is theatre.
-
-    **D3, RESOLVED (was: surfaced upward).**  §1.3 made two statements that are not the same
-    claim.  "4 iterations covers a 16x seed error" is true of the RESIDUAL — the damped map
-    halves it per step, so 4 steps reduce it exactly 16x (still asserted in T-N7).  But the
-    STOP RULE is a 5% *relative step change*, and reaching that band from initial relative
-    error `e` needs `k >= log2(e/0.05)` steps: a 2x seed needs 5, a 16x seed needs 9.  At
-    `max_iters = 4` the rule could never trip, so the fixpoint always fell back to the
-    non-convergence branch and `rstar_no_converge` fired every cycle — alarm fatigue on a
-    control that was inert.  `RSTAR_MAX_ITERS = 9` is the smallest value that makes both of
-    §1.3's own statements true at once.
-
-    NON-CONVERGENCE: use `max(r*_0..r*_k)` and report it.  Derivation of that tie-break — a
-    HIGHER r* prices carry higher, admits fewer venues and allocates LESS: the conservative
-    direction, and the one that fails toward the PayPal lesson rather than away from it.
-    T-N7 asserts the non-converged run allocates <= the converged run.
-
-    **The honest limit of that tie-break (corrected).**  An earlier draft of this docstring
-    claimed `max(trace)` "errs high in both regimes".  IT DOES NOT.  It errs high relative to
-    the SEED, which is not the same as erring high relative to the TRUTH:
-      * seed too HIGH — the trace DESCENDS toward r*, `max` returns the seed, which is indeed
-        above the true fixed point.  Conservative, as claimed.
-      * seed too LOW  — the trace ASCENDS toward r*, `max` returns the LAST value, which is
-        still BELOW the true fixed point.  Carry is then priced too CHEAPLY: the PayPal
-        direction, not the safe one.
-    The low-seed case is reachable at cold start, where `r*_0 = lambda_min/16` by construction.
-    What bounds the damage there is not this function — it is §1.4's unverified-exposure cap,
-    which is exactly why that cap, and not this tie-break, is the cold-start guard.
-    """
-    r_prev = float(r0)
-    trace = [r_prev]
-    alloc = None
-    converged = False
-    iters = 0
-    for _ in range(int(max_iters)):
-        iters += 1
-        alloc, r_new = allocate_fn(r_prev)
-        r_k = (1.0 - float(damping)) * r_prev + float(damping) * float(r_new)
-        trace.append(r_k)
-        if r_k > 0 and abs(r_k - r_prev) / r_k < float(tol):
-            r_prev = r_k
-            converged = True
-            break
-        r_prev = r_k
-    if not converged:
-        r_prev = max(trace)
-        alloc, _ = allocate_fn(r_prev)
-    return RStarResult(r_prev, iters, converged, trace, alloc)
 
 
 # =============================================================================================

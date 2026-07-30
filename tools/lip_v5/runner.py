@@ -22,7 +22,7 @@ Three properties this file exists to hold, each of which a naive loop loses:
 
 import time
 
-from . import config as C, cutover, engine, guards as G, ledger as LG
+from . import alloc, config as C, cutover, engine, guards as G, ledger as LG
 from . import ratchet as RT, ratelimit as RL, runtime as R, scan   # `money` left with the
                                                                   # shed path: its only use
                                                                   # here was l_shed_median_h
@@ -457,10 +457,14 @@ class Runner(object):
         tickers = scan.poll_set(self.slots, always, connected=False)
         if not tickers:
             return {"polled": 0, "due": 0}
+        # The degrade ladder sheds the WORST-ranked breadth first; "net" here is the LAW's
+        # ordering inverted into a higher-is-better score (cheapest need → largest score),
+        # so what the ladder sheds is exactly what the allocator would fund last.
         net_by = {}
         for s in self.slots:
-            net_by[s.ticker] = max(net_by.get(s.ticker, float("-inf")),
-                                   s.net_at(0, C.FLOOR_RATE_PER_H))
+            n = alloc.law_need(s)
+            score = -n.total_usd if n.reason == "" else float("-inf")
+            net_by[s.ticker] = max(net_by.get(s.ticker, float("-inf")), score)
         markets = [{"ticker": t,
                     "net": float("inf") if t in always else net_by.get(t, 0.0),
                     "ws_fresh_gated": False} for t in tickers]

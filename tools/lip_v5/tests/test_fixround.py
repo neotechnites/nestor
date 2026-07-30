@@ -110,7 +110,14 @@ class TestFillReplenishAtOneHz(FixRoundCase):
         ex.take(oid, n, now=NOW + 2)                       # the taker eats the WHOLE order
         return r, ex, oid, n
 
-    def test_fill_learned_via_fills_api_and_replenished(self):
+    def test_fill_learned_and_a_consumed_allocation_ends_presence_there(self):
+        """REWRITTEN under the owner's law §4 (2026-07-30).  WAS `..._and_replenished`,
+        asserting the reserve stack re-posted a lot after a full fill.  Under the law the
+        $10 per-market allocation IS the requote budget: a fill that consumes the whole
+        envelope ends that market's presence for the window — `allocation_exhausted`, with
+        numbers, never silent — the position RIDES, and a restart re-derives the same state
+        from exchange positions alone.  The requote-on-fill path (partial consumption) is
+        `test_a_partial_fill_...` below and test_law's TestTheRequoteBudget."""
         r, ex, oid, n = self._filled_runner(verified=True)
         t = NOW + 2
         for _ in range(2 * int(C.FILLS_POLL_S) + 5):       # true 1 Hz
@@ -123,8 +130,11 @@ class TestFillReplenishAtOneHz(FixRoundCase):
         self.assertGreater(ex.fills_calls, 0, "the fills API was NEVER polled")
         self.assertAlmostEqual(r.m.positions[TK]["yes"], n, places=6)
         self.assertNotIn(oid, r.m.orders, "the filled order is still counted as resting")
-        self.assertTrue(ex.resting, "NO REPLENISH ORDER RESTS: presence died after a fill")
-        self.assertGreater(len(ex.placed), 1, "silent after the first fill — v4's tape")
+        self.assertEqual(ex.resting, {},
+                         "the $10 envelope is consumed: nothing may re-post here")
+        self.assertTrue(any(rec.get("allocation_exhausted")
+                            for rec in self.logs_of("law_reasons")),
+                        "a consumed allocation must say so — no silent refusals")
         self.assertNotIn(TK, r.m.frozen)
 
     def test_the_fill_updates_collateral_so_the_feed_stays_true(self):
@@ -264,21 +274,20 @@ class TestRescueUnverifiedVenue(FixRoundCase):
         r.m.accrued["prog-1"] = 0.87                      # the stranded accrual
         return r, ex
 
-    def test_a_rescue_bigger_than_the_lot_container_is_REFUSED(self):
-        """WAS `test_the_top_up_reaches_the_wire_with_no_venue_state`, asserting a ~$16
-        top-up (271 contracts against S=1200 rivals) reached the wire.  Note 52 D6 refuses it
-        BY DESIGN: the cluster reserve is $10 and the lot container $2.50, and "fewer rungs,
-        never smaller lots" applies to rescues too — recovering $0.87 of stranded accrual is
-        not worth 1.6x a whole settle-source's reserve.  The venue reads UNPROBEABLE (its
-        cheapest fitting lot does not exist) and nothing reaches the wire.  The fitting-
-        reserve rescue mechanics stay covered in test_alloc's TestCliffRecovery."""
+    def test_stranded_accrual_is_rescued_by_ARITHMETIC_not_machinery(self):
+        """REWRITTEN under the owner's law §1 (2026-07-30).  WAS a lot-container refusal of
+        a ~$16 top-up.  The rescue machinery is DELETED: accrued subtracts from the need
+        (need = target − $0.87), so the stranded-accrual market ranks CHEAPER than a fresh
+        one and funds through the ordinary path — recovery is a consequence of the ranking,
+        not a special pass."""
         r, ex = self._runner()
         r.iteration(NOW + 1)
-        # STAGE 1: there is no UNPROBEABLE status to read — the venue holds no permission
-        # state at all.  What refuses the $16 top-up is the DOLLAR stack that always did the
-        # real work: the lot container and the cluster reserve.
-        self.assertEqual(self.logs_of("cliff_top_up"), [])
-        self.assertEqual(len(ex.placed), 0)
+        self.assertEqual(self.logs_of("cliff_top_up"), [])      # the machinery is gone
+        self.assertEqual(len(ex.placed), 1, "the accrued market funds like any other")
+        funded = self.logs_of("law_funded")
+        self.assertTrue(funded and funded[0]["accrued"] > 0.8, funded)
+        self.assertLess(funded[0]["need_usd"], funded[0]["target_usd"],
+                        "accrued must SUBTRACT from the need (law §1)")
 
     def test_dead_accrual_gets_no_cap_room(self):
         """The mirror: a cliff UNREACHABLE at the ρ/2 ceiling earns no exemption."""
@@ -340,7 +349,10 @@ class TestDayStopScale(FixRoundCase):
         out = r.iteration(NOW + 1)
         board = sum((s.rho / 2.0) * min(24.0, s.hours_left) for s in r.slots)
         self.assertGreater(board, 40.0)                    # the board number is huge
-        self.assertLess(r.m.projected_day_reward, 5.0)     # ours is what we can EARN
+        # Under the law the funded order is the whole $10 allocation (oversize, law §4),
+        # so our share is larger than the old $2.50 lot bought — but still OUR earnable
+        # number, an order of magnitude under the board pool.
+        self.assertLess(r.m.projected_day_reward, 10.0)
         self.assertGreater(r.m.projected_day_reward, 0.0)
         from .. import guards as G
         self.assertAlmostEqual(G.day_stop_usd(r.m.projected_day_reward),
@@ -742,21 +754,18 @@ class TestTheEmptyBookIsEnterable(FixRoundCase if 'FixRoundCase' in dir() else _
         logs = []
         R.set_log_sink(logs.append)
         self.addCleanup(R.set_log_sink, None)
-        with mock.patch.object(C, "FREE_RIDE_ONLY", False):
-            slots = scan.build_slots([prog], cls, now, p6=lambda t: True)
+        # (the FREE_RIDE_ONLY patch died with the flag — owner's law §7a, 2026-07-30)
+        slots = scan.build_slots([prog], cls, now, p6=lambda t: True)
         self.assertEqual([l for l in logs if l.get("t") == "entry_band_refused"], [])
         self.assertEqual(len(slots), 2)
         # both sides cheap IN THEIR OWN CURRENCY: the bid is 6c of YES, the ask is 6c of NO
         # (= a YES ask at 94c).  Nothing to cross in an empty book, so both stand.
         self.assertEqual(sorted(int(round(s.p * 100)) for s in slots),
                          [C.ENTRY_BAND_LO_C, C.ENTRY_BAND_LO_C])
-        # UNTOUCHED, AND INCONSISTENT ON PURPOSE: `land_grab_price_c` is the LAND GRAB's own
-        # price, and the land grab is dead under FREE_RIDE_ONLY (it is forced to 0).  With the
-        # gate off, as here, the qualification pass would buy at 1c/99c while the slot is
-        # priced at 6c — flagged, not silently reconciled, because which of the two is right
-        # depends on the qualification decision that is NOT ours to take (see the fork below).
+        # RESOLVED by the owner's law §7a (2026-07-30): the self-qualifying price IS the
+        # band floor on each side's own axis — the 1c/99c inconsistency died with the flag.
         self.assertEqual(sorted(s.land_grab_price_c for s in slots),
-                         [C.LAND_GRAB_PRICE_C, 100 - C.LAND_GRAB_PRICE_C])
+                         [C.ENTRY_BAND_LO_C, 100 - C.ENTRY_BAND_LO_C])
 
     def test_a_pinned_empty_book_is_still_refused(self):
         import time
@@ -778,57 +787,31 @@ class TestTheEmptyBookIsEnterable(FixRoundCase if 'FixRoundCase' in dir() else _
         self.assertEqual(scan.build_slots([prog], C0(), now, p6=lambda t: True), [])
 
 
-class TestTheEmptyBookFork(__import__('unittest').TestCase):
-    """THE FORK, MEASURED AND PINNED — do not resolve this in code without Ryan.
+class TestTheEmptyBookForkIsResolvedByTheLaw(__import__('unittest').TestCase):
+    """THE FORK, RESOLVED BY THE OWNER'S LAW (2026-07-30; was pinned "do not resolve in code
+    without Ryan" — this IS Ryan's resolution, law §7a).
 
-    Pricing the empty side inside the entry band (above) clears the FIRST of three gates
-    between the 7 sole-qualifier venues and a dollar.  The other two are not oversights, and
-    they rest on one arithmetic fact this suite now states out loud:
-
-        CREDIT IS A STEP FUNCTION OF SIZE, NOT THE SMOOTH q/(q+S) THE SIZING MODEL USES.
-
-    `alloc.score_side` implements the CFTC filing: the qualifying walk must reach
-    `target_size`, and `if not qualifies: S = 0`.  Our own resting size counts toward that
-    walk (the classified book contains our orders; `rival_S` subtracts them afterwards).  So
-    on a book nobody else quotes:
-
-        q  <  target_size   ⇒  credit 0        (we are not a qualifying set)
-        q  >= target_size   ⇒  credit pool/2   (we are the WHOLE qualifying set)
-
-    while `cliff_clearing_q` — the function every sizing decision asks — answers ONE CONTRACT
-    at S = 0, because `our_share(1, 0) = 1`.  The model believes one contract earns half the
-    pool.  The filing says it earns nothing.  Both are in this repo today.
-
-    WHAT QUALIFYING WOULD COST, at the live target of 1,000 contracts:
-        at LAND_GRAB_PRICE_C = 1c   ->  $10.00  == the whole cluster reserve (ceiling/N)
-        at ENTRY_BAND_LO_C  = 6c   ->  $60.00  == 12x the $5 lot, 6x the reserve, over the
-                                                  per-venue cap and the per-market cap
-    So the band edge, which is what makes the slot legal, is also what makes qualifying
-    unaffordable — and 1c, which is what makes qualifying affordable, is the price the band
-    exists to refuse on measured EV (note 47 3, n = 8,240: 2c realised 0.00% on 765 markets).
-    That is the fork.  It is the same trade FREE_RIDE_ONLY was armed to refuse on 2026-07-29
-    ("we were buying 1,000 contracts of a worthless contract to qualify a side that still
-    would not have paid"), now arriving from the opposite direction.
-
-    THE THREE GATES, in the order an empty market meets them:
-      1. the entry price band            — CLEARED by pricing the empty side at the band edge
-      2. FREE_RIDE_ONLY                  — refuses: an empty side never qualifies without us
-      3. alloc.allocate's `s.S <= 0`     — the slot is not even ELIGIBLE for water-filling
-    Gate 3 also means the sole-qualifier VENUE CAP (fixed this round) funds nothing on its
-    own: the cap is necessary and nowhere near sufficient.
-    """
+    The fork: credit is a STEP function of size (the filing's qualifying walk must reach
+    target_size; short of it a side scores ZERO) while the old sizing model (`our_share`,
+    `cliff_clearing_q`) was smooth in q and believed ONE contract at S = 0 earned half the
+    pool.  Under the law the step is priced where it lives: `alloc.law_need` charges an
+    unqualified side its whole self-qualifying walk at the band floor — 1,001 contracts at
+    6c is $60.06 against a $10 allocation — so the empty side ranks UNAFFORDABLE with its
+    arithmetic in the log, and no model anywhere still believes the one-contract fiction."""
 
     def _empty_slot(self, **kw):
         from lip_v5 import alloc
         kw.setdefault("rho", 9.0); kw.setdefault("S", 0.0); kw.setdefault("p", 0.06)
         kw.setdefault("hours_left", 11.0); kw.setdefault("window_h", 11.0)
+        kw.setdefault("target_size", 1000); kw.setdefault("cum_size", 0.0)
         return alloc.Slot("KXEMPTY-1", "bid", venue="KXEMPTY", **kw)
 
-    def test_the_model_says_ONE_CONTRACT_earns_half_the_pool(self):
+    def test_the_law_charges_the_whole_walk_not_one_contract(self):
         from lip_v5 import alloc
-        s = self._empty_slot()
-        self.assertEqual(alloc.our_share(1, s.S), 1.0)
-        self.assertEqual(alloc.cliff_clearing_q(s), 0)      # i.e. "any size at all clears"
+        n = alloc.law_need(self._empty_slot())
+        self.assertEqual(n.qualify_q, 1000)
+        self.assertEqual(n.q_rest, 1001)               # the walk plus the earning contract
+        self.assertAlmostEqual(n.total_usd, 1001 * 0.06, places=9)
 
     def test_the_FILING_says_a_sub_target_side_scores_zero(self):
         from lip_v5 import alloc
@@ -842,24 +825,29 @@ class TestTheEmptyBookFork(__import__('unittest').TestCase):
         self.assertTrue(sc2.qualifies)
         self.assertGreater(sc2.S, 0.0)
 
-    def test_what_qualifying_costs_at_each_price(self):
+    def test_what_qualifying_costs_at_the_band_floor(self):
         from lip_v5 import config as C
         import lip_v5.clusters as CL
         target = 1000.0
-        self.assertAlmostEqual(target * C.LAND_GRAB_PRICE_C / 100.0, 10.00, places=9)
         self.assertAlmostEqual(target * C.ENTRY_BAND_LO_C / 100.0, 60.00, places=9)
-        # $10 is exactly the cluster reserve; $60 is six of them.
+        # $60 is six whole cluster reserves — and six per-market allocations.
         self.assertAlmostEqual(CL.cluster_cap_usd(0.0, ceiling_usd=300.0), 10.00, places=9)
+        self.assertAlmostEqual(6 * C.ALLOC_PER_MARKET_USD, 60.00, places=9)
 
-    def test_gate_3_the_allocator_refuses_an_S_zero_slot_outright(self):
-        """So a nonzero venue cap on a sole-qualifier venue funds NOTHING by itself."""
-        from lip_v5 import alloc
-        a, spent, _ = alloc.allocate([self._empty_slot()], 234.0, 0.0625,
-                                     caps=alloc.Caps(inv_cap_usd=5.0),
-                                     cluster_cap_usd=10.0, ceiling_usd=300.0,
-                                     venue_caps={"KXEMPTY": 30.0})
+    def test_the_allocator_refuses_the_empty_side_with_its_numbers(self):
+        from lip_v5 import alloc, runtime as R
+        logs = []
+        R.set_log_sink(logs.append)
+        try:
+            a, spent, rep = alloc.allocate_law([self._empty_slot()], 234.0)
+        finally:
+            R.set_log_sink(None)
         self.assertEqual(a.get(("KXEMPTY-1", "bid"), 0), 0)
         self.assertEqual(spent, 0.0)
+        self.assertEqual(rep["reasons"].get("unaffordable"), 1)
+        ex = [l for l in logs if l.get("t") == "law_example"]
+        self.assertTrue(ex and ex[0]["qualify_q"] == 1000,
+                        "the refusal must carry the walk arithmetic: %s" % ex)
 
 
 class TestNoDuplicateOrderLoop(__import__('unittest').TestCase):

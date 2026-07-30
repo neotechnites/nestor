@@ -180,54 +180,49 @@ class TestTheLadderPlanIsFundable(NewRoundCase):
 
 
 class TestAllocateCarriesTheClusterTerm(LipTestCase):
-    """The pure half of NEW-1b: the water level itself refuses to over-plan a cluster."""
+    """NEW-1b's survivor under the owner's law (2026-07-30): the PLAN folds the same
+    cluster reserve the rails read into its envelope, so it can never propose an order
+    `place()` must refuse.  The water level is gone; the envelope is the whole rule."""
 
     def slots(self, n=4, p=0.02):
+        # cum_size >= target: the side qualifies on rival depth, so the law's qualify term
+        # is $0 and the tests below isolate the CLUSTER arithmetic.
         return [alloc.Slot("KXAAAGASD-26JUL29-T%d.0" % i, "bid", rho=6.25, S=50.0, p=p,
-                           phi=0.0, d=0.0, l_eff=0.0)
+                           phi=0.0, d=0.0, l_eff=0.0, cum_size=2000.0)
                 for i in range(1, n + 1)]
 
-    def test_one_cluster_is_capped_across_all_its_rungs(self):
-        a, spent, _ = alloc.allocate(self.slots(), 300.0, 0.0,
-                                     caps=alloc.Caps(inv_cap_usd=10.0),
-                                     cluster_cap_usd=10.0)
+    def test_one_cluster_funds_one_order_inside_the_cap(self):
+        a, spent, _ = alloc.allocate_law(self.slots(), 300.0, cluster_cap_usd=10.0)
         self.assertLessEqual(spent, 10.0 + 1e-9)
-        self.assertGreater(sum(a.values()), 0)
+        self.assertEqual(sum(1 for q in a.values() if q > 0), 1)   # law §2
 
     def test_separate_clusters_each_get_their_own_cap(self):
         ss = [alloc.Slot("KXGAS-26JUL29-T1.0", "bid", rho=6.25, S=50.0, p=0.02,
-                         phi=0.0, d=0.0, l_eff=0.0),
+                         phi=0.0, d=0.0, l_eff=0.0, cum_size=2000.0),
               alloc.Slot("KXIDX-26JUL29-T1.0", "bid", rho=6.25, S=50.0, p=0.02,
-                         phi=0.0, d=0.0, l_eff=0.0)]
-        a, spent, _ = alloc.allocate(ss, 300.0, 0.0, caps=alloc.Caps(inv_cap_usd=10.0),
-                                     cluster_cap_usd=10.0)
-        self.assertGreater(a[ss[0].key] * 0.02, 0.0)
-        self.assertGreater(a[ss[1].key] * 0.02, 0.0)
+                         phi=0.0, d=0.0, l_eff=0.0, cum_size=2000.0)]
+        a, spent, _ = alloc.allocate_law(ss, 300.0, cluster_cap_usd=10.0)
+        self.assertGreater(a[ss[0].key], 0)
+        self.assertGreater(a[ss[1].key], 0)
         self.assertLessEqual(spent, 20.0 + 1e-9)
 
     def test_held_inventory_consumes_the_clusters_room(self):
         ss = self.slots(n=2)
-        held = {ss[0].key: 500.0}                              # $10 of held at 2c: cap full
-        a, spent, _ = alloc.allocate(ss, 300.0, 0.0, caps=alloc.Caps(inv_cap_usd=10.0),
-                                     cluster_cap_usd=10.0, held=held)
+        ck = CL.cluster_of(ss[0].ticker)
+        a, spent, _ = alloc.allocate_law(ss, 300.0, cluster_cap_usd=10.0,
+                                         cluster_spent={ck: 10.0},
+                                         market_spent={ss[0].ticker: 10.0})
         self.assertEqual(spent, 0.0)
         self.assertEqual(sum(a.values()), 0)
 
-    def test_with_NO_cluster_cap_nothing_bounds_the_cluster_at_all(self):
-        """REWRITTEN 2026-07-30 (D5′: dollars, not count).  Was
-        `test_no_cluster_cap_is_ONE_RUNG_not_the_old_spray`, asserting that even with no
-        cluster cap the count rule funded exactly one rung.
-
-        ⚠ FLAG — with the count retired, `cluster_cap_usd=None` leaves a cluster with NO
-        bound whatsoever: the ladder sprays again, exactly as it did before NEW-1b.  That
-        argument is only safe because the None path is the PURE-TEST path — `engine.cycle`
-        always passes the real cap from `clusters.cluster_cap_usd` — but the count was
-        silently doing double duty as a backstop here, and now nothing is.  Asserted so the
-        hole is visible rather than discovered live."""
-        a, spent, _ = alloc.allocate(self.slots(), 300.0, 0.0,
-                                     caps=alloc.Caps(inv_cap_usd=10.0))
-        self.assertGreater(sum(1 for q in a.values() if q > 0), 1)
-        self.assertGreater(spent, 10.0 + 1e-9)
+    def test_with_NO_cluster_cap_the_market_allocation_still_binds(self):
+        """REWRITTEN under the law (2026-07-30).  The old assertion documented a HOLE: with
+        `cluster_cap_usd=None` the count-less water level sprayed the ladder unbounded.
+        The law closes it structurally — one order per cluster and $10 per market bind with
+        or without the rail's cap, so the None path is bounded by the law itself."""
+        a, spent, _ = alloc.allocate_law(self.slots(), 300.0)
+        self.assertEqual(sum(1 for q in a.values() if q > 0), 1)
+        self.assertLessEqual(spent, C.ALLOC_PER_MARKET_USD + 1e-9)
 
 
 class TestTheGuardHierarchy(LipTestCase):
@@ -273,12 +268,12 @@ class TestReleasesPrecedeClaims(EngineCase):
         m = self.maker(ex=X.FakeExchange(balance_cents=1_000_000))
         m.projected_day_reward = 40.0                         # ⇒ a $10 cluster cap
         ss = self._slots()
-        m.requote_pass(NOW + 1, ss, {ss[0].key: 0, ss[1].key: 500}, 0.0)
+        m.requote_pass(NOW + 1, ss, {ss[0].key: 0, ss[1].key: 500})
         self.assertEqual(len(m.orders), 1)
         n_before = len(self.logs)
         # The plan FLIPS: the later rung releases $10, the earlier one claims it.  Total
         # unchanged, and every rung of the pair is alphabetically hostile.
-        m.requote_pass(NOW + 60, ss, {ss[0].key: 500, ss[1].key: 0}, 0.0)
+        m.requote_pass(NOW + 60, ss, {ss[0].key: 500, ss[1].key: 0})
         refused = [r for r in self.logs[n_before:]
                    if r.get("t") == "place_refused"
                    and r.get("refused_by") in (CL.REFUSE_WORST, CL.REFUSE_SIGNED)]
@@ -450,7 +445,7 @@ class TestAMakerNeverTakes(__import__('unittest').TestCase):
         ask = alloc.Slot("KXLOCK-26JUL29-T1", "ask", rho=9.0, S=500.0, p=0.97,
                          venue="KXLOCK", hours_left=10.0)
         stats = m.requote_pass(1785268000.0, [bid, ask],
-                               {bid.key: 50, ask.key: 50}, 0.0625)
+                               {bid.key: 50, ask.key: 50})
         self.assertEqual(stats["placed"], 0, "a locked book must place NOTHING")
         self.assertEqual(ex.placed, [], "nothing may reach the wire")
 
@@ -461,17 +456,20 @@ class TestThePlanMeasuresTheSameBookAsTheRails(__import__('unittest').TestCase):
     RATES cluster, planned a second order into it, and the rails refused — 180 refusals a
     minute per rung, $4.71 deployed of a $300 ceiling."""
 
-    def test_a_resting_order_consumes_its_cluster_in_the_PLAN(self):
-        from lip_v5 import alloc
+    def test_committed_basis_consumes_the_cluster_in_the_PLAN(self):
+        """Under the law (2026-07-30) the plan's cluster tally is `cluster_spent`, built by
+        the engine from the SAME `place_context()` rows the rails read — this test holds the
+        pure half: an envelope fed a committed cluster never plans past the rail's cap."""
+        from lip_v5 import alloc, clusters as CL
         mk = lambda tk, p: alloc.Slot(tk, "bid", rho=9.0, S=500.0, p=p, venue="KXUST5AD",
-                                      hours_left=10.0)
+                                      hours_left=10.0, cum_size=2000.0)
         a = mk("KXUST5AD-26JUL29-T4.25", 0.30)
         b = mk("KXUST5AD-26JUL29-T4.35", 0.30)
-        # 100 contracts of `a` already RESTING = $30 of a $50 cluster.
-        plan, spent, _ = alloc.allocate([a, b], 300.0, 0.0625, cluster_cap_usd=50.0,
-                                        resting={a.key: 100.0})
-        used = spent + 30.0
-        self.assertLessEqual(used, 50.0 + 1e-9,
+        ck = CL.cluster_of(a.ticker)
+        # $30 of the cluster already committed against a $50 rail cap.
+        plan, spent, _ = alloc.allocate_law([a, b], 300.0, cluster_cap_usd=50.0,
+                                            cluster_spent={ck: 30.0})
+        self.assertLessEqual(spent + 30.0, 50.0 + 1e-9,
                              "the plan must not exceed the cluster the rails will measure")
 
 

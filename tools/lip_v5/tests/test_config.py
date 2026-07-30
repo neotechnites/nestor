@@ -110,40 +110,31 @@ class TestTheFateBlockIsInert(LipTestCase):
         self.assertNotEqual(C.MAX_WINDOW_MULT, C.DAILIES_ONLY_WINDOW_MULT)
 
 
-class TestFreeRideIsArmed(LipTestCase):
-    """Replaces test_free_ride_is_off_as_well_as_unwired (armed 2026-07-29).
+class TestFreeRideDiedIntoTheFormula(LipTestCase):
+    """Replaces TestFreeRideIsArmed (owner's law §7a, 2026-07-30).  The gate's insight —
+    qualification is worth the same whoever funds it, and a rival's costs nothing — SURVIVES
+    as pricing: `alloc.law_need` charges a non-qualifying side its self-qualifying walk at
+    the band floor.  The FLAG dies: a permission bit and a priced cost cannot both own the
+    same decision."""
 
-    WHY IT FLIPPED.  The staged note asked for the mirror to be measured before arming: the
-    fear was that nothing qualifies without us and the book deploys nothing.  Measured on the
-    live board -- 5,681 of 5,695 book-sides (99.75%) reach target_size on RIVAL size alone, and
-    99.3% of sides with a competing score of 3 or less qualify.  And the CFTC filing settles
-    what the funded size was worth: the qualifying walk stops once cumulative size reaches
-    target, so contracts posted beyond it score EXACTLY ZERO.  The 999-contract 1c gas rung and
-    the 1,500/3,000-contract TRUEV rungs were the largest objects in the whole tape and earned
-    nothing at all."""
+    def test_the_flag_is_deleted(self):
+        self.assertFalse(hasattr(C, "FREE_RIDE_ONLY"))
 
-    def test_it_is_on(self):
-        self.assertIs(C.FREE_RIDE_ONLY, True)
-
-    def test_it_is_wired_in_scan(self):
-        """Armed AND read.  A True constant nothing consults is worse than a False one: it
-        reads as shipped."""
-        import inspect
-        from .. import scan
-        src = inspect.getsource(scan)
-        self.assertIn("FREE_RIDE_ONLY", src)
-        self.assertIn("free_ride_refused", src)
-
-    def test_the_land_grab_price_is_now_unreachable_from_build_slots(self):
-        """LAND_GRAB_PRICE_C = 1 is the geometry of the -100% cohort.  Under free-ride the
-        funding branch is dead: every non-qualifying side is refused before it, and the
-        empty-book branch (which set p = 1c) is a non-qualifying side by definition."""
+    def test_scan_no_longer_carries_the_gate(self):
         import inspect
         from .. import scan
         src = inspect.getsource(scan.build_slots)
-        i = src.index("FREE_RIDE_ONLY")
-        j = src.index("land_grab = alloc.t0_qualification_size")
-        self.assertLess(i, j, "the free-ride gate must precede the funding branch")
+        self.assertNotIn("free_ride_refused", src)
+
+    def test_the_one_cent_land_grab_price_is_gone(self):
+        """LAND_GRAB_PRICE_C = 1 was the geometry of the -100% cohort.  The self-qualifying
+        price is the ENTRY BAND floor now, on the side's own axis, everywhere."""
+        self.assertFalse(hasattr(C, "LAND_GRAB_PRICE_C"))
+        import inspect
+        from .. import scan
+        src = inspect.getsource(scan.build_slots)
+        self.assertIn("ENTRY_BAND_LO_C if side ==", src.replace("C.ENTRY_BAND_LO_C",
+                                                                "ENTRY_BAND_LO_C"))
 
 
 if __name__ == "__main__":

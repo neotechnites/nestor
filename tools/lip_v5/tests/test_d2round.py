@@ -7,7 +7,7 @@ arriving inside our own tests — green meant self-consistent, not correct.
 
 import unittest
 
-from .. import config as C, guards as G, runner as RUN, runtime as R, scan
+from .. import alloc, config as C, guards as G, runner as RUN, runtime as R, scan
 from .base import LipTestCase
 from .test_engine import EngineCase, NOW
 
@@ -51,10 +51,17 @@ def sides(slots):
 # =============================================================================================
 class TestD1HeldInventoryKeepsItsSlot(LipTestCase):
 
-    def test_a_NON_held_non_qualifying_side_is_still_refused(self):
-        """The gate must still do its job — this is the control for the two below."""
+    def test_a_NON_held_non_qualifying_side_is_PRICED_not_refused(self):
+        """REWRITTEN under the owner's law §7a (2026-07-30): the free-ride gate is dead, so
+        the slot IS built — carrying its self-qualifying walk gap — and the refusal happens
+        in the allocator as an UNAFFORDABLE skip with the numbers (600 x 6c = $36 > $10)."""
         slots = scan.build_slots([prog()], Table(qualifies=False, cum=400.0), NOW)
-        self.assertEqual(slots, [])
+        self.assertEqual(sides(slots), ["ask", "bid"])
+        for s in slots:
+            self.assertEqual(s.land_grab_size, 600)
+        a, spent, rep = alloc.allocate_law(slots, 300.0)
+        self.assertEqual(spent, 0.0)
+        self.assertEqual(rep["reasons"].get("unaffordable"), 2)
 
     def test_a_HELD_non_qualifying_market_STILL_GETS_A_SLOT(self):
         """D1.  No slot ⇒ `update_shed_targets` can never START a shed (`s is None`) and
@@ -88,31 +95,40 @@ class TestD3TheGateTestsQualificationNotATruncatedCumulant(LipTestCase):
         slots = scan.build_slots([prog()], Table(qualifies=True, cum=1000.0), NOW)
         self.assertEqual(sides(slots), ["ask", "bid"])
 
-    def test_our_own_resting_size_exempts_the_side_without_deducting_from_the_walk(self):
+    def test_our_own_resting_size_counts_toward_the_walk_not_a_gate(self):
+        """Law §7a: with the gate dead, BOTH sides build; our resting size counts toward the
+        walk through `cum_size` (the classifier scores the public book, which contains us)."""
         own = {(TK, "bid"): [(12, 300.0)]}
         slots = scan.build_slots([prog()], Table(qualifies=False, cum=400.0), NOW,
                                  own_orders=own)
-        self.assertEqual(sides(slots), ["bid"])
+        self.assertEqual(sides(slots), ["ask", "bid"])
 
 
-class TestD4LandGrabIsDeadUnderFreeRide(LipTestCase):
-    """Deleting `land_grab = 0` in `scan.build_slots` passed all 626 tests.  It must not."""
+class TestD4SelfQualificationIsPricedAtTheBandFloor(LipTestCase):
+    """REWRITTEN under the owner's law §7a (2026-07-30).  The old class asserted the land
+    grab was DEAD under FREE_RIDE_ONLY; the flag is deleted and the walk gap is back as a
+    PRICED slot property — at the entry-band floor, never at the 1c the -100% cohort was
+    bought at (n = 8,240: 2c realised 0.00% on 765 markets)."""
 
-    def test_a_held_non_qualifying_side_funds_NO_qualification(self):
-        self.assertTrue(C.FREE_RIDE_ONLY, "this test is meaningless with the flag off")
+    def test_the_walk_gap_is_carried_and_priced_at_the_band_floor(self):
         slots = scan.build_slots([prog()], Table(qualifies=False, cum=400.0), NOW,
                                  held={TK})
         self.assertTrue(slots)
         for s in slots:
-            self.assertEqual(s.land_grab_size, 0,
+            self.assertEqual(s.land_grab_size, 600)
+            own_axis_c = s.land_grab_price_c if s.side == "bid" \
+                else 100 - s.land_grab_price_c
+            self.assertEqual(own_axis_c, C.ENTRY_BAND_LO_C,
                              "the 1c funding path is the -100% cohort's own geometry")
 
-    def test_and_a_resting_non_qualifying_side_funds_NO_qualification(self):
+    def test_the_allocator_not_a_gate_refuses_the_unaffordable_walk(self):
         own = {(TK, "bid"): [(12, 300.0)]}
         slots = scan.build_slots([prog()], Table(qualifies=False, cum=400.0), NOW,
                                  own_orders=own)
         self.assertTrue(slots)
-        self.assertEqual([s.land_grab_size for s in slots], [0])
+        a, spent, rep = alloc.allocate_law(slots, 300.0)
+        self.assertEqual(spent, 0.0)
+        self.assertGreaterEqual(rep["reasons"].get("unaffordable", 0), 1)
 
 
 # =============================================================================================

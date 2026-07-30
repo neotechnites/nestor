@@ -205,12 +205,8 @@ MAX_GATE_PASSES = 8                          # v1 §2.4 re-water-fill loop, boun
 # `max(r*_0..r*_4)` and `rstar_no_converge` fired every cycle — alarm fatigue on a control that
 # was doing nothing.  9 is the smallest value that makes the spec's OWN two statements
 # consistent: it covers the 16× seed error §1.3 names, at the 5% tolerance §1.3 sets.
-RSTAR_MAX_ITERS = 9                          # spec §1.3, reconciled (see money.solve_rstar)
-RSTAR_DAMPING = 0.5                          # prevents 2-cycles (spec §1.3)
-RSTAR_CONVERGE_FRAC = 0.05                   # ALLOCATE's own step resolution is 2%; chasing
-                                             # below its own noise is theatre (spec §1.3)
-RSTAR_NO_CONVERGE_ALERT_CYCLES = 3           # spec §1.3 "alert if 3 cycles in a row"
-RSTAR_TRAILING_DAYS = 7                      # spec §1.3 "trailing-7d achieved marginal rate"
+# RSTAR_* ARE DELETED (owner's law, 2026-07-30): the ranking is capital needed for a fixed
+# dollar target, so there is no marginal-rate fixpoint left to solve or to configure.
 
 # =============================================================================================
 # LIQUIDITY HORIZON  (spec §1.2) — ALL QUANTITIES IN HOURS.  The type error matters.
@@ -791,7 +787,10 @@ BAND_OUR_LEG_MAX_C = 50                      # staged-inert: REFUTED AS SPECIFIE
 # zero -- the 999-contract 1c gas rung and the 1,500/3,000-contract TRUEV rungs were the
 # largest objects in the tape and earned nothing at all.  `free_ride_refused` is the instrument
 # if the fear ever becomes real.
-FREE_RIDE_ONLY = True
+# FREE_RIDE_ONLY IS DELETED (owner's law §7a, 2026-07-30).  The gate's job — who pays for
+# qualification — became a PRICE inside `alloc.law_need`: a side rivals qualify rides free,
+# a side they don't is charged its self-qualifying walk at the band floor, which at
+# $10/market practically ranks empty sides unaffordable, with the numbers in the skip log.
 
 # --- THE ENTRY BAND: FREE-RIDE IS ONLY CORRECT INSIDE A PRICE BAND (2026-07-29 night) ---
 # THE CONFLICT THIS RESOLVES.  Enchiridion notes 46 and 47 §6 record `FREE_RIDE_ONLY` as
@@ -1240,9 +1239,10 @@ ALLOC_PER_MARKET_USD = 10.0
 # also a failure; `idle_capital` below is its alarm.
 IDLE_CAPITAL_COMMITTED_FRAC = 0.50           # spec §4.4 — committed >50% of ceiling while
 IDLE_CAPITAL_WINDOW_S = 3600.0               # book-wide net < λ_min/16 for 1 h
-LAND_GRAB_MAX_COLLATERAL_FRAC = 0.25         # spec §4.5 / v1 §6.2
-LAND_GRAB_MAX_MARKETS = 6
-LAND_GRAB_PRICE_C = 1
+# LAND_GRAB_* ARE DELETED (owner's law §7a, 2026-07-30).  The 1c land grab was the -100%
+# cohort's own geometry; self-qualification is now priced inside `alloc.law_need` at the
+# ENTRY BAND floor, and there is no separate revival budget because there is no separate
+# revival machinery.
 # --- B9: refill / turnover cap ---
 # v1 §8.7 — post-size and refill-cap are DECOUPLED knobs (the v3 lesson).  Beyond 4 turnovers
 # of its own inventory cap in one window a slot is a FLOW MAGNET, not a maker.  This is the
@@ -1339,7 +1339,8 @@ P4_FILL_HONOR_FLOOR = 0.90
 # nothing cannot clear the $1 cliff and is dropped) and by the verified-accrual ratchet, which
 # needs a CREDITED reward before it raises any cap.  Both are evidence-driven, so a venue that
 # genuinely pays nothing is refused by measurement rather than by assumption.
-P6_ADVISORY = True
+# P6_ADVISORY IS DELETED (owner's law §7, 2026-07-30): p6 informs phi only — there is no
+# refusal left for an advisory flag to soften.  The verification note above stands.
 P6_LOOKBACK_DAYS = 5                         # MIRROR (kill for too MANY fills — we are the
                                              # fish ↔ kill for ZERO fills ever — a decorative
                                              # book): §2.5 is the first end, P6 the second.
@@ -1349,9 +1350,8 @@ P6_LOOKBACK_DAYS = 5                         # MIRROR (kill for too MANY fills �
 # 1/20 of the evidence window that judged it dead.  The FIRST check is immediate (at first
 # classify), so a newly listed market with trades admits without waiting.
 P6_RECHECK_S = P6_LOOKBACK_DAYS * 86400 / 20.0               # = 6 h
-P7_MAX_REVIVAL_MARKETS = 3
-P7_MAX_SIDE_SHARE = 0.90
-P7_MAX_SIDE_SHARE_DAYS = 5
+# P7_* ARE DELETED with `alloc.qualification_pass` (owner's law, 2026-07-30): revival is
+# not a separate pass, it is a candidate like any other, priced by the formula.
 P5_CHEAP_SIDE_ALERT = 0.95                   # spec §4.6 — an ALERT, never a block.  P5 stays
 P5_CHEAP_SIDE_ALERT_DAYS = 3                 # DELETED and v5 owns that the exposure is LARGER
 PROGRAM_EV_LOW_USD = 3400.0                  # spec §4.6 — both numbers print every cycle so

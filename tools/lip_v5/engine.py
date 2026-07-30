@@ -909,140 +909,61 @@ class Maker(object):
             self.halt_flatten_done = True
             return out
 
-        # --- allocate → REQUOTE (charter A: the stage that was never written) ---
+        # --- allocate → REQUOTE: THE OWNER'S LAW (Ryan, 2026-07-30) ---
+        # The whole plan is `alloc.allocate_law`: rank every candidate by the capital needed
+        # to earn $1.50 in the next 24 hours, fund cheapest-need first, one order per
+        # cluster, $10 per market, $300 total.  Water-filling, r*, the forfeit gate, the
+        # rescue, owner displacement/recall, the plan-side variance test and the idle sweep
+        # are all DELETED — their jobs are inside the formula (accrued subtracts from the
+        # need; a short window clamps at the $1.00 cliff; qualification is a priced cost).
         if slots:
-            # Note 52 D6: the per-ORDER cap is the LOT CONTAINER — the cluster reserve
-            # (ceiling/N) divided by (1+refills) — so one fill converts at most a quarter of
-            # a settle source's reserve into inventory.  Scales with the ceiling, not the
-            # day stop (the day-stop bound holds transitively; see config.N_TARGET_CLUSTERS).
-            self.slot_cap_usd = C.slot_cap_usd(
-                G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd),
-                ceiling_usd=self.ceiling_usd)
-            caps = alloc.Caps(inv_cap_usd=self.slot_cap_usd)
-            # ── STAGE 1 (2026-07-30): VENUE ADMISSION IS GONE FROM THE PLAN. ─────────
-            # `admit_venues` was a PERMISSION machine — probe floors, rungs,
-            # verified-ness, oversized slots, stand-downs — and every one of those is
-            # a memory of OUR OWN PAST DECISIONS being fed back in as an input.  A book
-            # that must be a pure function of the world cannot ask what rung it climbed
-            # yesterday; two processes with the same world and different histories would
-            # quote different books, which is the whole disease.  Every (market, side)
-            # now competes in ONE global ranking on expected net credit per dollar, and
-            # the only things that may refuse it are facts: the static deny list, a
-            # MEASURED divergence (see `venue_reading`), and the risk rails that bound
-            # dollars rather than permission — cluster reserve, market, lot, ceiling,
-            # variance, day stop, halt.
-            venue_caps = {}
-            # SECOND AMENDMENT (a): held inventory attributed per slot leg, so the cap binds
-            # NET exposure and the replenish target after a fill is n_cap − held — presence
-            # continues, correctly sized, instead of the v4 tape's silence-to-settlement.
-            held = self.held_by_slot(slots)
-            # MBB's reserve is one copy of the LARGEST slot (the derived cap), and the
-            # budget plans against what is GENUINELY available: held positions already
-            # consume the ceiling (v4 D5 — planning against the raw ceiling makes place()
-            # ration an infeasible plan first-come).
-            budget = alloc.reserve_budget(
-                self.ceiling_usd - self.cash.inventory_basis, self.slot_cap_usd)
-            # SF-6: the turnover window is the slot's own PROGRAM PERIOD, set before the
-            # requoter consults the B9 guard.
-            for s in slots:
-                if s.program_end_ts is not None and s.window_h:
-                    self.refill.set_window(s.ticker, s.side,
-                                           s.program_end_ts - s.window_h * 3600.0)
-            # NEW-1b: the SAME cluster cap the rails read, brought inside the plan — an
-            # allocator that plans what `place()` must refuse is not a plan (264 refusals in
-            # 90 cycles on a 4-rung ladder, every cycle, forever).
-            cluster_cap = CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd),
-                                             ceiling_usd=self.ceiling_usd)
-            # The plan must measure the same book the rails do: OPEN positions (`held`) PLUS
-            # RESTING orders.  Omitting the second made every cycle plan an order `place()`
-            # would refuse on a cluster already full of our own quotes.
-            resting_by_slot = {}
-            for o in self.orders.values():
-                if o.get("remaining", 0) > 0 and not o.get("gone_404"):
-                    k = (o["ticker"], o["side"])
-                    resting_by_slot[k] = resting_by_slot.get(k, 0.0) + float(o["remaining"])
-            # NEW-1c: the plan's cluster tally is seeded from THE SAME BOOK the rails read, not
-            # from the slot list.  `place_context()` builds `positions + resting_basis` for
-            # `guards.PlaceContext`; reuse exactly that, so a market we hold but no longer quote
-            # (frozen, denied, out of window, P6-refused, or not free-ride-qualifying) is counted
-            # by both or by neither.  Measured: without this, arming FREE_RIDE_ONLY dropped one
-            # rung of a ladder and the plan breached the cluster cap 61 times in 90 cycles while
-            # resting $56.16 where four slots had rested $75.00.
+            # The per-ORDER bound IS the per-market allocation (law §3/§4: a single order
+            # may carry the whole $10 — "we will put all 10").  B9's turnover cap and the
+            # cluster rail still bound what fills may accumulate.
+            self.slot_cap_usd = C.ALLOC_PER_MARKET_USD
             for s in slots:
                 if s.program_id is not None:
                     self.ticker_program[s.ticker] = s.program_id
+                # SF-6: the turnover window is the slot's own PROGRAM PERIOD, set before
+                # the requoter consults the B9 guard.
+                if s.program_end_ts is not None and s.window_h:
+                    self.refill.set_window(s.ticker, s.side,
+                                           s.program_end_ts - s.window_h * 3600.0)
+            # THE REQUOTE BUDGET IS READ OFF THE EXCHANGE'S OWN BOOK (law §4/§8): the
+            # consumed part of each market's $10 is the inventory basis bought there —
+            # `place_context().positions`, the identical rows the rails measure, so plan
+            # and rail cannot disagree about what a market has already spent, and a restart
+            # re-derives the same numbers (law §10: no state of our own).
             _pc = self.place_context()
-            # ── THE OWNER SEED (the 1.155 incident, 2026-07-30).  One TICKER owns each
-            # cluster's rung, chosen from the REAL book (positions + live orders — survives
-            # restarts, independent of classification timing), preferring the rung whose
-            # program already holds ACCRUED credit: presence there compounds a pot that has
-            # started; presence on a sibling starts a new pot at $0 while the accrued one
-            # drifts to the forfeit cliff.  Ties: larger committed basis, then name.
-            _cand = {}
-            # (a) tickers where we HOLD or REST — the leg names the side (an acquired YES
-            #     came from our bid, NO from our ask; D9: one SIDE per cluster).
-            for _p in list(_pc.positions) + list(_pc.resting_basis):
-                _t = _p["ticker"]
+            market_spent, cluster_spent = {}, {}
+            for _p in _pc.positions:
                 _usd = float(_p.get("n", 0)) * float(_p.get("basis", 0.0))
-                if _usd <= 0:
-                    continue
-                _key = (_t, "bid" if _p.get("side") == "yes" else "ask")
-                _acc = float(self.accrued.get(self.ticker_program.get(_t), 0.0) or 0.0)
-                _ck = CL.cluster_of(_t)
-                _prev = _cand.get(_ck)
-                # RANK BY ACCRUED DOLLARS (Ryan: 1c may not tie with 26c — the AMOUNT is
-                # the weight), then committed basis, then name.
-                _score = (_acc, _usd)
-                if _prev is None or _score > _prev[0] or (
-                        _score == _prev[0] and _key < _prev[1]):
-                    _cand[_ck] = (_score, _key)
-            # (b) programs with BANKED ACCRUAL and no tracked money at all — the 1.155 case:
-            #     the position predated the state archive, so the book had nothing to rank,
-            #     but the $0.26 in the accrual ledger is the strongest claim in the cluster.
-            #     Side unknown ⇒ wildcard (None): any side of that ticker may own the seat.
-            _prog_tickers = {}
-            for _t2, _pid in self.ticker_program.items():
-                _prog_tickers.setdefault(_pid, []).append(_t2)
-            for _pid, _acc in self.accrued.items():
-                _acc = float(_acc or 0.0)
-                if _acc <= 0.0:
-                    continue
-                for _t2 in sorted(_prog_tickers.get(_pid, ())):
-                    _ck = CL.cluster_of(_t2)
-                    _prev = _cand.get(_ck)
-                    _score = (_acc, 0.0)
-                    if _prev is None or _score > _prev[0]:
-                        _cand[_ck] = (_score, (_t2, None))
-            owner_seed = {ck: k for ck, (_sc, k) in _cand.items()}
-            # displacement input: the owner's accrued dollars per cluster
-            owner_accrued = {ck: sc[0] for ck, (sc, _k) in _cand.items() if sc[0] > 0.0}
-            cluster_seed = {}
-            cluster_seed_px = {}              # D11 — Σ usd·basis, the variance ledger's
-                                              # price side, from the SAME book as the rail
-            for _p in list(_pc.positions) + list(_pc.resting_basis):
+                market_spent[_p["ticker"]] = market_spent.get(_p["ticker"], 0.0) + _usd
                 _ck = CL.cluster_of(_p["ticker"])
-                _usd = float(_p.get("n", 0)) * float(_p.get("basis", 0.0))
-                cluster_seed[_ck] = cluster_seed.get(_ck, 0.0) + _usd
-                cluster_seed_px[_ck] = cluster_seed_px.get(_ck, 0.0) + \
-                    _usd * float(_p.get("basis", 0.0))
-            a, spent, res = alloc.allocate_with_rstar(slots, budget, caps=caps,
-                                                      venue_caps=venue_caps, held=held,
-                                                      resting=resting_by_slot,
-                                                      cluster_cap_usd=cluster_cap,
-                                                      cluster_seed=cluster_seed,
-                                                      cluster_seed_px=cluster_seed_px,
-                                                      ceiling_usd=self.ceiling_usd,
-                                                      owner_seed=owner_seed,
-                                                      owner_accrued=owner_accrued)
+                cluster_spent[_ck] = cluster_spent.get(_ck, 0.0) + _usd
+            # MBB's reserve is one copy of the LARGEST order (one allocation), and the
+            # budget plans against what is GENUINELY available: held positions already
+            # consume the ceiling (settlements release them back through reconcile — law
+            # §8's capital events, arriving through the machinery that already exists).
+            budget = alloc.reserve_budget(
+                self.ceiling_usd - self.cash.inventory_basis, C.ALLOC_PER_MARKET_USD)
+            # The SAME cluster cap the rails read, inside the plan — an allocator that
+            # plans what `place()` must refuse is not a plan.
+            cluster_cap = CL.cluster_cap_usd(
+                G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd),
+                ceiling_usd=self.ceiling_usd)
+            a, spent, rep = alloc.allocate_law(slots, budget,
+                                               market_spent=market_spent,
+                                               cluster_spent=cluster_spent,
+                                               cluster_cap_usd=cluster_cap)
             self.last_alloc = dict(a)
-            out["allocate"] = {"spent": spent, "r_star": res.r_star,
-                               "converged": res.converged, "slots": len(slots),
-                               "slot_cap_usd": self.slot_cap_usd,
+            out["allocate"] = {"spent": spent, "slots": len(slots),
+                               "alloc_cap_usd": C.ALLOC_PER_MARKET_USD,
                                "cluster_cap_usd": cluster_cap,
-                               "dropped_programs": sorted(str(d) for d in
-                                                          (res.dropped or ()))}
+                               "funded": len(rep["funded"]),
+                               "reasons": rep["reasons"]}
             out["alloc"] = a
-            out["requote"] = self.requote_pass(now, slots, a, res.r_star)
+            out["requote"] = self.requote_pass(now, slots, a)
             out["accrued"] = self.integrate_accrual(now, slots, a)
             # SF-1: the day stop's scale is OUR projected accrual — share × ρ/2 over the
             # slots we actually fund (allocated or resting) — never the board's pools.  A
@@ -1665,7 +1586,7 @@ class Maker(object):
     # THE REQUOTING STAGE (charter A) — diff the post-forfeit-gate allocation against the
     # resting book; every emission goes through place()/cancel(), the rails stay the one path.
     # =========================================================================================
-    def requote_pass(self, now, slots, alloc_map, r_star):
+    def requote_pass(self, now, slots, alloc_map):
         """One requote pass.  Returns the read-out {placed, cancelled, skipped}.
 
         **EVERY ORDER THIS PASS EMITS IS AN OPENING MAKER QUOTE.**  There is no exit branch,
@@ -1749,7 +1670,11 @@ class Maker(object):
 
             # Price, on the YES axis (order bodies speak YES; `s.p` is the SAME-SIDE best in
             # its own collateral currency, so the ask converts).
-            if s.is_land_grab and 0 < q_alloc <= s.land_grab_size:
+            # A SELF-QUALIFYING slot prices at its scoring-legal band-floor price (law §7a:
+            # the qualifying depth IS the order, and the allocator priced its whole cost at
+            # this price).  The law may size it PAST the bare walk gap (the earning contract,
+            # or the oversize) — the price is a property of the slot, not of the size.
+            if s.is_land_grab and q_alloc > 0:
                 price = s.land_grab_price_c / 100.0
                 if key not in self.land_grabbed:
                     self.land_grabbed.add(key)
@@ -2103,14 +2028,16 @@ class Maker(object):
         Quotes NOTHING — `self.shadow` makes `place()` refuse before the rate lane."""
         rows = []
         for s in (slots or []):
-            terms = M.net_terms(s.rho, s.S, s.p, 0, s.phi, s.d, s.l_eff,
-                                C.FLOOR_RATE_PER_H, s.t_hat)
-            rows.append({"ticker": s.ticker, "side": s.side, "venue": s.venue,
-                         "net": round(terms["net"], 6), "gross": round(terms["gross"], 6),
-                         "carry": round(terms["carry"], 6), "drift": round(terms["drift"], 6),
-                         "t_hat": round(terms["t_hat"], 4),
-                         "admits": M.admits(terms["net"])})
-        rows.sort(key=lambda r: -r["net"])
+            n = alloc.law_need(s)
+            row = n.numbers()
+            row["venue"] = s.venue
+            row["reason"] = n.reason
+            row["affordable"] = (n.reason == "" and
+                                 n.total_usd <= C.ALLOC_PER_MARKET_USD + 1e-9)
+            rows.append(row)
+        # Cheapest need first — the LAW's own ranking (skips sort last, by name).
+        rows.sort(key=lambda r: (r["reason"] != "", r["total_usd"] or 0.0,
+                                 r["ticker"], r["side"]))
         for r in rows:
             R.log("venue_rank", **r)
         seg = self.presence_log.read_segment(now)

@@ -287,8 +287,15 @@ class TestLandGrabAppears(EngineCase):
                  or abs(float(b["price"]) - 0.99) < 1e-9]
         self.assertEqual(grabs, [], "a 1c/99c land-grab order reached the exchange")
         self.assertFalse(self.logs_of("land_grab"))
-        self.assertTrue(self.logs_of("free_ride_refused"),
-                        "the refusal must be INSTRUMENTED, not silent")
+        # The instrument moved (owner's law §7a/§2, 2026-07-30): the thin side is PRICED —
+        # its 990-contract walk at the band floor is ~$59 against a $10 allocation — and on
+        # this fixture the healthy NO side takes the cluster's ONE seat first, so the thin
+        # side's logged skip is cluster_taken (or unaffordable when no sibling funds).
+        # Either way the skip is instrumented, never a silent gate.
+        reasons = self.logs_of("law_reasons")
+        self.assertTrue(any(rec.get("unaffordable") or rec.get("cluster_taken")
+                            for rec in reasons),
+                        "the refusal must be INSTRUMENTED, not silent: %s" % reasons)
 
     def test_the_grab_respects_the_venue_rung0_cap(self):
         """Under the note-52 lot container ($2.50) this venue's only quotable side carries a
