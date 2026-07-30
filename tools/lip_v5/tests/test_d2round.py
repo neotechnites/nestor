@@ -313,5 +313,74 @@ class TestB15B16FireThroughTheRealPlaceContext(EngineCase):
                                msg="the $200 ghost must not be charged against the ceiling")
 
 
+# =============================================================================================
+# PHI, BREADTH, AND THE CONDITIONAL FLOOR — the round that made the runtime match the strategy.
+# =============================================================================================
+class TestPhiIsActuallyMeasured(LipTestCase):
+    """The whole point of running is to learn the fill rate.  It was never wired: the meter
+    recorded fills (engine.py note_fill) and nothing carried them to the estimator."""
+
+    def rows(self, fills, rest_contract_s, side="bid"):
+        return [{"ticker": TK, "side": side, "fills_ct": fills,
+                 "rest_contract_s": rest_contract_s, "rest_dollar_s": 0.0,
+                 "prox_dollar_s": 0.0, "inv_dollar_s": 0.0, "at_best_s": 0.0,
+                 "fill_notional": 0.0}]
+
+    def test_presence_exposes_the_NUMERATOR_not_only_the_denominator(self):
+        from .. import presence as P
+        rows = self.rows(7, 3600.0)
+        self.assertEqual(P.fills_ct(rows, (TK, "bid")), 7)
+        self.assertAlmostEqual(P.rest_contract_hours(rows, (TK, "bid")), 1.0, places=9)
+
+    def test_build_slots_carries_measured_fills_into_phi(self):
+        """With fills on the tape, phi must be the MEASURED rate, not the seed."""
+        rows = self.rows(50, 1000.0 * 3600.0)
+        slots = scan.build_slots([prog()], Table(), NOW, presence_rows=rows)
+        bid = [s for s in slots if s.side == "bid"][0]
+        self.assertAlmostEqual(bid.phi, 50.0 / 1000.0, places=9)
+        # and with NO evidence it falls back to the single seed
+        clean = [s for s in scan.build_slots([prog()], Table(), NOW) if s.side == "bid"][0]
+        self.assertAlmostEqual(clean.phi, C.PHI_SEED_CHEAP, places=9)
+
+
+class TestTheFloorLiftsOnEvidence(LipTestCase):
+    """Ryan: "there shouldnt be a floor, there should be an average."  The average is
+    PORTFOLIO_VAR_MAX; the floor survives only where phi has no evidence to price drift with."""
+
+    def rows(self, fills, rest_contract_s):
+        return [{"ticker": TK, "side": "bid", "fills_ct": fills,
+                 "rest_contract_s": rest_contract_s, "rest_dollar_s": 0.0,
+                 "prox_dollar_s": 0.0, "inv_dollar_s": 0.0, "at_best_s": 0.0,
+                 "fill_notional": 0.0}]
+
+    def test_an_UNMEASURED_cheap_side_is_refused(self):
+        self.assertEqual(
+            sides(scan.build_slots([prog()], Table(bid_p=0.02, ask_p=0.95), NOW)), ["ask"])
+
+    def test_a_MEASURED_cheap_side_is_admitted_and_judged_by_star_instead(self):
+        rows = self.rows(1, 500.0 * 3600.0)
+        self.assertIn("bid", sides(scan.build_slots(
+            [prog()], Table(bid_p=0.02, ask_p=0.95), NOW, presence_rows=rows)))
+
+
+class TestBreadthIsNotRationedByIgnorance(LipTestCase):
+    """MEASURED before the fix: 40 venues offered, 80 slots built, TWO orders resting, $60 of a
+    $300 ceiling — because every planned rung counted as an "oversized probe" (>2% of ceiling)
+    and only 2 may be outstanding.  Breadth then grew 2 per credit cycle: ~15 days to reach 30."""
+
+    def test_the_oversized_threshold_is_the_per_market_cap_not_a_looser_number(self):
+        self.assertAlmostEqual(C.OVERSIZED_PROBE_FRAC, C.MARKET_CAP_FRAC, places=12,
+                               msg="a probe inside the per-market cap is not 'unusual'")
+
+    def test_the_PLANNED_rung_size_is_not_classified_as_oversized(self):
+        """The test that would have caught it: a threshold for 'unusually large' must sit above
+        what the plan normally asks for.  30 rungs on a $300 ceiling is $10 each."""
+        from .. import ratchet as RT
+        ceiling = 300.0
+        planned = ceiling / 30.0
+        self.assertFalse(RT.classify_probe(planned, ceiling),
+                         "the strategy's own rung size must not read as an oversized probe")
+
+
 if __name__ == "__main__":
     unittest.main()

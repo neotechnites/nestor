@@ -186,6 +186,18 @@ def rest_contract_hours(rows, key=None):
     return _sum_rows(rows, key)["rest_contract_s"] / 3600.0
 
 
+def fills_ct(rows, key=None):
+    """Σ fills_ct — φ's NUMERATOR (spec §2.4).
+
+    This accessor did not exist, and its absence is why φ was never measured.  The denominator
+    had one (`rest_contract_hours`, above) and `scan.build_slots` used it; the numerator was read
+    ONLY from an optional `tape` argument that the runner never passes — so `fills_ct` was 0 on
+    every cycle of every run, φ took the zero-fill branch forever, and the Rule of Three could
+    never see the evidence the meter was faithfully recording all along (`Meter.note_fill`,
+    wired at `engine.py:534`).  The fill data existed; nothing carried it the last inch."""
+    return int(_sum_rows(rows, key)["fills_ct"])
+
+
 # =============================================================================================
 # AUTOMATIC SIZE-DOWN AND KILL  (spec §2.5, charter §2 "sized down or killed automatically")
 #

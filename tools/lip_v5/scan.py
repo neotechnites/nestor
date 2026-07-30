@@ -594,13 +594,36 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             # calibration table is indexed by.  For an ask that is the NO price, not 100−yes.
             # ENTRY ONLY (`is_held`), for the same reason the free-ride gate is entry-only:
             # accrual is per PERIOD, so leaving mid-period forfeits everything earned for nothing.
-            # STAGED INERT (`C.ENTRY_BAND_ARMED = False`): armed, the band's intersection with the
-            # (★) admission gate is EMPTY and the book rests nothing, because `phi` is seeded by
-            # PRICE with an 80x step at 5c and every in-band price lands on the refusing side.
-            # The full measurement is in config beside the constant.  The gate stays wired so
-            # arming remains ONE constant, per config's own instruction.
+            # ── THE BIAS FLOOR IS A BOOTSTRAP GUARD, NOT A STANDING RULE (Ryan, 2026-07-29). ──
+            # "there shouldnt be a floor, there should be an average.  we can have a 1 cent so long
+            # as all the others are 90 c."  Correct, and the average is now an actual instrument:
+            # `PORTFOLIO_VAR_MAX` reads the realised mix, so a 1c rung beside a book of 90c rungs
+            # contributes almost nothing to V and is admitted on its own merits.
+            # WHY ANY FLOOR SURVIVES AT ALL, AND ONLY HERE.  The floor was never a variance
+            # argument — it is measured EV (note 47 §3, n = 8,240: 2c realised 0.00% on 765
+            # markets), and averaging does not repair a negative mean; it only spreads it.  But
+            # (★) ALREADY charges that: `d_estimate` caps drift at `p`, so at 1c it charges the
+            # whole penny.  The reason that charge was inert is that `drift_cost` scales with φ,
+            # and φ's numerator was never wired (see `presence.fills_ct`) — so drift was ~0 and
+            # the floor was standing in for a term that existed and could not fire.
+            # NOW THAT φ IS WIRED, the floor is only needed where φ still has NO EVIDENCE — a
+            # venue we have never rested in, whose drift charge is therefore still the seed rather
+            # than a measurement.  So: floor the UNMEASURED, and let (★) judge the measured.  One
+            # venue-hour of our own fills lifts it.
+            # MIRROR (floor forever ↔ no floor at all): forever is what Ryan refused and what a
+            # variance instrument makes unnecessary; none at all reproduces the 1c book on day one,
+            # before any fill exists to price it.  The evidence test is the seam between them.
+            # The evidence read is hoisted here, above the floor, because the floor now DEPENDS on
+            # it.  Both halves come from `presence_rows` — see `presence.fills_ct` for why the
+            # numerator was missing for the whole life of this program.
+            rows = [r for r in presence_rows if (r.get("ticker"), r.get("side")) == key]
+            t = tape.get(key, {})
+            fills = int(t.get("fills_ct", P.fills_ct(rows, key) if rows else 0))
+            rest_ch = float(t.get("rest_contract_hours",
+                                  P.rest_contract_hours(rows, key) if rows else 0.0))
             p_c = int(round(float(p) * 100))
-            if C.ENTRY_BAND_ARMED and not is_held and \
+            unmeasured = fills <= 0 and rest_ch <= 0.0
+            if C.ENTRY_BAND_ARMED and not is_held and unmeasured and \
                     not (C.ENTRY_BAND_LO_C <= p_c <= C.ENTRY_BAND_HI_C):
                 R.log("entry_band_refused", ticker=ticker, side=side, p_c=p_c,
                       lo=C.ENTRY_BAND_LO_C, hi=C.ENTRY_BAND_HI_C)
@@ -657,12 +680,6 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                           cum_size=round(float(sd["cum_size"]), 2),
                           target=float(rec["target_size"]))
                     continue
-            rows = [r for r in presence_rows
-                    if (r.get("ticker"), r.get("side")) == key]
-            t = tape.get(key, {})
-            fills = int(t.get("fills_ct", 0))
-            rest_ch = float(t.get("rest_contract_hours",
-                                  P.rest_contract_hours(rows, key) if rows else 0.0))
             # THE FILL-RATE SEED MUST REFLECT THE EVIDENCE WE ALREADY HAVE.  With no tape of
             # our own, phi falls back to PHI_SEED_MID = 0.08 fills/hour/resting-contract —
             # a v1 guess, flagged UNDERIVED, describing a BUSY book.  Since the ratchet was

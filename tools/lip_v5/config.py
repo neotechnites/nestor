@@ -282,8 +282,31 @@ RUNG0_FLOOR_MULT = 4.0
 # several rungs per venue, not one.  4 keeps a venue's budget meaningfully below the cluster
 # cap (which bounds the correlated group) while letting the ladder actually be occupied.
 RUNGS_PER_VENUE = 4.0
-OVERSIZED_PROBE_FRAC = 0.02                  # spec §9.3: now a CLASSIFICATION threshold, not
-                                             # a cap
+# ── CORRECTED 2026-07-29 night.  THIS 2% WAS THE REAL BREADTH LIMIT, AND IT WAS INVISIBLE. ───
+# MEASURED, end to end: 40 distinct venues offered, 40 classified, 80 slots built — and TWO
+# ORDERS RESTING, $60 of a $300 ceiling.  Not the poll breadth, not the caps, not (★).  This.
+# HOW.  `ratchet.classify_probe` calls a venue OVERSIZED when its floor-clearing size exceeds
+# `OVERSIZED_PROBE_FRAC × ceiling` = $6 at $300, and `admit` allows only `OVERSIZED_PROBE_MAX = 2`
+# oversized probes concurrently.  The strategy plans ~$10 per rung (a $300 ceiling across ~30
+# settle sources), so EVERY planned rung is "oversized" by this threshold and venues 3..40 are
+# refused.  Breadth then grows two per verification cycle, and verification needs a credit
+# receipt — i.e. ~15 days to reach thirty venues.
+# WHY IT HID.  The two constants beside it were already loosened FOR breadth
+# (`UNVERIFIED_EXPOSURE_FRAC = 1.00`, `N_UNVERIFIED_MAX = 40`, "breadth is the strategy"), which
+# made this one binding without anyone editing it.  A threshold that was calibrated as an
+# exception became the rule when the rule around it changed.
+# THE DERIVATION.  A classification threshold for "unusually large probe" must sit ABOVE the
+# size the plan normally asks for, or it classifies normal as unusual.  The largest a single
+# market may be is `MARKET_CAP_FRAC`, and `rung0_cap` already refuses anything past it — so a
+# probe inside the per-market cap is by construction NOT unusual, and one that exceeds it is
+# already impossible.  Tying the two together makes "oversized" mean what it says.
+# WHAT STILL BOUNDS RISK, unchanged: `N_UNVERIFIED_MAX`, the per-leg cap, the cluster cap, the
+# tracked portfolio variance, the day stop, the drawdown halt and the §2.5 toxicity kill.  This
+# layer rationed by IGNORANCE — its own comment above says so — and the others ration by RISK.
+# Written as a literal because `MARKET_CAP_FRAC` is defined further down this file; the two are
+# ONE number by intent and `test_config` asserts the identity so they cannot silently diverge.
+OVERSIZED_PROBE_FRAC = 0.10                  # == MARKET_CAP_FRAC.  A CLASSIFICATION
+                                             # threshold, not a cap (spec §9.3)
 OVERSIZED_PROBE_MAX = 2                      # spec §1.4 concurrent oversized-probe slots
 STANDDOWN_DAYS = 2                           # spec §1.4 / charter §5
 # MIRROR (unverified-exposure CEILING ↔ exploration FLOOR): spec §4.4 — a cap on learning is

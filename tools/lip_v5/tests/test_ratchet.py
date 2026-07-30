@@ -68,12 +68,19 @@ class TestAdmission(LipTestCase):
         self.assertEqual(d["reason"], "unverified_count_cap")
 
     def test_TR6_oversized_probe_is_admitted_at_floor_q_never_shrunk(self):
-        """T-R6 (B3) — a venue whose `floor_q` exceeds 2% of the ceiling is admitted AT
-        `floor_q` while unverified totals allow, and consumes an oversized-probe slot."""
+        """T-R6 (B3) — a venue whose `floor_q` exceeds the oversized threshold is admitted AT
+        `floor_q` while unverified totals allow, and consumes an oversized-probe slot.
+
+        THRESHOLD CORRECTED 2026-07-29: `OVERSIZED_PROBE_FRAC` was 0.02, which classified the
+        strategy's OWN planned rung size (~$10 of a $300 ceiling) as oversized and so made the
+        <=2 concurrent rule the real breadth limit — measured, 40 venues offered and TWO orders
+        resting.  The rule itself is unchanged and this test still owns it; the fixture just has
+        to be oversized under the threshold that now applies."""
         v = self._venue()
-        floor = 0.03 * CEILING                                 # $9, above the 2% = $6 line
+        floor = 1.5 * C.OVERSIZED_PROBE_FRAC * CEILING         # comfortably over the line
         self.assertTrue(RT.classify_probe(floor, CEILING))
-        status, cap, _ = RT.admit(v, floor, inv_cap_usd=10.0, per_market_cap_usd=25.0,
+        status, cap, _ = RT.admit(v, floor, inv_cap_usd=2 * floor,
+                                  per_market_cap_usd=2 * floor,
                                   global_ceiling_usd=CEILING, unverified_exposure_usd=0.0,
                                   unverified_count=0, oversized_count=0)
         self.assertEqual(status, RT.OVERSIZED)
@@ -81,7 +88,8 @@ class TestAdmission(LipTestCase):
 
     def test_only_two_oversized_probes_concurrently(self):
         v = self._venue()
-        status, _, d = RT.admit(v, 0.03 * CEILING, 10.0, 25.0, CEILING, 0.0, 0,
+        floor = 1.5 * C.OVERSIZED_PROBE_FRAC * CEILING
+        status, _, d = RT.admit(v, floor, 2 * floor, 2 * floor, CEILING, 0.0, 0,
                                 oversized_count=C.OVERSIZED_PROBE_MAX)
         self.assertEqual(status, RT.QUEUED)
         self.assertEqual(d["reason"], "oversized_probe_slots_full")
