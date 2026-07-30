@@ -540,6 +540,56 @@ class TestRecoveryOrders(RunnerCase):
         self.assertTrue(self.logs_of("recovery_order_gone"))
 
 
+class TestCrashGapDoesNotReBookTheTape(RunnerCase):
+    """B8's dedupe is IN-MEMORY and reborn empty every process, while the crash-gap window is
+    overlapping BY CONSTRUCTION — so recovery re-booked fills the dying process had already
+    written.  Three damages, all unsafe: the position doubles, the second booking drives the
+    order's remaining to 0 so book_fill POPS an order that is still resting (uncancellable
+    thereafter), and the pop releases collateral the exchange is still holding, publishing
+    delta_dollars ABOVE truth.  recover() seeds the dedupe from the replayed tape."""
+
+    NESTOR = {"open_order_tickers": [], "position_tickers": []}
+
+    def tape(self, r):
+        r.m.ledger.write("place_resp", order_id="o1", coid="v5-lipm-T-y-1", ticker="T",
+                         side="bid", price=0.40, size=10, remaining_count=10,
+                         expiration_ts=int(NOW + 3600), fully_closing=False)
+        r.m.ledger.write("fill_obs", order_id="o1", ticker="T", side="bid", count=6,
+                         price_c=40, fill_id="t-1", closing=False)
+        # The SAME fill still sitting in the exchange's index inside the lookback window.
+        r.m.ex.fills_rows = [{"trade_id": "t-1", "fill_id": "t-1", "order_id": "o1",
+                              "ticker": "T", "market_ticker": "T", "book_side": "bid",
+                              "side": "yes", "action": "buy", "count_fp": "6.00",
+                              "yes_price_dollars": "0.4000", "no_price_dollars": "0.6000",
+                              "fee_cost": "0.000000", "is_taker": False,
+                              "created_time": NOW, "ts": int(NOW)}]
+        r.m.ex.resting["o1"] = {"ticker": "T", "side": "bid", "count": 4, "price": "0.4000",
+                                "client_order_id": "v5-lipm-T-y-1"}
+        r.m.ex._positions = [{"ticker": "T", "position": 6}]
+
+    def test_the_replayed_fill_is_not_booked_a_second_time(self):
+        r = self.runner()
+        self.tape(r)
+        r.init(NOW + 30, nestor_state=self.NESTOR)
+        self.assertAlmostEqual(r.m.positions["T"]["yes"], 6.0, places=9)   # not 12
+        self.assertTrue(self.logs_of("dedupe_seeded"))
+        # Asserted on the TAPE as well as on state: reconcile's exchange-truth resync would
+        # quietly repair a doubled position at the next cycle, so state alone cannot prove
+        # the re-book did not happen — a second fill_obs row for the same fill_id can.
+        obs = [x for x in r.m.ledger.read()
+               if (x.get("k") or x.get("kind")) == "fill_obs" and x.get("fill_id") == "t-1"]
+        self.assertEqual(len(obs), 1)
+
+    def test_the_still_resting_order_survives_recovery_with_its_collateral(self):
+        r = self.runner()
+        self.tape(r)
+        r.init(NOW + 30, nestor_state=self.NESTOR)
+        self.assertIn("o1", r.m.orders)                        # popped ⇒ uncancellable forever
+        self.assertAlmostEqual(r.m.orders["o1"]["remaining"], 4.0, places=9)
+        # published expected-cash NEVER above truth: the exchange still holds 4 × $0.40.
+        self.assertAlmostEqual(r.m.cash.resting_collateral, 1.6, places=9)
+
+
 class TestAdoptionIdempotent(RunnerCase):
     """BLOCKER-2 — adoption is a money event: it writes `adopt` rows, replay rebuilds them,
     and a re-supplied adopt file is SKIPPED, so `position_cost` can never double."""

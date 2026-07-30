@@ -239,6 +239,30 @@ class Runner(object):
         last_ts = max([float(x.get("ts", 0.0)) for x in rows] or [0.0])
         self.m.coid_seq = max(self.m.coid_seq, LG.coid_seq_load())
 
+        # THE DEDUPE IS MEMORY; THE LEDGER IS THE RECORD.  B8's FillDedupe is an in-process
+        # set, reborn EMPTY every start — so the deliberately-overlapping crash-gap window
+        # below re-booked every fill the dying process had already written, and did it
+        # through book_fill, the one door that is supposed to make double-booking
+        # impossible.  Three damages from one re-book, all in the unsafe direction:
+        # positions DOUBLE (v4 measured filled_cum 20 against a truth of 10 — the same
+        # incident, one layer up); the second booking drives the order's `remaining` to 0 so
+        # book_fill POPS an order that is STILL RESTING on the exchange, leaving it
+        # uncancellable by us forever; and popping it releases its resting collateral, which
+        # publishes delta_dollars ABOVE truth — the one thing §5.3 exists to prevent.
+        # Seed the set from the tape we just replayed: every fill_obs row carries the
+        # exchange's own fill_id (engine.book_fill writes it), which is exactly the key
+        # is_new() tests.  MIRROR (double-book ↔ never book): rows with no fill_id seed
+        # nothing, so an unkeyed fill is still ACCEPTED on re-read — understating inventory
+        # is the naked-short direction, and guards.FillDedupe makes the same choice.
+        seeded = 0
+        for r in rows:
+            if (r.get("k") or r.get("kind")) == "fill_obs" and r.get("fill_id"):
+                self.m.dedupe.seen.add(str(r["fill_id"]))
+                seeded += 1
+        if seeded:
+            R.log("dedupe_seeded", fills=seeded,
+                  why="crash-gap window re-reads fills this tape already booked")
+
         # Crash-gap fills: [last_ledger_ts − 60 s, now].  Overlapping BY CONSTRUCTION, which is
         # exactly why B8's dedupe lives at the state layer.
         if last_ts:
