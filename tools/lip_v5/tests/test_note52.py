@@ -209,6 +209,43 @@ class TestPostFillCooldown(LipTestCase):
                          "a rung whose lot was eaten in 2s must be φ-refused, not re-fed")
         self.assertFalse(r.m.halt.halted)
 
+    def test_an_INSTANT_fill_on_the_place_response_starts_the_cooldown(self):
+        """2026-07-30 ~22:12 MT, gas 4.105: the place RESPONSE itself reported the fill
+        (the quote crossed a book that moved since our read; taker fees paid) — and no
+        fills-poll observation existed yet (30s poll gap), so nothing started the 90s
+        cooldown: the rung read as unfunded and was re-placed every cycle, three unpaced
+        placements in 60s tripped B14 and halted the book.  A fill is a fill wherever it
+        is reported: the clock starts at place time.  The fixture insta-fills the FIRST
+        placement and queues no observable fill — exactly the live geometry."""
+        from .test_engine import EngineCase
+        from .test_runner import NOW as RNOW, program_body
+        from .. import exchange as X, runner as RUN
+
+        class T(EngineCase):
+            def runTest(self):
+                pass
+        t = T()
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        tk = "KXAAAGASD-26JUL29-T4.12"
+        ex = X.FakeExchange(balance_cents=1_000_000, now=RNOW)
+        ex.books[tk] = {"orderbook": {"orderbook_fp": {
+            "yes_dollars": [["0.06", "1200"]], "no_dollars": [["0.93", "1200"]]}}}
+        ex._programs = program_body(tickers=(tk,))
+        ex.programs = lambda cursor=None: (200, ex._programs)
+        ex.market_closes[tk] = RNOW + 16 * 3600
+        ex.instant_fill_count = 999                       # every placement dies on arrival
+        m = t.maker(ex=ex)
+        r = RUN.Runner(m, sleep=lambda _s: None)
+        r.init(RNOW, nestor_state={"open_order_tickers": [], "position_tickers": []})
+        for k in range(1, 60):
+            r.iteration(RNOW + k)
+        # the first placement insta-filled and started the clock: inside the 90s window the
+        # rung may not be re-fed, and B14 must be unreachable
+        self.assertLessEqual(len(ex.placed), 2,
+                             "insta-filled rung re-placed unpaced inside the cooldown")
+        self.assertFalse(r.m.halt.halted, "B14 tripped through the insta-fill lane")
+
     def test_the_burst_breaker_is_unreachable_through_the_replenish(self):
         """The property that ends the halt class: even a flow that eats every lot on
         contact cannot draw 3 placements in 60s out of the requoter."""

@@ -249,10 +249,13 @@ class FakeExchange(object):
         # and re-placed the same order every second — 130 duplicates on one rung.  The fake is
         # the engine's contract with the wire; when it speaks a dialect the wire does not, a
         # green suite certifies nothing.
+        # `instant_fill_count` (test hook): the real wire can report a fill ON the place
+        # response — the quote crossed a book that moved since our read.  Default 0.
+        _ifc = float(getattr(self, "instant_fill_count", 0) or 0)
         return self.place_status, {"order_id": oid,
                                    "client_order_id": body.get("client_order_id"),
-                                   "remaining_count": "%.2f" % float(body.get("count", 0)),
-                                   "fill_count": "0.00",
+                                   "remaining_count": "%.2f" % max(0.0, float(body.get("count", 0)) - _ifc),
+                                   "fill_count": "%.2f" % _ifc,
                                    "ts_ms": int((now_ms := 0) or 1785268562482)}
 
     def cancel(self, order_id):

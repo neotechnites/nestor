@@ -473,6 +473,23 @@ class Maker(object):
                           remaining_count=o.get("remaining_count"),
                           fill_count=o.get("fill_count", 0), seq=self.coid_seq,
                           expiration_ts=int(expiration_ts))
+        # ── AN INSTANT FILL STARTS THE COOLDOWN AT PLACE TIME (2026-07-30 ~22:12 MT). ────
+        # The place response itself can report a fill (`fill_count` > 0: the quote crossed
+        # a book that moved since our read, or a taker was waiting).  The 90 s post-fill
+        # cooldown used to start only when the FILLS POLL observed the fill ~30 s later —
+        # so an insta-filled rung read as simply unfunded, the plan re-placed it every
+        # cycle, and three unpaced placements in 60 s tripped B14 (gas 4.105, taker fees
+        # paid three times).  The BOOKING of the fill stays with fill_obs (the tape law —
+        # one source of position truth); only the CLOCK starts here, which is exactly the
+        # clock's job: "a fill happened at this rung, stand back."
+        try:
+            _fc = float(o.get("fill_count") or 0)
+        except (TypeError, ValueError):
+            _fc = 0.0
+        if _fc > 0:
+            self.fill_cooldown[(ticker, side)] = float(now)
+            R.log("placed_and_instantly_filled", ticker=ticker, side=side,
+                  fill_count=_fc, price=float(price))
         self.publisher.publish(now)
         return True, "ok", resp
 
