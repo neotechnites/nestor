@@ -1108,8 +1108,9 @@ PER_MARKET_POOL_MULT = 4.0                   # v1 §8.2 never risk 4× a market'
 # a comment.  So the two are now ONE number by construction, and `alloc.market_cap_usd`'s
 # docstring carries the plan ⊆ rail proof that this identity is the load-bearing step of.
 #
-# THE DERIVATION.  We do not exit: 149 of 6,149 acquired contracts were ever closed (2.4%),
-# across 7 closing orders in the operation's entire history, all takers.  So NET exposure equals
+# THE DERIVATION.  We do not exit -- an OBSERVATION when this was written (149 of 6,149
+# acquired contracts ever closed, 2.4%, across 7 closing orders in the whole history, all
+# takers) and a LAW since 2026-07-30.  So NET exposure equals
 # GROSS, and the only control on directional risk is refusing to acquire.  The whole reason for
 # breadth is variance: with N equally-weighted independent markets the book's SD scales as
 # 1/sqrt(N), and with UNEQUAL weights the effective count is the inverse Herfindahl
@@ -1271,8 +1272,10 @@ DAILY_LOSS_LIMIT_USD = DAY_STOP_CAP_USD
 # shorter than the 15-min kill cadence it feeds evidence into.  Costs at most 90s of
 # presence per fill on a healthy rung (~2% of a window at the measured fill rates).
 # MIRROR (cooldown too LONG - presence lost on rungs whose fills are benign - is bounded at
-# 90s per fill; too SHORT is the measured failure: two halts, five lost hours).  Sheds and
-# fully-closing orders are EXEMPT - a cooldown must never delay an exit.
+# 90s per fill; too SHORT is the measured failure: two halts, five lost hours).  The exemption
+# this used to carry ("sheds and fully-closing orders are EXEMPT - a cooldown must never delay
+# an exit") is deleted with the exits themselves, 2026-07-30: every order is an entry now, so
+# the cooldown applies to every order, with nothing to make an exception for.
 POST_FILL_COOLDOWN_S = 90.0
 
 PLACE_BURST_MAX = 3
@@ -1365,8 +1368,10 @@ CASH_FEED_STALE_S = 120.0                    # spec §5.4 — 4× heartbeat: sur
                                              # MIRROR (stale ↔ absent): an absent file is
                                              # (0,0), correct ONLY if v5 is truly flat, so
                                              # SIGTERM writes a final ZEROED feed after
-                                             # cancel-all + shed, and only then may the file
-                                             # be removed.
+                                             # cancel-all (the shed that used to follow it is
+                                             # deleted, 2026-07-30 - shutdown cancels OUR
+                                             # orders and leaves positions to settle), and
+                                             # only then may the file be removed.
 SETTLEMENT_CASH_TIMEOUT_S = 6 * 3600.0       # spec §5.2a — ≈9× the 41-min observed lag.
                                              # NEVER auto-releases; it PAGES.  UNDERIVED §9.4.
                                              # MIRROR (released too EARLY ↔ too LATE): early
@@ -1415,14 +1420,14 @@ TAKER_EXIT_MAX_SLIPPAGE_C = 3                # v1 — a MARKETABLE LIMIT, never 
                                              # intend", and only a limit price makes that
                                              # statement checkable BEFORE the order is sent.
                                              # 3c is the observed spread on qualifying rungs.
-# GATE G6 (spec §7): the taker-exit is the ONLY code path in this binary able to cross the
-# spread, and spec §7 assigns it to Ryan as a separate human gate with its own rollback
-# ("flag false").  It therefore ships FALSE.  While it is false the triage still COMPUTES the
-# crossing verdict and LOGS THE VALUE FORGONE — the choice is measured rather than asserted —
-# and falls back to the maker shed, which is v1 §5.4's strictly-preferred path anyway.
-# MIRROR (crossing too eagerly ↔ never being able to leave): this flag guards the first end;
-# the second is guarded by the fact that the maker shed is unconditional and never gated, so a
-# position is always leaving, only more slowly.
+# GATE G6 (spec §7): the taker-exit was the ONLY code path in this binary able to cross the
+# spread, gated to Ryan with its own rollback ("flag false"), and it has ALWAYS shipped FALSE.
+# As of 2026-07-30 there is no exit path at all — maker or taker — so these two constants
+# survive only as inputs to `cutover.triage`'s arithmetic, which computes the crossing verdict
+# and the VALUE FORGONE as a measurement written to the tape.  Nothing places from either.
+# The old mirror ("crossing too eagerly ↔ never being able to leave", answered by "the maker
+# shed is unconditional so a position is always leaving") no longer has a second end to guard:
+# a position is never leaving except by settlement, which the D4 gate bounds at 7 days.
 TAKER_EXIT_ENABLED = False
 TAKER_EXIT_DECISION = "off_accepted"         # "undecided" | "on" | "off_accepted".  The gate
                                              # is on the DECISION, not the answer: reaching a

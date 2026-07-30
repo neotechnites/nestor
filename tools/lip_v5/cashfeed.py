@@ -182,7 +182,10 @@ class CashState(object):
         sum — which is exactly right, because the exchange took the cash at PLACEMENT, not at
         fill.
 
-        **CLOSING** (`side_sign < 0`, i.e. a shed or any disposal): `n` contracts leave
+        **CLOSING** (`side_sign < 0`).  The bot no longer PLACES a closing order (2026-07-30)
+        but the exchange NETS AUTOMATICALLY, so an opening quote can still execute against
+        inventory and this branch is still reached — see `engine.fill_nets_against_inventory`.
+        `n` contracts leave
         inventory at basis `b` and the exchange returns `n × proceeds` in cash.  The basis
         leaving raises `delta_dollars` by `n·b`, but the cash that actually arrived is
         `n·proceeds` — so WITHOUT realizing the P&L the published number rises by the basis
@@ -478,8 +481,9 @@ class CashState(object):
 
     def zeroed_feed(self, now=None):
         """§5.4 MIRROR (stale ↔ absent): an ABSENT file is (0,0), which is correct ONLY if v5
-        is truly flat.  So the SIGTERM path writes a final ZEROED feed AFTER cancel-all + shed,
-        and only then may the file be removed.  A `-9` kill leaves the last conservative value
+        is truly flat.  So the SIGTERM path writes a final ZEROED feed AFTER cancel-all (the
+        shed that used to follow it died with the exit paths, 2026-07-30 — shutdown cancels
+        OUR orders and leaves positions to settle), and only then may the file be removed.  A `-9` kill leaves the last conservative value
         plus the staleness page."""
         f = self.feed(now)
         f["delta_dollars"] = 0.0

@@ -1247,7 +1247,7 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
     # — two wire calls, a forfeited pot, and the same expected dollars.
     #
     # POSITIONS ARE NEVER DISPLACED.  Only a RESTING allocation can be recalled; held
-    # inventory rides (the 2026-07-30 "positions RIDE" decision — the auto-shed path is off),
+    # inventory rides (the 2026-07-30 "positions RIDE" decision — every exit path is DELETED,
     # and pretending otherwise would have the planner "free" dollars that no cancel can
     # actually free.
     #

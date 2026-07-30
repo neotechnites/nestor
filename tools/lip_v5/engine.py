@@ -1,10 +1,11 @@
 """
 lip_v5.engine — THE RUN CYCLE.
 
-    startup  → refusals → ledger replay → adopt → triage → arm
+    startup  → refusals → ledger replay → adopt (positions) → arm.  NO order adoption:
+               the order book starts empty and only orders THIS process places enter it.
     cycle    → clock/rate → classify → slots → r*+ALLOCATE → quote(MBB) → fills
              → meter → recycler → cash feed → recon → checkpoints → health
-    shutdown → cancel-all → shed → handback (ALWAYS) → zeroed cash feed
+    shutdown → cancel-all (OURS only) → handback (ALWAYS) → zeroed cash feed
 
 Two structural rules make this testable and make the guards real:
 
@@ -25,7 +26,9 @@ import signal
 from . import alloc, cashfeed, clusters as CL, config as C, cutover
 from . import guards as G, ledger as LG, money as M, presence as P
 from . import quote as Q
-from . import ratchet as RT, ratelimit as RL, runtime as R, scan, wsgate
+from . import ratchet as RT, ratelimit as RL, runtime as R, wsgate
+# `scan` left with the halted closing pass: its only use here was `scan._book_levels`,
+# reading a book in order to price a shed.
 
 
 class Maker(object):
