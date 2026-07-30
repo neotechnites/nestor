@@ -1224,6 +1224,16 @@ CREDIT_TARGET_MARGIN = 1.5
 MAX_TOTAL_COLLATERAL_USD = 300.0             # R168 ladder rung.  G5 owns changes to this: one
                                              # constant, one commit, funded by the PREVIOUS
                                              # window's OBSERVED print, never the model.
+# ── THE OWNER'S LAW (Ryan, 2026-07-30) — the TWO strategy constants. ─────────────────────────
+# "$10 allocation per market, $300 total."  The $10 is an ALLOCATION, not an order size: the
+# order is sized to the market's need and the remainder is that market's requote budget,
+# consumed as fills convert resting collateral into inventory ("if phi is 24, and it costs 10
+# dollar-hours, we will put in 1000/24 cents, 24 times").  Above $10 in one market "makes us
+# too concentrated" — his words, and the whole derivation.  BOTH CONSTANTS LATER DERIVE FROM
+# AVAILABLE CAPITAL: $300 is the current capital rung (R168 ladder above), and $10 is
+# $300 / 30 target markets — when the ladder moves, these move together, so the pair is really
+# (capital, capital / N).  Until that derivation ships they are the law's own two numbers.
+ALLOC_PER_MARKET_USD = 10.0
 # MIRROR (day stop for LOSS ↔ day stop for WIN): none needed, and the consideration is the
 # record — a large POSITIVE divergence is the settlement/credit path, covered by §5.2's
 # pending widening.  MIRROR (day stop ↔ IDLE capital): losing nothing and earning nothing is

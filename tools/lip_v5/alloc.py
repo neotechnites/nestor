@@ -1523,6 +1523,288 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
     return alloc, spent, marginal, dropped
 
 
+# =============================================================================================
+# THE OWNER'S LAW (Ryan, 2026-07-30) — the allocator.  Everything above this line in the
+# ALLOCATE family (water-filling, r*, gates, bolt-ons) is replaced by what follows.
+#
+# THE LAW, verbatim where it is sizing:
+#   1. RANKING — for every candidate market compute CAPITAL NEEDED TO EARN $1.50 IN THE NEXT
+#      24 HOURS from the live window's pool, competition, time left, phi, and accrued already
+#      banked there.  Accrual >= target is DONE — skip, fund next-best.  Fund cheapest-need
+#      first until capital is gone.
+#   2. ONE ORDER PER CLUSTER (clusters.py grouping).
+#   3. CAPS — $10 per market, $300 total (config.ALLOC_PER_MARKET_USD /
+#      MAX_TOTAL_COLLATERAL_USD, the only two strategy constants).
+#   4. SIZING — "if it costs 5 dollar-hours to earn 1.5, and phi is 2.5, we will put in
+#      5 dollars, and requote when it fills.  if phi is 24, and it costs 10 dollar-hours, we
+#      will put in 1000/24 cents, 24 times.  if it doesn't fit in there, we can't afford it,
+#      because going above 10 dollars makes us too concentrated.  if somehow this market is
+#      awesome and we can earn a dollar in 24 hours with only one dollar, we will put all 10,
+#      because that capital can't go to any other rung or it would be too consolidated."
+#   5. FLOOR — $1.50 per 24 hours AND never below $1.00 by window end.
+#
+# THE READING OF §4, stated once so the arithmetic can be argued with (the three examples are
+# reproduced numerically in tests/test_law.py):
+#   * "dollar-hours" is the TOTAL capital the market consumes over the horizon: the resting
+#     lot, replaced each time a fill converts it into inventory.  phi in his examples counts
+#     TURNOVERS of the lot over the horizon; in this codebase phi is fills/hour/resting-
+#     contract, so turnovers T = phi x h (fills scale linearly with size, so T is
+#     size-independent).  Total consumption of a lot L held through the horizon is
+#     L x max(1, T): the lot itself, T times over ("1000/24 cents, 24 times" = $10 total at
+#     T = 24; "put in 5 dollars, and requote when it fills" = $5 total at T = 2.5).
+#   * the NEED is the smallest lot that earns the target: W = q_rest x p from the share
+#     equation below.  total_need = W x max(1, T) (+ self-qualification where the side does
+#     not qualify on rival depth — law §7a).  total_need > $10 ⇒ we can't afford it: SKIP,
+#     logged with the numbers, never silent.
+#   * the ORDER is OVERSIZED up to the envelope: lot = env / max(1, T) where env = min($10,
+#     budget room, $10 − basis already bought here).  At T <= 1 that is the whole $10 ("we
+#     will put all 10") and at T = 24 it is 1000/24 cents; affordability (total_need <= env)
+#     guarantees lot >= W, so the order never undershoots the need.  Oversizing is free in
+#     the owner's frame because the excess "can't go to any other rung [of this cluster] or
+#     it would be too consolidated" — and share is monotone in q, so the extra size earns.
+#   * env shrinks as fills accumulate basis in the market (market_spent), so the remainder of
+#     the $10 IS the requote budget, consumed as fills happen, with no bookkeeping beyond the
+#     positions the exchange already confirms — restart-safe by construction.
+# =============================================================================================
+LAW_HORIZON_H = 24.0                          # "in the next 24 hours" — the law's own horizon
+
+
+def law_target_usd(hours_left, floor_24h=None, cliff=None, horizon_h=LAW_HORIZON_H):
+    """The credit this market must reach inside the horizon, and the hours it has.
+
+    Law §5: "$1.50 per 24 hours AND never below $1.00 by window end (sub-$1 windows forfeit;
+    pro-rating a short window earns credit that forfeits)."  A window longer than the horizon
+    is judged on the $1.50 pace.  A window SHORTER than the horizon may pro-rate the pace —
+    but never below the $1.00 forfeit cliff, because $1.50 x (4h/24h) = $0.25 is credit
+    Kalshi pays ZERO for: the pro-rated target is clamped at the cliff, and a window whose
+    pool cannot reach $1.00 by its end is skipped as unreachable, not funded small.
+
+    Returns (target_usd, h) with h = min(hours_left, horizon).
+    """
+    floor_24h = C.ENTRY_FLOOR_USD if floor_24h is None else float(floor_24h)
+    cliff = C.CREDIT_TARGET_USD if cliff is None else float(cliff)
+    h = min(max(0.0, float(hours_left)), float(horizon_h))
+    if float(hours_left) >= float(horizon_h):
+        return floor_24h, h
+    return max(cliff, floor_24h * h / float(horizon_h)), h
+
+
+# Skip reasons — every one is logged with numbers (three separate incidents on 2026-07-30
+# were caused by silent refusal paths; a skip that cannot say why is a defect, not a policy).
+DONE, UNREACHABLE, UNAFFORDABLE, CLUSTER_TAKEN, BUDGET_EXHAUSTED, EXHAUSTED, FUND = (
+    "done", "unreachable", "unaffordable", "cluster_taken", "budget_exhausted",
+    "allocation_exhausted", "funded")
+
+
+class Need(object):
+    """One candidate's LAW arithmetic — every number a skip or a fund line must cite."""
+
+    __slots__ = ("slot", "cluster", "target_usd", "need_usd", "h", "q_rest", "rest_usd",
+                 "turnovers", "qualify_q", "qualify_usd", "unit_usd", "total_usd", "reason")
+
+    def __init__(self, slot, cluster, target_usd, need_usd, h, q_rest=0, rest_usd=0.0,
+                 turnovers=0.0, qualify_q=0, qualify_usd=0.0, unit_usd=0.0, total_usd=0.0,
+                 reason=""):
+        self.slot = slot
+        self.cluster = cluster
+        self.target_usd = target_usd
+        self.need_usd = need_usd
+        self.h = h
+        self.q_rest = int(q_rest)
+        self.rest_usd = rest_usd
+        self.turnovers = turnovers
+        self.qualify_q = int(qualify_q)
+        self.qualify_usd = qualify_usd
+        self.unit_usd = unit_usd                  # collateral $/contract at the ORDER's price
+        self.total_usd = total_usd                # THE RANKING NUMBER (law §1)
+        self.reason = reason
+
+    def numbers(self):
+        """The log payload: no refusal without its arithmetic."""
+        return {"ticker": self.slot.ticker, "side": self.slot.side, "cluster": self.cluster,
+                "target_usd": round(self.target_usd, 4), "need_usd": round(self.need_usd, 4),
+                "h": round(self.h, 2), "q_rest": self.q_rest,
+                "rest_usd": round(self.rest_usd, 4), "turnovers": round(self.turnovers, 3),
+                "qualify_q": self.qualify_q, "qualify_usd": round(self.qualify_usd, 4),
+                "total_usd": round(self.total_usd, 4), "accrued": round(self.slot.accrued, 4)}
+
+
+def law_need(slot):
+    """CAPITAL NEEDED TO EARN THE TARGET IN THE NEXT 24 HOURS (law §1) — from the live
+    window's pool (slot.rho), competition (slot.S, the RIVAL score), time left
+    (slot.hours_left), phi (slot.phi, law §6's chain, resolved in scan.build_slots) and
+    accrued already banked there (slot.accrued, the estimates truth feed).
+
+    THE SHARE EQUATION.  Credit = share x (rho/2) x h with share = q/(q+S) at the touch
+    (DF^0 = 1; the CFTC filing's own scoring).  Solving share x (rho/2) x h >= need for q:
+
+        s = need / ((rho/2) x h)          the share of the side's remaining half-pool needed
+        q_rest = S x s / (1 - s)          contracts;  s >= 1 ⇒ UNREACHABLE at any size
+
+    Note what is absent from q_rest: the price.  Score counts CONTRACTS and the target is
+    DOLLARS, so the contracts needed do not depend on what one costs — price enters only in
+    W = q_rest x p, which is why the same target costs ~7x less at 6c than at 40c.
+
+    QUALIFICATION (law §7a — a former gate, now a formula input).  A side scores ZERO until
+    the resting-depth walk reaches target_size.  Where rivals' depth already qualifies the
+    side, our quote rides free and this term is $0.  Where it does not, the cost includes
+    self-qualifying: the missing (target_size − cum_size) contracts at a scoring-legal price
+    — priced at the ENTRY BAND floor, because the band is preserved law (§7b) and 1c is the
+    price it exists to refuse (n = 8,240: 2c realised 0.00% on 765 markets).  Our own resting
+    size counts toward the walk, so the self-qualifying depth IS the order.  At $10/market
+    this practically ranks empty sides unaffordable (1,000 x 6c = $60) — and the skip is
+    logged with those numbers, never silent.
+    """
+    ck = CL.cluster_of(slot.ticker)
+    target, h = law_target_usd(slot.hours_left)
+    need = target - float(slot.accrued or 0.0)
+    if need <= 1e-12:
+        # DONE (law §1): a market that has already banked the target earns its keep with no
+        # further presence; its allocation funds the next-best in its cluster or elsewhere.
+        return Need(slot, ck, target, need, h, reason=DONE)
+    avail = (float(slot.rho) / 2.0) * h           # the whole side's half-pool over the horizon
+    if avail <= 0.0:
+        return Need(slot, ck, target, need, h, reason=UNREACHABLE)
+    s_needed = need / avail
+    if s_needed >= 1.0:
+        # Even owning the whole side cannot reach the target inside the horizon (this is
+        # also the never-below-$1.00-by-window-end clause refusing a dying window).
+        return Need(slot, ck, target, need, h, reason=UNREACHABLE)
+    T = max(0.0, float(slot.phi)) * h             # expected turnovers of the lot (see header)
+    qual_gap = max(0, int(math.ceil(float(slot.target_size) - float(slot.cum_size))))
+    if qual_gap > 0 and slot.S <= 0:
+        # Self-qualification: we become the side.  Rival score is ~0, so one contract past
+        # the walk takes the whole share; the walk itself is the cost.  Unit price is the
+        # slot's land-grab price (scan prices it at the band floor on the side's own axis).
+        unit = R.unit_collateral(slot.side, slot.land_grab_price_c / 100.0)
+        q_rest = qual_gap + 1
+        rest = q_rest * unit
+        total = rest * max(1.0, T)
+        return Need(slot, ck, target, need, h, q_rest=q_rest, rest_usd=rest, turnovers=T,
+                    qualify_q=qual_gap, qualify_usd=qual_gap * unit, unit_usd=unit,
+                    total_usd=total)
+    q_rest = max(1, int(math.ceil(float(slot.S) * s_needed / (1.0 - s_needed))))
+    unit = float(slot.p)
+    rest = q_rest * unit
+    qual_usd = 0.0
+    if qual_gap > 0:
+        # Rival depth is short of the walk AND rivals exist: our order must both fill the
+        # gap and earn.  The order is one object at one price, so the binding size is the
+        # larger of the two and the cost carries the gap explicitly (law §7a's parenthetical
+        # is `target_size x price`; the gap form is never larger, because rivals' partial
+        # depth and our own resting size count toward the walk).
+        qual_usd = qual_gap * unit
+        q_rest = max(q_rest, qual_gap)            # the order covers the gap, so the gap's
+        rest = q_rest * unit                      # cost is inside `rest` from here on
+    total = rest * max(1.0, T)
+    return Need(slot, ck, target, need, h, q_rest=q_rest, rest_usd=rest, turnovers=T,
+                qualify_q=qual_gap, qualify_usd=qual_usd, unit_usd=unit, total_usd=total)
+
+
+def law_rank(needs):
+    """Cheapest-need first (law §1), ties broken by (ticker, side) so a restart with the
+    same world produces the same ranking — no discovery-order dependence (law §10)."""
+    return sorted(needs, key=lambda n: (n.total_usd, n.slot.ticker, n.slot.side))
+
+
+def law_order_q(need, env_usd):
+    """The ORDER, oversized up to the envelope (law §4, reading in the header):
+
+        lot = env / max(1, T)   — the largest lot whose T expected turnovers still fit the
+                                  envelope, i.e. the whole $10 at T <= 1 ("we will put all
+                                  10") and 1000/24 cents at T = 24.
+
+    Affordability (total_need <= env) guarantees lot >= W, so the floor at q_rest below is a
+    rounding guard, not a second policy."""
+    if need.unit_usd <= 0:
+        return 0
+    lot_usd = float(env_usd) / max(1.0, need.turnovers)
+    return max(need.q_rest, int(lot_usd / need.unit_usd + 1e-9))
+
+
+def allocate_law(slots, budget_usd, market_spent=None, alloc_cap_usd=None,
+                 total_cap_usd=None):
+    """THE LAW's allocation pass.  Returns (alloc {key: qty}, spent_usd, report).
+
+    `market_spent` — {ticker: $ basis of inventory already bought there this window}: the
+    consumed part of each market's $10 allocation (the requote budget, law §4).  Comes from
+    the exchange's own positions, so a restart re-derives it — no state of our own.
+    `budget_usd` — what remains of the $300 after inventory basis (the engine computes it
+    from the same book the rails read).
+
+    Pure function of its inputs, deterministic, re-ranked every pass (law §8: capital events
+    flow through reconcile/settlement into `budget_usd` and the next pass re-ranks —
+    "the owner chose the easy way").  Every skip is aggregated into ONE `law_reasons` line
+    per pass with per-reason counts plus worked examples; every funded market logs
+    `law_funded` with its full arithmetic.  No silent refusals.
+    """
+    market_spent = market_spent or {}
+    alloc_cap = C.ALLOC_PER_MARKET_USD if alloc_cap_usd is None else float(alloc_cap_usd)
+    total_cap = C.MAX_TOTAL_COLLATERAL_USD if total_cap_usd is None else float(total_cap_usd)
+    budget = max(0.0, min(float(budget_usd), total_cap))
+    alloc = {s.key: 0 for s in slots}
+    needs, why, examples = [], {}, []
+
+    def skip(n, reason):
+        why[reason] = why.get(reason, 0) + 1
+        if len(examples) < 3:
+            ex = n.numbers()
+            ex["reason"] = reason
+            examples.append(ex)
+
+    for s in slots:
+        if s.pinned or s.denied or not s.legal_price_exists:
+            continue                              # structurally unquotable: no arithmetic
+        if s.hours_left <= 0 or s.hours_to_start > C.PREPOSITION_LEAD_H:
+            continue                              # window over / not yet open: rho is not live
+        n = law_need(s)
+        if n.reason in (DONE, UNREACHABLE):
+            skip(n, n.reason)
+            continue
+        needs.append(n)
+
+    spent = 0.0
+    funded_clusters = {}
+    for n in law_rank(needs):
+        s = n.slot
+        if n.cluster in funded_clusters:
+            skip(n, CLUSTER_TAKEN)                # law §2: one order per cluster
+            continue
+        env = min(alloc_cap - float(market_spent.get(s.ticker, 0.0)), budget - spent)
+        if env < n.unit_usd:
+            # This market's $10 is spent (fills consumed it) or the $300 is gone.  The
+            # distinction matters in the log: one is the market's requote budget exhausted
+            # (law §4 — presence here is complete for the window), the other ends the pass.
+            if budget - spent < n.unit_usd:
+                skip(n, BUDGET_EXHAUSTED)
+                continue
+            skip(n, EXHAUSTED)
+            continue
+        if n.total_usd > env + 1e-9:
+            # "if it doesn't fit in there, we can't afford it, because going above 10
+            # dollars makes us too concentrated."
+            skip(n, UNAFFORDABLE)
+            continue
+        q = law_order_q(n, env)
+        if q < 1:
+            skip(n, UNAFFORDABLE)
+            continue
+        alloc[s.key] = q
+        charge = min(q * n.unit_usd * max(1.0, n.turnovers), env)
+        spent += charge
+        funded_clusters[n.cluster] = s.key
+        R.log("law_funded", q=q, order_usd=round(q * n.unit_usd, 4),
+              env_usd=round(env, 4), charge_usd=round(charge, 4), **n.numbers())
+    if why:
+        R.log("law_reasons", candidates=len(needs) + sum(
+            v for k, v in why.items() if k in (DONE, UNREACHABLE)),
+            funded=len(funded_clusters), spent=round(spent, 2),
+            budget=round(budget, 2), **{k: v for k, v in sorted(why.items())})
+        for ex in examples:
+            R.log("law_example", **ex)
+    return alloc, spent, {"reasons": why, "funded": funded_clusters}
+
+
 def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
                         floor_rate=C.ADMIT_FLOOR_RATE_PER_H, venue_caps=None, held=None,
                         resting=None,
