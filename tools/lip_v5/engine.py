@@ -805,8 +805,6 @@ class Maker(object):
 
         # --- SF-4: the operator's venue readings (credits ritual → ratchet) ---
         self.consume_readings(now)
-        # --- SF-4c: the exchange's OWN accrual feed re-anchors the model every minute ---
-        self.poll_estimates(now)
         # --- SF-4b: accrued overrides — the exchange's displayed pot outranks the model ---
         try:
             _ov = R.read_json(C.ACCRUED_OVERRIDES_PATH, default=None)
@@ -1036,10 +1034,12 @@ class Maker(object):
             return 0
         admitted, _ = self.bucket.admit("verify", now)
         if not admitted:
+            R.log_once("estimates_rate_refused", note="verify lane refused the poll")
             return 0
         status, body = self.ex.estimates(C.KALSHI_USER_ID)
         self.note_http(status, now)
         if status != 200:
+            R.log_once("estimates_poll_failed", status=status)
             return 0
         self.last_estimates_poll = float(now)
         n = 0

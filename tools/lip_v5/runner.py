@@ -309,6 +309,12 @@ class Runner(object):
             R.log("iteration_skipped_halted", reason=self.m.halt.reason)
             return {"halted": True, "reason": self.m.halt.reason}
 
+        # (1b) SF-4c FIRST: the exchange's accrual feed is ONE request a minute and it was
+        # measured starved to zero polls when it ran after the discovery stages — scan,
+        # classify and the book polls drain the bucket to its reserve every iteration, so a
+        # cycle-time verify admit never sees a free token.  The smallest consumer goes first.
+        self.m.poll_estimates(now)
+
         # (2) scan → classify → slots.  Each is cadence-gated and rate-laned inside.
         programs = self.scanner.scan(self.m.ex, self.m.bucket, now)
         self.classifier.sweep(self.m.ex, self.m.bucket, programs, now, books=books)
