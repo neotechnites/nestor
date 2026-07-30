@@ -181,13 +181,25 @@ class TestDerivedSlotCap(LipTestCase):
         # the surviving constant is the FLOOR, and the floor itself is derived
         self.assertAlmostEqual(C.INV_CAP_USD, 0.5 * C.DAY_STOP_FLOOR_USD, places=9)
 
-    def test_a_contested_rung_whose_reward_supports_50_gets_50(self):
-        """Amendment T1: marginal rate supports it, cluster bounds allow it ⇒ ~$50 lands."""
+    def test_a_contested_rung_is_bounded_by_the_PER_MARKET_cap_not_the_slot_cap(self):
+        """WAS `test_a_contested_rung_whose_reward_supports_50_gets_50`, asserting $50.
+
+        D2 supersedes the $50: `PER_MARKET_BUDGET_FRAC` is now `MARKET_CAP_FRAC` (0.10), so on a
+        $300 budget one MARKET may hold $30 — and $30 < the $50 slot cap, so at this budget the
+        per-market cap binds FIRST.  That is the variance constraint working, not a regression:
+        MARKET_CAP_FRAC's own derivation is that a single weight above 0.10 collapses
+        `N_eff = 1/Σwᵢ²` below ~20, and $50 of $300 is a weight of 0.167 (N_eff ≈ 6 for that
+        market).  The charter's "$50 per rung at a day stop ≥ $100" predates that derivation and
+        `slot_cap_usd`'s docstring already restated it as "$50 per CLUSTER".
+        The plan ⊆ rail chain still holds: plan gross $30 ≤ rail per-leg
+        `max(slot_cap, 0.10 × ceiling)` = $30.
+        """
         from .. import clusters as CL
         s = slot("KXBIG-1", p=0.50, S=50, phi=0.01)      # contested share, thin fill risk
-        caps = alloc.Caps(inv_cap_usd=C.slot_cap_usd(100.0))   # day stop $100 ⇒ cap $50
+        caps = alloc.Caps(inv_cap_usd=C.slot_cap_usd(100.0))   # day stop $100 ⇒ slot cap $50
         a, spent, _ = alloc.allocate([s], 300.0, RSTAR, caps=caps)
-        self.assertAlmostEqual(spent, 50.0, places=6)
+        self.assertAlmostEqual(spent, C.MARKET_CAP_FRAC * 300.0, places=6)
+        self.assertLess(spent, 50.0, "the per-market cap must bind before the slot cap here")
         # ...and the SAME day stop's cluster cap admits the order it sized
         ok, reason, _ = CL.cluster_admits(
             [], {"ticker": "KXBIG-1", "side": "yes", "n": a[s.key], "basis": 0.50},

@@ -442,8 +442,32 @@ def rival_S(S, ref_p, our_orders, df=C.DISCOUNT_FACTOR_DEFAULT):
 
 
 def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen=None,
-                l_shed=None, prior_t_hat=None, p6=None, accrued=None, own_orders=None):
+                l_shed=None, prior_t_hat=None, p6=None, accrued=None, own_orders=None,
+                held=None):
     """The slot table `engine.cycle()` consumes.
+
+    `held` — D1, THE INVENTORY-SLOT GUARANTEE, EXTENDED FROM POLLING TO SLOT-BUILDING.
+    A set of tickers we hold a position in or rest an order in.  `rank_for_poll` has always
+    carried this guarantee ("a de-polled held market is never requoted, never cancelled, and its
+    fills are never learned"), but it guaranteed only that a held market gets POLLED — and a poll
+    with no SLOT is nearly as blind, because `engine.update_shed_targets` reads
+    `by_key = {s.key: s for s in slots}` and on a miss can only KEEP a previous verdict
+    (`held_from_last_reading`), never START a shed, and `requote_pass` has no `s.p` to price one
+    with.  So every entry-only exclusion below is skipped for a held ticker.
+    HOW THE BLOCKER ARRIVED: the free-ride gate's exemption was `own_qty > 0` read from LIVE
+    ORDERS, and `book_fill` pops an order at `remaining <= 0` — so the exemption vanished at
+    exactly the moment a fill first gave us inventory to shed.  The gate deleted the exit.
+    WHICH EXCLUSIONS ARE ENTRY-ONLY, and why each is skipped rather than kept: `hours_left <= 0`,
+    `preposition_ok`, `runway_ok`, P6, the entry price band and the free-ride gate ALL answer "is
+    it worth ENTERING here", which is not the question a market we are already inside asks.
+    Skipping them yields a slot with `hours_left = 0`, which `alloc.allocate` refuses for NEW
+    allocation on its own line — so the slot buys a shed and a requote and cannot buy exposure.
+    WHAT IS NOT SKIPPED: `series_denied` and `frozen`.  Those are kill switches, not opportunity
+    tests; a frozen ticker is frozen because our books and the wire disagree about it, and
+    quoting into that disagreement is the emergency, not the cure.
+    MIRROR (exempting too much ↔ D1): the exemption cannot ADD exposure (see the `hours_left`
+    note above, and B16/B15 still bind at `place()`), and it is scoped to tickers where we
+    already have money — a set that only shrinks as positions close.
 
     Every exclusion that can be decided WITHOUT a request is applied here, so the rate budget is
     never spent on a market we would refuse anyway.  What this stage may NOT do is decide size —
@@ -462,6 +486,7 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
     tape = tape or {}
     accrued = accrued or {}                   # program_id -> $ accrued (the cliff's memory)
     presence_rows = presence_rows or []
+    held = set(held or ())                    # D1 — tickers we hold or rest an order in
     slots = []
     by_prog = {p["program_id"]: p for p in programs}
 
@@ -469,15 +494,49 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
         prog = by_prog.get(rec["program_id"])
         if prog is None or C.series_denied(ticker) or ticker in frozen:
             continue
+        # D1: a market we are already inside is not asking whether entry is worthwhile.
+        is_held = ticker in held
         hours_left = max(0.0, (prog["end_ts"] - float(now)) / 3600.0)
         hours_to_start = max(0.0, (prog["start_ts"] - float(now)) / 3600.0)
-        if hours_left <= 0 or not preposition_ok(hours_to_start):
+        if not is_held and (hours_left <= 0 or not preposition_ok(hours_to_start)):
             continue
-        if not runway_ok(prog["rho"], hours_left,
-                         accrued_usd=accrued.get(prog["program_id"], 0.0)):
+        if not is_held and not runway_ok(prog["rho"], hours_left,
+                                        accrued_usd=accrued.get(prog["program_id"], 0.0)):
             continue
+        # ── THE LIVE-PROGRAM FILTER (2026-07-29 night). ─────────────────────────────────────
+        # REWARDS ARE THE ONLY REASON WE ARE IN ANY OF THESE MARKETS.  A program that is not
+        # currently paying turns every rung under it into a naked directional bet wearing a
+        # market-making rationale — and that is not hypothetical: **$225 of the day's $477 loss
+        # (47%) sat in six events that paid $0.00 of LIP.**  Refusing them costs exactly zero
+        # credit, which makes this the only change on the board with no trade-off to price.
+        # WHAT IS ACTUALLY TESTED HERE, stated narrowly on purpose.  The $0-credit events
+        # decompose into at least two mechanisms and this closes the cheaper one:
+        #   (a) `paid_out` — the program has already settled its period, so resting in it now
+        #       accrues nothing toward a payout that has been made.  The field was PARSED by
+        #       `parse_programs` and read by NOTHING; `lip_v5.py`'s own schedule note describes
+        #       it flipping ~2 h post-close, so its meaning was never in doubt, only unused.
+        #   (b) `pool_usd == 0` — a program with no period_reward cannot pay any share of it.
+        #       `runway_ok` refuses ρ ≤ 0 today, but ONLY on the entry path and NOT when accrual
+        #       already exceeds the rescue target (`if need <= 0: return True`), so a zero-pool
+        #       program could still produce slots.  Made explicit rather than left as a
+        #       side-effect of a different guard.
+        # NOT CLAIMED: that this recovers the whole 47%.  The other mechanism in that $225 is
+        # the $1.00 forfeit cliff (note 47 §1 — UST2AD/30AD absent from the receipt because
+        # every rung was under a dollar), which is `floor_clearing_size`'s job, not this one.
+        # Per note 49 R1, the honest scope is "this closes (a) and (b)", and the instrument that
+        # will size the remainder is a per-event credit join we do not have yet.
+        # MIRROR (refusing a live program ↔ quoting a dead one): a held ticker is exempt, so this
+        # can never strand inventory (D1); and `paid_out` is the exchange's OWN word about its
+        # own program, never our inference from a clock.
+        if not is_held:
+            if bool(prog.get("paid_out")):
+                R.log("program_paid_out", ticker=ticker, program_id=prog.get("program_id"))
+                continue
+            if pool_usd(prog.get("period_reward")) <= 0.0:
+                R.log("program_no_pool", ticker=ticker, program_id=prog.get("program_id"))
+                continue
 
-        if p6 is not None and not p6(ticker):
+        if not is_held and p6 is not None and not p6(ticker):
             # ADVISORY by default (config.P6_ADVISORY, derivation there): rewards are paid for
             # RESTING, not for trading, so an untraded market is an uncontested one.  The
             # observation is still recorded per ticker so the first payout settles the question
@@ -521,6 +580,31 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             elif not sd["legal"]:
                 continue
             key = (ticker, side)
+            # ── THE ENTRY PRICE BAND (config.ENTRY_BAND_LO_C..HI_C, 2026-07-29 night) ───────
+            # FREE-RIDING IS RIGHT ABOUT WHO PAYS FOR QUALIFICATION AND SILENT ABOUT WHERE, and
+            # left unbanded it lands on 1c — because 1c is where rival depth is deepest and so
+            # where a free ride is ALWAYS available.  That is the whole content of notes 46/47
+            # §6's "actively harmful: a covert instruction to quote the cheap crowded side", and
+            # it is why arming `FREE_RIDE_ONLY` without this band arms half a rule.  The band's
+            # two independent derivations (measured bias, n=8,240; measured competition and
+            # cost-to-clear) are in config, along with why this is NOT the refuted
+            # `p_min = k/bankroll`.
+            # `p` IS THE RIGHT VARIABLE: it is the same-side best in its own collateral currency
+            # — what one contract on THIS side costs us — which is exactly the axis note 47 §3's
+            # calibration table is indexed by.  For an ask that is the NO price, not 100−yes.
+            # ENTRY ONLY (`is_held`), for the same reason the free-ride gate is entry-only:
+            # accrual is per PERIOD, so leaving mid-period forfeits everything earned for nothing.
+            # STAGED INERT (`C.ENTRY_BAND_ARMED = False`): armed, the band's intersection with the
+            # (★) admission gate is EMPTY and the book rests nothing, because `phi` is seeded by
+            # PRICE with an 80x step at 5c and every in-band price lands on the refusing side.
+            # The full measurement is in config beside the constant.  The gate stays wired so
+            # arming remains ONE constant, per config's own instruction.
+            p_c = int(round(float(p) * 100))
+            if C.ENTRY_BAND_ARMED and not is_held and \
+                    not (C.ENTRY_BAND_LO_C <= p_c <= C.ENTRY_BAND_HI_C):
+                R.log("entry_band_refused", ticker=ticker, side=side, p_c=p_c,
+                      lo=C.ENTRY_BAND_LO_C, hi=C.ENTRY_BAND_HI_C)
+                continue
             # SF-5: S is the RIVAL score — the classified book contains our own orders.
             S_riv = rival_S(sd["S"], p, (own_orders or {}).get(key))
             # -------------------------------------------------------------------------------
@@ -554,14 +638,24 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             # forfeits everything earned so far in exchange for nothing.
             # So: refuse to ENTER a book that does not qualify without us; once resting, hand the
             # decision to the requoter, which already prices staying.
-            if C.FREE_RIDE_ONLY:
+            # D3 — WHAT THIS TEST IS AND IS NOT.  The first cut subtracted our own resting size
+            # from `cum_size` "per SF-5" and then guarded the whole test on `own_qty <= 0`, so
+            # the subtraction was UNREACHABLE — inside that branch our own size is zero by
+            # definition and `rival_cum == cum_size` always.  Worse, the deduction could not have
+            # been right even where it ran: `cum_size` is the TARGET-SIZE QUALIFYING WALK, which
+            # STOPS at `target_size` (CFTC filing), so it is not side depth and subtracting from
+            # it understates rival depth by up to 2x — verified, a side with 1,800 of depth
+            # against a 1,000 target reports `cum_size = 1,200`, not 1,800.  SF-5's deduction is
+            # correct for `S` (a sum over levels, which our order really is inside) and wrong for
+            # a walk that terminates.  So the honest statement of this gate is the one written
+            # below: **does the walk reach target at all** — with our own orders exempted by
+            # `is_held`/`own_qty` rather than by arithmetic on a truncated cumulant.
+            if C.FREE_RIDE_ONLY and not is_held:
                 own_qty = sum(float(q) for _, q in ((own_orders or {}).get(key) or []))
-                rival_cum = max(0.0, float(sd["cum_size"]) - own_qty)
-                if own_qty <= 0 and rival_cum < float(rec["target_size"]):
+                if own_qty <= 0 and not sd["qualifies"]:
                     R.log("free_ride_refused", ticker=ticker, side=side,
-                          rival_cum=round(rival_cum, 2),
-                          target=float(rec["target_size"]),
-                          own=round(own_qty, 2))
+                          cum_size=round(float(sd["cum_size"]), 2),
+                          target=float(rec["target_size"]))
                     continue
             rows = [r for r in presence_rows
                     if (r.get("ticker"), r.get("side")) == key]
@@ -597,12 +691,18 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             # at 1c, an instantly-marketable CROSS wearing a land grab's name).
             lg_px_c = C.LAND_GRAB_PRICE_C if side == "bid" \
                 else (100 - C.LAND_GRAB_PRICE_C)
-            # FREE_RIDE_ONLY makes the funding path unreachable: the rival-qualification test
-            # above already `continue`d on every side that does not clear target without us, so
-            # this branch can only be entered when we are ALREADY inside a qualifying book —
-            # where there is by definition no gap to fund.  Kept explicit rather than deleted so
-            # the flag remains one constant in either direction (config's own instruction), and
-            # asserted here so a future edit cannot silently re-open the 1c path.
+            # D4 — THIS ZERO IS LOAD-BEARING, AND THE COMMENT THAT SAID OTHERWISE WAS FALSE.
+            # The previous note here claimed the `elif` was unreachable under FREE_RIDE_ONLY
+            # because the gate above had already `continue`d every non-qualifying side.  It had
+            # not: the gate exempts sides we already rest in (`own_qty > 0`) and, since D1, every
+            # ticker we hold (`is_held`) — and BOTH exemptions can carry a side whose walk does
+            # NOT reach target.  So `not sd["qualifies"]` is reachable with FREE_RIDE_ONLY armed,
+            # and without this branch those sides would fund the 1c land grab: the exact geometry
+            # of the 999-contract 1c gas rung and the 1,500/3,000-contract TRUEV rungs, the
+            # largest objects in the whole tape, which scored ZERO because the qualifying walk
+            # stops at target.  `test_fixround.TestLandGrabIsDeadUnderFreeRide` now fails if this
+            # line is deleted; before D4 the whole suite passed without it, which is note 45's
+            # thesis arriving inside our own tests — green meant self-consistent, not correct.
             if C.FREE_RIDE_ONLY:
                 land_grab = 0
             elif not sd["qualifies"] and not rec["pinned"]:

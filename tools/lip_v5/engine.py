@@ -252,6 +252,16 @@ class Maker(object):
         for oid, o in self.orders.items():
             if replacing_order_id is not None and str(oid) == str(replacing_order_id):
                 continue                                      # NEW-1: replacement, not add
+            if o.get("gone_404"):
+                # D5 — A `gone_404` ORDER IS NOT ON THE WIRE AND HOLDS NO COLLATERAL.  The
+                # exchange itself told us the id does not exist; `_mark_gone` keeps the row only
+                # so the reconciler can still learn its fate.  Every other consumer of
+                # `self.orders` in this file already excludes it — the presence measure, the
+                # blindness test, the requoter, the cash feed (six call sites, all
+                # `remaining > 0 and not gone_404`) — and this builder was the one that did not,
+                # so B15's ceiling and B16's cap were charged for PHANTOM collateral.  Under a
+                # binding ceiling a phantom dollar refuses a real one 1:1.
+                continue
             if o.get("remaining", 0) > 0:
                 # `basis` is WHAT ONE CONTRACT CAN LOSE, i.e. the collateral we actually
                 # posted — and `o["price"]` is on the YES axis for BOTH sides.  A no-leg
@@ -284,8 +294,13 @@ class Maker(object):
             # refused.  The per-market cap derives from the ceiling rather than being a fresh
             # constant: with no exit, one market's worst case must not be able to consume the
             # whole book, and MARKET_CAP_FRAC is the fraction that bound is set at.
+            # D2: through `config.market_cap_usd`, which enforces `slot_cap ≤ market_cap` — the
+            # bare `MARKET_CAP_FRAC × ceiling` inverts the hierarchy below ~$100 of ceiling and
+            # a rail tighter than the plan's own per-slot cap is a permanent re-offer loop.
             ceiling_usd=self.ceiling_usd,
-            market_cap_usd=C.MARKET_CAP_FRAC * self.ceiling_usd)
+            market_cap_usd=C.market_leg_cap_usd(
+                self.ceiling_usd,
+                G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd)))
 
     def place(self, ticker, side, price, count, expiration_ts, now,
               fully_closing=False, available_cash_usd=None, lane="place",

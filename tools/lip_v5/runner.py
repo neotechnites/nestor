@@ -340,7 +340,8 @@ class Runner(object):
                                       presence_rows=seg, frozen=self.m.frozen,
                                       l_shed=l_shed, p6=self.classifier.p6_ok,
                                       accrued=self.m.accrued,
-                                      own_orders=self.own_orders())
+                                      own_orders=self.own_orders(),
+                                      held=self.held_tickers())
         # SF-1: `projected_day_reward` is OURS (share × ρ/2 over funded slots), computed by
         # the cycle from its own allocation — the board-pool sum that used to live here
         # saturated the day stop at $150 against a ≤$60 deployment: untrippable.
@@ -352,6 +353,21 @@ class Runner(object):
         out["classified"] = len(self.classifier.table)
         out["slots"] = len(self.slots)
         self.last_cycle_ts = now
+        return out
+
+    def held_tickers(self):
+        """D1 — every ticker we have money in: an open position OR a live resting order.
+
+        This is the SAME SET `book_poll_pass` builds for the inventory-slot guarantee, and that
+        is the point: the guarantee that a held market is always polled is worth little if the
+        same market can fail to produce a SLOT, because the shed and the requote both read the
+        slot table and not the poll set.  One definition, two consumers.
+        """
+        m = self.m
+        out = {t for t, p in m.positions.items()
+               if abs(p.get("yes", 0.0)) + abs(p.get("no", 0.0)) > 0}
+        out |= {o["ticker"] for o in m.orders.values()
+                if o.get("remaining", 0) > 0 and not o.get("gone_404")}
         return out
 
     def own_orders(self):

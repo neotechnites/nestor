@@ -113,6 +113,32 @@ def log(event, **fields):
     return rec
 
 
+_LOGGED_ONCE = set()
+
+
+def log_once(event, **fields):
+    """`log`, but at most once per (event, sorted field values) per process.
+
+    For a condition that is a PROPERTY OF THE CONFIGURATION rather than an event — e.g. a cap
+    hierarchy that inverts at the running ceiling.  Such a condition is true on every cycle, so
+    plain `log` would emit it 86,400 times a day and the operator would filter it out, which is
+    the same as not logging it.  Once is the honest cadence for a standing fact.
+
+    Keyed on the fields as well as the event, so the SAME condition at a DIFFERENT ceiling still
+    reports — a config change is new information even when the defect class is not.
+    """
+    key = (event, tuple(sorted((k, str(v)) for k, v in fields.items())))
+    if key in _LOGGED_ONCE:
+        return None
+    _LOGGED_ONCE.add(key)
+    return log(event, **fields)
+
+
+def reset_log_once():
+    """Tests only: a process-lifetime latch would make the second test in a file see nothing."""
+    _LOGGED_ONCE.clear()
+
+
 # =============================================================================================
 # ALERTS — spec §11.  NTFY_DISABLE honored BY CONSTRUCTION.
 # =============================================================================================

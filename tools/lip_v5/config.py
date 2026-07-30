@@ -693,6 +693,87 @@ BAND_OUR_LEG_MAX_C = 50                      # staged-inert: REFUTED AS SPECIFIE
 # if the fear ever becomes real.
 FREE_RIDE_ONLY = True
 
+# --- THE ENTRY BAND: FREE-RIDE IS ONLY CORRECT INSIDE A PRICE BAND (2026-07-29 night) ---
+# THE CONFLICT THIS RESOLVES.  Enchiridion notes 46 and 47 §6 record `FREE_RIDE_ONLY` as
+# "ACTIVELY HARMFUL — a covert instruction to quote the cheap crowded side."  The backtest
+# (`work/audit-nonlip-strategies-2026-07-28.md`) records the same rule as the STRONGEST single
+# improvement on the tape (−$51.40 against −$75.40 for the variant without it).  Both readings
+# are correct and they are not about the same thing: free-riding is right about WHO PAYS FOR
+# QUALIFICATION and silent about WHERE, and left unbanded it lands on 1c, because 1c is where
+# rival depth is deepest and therefore where a free ride is always available.  Arming the rule
+# without a band is arming half of it.
+#
+# WHY THE BAND IS 7-20c, MEASURED, NOT CHOSEN.  Two independent readings pick the same window:
+#   (1) BIAS (note 47 §3, n = 8,240 settled markets, real two-sided quotes at close−60min).
+#       Realised frequency against posted price: 1c −94.8%, 2c **0.00% realised on 765 markets**
+#       (−100%), 3–5c −64.6%, and 6–20c −13% to −19% NOT SIGNIFICANT.  6c is where the measured
+#       negative bias stops being distinguishable from zero.  This is the whole reason the cheap
+#       end is not free money: on Kalshi A RESTING CHEAP BID IS A BUY, so we were on the same
+#       side as the retail flow that overpays for longshots.
+#   (2) COMPETITION AND COST-TO-CLEAR (note 47 §4, `~/compmap.json`).  Median competing score
+#       is 6,618 at 1c, **403 at 11–20c**, 2,877 at 96–99c — everyone runs the same
+#       score-per-dollar arithmetic and crowds both extremes.  Median cost to clear the $1.00
+#       floor: $6.36 at 1–5c, **$3.68 at 11–20c**, $244 at 96–99c.  So the band is simultaneously
+#       the emptiest side of the book, the cheapest floor to clear, and the only stretch with no
+#       measured negative bias.  There is no trade-off to make here; it is the same window.
+# SUPPLY IS MEASURED, NOT ASSUMED: **317 rungs at 7–12% clear $1.00 for ≤$20, across 177
+# INDEPENDENT CLUSTERS** (note 47 §4).  The band therefore cannot starve a 30-market book.
+#
+# WHY NOT WIDER ON THE UPSIDE.  Note 47 §4: our presence was 76% below 20c, **0.3% between
+# 20–80c**, 23% above 80c — strikes sit deep-OTM or deep-ITM and almost nothing rests near 50c.
+# "A 20–80c band does not filter a ladder — it DELETES it."  20c is the top of the populated
+# cheap cohort, not a risk preference.
+#
+# THIS IS NOT `p_min = k/bankroll`, WHICH IS REFUTED (note 47 §5/§6, "do not rediscover").  That
+# idea derived a price floor from RUIN, and it is wrong because floor-clearing size is a CONTRACT
+# count with no price term, so cost per rung is `Q·p` and FALLS with price; at a fixed budget you
+# afford `N = B/(Q·p)` rungs, `E[hits] = N·p = B/Q`, and the price CANCELS.  This band is derived
+# from measured BIAS and measured COMPETITION instead, which do not cancel.  A reviewer should
+# hold this constant to that standard: if it is ever re-justified by variance, it is the refuted
+# idea wearing a new name and it must come out.
+#
+# ENTRY ONLY, exactly like the free-ride gate itself and for the same reason: accrual is per
+# PERIOD, so abandoning a market mid-period forfeits everything earned in it for nothing.  Held
+# inventory and live orders are exempt (`held` in `scan.build_slots`); the requoter prices
+# staying.  MIRROR (band too NARROW ↔ too wide): too narrow starves the book and shows up as
+# `entry_band_refused` counts with idle capital — the instrument is in place; too wide is the
+# 2c cohort, which is a measured −100% on 765 markets.
+ENTRY_BAND_LO_C = 7
+ENTRY_BAND_HI_C = 20
+# ── STAGED INERT.  THE BAND IS DERIVED AND CORRECT AND CANNOT BE ARMED YET. ─────────────────
+# MEASURED, on arming it: the band's intersection with the (★) ADMISSION GATE IS EMPTY, so the
+# book rests NOTHING AT ALL.  Not a fixture artifact — the cause is a single input:
+#
+#     phi (fills/hour per resting contract) is SEEDED BY PRICE for any venue with no tape of
+#     our own: `PHI_SEED_CHEAP = 0.001` below `PHI_CHEAP_PRICE_CUT = 0.05`, `PHI_SEED_MID =
+#     0.08` at or above it.  AN 80x STEP AT A PRICE CUTOFF.
+#
+# Holding everything else fixed (pool $100, rival score 1,200, q = 100) and varying ONLY phi:
+#     phi = 0.001  → `admits` is TRUE at every price from 1c to 40c
+#     phi = 0.080  → `admits` is TRUE at 1c ONLY
+# So the seed is not a prior on one venue; it is a GLOBAL ON/OFF SWITCH FOR THE WHOLE BOOK, and
+# the 5c cut is the router that decides which side of the switch each venue lands on.  Every
+# price in a 7-20c band is above the cut, therefore gets 0.08, therefore is refused.
+#
+# THIS IS THE MECHANISM BEHIND "98.4% OF CONTRACTS PLACED AT <=5c".  It was never the sizing
+# rule — it is ADMISSION.  And the cohort the switch admits is the one note 47 §3 measured at
+# −94.8% (1c, n=3,205) and −100% (2c, 0 of 765 markets ever paid).  The gate's binding input
+# selects, by construction, the only prices whose realised EV we have measured to be total loss.
+# `scan.build_slots` already says the mid seed "prices every fresh venue out"; what was not
+# said is that the cheap seed prices every venue IN, and that the switch is a price rule
+# masquerading as a fill-rate estimate.
+#
+# WHY NOT JUST PICK A NUMBER.  Because there is no measurement to pick from — note 47 §7 still
+# lists "fill probability on resting cheap bids" as OPEN, and what we DO know contradicts the
+# price form of the prior: fill rate is a MARKET property, not a price or size property (the
+# larger half of rungs had the higher fill rate in 1 of 10 events, P = 1.1%).  Choosing 0.001
+# arms every venue on the board; choosing 0.08 arms none.  Under note 49 R1 a constant that
+# swings the entire book and has no interval is not an estimate, and under R2 it may not be set
+# by whichever value makes the current change look good.  Arming this band therefore REQUIRES
+# the λ measurement (note 50 §5's classify-sweep field), not a choice.
+# Instrument if this is ever armed: `entry_band_refused` against `idle_capital`.
+ENTRY_BAND_ARMED = False
+
 # UNDERIVED (note 23 §II), flagged upward rather than shipped silently:
 #   * THE FATE SENTENCE ITSELF.  "A position acquired by this system ends by ____" has no
 #     measured answer.  The mechanism proposed for it (the resting sell leg) was measured and
@@ -801,13 +882,21 @@ def slot_cap_usd(day_stop_threshold_usd, floor_usd=None):
 
 
 PER_MARKET_POOL_MULT = 4.0                   # v1 §8.2 never risk 4× a market's own max prize
-PER_MARKET_BUDGET_FRAC = 0.25                # v1 §8.2 no single-market concentration
 
 # --- B16: THE PER-MARKET ACQUISITION CAP (2026-07-29) ---
 # WHY A SECOND, TIGHTER PER-MARKET BOUND.  `PER_MARKET_BUDGET_FRAC = 0.25` was inherited from
 # v1 and permits $75 of one market at a $300 ceiling — which is not a concentration limit, it is
 # a rounding error away from the -$80.60 gas ladder.  This constant replaces it as the binding
 # one, and unlike v1's it is derived from the RISK MODEL rather than from a round number.
+#
+# ── D2 CORRECTION (2026-07-29 night).  "REPLACES IT" WAS FALSE WHEN WRITTEN. ────────────────
+# The sentence above claimed a replacement that did not happen: `PER_MARKET_BUDGET_FRAC` kept
+# its own value of 0.25 and `alloc.market_cap_usd` kept reading it, so the PLAN went on
+# permitting $75 of one market at a $300 ceiling while the new RAIL refused above $30 — and a
+# rail tighter than the plan is a permanent re-offer loop, because `place()` returning False
+# arms no degrade.  A derivation that says "replaces" must be enforced by an assignment, not by
+# a comment.  So the two are now ONE number by construction, and `alloc.market_cap_usd`'s
+# docstring carries the plan ⊆ rail proof that this identity is the load-bearing step of.
 #
 # THE DERIVATION.  We do not exit: 149 of 6,149 acquired contracts were ever closed (2.4%),
 # across 7 closing orders in the operation's entire history, all takers.  So NET exposure equals
@@ -826,6 +915,59 @@ PER_MARKET_BUDGET_FRAC = 0.25                # v1 §8.2 no single-market concent
 # shows up as `market_cap` refusals with accrual left on the table — bounded and recoverable
 # next period.  Too high is the -$587: an unbounded one-sided position with no exit.
 MARKET_CAP_FRAC = 0.10
+# ONE FRACTION, TWO CONSUMERS.  The plan (`alloc.market_cap_usd`) and the rail (B16) must not
+# hold separate opinions about how much of the book one market may be; see the plan ⊆ rail proof
+# in `alloc.market_cap_usd`, whose middle inequality is this line.  v1's 0.25 is superseded.
+PER_MARKET_BUDGET_FRAC = MARKET_CAP_FRAC
+
+
+def market_leg_cap_usd(ceiling_usd, day_stop_threshold_usd):
+    """The B16 per-LEG bound: `max(slot_cap, MARKET_CAP_FRAC × ceiling)`.
+
+    Named for the measure, not the level, because `alloc.market_cap_usd` is a DIFFERENT
+    quantity — the plan-side GROSS per-ticker cap — and two functions called `market_cap_usd`
+    measuring two things is how the plan and the rail came to disagree in the first place.
+
+    ── D2: WHY THE `max` IS MANDATORY AND NOT DEFENSIVE PADDING. ─────────────────────────────
+    `MARKET_CAP_FRAC × ceiling` alone INVERTS THE CAP HIERARCHY at small capital, and an
+    inverted cap is not a conservative cap — it is a deadlock.  Worked at the two live
+    ceilings, with `slot_cap = max(INV_CAP_USD, 0.5 × day_stop)`:
+
+        ceiling $300 → day_stop $60 → slot_cap $30 ; 0.10 × 300 = $30  → equal, legal
+        ceiling  $45 → day_stop $20 → slot_cap $10 ; 0.10 ×  45 = $4.50 → **INVERTED**
+
+    At $45 the allocator may plan a $10 rung (that is its own cap) and the rail would refuse
+    everything above $4.50.  `place()` returning False does not arm any degrade — the cancel-
+    first path latches only on an exchange `insufficient balance` reject — so `_requote_slot`
+    returns False and THE SLOT RE-OFFERS THE SAME REFUSED ORDER EVERY CYCLE, FOREVER.  This is
+    the identical failure mode NEW-1 found and fixed at the cluster cap, arriving one level
+    finer; `slot_cap_usd`'s R1 states the rule it breaks ("a finer cap may never exceed the
+    coarser one it sits inside" — read from the market's side, a coarser cap may never fall
+    below the finer one it contains).
+
+    WHAT THE `max` COSTS, STATED PLAINLY: below `slot_cap / MARKET_CAP_FRAC` (≈ $100 of ceiling
+    at today's $10 slot-cap floor) the per-market cap is NOT 10% of the book and the N_eff > 20
+    variance guarantee in `MARKET_CAP_FRAC`'s derivation IS VOID.  That is not a defect of the
+    `max`; it is arithmetic — a $45 ceiling cannot hold 30 markets at any per-market cap, since
+    $45/30 = $1.50 and the payout floor alone needs more than that.  The honest statement is
+    that the variance instrument requires capital to exist, and `market_cap_inverted` is logged
+    at the boundary so the void guarantee is visible rather than assumed.
+
+    MIRROR (max too permissive ↔ inverted cap): the max can only ever raise the per-market cap
+    to the per-SLOT cap, which is already a rail the allocator plans inside, so nothing new
+    becomes reachable through it — the cluster cap and the ceiling both still bind above.  The
+    inverted end is a permanent re-offer loop against a live account.
+    """
+    slot = slot_cap_usd(day_stop_threshold_usd)
+    derived = MARKET_CAP_FRAC * float(ceiling_usd)
+    if derived < slot:
+        from . import runtime as _R
+        _R.log_once("market_cap_inverted", ceiling_usd=float(ceiling_usd),
+                    derived=round(derived, 2), slot_cap=round(slot, 2),
+                    note="per-market cap raised to the slot cap; the N_eff>20 variance "
+                         "guarantee is VOID at this ceiling")
+    return max(slot, derived)
+
 
 # --- THE PAYOUT FLOOR AND THE SIZING TARGET (2026-07-29) ---
 # SCORE_SIDES: scores normalise WITHIN EACH SIDE (CFTC filing, KalshiEX 2026-02-11), so the sum

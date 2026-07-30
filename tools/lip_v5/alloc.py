@@ -303,7 +303,28 @@ def slot_target_q(slot, caps=None):
 
 
 def market_cap_usd(slot, budget_usd, caps=None):
-    """v1 §8.2 — collateral ≤ min(4·ρ·H, 0.25·budget).  ρ·H is the market's own pool."""
+    """v1 §8.2 — collateral ≤ min(4·ρ·H, `PER_MARKET_BUDGET_FRAC`·budget).  ρ·H is the market's
+    own pool.  This is the PLAN side and it is measured GROSS across both legs of the ticker
+    (`per_market` in `allocate` is keyed by `s.ticker`).
+
+    ── D2: HOW THIS RELATES TO THE RAIL, AND WHY PLAN ⊆ RAIL IS NOW A PROOF. ─────────────────
+    `guards`' B16 is the RAIL and after D2 it is measured PER LEG at
+    `config.market_leg_cap_usd(ceiling, day_stop) = max(slot_cap, MARKET_CAP_FRAC·ceiling)`.
+    Two different measures of "one market" is exactly the plan-refuses-plan defect NEW-1c
+    found at the cluster cap, so the containment has to be shown, not assumed:
+
+        plan_leg  ≤  plan_gross  ≤  PER_MARKET_BUDGET_FRAC · budget      (this function)
+                  ≤  MARKET_CAP_FRAC · ceiling                            (frac equal; budget ≤ ceiling)
+                  ≤  max(slot_cap, MARKET_CAP_FRAC · ceiling)  =  rail_leg
+
+    Every step is an inequality that holds by construction, and the middle one holds ONLY
+    BECAUSE `PER_MARKET_BUDGET_FRAC == MARKET_CAP_FRAC` — which is asserted in config, because
+    if the two fractions ever drift apart the plan can propose a leg the rail must refuse and
+    nothing arms a degrade on that path (the slot re-offers the same refused order forever).
+    Keeping the plan GROSS is deliberate: gross ≥ per-leg, so the plan stays the tighter of the
+    two and the 4·pool term keeps its per-MARKET meaning (a two-sided quote can earn at most one
+    pool, so the risk bound against that prize is a per-market statement, not a per-leg one).
+    """
     caps = caps or Caps()
     return min(caps.per_market_pool_mult * slot.rho * slot.window_h,
                caps.per_market_budget_frac * float(budget_usd))

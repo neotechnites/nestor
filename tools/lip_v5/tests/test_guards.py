@@ -525,6 +525,46 @@ class TestB16ThePerMarketAcquisitionCap(LipTestCase):
         ok, reason, _ = G.place_allowed(ctx, order(ticker="MINE-1", n=100, basis=0.50, closing=True))
         self.assertTrue(ok, reason)
 
-    def test_the_cap_derives_from_the_ceiling_and_is_strictly_inside_v1s_inherited_bound(self):
-        self.assertLess(C.MARKET_CAP_FRAC, C.PER_MARKET_BUDGET_FRAC)
+    def test_the_cap_derives_from_the_ceiling_and_REPLACED_v1s_inherited_bound(self):
+        """WAS `..._is_strictly_inside_v1s_inherited_bound`, asserting
+        `MARKET_CAP_FRAC < PER_MARKET_BUDGET_FRAC`.
+
+        D2: "strictly inside" was the defect, not the property.  B16's derivation claimed it
+        REPLACED v1's 0.25 — but nothing assigned it, so `alloc.market_cap_usd` went on reading
+        0.25 and THE PLAN PERMITTED $75 OF ONE MARKET WHILE THE RAIL REFUSED ABOVE $30.  A rail
+        tighter than the plan arms no degrade: `place()` returns False and the slot re-offers the
+        same refused order every cycle, forever.  So the two are now ONE number and this test
+        asserts the identity the derivation always claimed.
+        """
+        self.assertEqual(C.MARKET_CAP_FRAC, C.PER_MARKET_BUDGET_FRAC,
+                         "plan and rail must not hold separate opinions about one market")
         self.assertAlmostEqual(C.MARKET_CAP_FRAC * 300.0, 30.0)
+
+    def test_the_per_market_cap_can_never_fall_below_the_per_slot_cap(self):
+        """D2's nesting half.  `MARKET_CAP_FRAC × ceiling` alone INVERTS below ~$100 of ceiling:
+        at $45 it is $4.50 against a $10 slot cap, and the allocator plans to its own $10.  An
+        inverted cap is a permanent re-offer loop, not a conservative one."""
+        for ceiling in (20.0, 45.0, 100.0, 150.0, 300.0, 1000.0):
+            day_stop = G.day_stop_usd(0.0, ceiling_usd=ceiling)
+            self.assertGreaterEqual(
+                C.market_leg_cap_usd(ceiling, day_stop) + 1e-9, C.slot_cap_usd(day_stop),
+                "market cap inverted under the slot cap at ceiling $%.0f" % ceiling)
+        # and the bare fraction really does invert, so the `max` is load-bearing, not padding
+        self.assertLess(C.MARKET_CAP_FRAC * 45.0,
+                        C.slot_cap_usd(G.day_stop_usd(0.0, ceiling_usd=45.0)))
+
+    def test_the_cap_is_PER_LEG_so_a_full_bid_leg_does_not_refuse_the_ask(self):
+        """D2's side half.  Exactly one outcome pays, so worst-case market loss is
+        `max(yes_collateral, no_collateral)` — never the sum.  Under a gross sum a bid leg at the
+        cap refused the ask outright, and matched pairs (the ONLY profitable configuration on the
+        tape, +$39.63) hit the cap fastest of all."""
+        full_bid = [{"ticker": "MINE-1", "side": "yes", "n": 60, "basis": 0.50}]   # $30, at cap
+        ctx = G.PlaceContext(market_cap_usd=30.0, resting_basis=full_bid)
+        ok, reason, _ = G.place_allowed(ctx, order(ticker="MINE-1", side="no",
+                                                  n=60, basis=0.50))
+        self.assertTrue(ok, "the OPPOSING leg must remain quotable: %s" % reason)
+        # ...and the SAME leg is still bounded
+        ok2, reason2, _ = G.place_allowed(ctx, order(ticker="MINE-1", side="yes",
+                                                     n=2, basis=0.50))
+        self.assertFalse(ok2)
+        self.assertEqual(reason2, "market_cap")

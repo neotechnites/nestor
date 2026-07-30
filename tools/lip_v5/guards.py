@@ -554,14 +554,40 @@ def place_allowed(ctx, order):
     # payout floor in a market that would have paid — bounded, visible as `market_cap` refusals
     # against the accrual, and recoverable next period.  Too high is the -$587: an unbounded
     # one-sided position in a single market with no way out of it.
+    # ── D2: THE CAP IS PER LEG, NOT PER MARKET-GROSS.  THE DERIVATION. ──────────────────────
+    # First cut summed BOTH legs of a ticker with no side test.  That is the wrong measure, and
+    # it is wrong in the direction that contradicts this guard's own stated purpose.
+    # WHAT A BINARY CAN ACTUALLY LOSE.  Exactly one outcome pays.  If YES settles, every yes
+    # contract pays $1 (they cannot lose) and only the NO-side collateral is lost; if NO settles,
+    # only the YES-side collateral is lost.  So
+    #     worst-case market loss = max(yes_side_collateral, no_side_collateral)
+    # and bounding EACH SIDE at the cap bounds the market's worst case at the cap EXACTLY.  The
+    # gross sum bounds the same quantity at the same number while CHARGING TWICE for it, and what
+    # it over-charges is precisely the two-sided book.
+    # WHY THAT MATTERS HERE.  Decomposing the settled tape, MATCHED PAIRS EARNED +$39.63
+    # (+6.88c/pair) AND THE UNMATCHED RESIDUAL LOST -$587.42 (90% of the loss).  A gross cap
+    # reaches its limit fastest on a fully matched book — the only configuration that made money —
+    # and never distinguishes it from thirty one-sided bets, which is what the cap exists to
+    # refuse.  Per-leg is the measure the loss was denominated in.
+    # AND IT IS THE OTHER HALF OF D2.  At a $300 ceiling `slot_cap_usd` is $30 and this cap is
+    # $30, so under a gross sum ONE FULL BID LEG REFUSES THE ASK OUTRIGHT: `place()` returns
+    # False, no degrade arms (the cancel-first path latches only on an exchange `insufficient
+    # balance` reject), and the slot re-offers the same refused order every cycle forever.
+    # Per-leg cannot deadlock that way, because `slot_cap <= market_cap` is enforced in
+    # `config.market_leg_cap_usd` and one leg is one slot.
+    # MIRROR (per-leg too permissive ↔ gross too tight): per-leg admits a market holding the cap
+    # on BOTH sides — which is a box, whose worst case is still one side's collateral, and whose
+    # >$1.00-sum failure mode is `joint_sub_dollar` above and one-rung-per-side upstream, not this
+    # cap.  Total dollars remain bound by the cluster cap and by B15's ceiling.
     if not fully_closing and ctx.market_cap_usd is not None:
+        leg = order.get("side")
         held = sum(float(p.get("n", 0)) * float(p.get("basis", 0.0))
                    for p in list(ctx.positions) + list(ctx.resting_basis)
-                   if p.get("ticker") == ticker)
+                   if p.get("ticker") == ticker and p.get("side") == leg)
         add = float(order.get("n", 0)) * float(order.get("basis", 0.0))
         if held + add > float(ctx.market_cap_usd) + 1e-9:
             return False, "market_cap", {"held": round(held, 4), "add": round(add, 4),
-                                         "cap": float(ctx.market_cap_usd)}
+                                         "side": leg, "cap": float(ctx.market_cap_usd)}
 
     # -----------------------------------------------------------------------------------------
     # B15 — THE COLLATERAL CEILING, ENFORCED AT PLACEMENT.  (2026-07-29)
