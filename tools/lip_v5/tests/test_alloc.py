@@ -481,10 +481,14 @@ class TestTheRungCapMustExceedTheCliff(LipTestCase):
     would silently fund nothing — so the drop is LOGGED, never silent."""
 
     def test_a_cap_below_the_cliff_funds_nothing_and_says_so(self):
+        # THE BUDGET MUST BE SCARCE FOR THE CONTAINER TO BE THE LAST WORD (2026-07-30, the
+        # pass-2 sweep): with idle dollars the second pass re-offers this exact rung at the
+        # cluster reserve, which is the feature.  Here the budget cannot fund the
+        # cliff-clearing lot at all, so the container's refusal stands and must be LOGGED.
         rungs = [alloc.Slot("KXV-0", "bid", rho=6.25, S=1000.0, p=0.50, hours_left=16.0,
                             venue="KXV", window_h=16.0)]
         caps = alloc.Caps(inv_cap_usd=10.0)                  # one contract short of the cliff
-        a, spent, _ = alloc.allocate(rungs, 300.0, 0.0625, caps=caps, cluster_cap_usd=75.0)
+        a, spent, _ = alloc.allocate(rungs, 10.0, 0.0625, caps=caps, cluster_cap_usd=75.0)
         self.assertEqual(sum(a.values()), 0)
         self.assertTrue(self.logs_of("below_cliff_dropped"),
                         "capital refused for being unearnable must be logged, never silent")
@@ -607,3 +611,91 @@ class TestFloorClearingSize(LipTestCase):
         src = inspect.getsource(alloc)
         body = src.split("def slot_target_q", 1)[1]
         self.assertNotIn("slot_target_q(", body.split("return int(min", 1)[1])
+
+
+class TestPass2IdleCapitalSweep(LipTestCase):
+    """IDLE CAPITAL IS WASTED (Ryan, 2026-07-30).  The lot container (reserve/2) is sized to
+    leave room for refills, which is right when capital is scarce and wrong when it is idle:
+    a rung whose floor-clearing lot costs $8 was refused outright by a $5 container and
+    earned NOTHING, where the same $8 as one reserve-consuming lot with zero refills earns
+    what that rung pays.  A worse rung beats an empty one."""
+
+    R_STAR = 0.0625
+    LOT, RESERVE, CEILING = 5.0, 10.0, 300.0
+
+    def caps(self):
+        return alloc.Caps(inv_cap_usd=self.LOT)
+
+    def fat(self, tk="KXFAT-1", venue="KXFAT", **kw):
+        """q_min = 32 at p=0.25 ⇒ an $8.00 lot: over the $5 container, under the $10 reserve."""
+        kw.setdefault("rho", 1.0); kw.setdefault("S", 224.0); kw.setdefault("p", 0.25)
+        kw.setdefault("hours_left", 24.0); kw.setdefault("window_h", 24.0)
+        return alloc.Slot(tk, "bid", venue=venue, **kw)
+
+    def lean(self, tk="KXLEAN-1", venue="KXLEAN", **kw):
+        """q_min = 20 at p=0.25 ⇒ a $5.00 lot: fits the container, so pass 1 funds it."""
+        kw.setdefault("rho", 1.0); kw.setdefault("S", 140.0); kw.setdefault("p", 0.25)
+        kw.setdefault("hours_left", 24.0); kw.setdefault("window_h", 24.0)
+        return alloc.Slot(tk, "bid", venue=venue, **kw)
+
+    def _run(self, slots, budget, **kw):
+        kw.setdefault("caps", self.caps())
+        kw.setdefault("cluster_cap_usd", self.RESERVE)
+        kw.setdefault("ceiling_usd", self.CEILING)
+        return alloc.allocate(slots, budget, self.R_STAR, **kw)
+
+    def test_the_cliff_clearing_lot_is_the_size_this_test_claims(self):
+        self.assertEqual(alloc.cliff_clearing_q(self.fat()), 32)      # 32 × $0.25 = $8.00
+        self.assertEqual(alloc.cliff_clearing_q(self.lean()), 20)     # 20 × $0.25 = $5.00
+
+    def test_idle_budget_funds_the_over_container_rung_as_ONE_lot(self):
+        a, spent, _ = self._run([self.fat()], 300.0)
+        self.assertEqual(a[("KXFAT-1", "bid")], 32)
+        self.assertAlmostEqual(spent, 8.00, places=9)
+        rows = self.logs_of("pass2_funded")
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["rungs"], 1)
+        self.assertAlmostEqual(rows[0]["usd"], 8.00, places=9)
+        # the rung the container refused is the SAME rung pass 2 took
+        self.assertTrue(self.logs_of("below_cliff_dropped"))
+
+    def test_when_pass_1_exhausts_the_budget_pass_2_changes_NOTHING(self):
+        """The control: pass 2 is a sweep of what is LEFT, never a second helping.  Four lean
+        rungs, each fitting the container, against a budget only three of them fit in — pass 1
+        spends it, so the fourth (and the fat rung beside it) get nothing."""
+        lean = [self.lean("KXL%d-1" % i, venue="KXL%d" % i) for i in range(10)]
+        budget = 10 * 5.00
+        a, spent, _ = self._run(lean + [self.fat()], budget)
+        self.assertEqual(sum(1 for q in a.values() if q > 0), 10)
+        self.assertAlmostEqual(spent, budget, places=9)
+        self.assertEqual(a[("KXFAT-1", "bid")], 0)
+        self.assertEqual(self.logs_of("pass2_funded"), [])
+
+    def test_the_cluster_RESERVE_still_bounds_the_relaxed_lot(self):
+        """The bound moves from the lot to the reserve — and stops there."""
+        a, spent, _ = self._run([self.fat()], 300.0, cluster_cap_usd=6.0)
+        self.assertEqual(a[("KXFAT-1", "bid")], 0)
+        self.assertAlmostEqual(spent, 0.0, places=9)
+        self.assertEqual(self.logs_of("pass2_funded"), [])
+
+    def test_ONE_RUNG_PER_CLUSTER_still_holds_in_pass_2(self):
+        """D5: KXFAT-1 and KXFAT-2 are one settle source, so one of them gets the reserve."""
+        a, spent, _ = self._run([self.fat("KXFAT-1"), self.fat("KXFAT-2")], 300.0)
+        funded = {k: q for k, q in a.items() if q > 0}
+        self.assertEqual(len(funded), 1, funded)
+        self.assertAlmostEqual(spent, 8.00, places=9)
+
+    def test_the_plan_side_VARIANCE_test_still_refuses_in_pass_2(self):
+        """D11 is unchanged by pass 2 because it was ALREADY charging the cluster reserve —
+        which is exactly the container pass 2 hands out."""
+        a, _, _ = self._run([self.fat()], 300.0, ceiling_usd=20.0)
+        self.assertEqual(a[("KXFAT-1", "bid")], 0)
+
+    def test_a_rung_that_cannot_REACH_the_floor_is_never_funded_at_any_idleness(self):
+        """Guaranteed forfeit beats nothing is FALSE.  The whole side's remaining pool cannot
+        pay the floor here, so no amount of idle capital rescues it."""
+        hopeless = self.fat("KXDEAD-1", venue="KXDEAD", rho=0.01)
+        self.assertIsNone(alloc.cliff_clearing_q(hopeless))
+        a, spent, _ = self._run([hopeless], 300.0)
+        self.assertEqual(a[("KXDEAD-1", "bid")], 0)
+        self.assertAlmostEqual(spent, 0.0, places=9)

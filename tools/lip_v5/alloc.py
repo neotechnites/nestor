@@ -732,6 +732,11 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
             continue
         elig.append(s)
 
+    # The eligible set BEFORE the cliff pass starts removing from it — pass 2 below must be
+    # able to reconsider exactly the rungs the cliff pass zeroed, since "its cliff-clearing
+    # lot did not fit the lot container" is the failure pass 2 exists to answer.
+    elig_all = list(elig)
+
     spent = q_spent
     per_market = {}
     per_venue = {}
@@ -947,6 +952,193 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
         # Nothing pruned ⇒ the plan is stable; anything pruned ⇒ re-water-fill its dollars.
         if not freed_any:
             break
+
+    # =========================================================================================
+    # PASS 2 — THE IDLE-CAPITAL SWEEP, and DISPLACEMENT AT CAPACITY.
+    #
+    # IDLE CAPITAL IS WASTED (Ryan, 2026-07-30).  Everything above sizes a rung inside the LOT
+    # CONTAINER — `INV_CAP_USD` = reserve/2 — because the container is what makes refills
+    # possible: a $2 lot leaves the cluster reserve room for four re-posts as fills convert
+    # resting into inventory.  That is the right shape for capital that is SCARCE.  It is the
+    # wrong shape for capital that is IDLE: a rung whose floor-clearing lot costs $8 is
+    # refused outright by a $5 container, so its dollars earn NOTHING, while the same $8 as a
+    # single reserve-consuming lot with zero refills earns whatever that rung pays.  Zero
+    # refills is a worse rung, not a worthless one, and a worse rung beats an empty one.
+    #
+    # So: once the water-fill + cliff passes have converged, any budget still unspent gets ONE
+    # more pass over the rungs the container refused, with the per-slot dollar bound raised
+    # from the lot to the FULL CLUSTER RESERVE (`cluster_cap_usd`) — the same dollars the
+    # cluster rail already permits for that settle source, so nothing downstream has to be
+    # relaxed to let it through.  EVERYTHING ELSE STILL BINDS, and binds through the same
+    # `_fund_lot` gate the displacement below uses: one rung per cluster (D5), the plan-side
+    # variance test charged at the reserve (D11 — unchanged, because it was ALREADY charging
+    # the reserve, which is exactly why pass 2 needs no new variance argument), the cluster
+    # rail, the per-market and per-venue caps, the (★) hurdle, and the budget.
+    #
+    # THE ADMISSION CRITERION IS THE ONE THAT ALREADY EXISTS: `cliff_clearing_q`.  A rung is
+    # funded at the smallest size that reaches the forfeit floor, or not at all — GUARANTEED
+    # FORFEIT BEATS NOTHING is false, and its converse is the whole point of the cliff pass.
+    # A rung that cannot reach the floor at any size (q is None) is never funded here, at any
+    # level of idleness.
+    # MIRROR (pass 2 too EAGER ↔ absent): too eager spends the refill reserve of a cluster
+    # that would rather have re-posted — bounded, because a cluster with an owner is skipped
+    # and the reserve is per-cluster, so pass 2 can only ever consume the reserve of a cluster
+    # that has NO rung at all.  Absent is measured: idle dollars, which is the state this book
+    # has been in every cycle its container refused an $8 lot.
+    # =========================================================================================
+    def _apply_delta(sl, dq):
+        """Move a rung's allocation by `dq` contracts, carrying every running tally with it —
+        so a funding and an un-funding are the same operation with opposite sign, and neither
+        can leave the tallies disagreeing with `alloc` (the class of defect that let the plan
+        and the rails measure different books)."""
+        nonlocal spent
+        ck = _cluster_key(sl)
+        cost = dq * sl.p
+        alloc[sl.key] = alloc.get(sl.key, 0) + dq
+        spent = max(0.0, spent + cost)
+        per_market[sl.ticker] = max(0.0, per_market.get(sl.ticker, 0.0) + cost)
+        per_venue[sl.venue] = max(0.0, per_venue.get(sl.venue, 0.0) + cost)
+        per_cluster[ck] = max(0.0, per_cluster.get(ck, 0.0) + cost)
+        per_cluster_px[ck] = max(0.0, per_cluster_px.get(ck, 0.0) + cost * sl.p)
+        if dq > 0:
+            cluster_owner.setdefault(ck, sl.key)
+        elif alloc.get(sl.key, 0) <= 0 and cluster_owner.get(ck) == sl.key:
+            cluster_owner.pop(ck, None)
+
+    def _fund_lot(sl, q_target, lot_cap_usd):
+        """Try to raise `sl` to `q_target` as ONE lot.  Returns (funded, blocking_term).
+
+        THE BUDGET IS TESTED LAST, DELIBERATELY.  "budget" as the blocking term therefore
+        means *every other rail admitted this rung and only the money was missing* — which is
+        precisely the precondition displacement needs, and the reason it can be read off this
+        function instead of re-derived (a second derivation of the same admission is how a
+        plan and a rail come to disagree)."""
+        q_now = alloc.get(sl.key, 0)
+        if q_target <= q_now:
+            return False, "already_funded"
+        dq = q_target - q_now
+        cost = dq * sl.p
+        ck = _cluster_key(sl)
+        owner = cluster_owner.get(ck)
+        if owner is not None and owner != sl.key and \
+                not (owner[1] is None and owner[0] == sl.ticker):
+            return False, "cluster_owned"                     # D5
+        if q_target * sl.p > float(lot_cap_usd) + 1e-9:
+            return False, "lot_cap"
+        if per_market.get(sl.ticker, 0.0) + cost > market_cap_usd(sl, budget_usd, caps) + 1e-9:
+            return False, "market_cap"
+        vcap = venue_caps.get(sl.venue)
+        if vcap is not None and per_venue.get(sl.venue, 0.0) + cost > float(vcap) + 1e-9:
+            return False, "venue_cap"
+        if cluster_cap_usd is not None and \
+                per_cluster.get(ck, 0.0) + cost > float(cluster_cap_usd) + 1e-9:
+            return False, "cluster_cap"
+        if ceiling_usd:
+            # D11, charged exactly as the water-fill charges it: at what the cluster can
+            # BECOME, not at this lot.
+            _cont = max(0.0, (float(cluster_cap_usd) if cluster_cap_usd else cost)
+                        - per_cluster.get(ck, 0.0))
+            if _plan_var(ck, _cont, _cont * sl.p) > C.PORTFOLIO_VAR_MAX + 1e-12:
+                return False, "plan_var"
+        if not M.admits(sl.net_at(q_target, r_star), floor_rate):
+            return False, "below_hurdle"                      # (★) still governs entry
+        if spent + cost > budget_usd + 1e-9:
+            return False, "budget"
+        _apply_delta(sl, dq)
+        return True, "ok"
+
+    def _credit_usd(sl, q):
+        """Expected credit in DOLLARS over the horizon we are judged on:
+        `share(q,S) × (ρ/2) × min(hours_left, PAYOUT_HORIZON_H)` — the same product
+        `projected_period_payout` uses, so the two can never disagree about what a rung is
+        worth."""
+        h_eff = min(max(0.0, float(sl.hours_left)), C.PAYOUT_HORIZON_H)
+        return our_share(q, sl.S) * (float(sl.rho) / 2.0) * h_eff
+
+    candidates = []
+    if cluster_cap_usd is not None:
+        for sl in elig_all:
+            if alloc.get(sl.key, 0) > 0:
+                continue                                      # already carries money
+            q_min = cliff_clearing_q(sl)
+            if not q_min:
+                continue                                      # unreachable, or already clear
+            candidates.append((sl, int(q_min)))
+        candidates.sort(key=lambda sq: (-_credit_usd(sq[0], sq[1]), sq[0].ticker, sq[0].side))
+
+    blocked = []
+    p2_n, p2_usd = 0, 0.0
+    for sl, q_min in candidates:
+        ok, why = _fund_lot(sl, q_min, float(cluster_cap_usd))
+        if ok:
+            p2_n += 1
+            p2_usd += q_min * sl.p
+        elif why == "budget":
+            blocked.append((sl, q_min))
+    if p2_n:
+        R.log("pass2_funded", rungs=p2_n, usd=round(p2_usd, 4),
+              idle_left=round(max(0.0, budget_usd - spent), 4),
+              lot_cap_usd=round(float(cluster_cap_usd), 4))
+
+    # ── DISPLACEMENT AT CAPACITY — CALCULABLE, NOT RULED (Ryan: "which makes more total is
+    # calculable").  Only reached when the budget is the ONLY thing refusing a candidate, i.e.
+    # the book is full.  Then the question is not "may we?" but "which rung makes more?", and
+    # both sides are the same product in the same units:
+    #
+    #     E_new  = share(q_new , S_new ) × (ρ_new /2) × min(h_new , PAYOUT_HORIZON_H)
+    #     E_keep = accrued_worst + share(q_worst, S_worst) × (ρ_worst/2) × min(h_worst, …)
+    #
+    # THE ACCRUED TERM IS THE WHOLE HYSTERESIS, and it is why no anti-flap constant is needed.
+    # Cancelling a rung's presence forfeits its banked pot (the cliff is a cliff, not a
+    # taper), so the incumbent is charged with what it would DESTROY as well as what it would
+    # stop earning — and that pot only grows with every hour it keeps resting.  A displaced
+    # rung is therefore progressively harder to displace the longer it has earned, which is
+    # exactly the seniority note 52 D6 argues for, arriving from the arithmetic instead of
+    # from a threshold.  Ties KEEP THE INCUMBENT (strict >): an equal-value swap is pure churn
+    # — two wire calls, a forfeited pot, and the same expected dollars.
+    #
+    # POSITIONS ARE NEVER DISPLACED.  Only a RESTING allocation can be recalled; held
+    # inventory rides (the 2026-07-30 "positions RIDE" decision — the auto-shed path is off),
+    # and pretending otherwise would have the planner "free" dollars that no cancel can
+    # actually free.
+    #
+    # The recall itself reuses the OWNER-DISPLACEMENT mechanism above: zeroing the incumbent's
+    # alloc withholds the keep-it resting seed, so the requoter's q=0 path cancels the order.
+    # This deliberately overrides D12's period lock for the displaced rung, on the same
+    # argument the owner case already makes ("forfeiting 1c of accrual to keep presence
+    # compounding a 26c pot is the trade, every time") — and now with the pot on BOTH sides of
+    # the inequality rather than assumed.
+    for sl, q_min in blocked:
+        if alloc.get(sl.key, 0) > 0:
+            continue
+        e_new = _credit_usd(sl, q_min)
+        slot_by_key = {x.key: x for x in slots}
+        worst_key, worst_e, worst_sl = None, None, None
+        for k, q in sorted(alloc.items()):
+            if q <= 0 or k == sl.key:
+                continue
+            if float((held or {}).get(k, 0.0)) > 0:
+                continue                                      # a POSITION: never displaced
+            x = slot_by_key.get(k)
+            if x is None:
+                continue                                      # land grab / no slot this cycle
+            e_keep = float(getattr(x, "accrued", 0.0) or 0.0) + _credit_usd(x, q)
+            if worst_e is None or e_keep < worst_e:
+                worst_key, worst_e, worst_sl = k, e_keep, x
+        if worst_key is None or not (e_new > worst_e + 1e-12):
+            continue                                          # ties keep the incumbent
+        freed_q = alloc[worst_key]
+        _apply_delta(worst_sl, -freed_q)
+        ok, why = _fund_lot(sl, q_min, float(cluster_cap_usd))
+        if not ok:
+            _apply_delta(worst_sl, freed_q)                   # the swap did not pay: restore
+            continue
+        R.log("rung_displaced", took=sl.ticker, took_side=sl.side, took_q=q_min,
+              e_new_usd=round(e_new, 6),
+              dropped=worst_sl.ticker, dropped_side=worst_sl.side, dropped_q=freed_q,
+              e_keep_usd=round(worst_e, 6),
+              accrued_at_risk_usd=round(float(getattr(worst_sl, "accrued", 0.0) or 0.0), 6))
+
     return alloc, spent, last_rate
 
 
