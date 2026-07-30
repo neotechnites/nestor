@@ -1068,17 +1068,25 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
 
     blocked = []
     p2_n, p2_usd = 0, 0.0
+    p2_refused = {}
     for sl, q_min in candidates:
         ok, why = _fund_lot(sl, q_min, float(cluster_cap_usd))
         if ok:
             p2_n += 1
             p2_usd += q_min * sl.p
-        elif why == "budget":
-            blocked.append((sl, q_min))
+        else:
+            p2_refused[why] = p2_refused.get(why, 0) + 1
+            if why == "budget":
+                blocked.append((sl, q_min))
     if p2_n:
         R.log("pass2_funded", rungs=p2_n, usd=round(p2_usd, 4),
               idle_left=round(max(0.0, budget_usd - spent), 4),
               lot_cap_usd=round(float(cluster_cap_usd), 4))
+    if p2_refused:
+        # No silent caps: an idle-capital pass that funds nothing must say WHICH gate ate
+        # every candidate, or "$170 idle, pass 2 dark" is undiagnosable from the tape.
+        R.log("pass2_refused", candidates=len(candidates), funded=p2_n,
+              idle_left=round(max(0.0, budget_usd - spent), 4), reasons=p2_refused)
 
     # ── DISPLACEMENT AT CAPACITY — CALCULABLE, NOT RULED (Ryan: "which makes more total is
     # calculable").  Only reached when the budget is the ONLY thing refusing a candidate, i.e.

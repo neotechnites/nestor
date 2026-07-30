@@ -678,6 +678,17 @@ class TestPass2IdleCapitalSweep(LipTestCase):
         self.assertAlmostEqual(spent, 0.0, places=9)
         self.assertEqual(self.logs_of("pass2_funded"), [])
 
+    def test_a_dark_pass_2_says_WHICH_gate_ate_every_candidate(self):
+        """No silent caps (Ryan, 2026-07-30: "we should be logging why we are refusing
+        rungs").  Live, pass 2 funded zero against ~$170 idle and the tape could not say
+        why — only successes were logged.  A refused candidate now lands in a reason tally."""
+        self._run([self.fat()], 300.0, cluster_cap_usd=6.0)
+        rows = self.logs_of("pass2_refused")
+        self.assertTrue(rows)
+        self.assertEqual(rows[-1]["funded"], 0)
+        self.assertEqual(rows[-1]["candidates"], 1)
+        self.assertEqual(rows[-1]["reasons"], {"lot_cap": 1})
+
     def test_ONE_RUNG_PER_CLUSTER_still_holds_in_pass_2(self):
         """D5: KXFAT-1 and KXFAT-2 are one settle source, so one of them gets the reserve."""
         a, spent, _ = self._run([self.fat("KXFAT-1"), self.fat("KXFAT-2")], 300.0)
