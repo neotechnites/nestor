@@ -118,6 +118,10 @@ class FakeExchange(object):
         self.settlement_rows = []
         self.market_closes = {}              # ticker -> close_ts (epoch s); default now+24h
         self.market_close_missing = set()    # tickers whose market payload carries NO close
+        self.market_statuses = {}            # ticker -> status; default "active".  Settled
+                                             # markets speak the wire's own vocabulary:
+                                             # "determined"/"settled"/"finalized"
+        self.market_results = {}             # ticker -> "yes"/"no" once determined
         self.trades_rows = None              # None => "one recent trade" (P6 admits)
         self.now = now
 
@@ -159,7 +163,9 @@ class FakeExchange(object):
         return out
 
     def market(self, ticker):
-        body = {"status": "active", "ticker": ticker}
+        body = {"status": self.market_statuses.get(ticker, "active"), "ticker": ticker}
+        if ticker in self.market_results:
+            body["result"] = self.market_results[ticker]
         # REAL-WIRE FIDELITY: every live market carries a `close_time` — it is not optional
         # on the wire, so a fake market without one models a market that does not exist.
         # Default = now + 24 h, i.e. the common near-settling case the settlement gate
@@ -260,6 +266,28 @@ class FakeExchange(object):
             # exchange would refuse, hiding the missing fills poll.
             return 404, {"error": {"code": "order_not_found"}}
         return 200, {"reduced_by": float(body.get("count", 0))}
+
+    # -- the settler -------------------------------------------------------------------
+    def settle(self, ticker, result, now=None):
+        """The exchange SETTLES a market, emitting exactly the three statements the engine
+        may learn a settlement from and nothing else: the market's status becomes
+        "determined" (with its `result`), the position row goes to ZERO with no fills row
+        (settlement is not a fill), and a `/portfolio/settlements` row appears carrying
+        `revenue` in CENTS — a winning contract pays $1.00, a losing one $0.00, the
+        binary's own arithmetic.  Returns the settlements row."""
+        self.market_statuses[ticker] = "determined"
+        self.market_results[ticker] = result
+        revenue_c = 0
+        for p in self._positions:
+            if p.get("ticker") == ticker:
+                pos = float(p.get("position", 0))
+                won = (result == "yes" and pos > 0) or (result == "no" and pos < 0)
+                revenue_c = int(round(abs(pos) * 100.0)) if won else 0
+                p["position"] = 0.0
+        row = {"ticker": ticker, "market_result": result, "revenue": revenue_c,
+               "settled_time": now}
+        self.settlement_rows.append(row)
+        return row
 
     # -- the taker ---------------------------------------------------------------------
     def take(self, order_id, count, now=None, trade_id=None):

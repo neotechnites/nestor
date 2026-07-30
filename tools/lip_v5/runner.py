@@ -222,6 +222,39 @@ class Runner(object):
             if (r.get("k") or r.get("kind")) == "assume_filled" and \
                     r.get("ticker") not in cleared:
                 self.m.frozen.add(r.get("ticker"))
+        # SETTLEMENT rows are MONEY state and replay them EXACTLY (the position half is
+        # already done: V4Positions.replay zeroes a settled ticker's book, so st.rows()
+        # above rebuilt neither its inventory nor its cost — the released budget state).
+        # The cash half comes back here, row by row in tape order:
+        #   released=False → the claim is still awaiting cash: rebuild the
+        #     settled-awaiting-payout entry from the ROW's basis (restore_pending — replay
+        #     zeroed the inventory, so resolve() would book $0 of basis and let
+        #     delta_dollars rise unconfirmed), and the 6 h page clock restarts from the
+        #     row's own ts, not from boot.
+        #   released=True → the cash was CONFIRMED before the restart: retire the pending
+        #     claim the earlier row rebuilt and re-book the realized P&L, so the drawdown
+        #     guard's equity term does not read a paid-out winner as capital that
+        #     evaporated across a restart.
+        # Every settlement row re-seeds `resolved`: the cluster must not re-charge a
+        # determined market after a restart, the divergence loop must not freeze it, and
+        # the settlements tape (returned in FULL every poll) must stay deduped.
+        for r in rows:
+            if (r.get("k") or r.get("kind")) != "settlement":
+                continue
+            tk = r.get("ticker")
+            if not tk:
+                continue
+            self.m.resolved.add(tk)
+            if r.get("released"):
+                p = self.m.cash.pending.pop(tk, None)
+                if p is not None:
+                    self.m.cash.settled_payout_expected = max(
+                        0.0, self.m.cash.settled_payout_expected - p.expected_credit_usd)
+                self.m.cash.realized_pnl += float(r.get("realized_usd") or 0.0)
+            elif float(r.get("basis_usd") or 0.0) or float(r.get("expected_usd") or 0.0):
+                self.m.cash.restore_pending(tk, float(r.get("basis_usd") or 0.0),
+                                            float(r.get("expected_usd") or 0.0),
+                                            float(r.get("ts") or 0.0))
         # SECOND AMENDMENT (b): accrued value survives restart — the cliff decision is only
         # as good as the A it remembers, and a restart that forgot 70¢ of accrual would
         # abandon the very program the rescue exists to recover.  Rows are cumulative; the
