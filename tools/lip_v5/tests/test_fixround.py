@@ -399,10 +399,25 @@ class Test429Yields(EngineCase):
 
 
 # =============================================================================================
-# SF-3 — a halted book can LEAVE: the closing-only pass.
+# A HALTED BOT PLACES NOTHING.  (Law change, owner decision 2026-07-30.)
+#
+# THIS CLASS ASSERTED THE OPPOSITE UNTIL TODAY.  Its old name was `TestHaltedClosingPass` and
+# its central case, `test_a_halted_book_posts_its_shed`, REQUIRED a halted iteration to put an
+# ask on the wire ("halted book cannot leave: no shed posted").  That is the behaviour that
+# cost us the 2026-07-30 incident: a books-integrity bug halted the bot, the halt armed the
+# closing pass, the pass sized cap-EXEMPT closing orders from the very books the halt had just
+# declared wrong, and a 98-contract $93 buy at 95c went out against a phantom short.
+#
+# THE NEW LAW, in the owner's words: "it's either running and placing orders, or it's not
+# running."  Nothing in between.  A halt cancels the orders THIS PROCESS placed and then does
+# nothing at all; the positions ride to settlement (bounded ≤7 days by the D4 gate, and the
+# tape prices paying the spread to leave at −$40.30 / −$123 anyway).
+#
+# The tests below are the same fixtures with the assertion inverted, which is the point: the
+# old law and the new one are distinguishable on the identical world.
 # =============================================================================================
-class TestHaltedClosingPass(FixRoundCase):
-    def test_a_halted_book_posts_its_shed(self):
+class TestHaltedBotPlacesNothing(FixRoundCase):
+    def test_a_halted_book_posts_NOTHING_even_holding_inventory(self):
         ex = CountingExchange(program_body(), {TK: cheap_book()})
         r = self.runner(ex)
         r.init(NOW, nestor_state=NESTOR)
@@ -411,14 +426,28 @@ class TestHaltedClosingPass(FixRoundCase):
         r.m.halt.halt("day_stop", NOW + 1)
         out = r.iteration(NOW + 2)
         self.assertTrue(out["halted"])
-        sheds = [b for b in ex.placed if b["side"] == "ask"]
-        self.assertTrue(sheds, "halted book cannot leave: no shed posted")
-        # joins the opposing best (1 − 0.93 = 0.07), never crossing the 0.06 bid
-        self.assertAlmostEqual(float(sheds[0]["price"]), 0.07, places=6)
-        self.assertAlmostEqual(float(sheds[0]["count"]), 20.0, places=6)
-        # and it is not re-posted while one rests
+        self.assertEqual(ex.placed, [],
+                         "a halted bot placed an order; the halt has exactly one action, "
+                         "cancel-own-orders, and it is not a placing action")
+        # ...and it stays nothing, pass after pass — there is no re-post cadence to reach.
         r.iteration(NOW + 3)
-        self.assertEqual(len([b for b in ex.placed if b["side"] == "ask"]), 1)
+        r.iteration(NOW + 4)
+        self.assertEqual(ex.placed, [])
+
+    def test_the_halt_cancels_only_orders_this_process_placed(self):
+        """The account is SHARED (nestor and others live on it).  `flatten` walks
+        `self.orders` — this process's own book — so a halt can never reach a foreign
+        order.  Asserted on the cancel ids the exchange actually saw."""
+        ex = CountingExchange(program_body(), {TK: cheap_book()})
+        r = self.runner(ex)
+        r.init(NOW, nestor_state=NESTOR)
+        r.m.orders["ours-1"] = {"order_id": "ours-1", "coid": "lipv5-x", "ticker": TK,
+                                "side": "bid", "price": 0.06, "size": 10.0,
+                                "remaining": 10.0, "placed_ts": NOW}
+        r.m.halt.halt("books_integrity", NOW + 1)
+        r.iteration(NOW + 2)
+        self.assertEqual(sorted(getattr(ex, "cancelled", [])), ["ours-1"])
+        self.assertEqual(ex.placed, [])
 
     def test_the_halted_pass_never_opens(self):
         ex = CountingExchange(program_body(), {TK: cheap_book()})

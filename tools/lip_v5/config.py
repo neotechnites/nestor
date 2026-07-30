@@ -1514,12 +1514,9 @@ ACCRUED_OVERRIDES_NAME = "v5_accrued_overrides.json"
 READINGS_NAME = "v5_readings.jsonl"
 READINGS_PATH = os.path.join(DATA_DIR, READINGS_NAME)
 ACCRUED_OVERRIDES_PATH = os.path.join(DATA_DIR, ACCRUED_OVERRIDES_NAME)
-# SF-3: the halted closing pass posts fully-closing sheds so a halted book can LEAVE.  When
-# the market's close is UNKNOWN (halt before the classify sweep learned it) the expiration
-# backstop cannot discharge its real job, so the order's life is bounded by the halt's own
-# human-review scale instead: one hour, re-posted each halted-idle pass while the position
-# remains.  UNDERIVED as a distribution; derived as "bounded, and long enough to rest".
-HALTED_SHED_TTL_S = 3600.0
+# HALTED_SHED_TTL_S is GONE with the halted closing pass (owner decision, 2026-07-30): it
+# bounded the life of a shed the halt is no longer allowed to post.  A halted bot places
+# nothing, so there is no order whose TTL needs a constant.
 
 # =============================================================================================
 # ALERTS  (spec §11) — every one of these is detect-and-page, never silent.

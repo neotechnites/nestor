@@ -121,7 +121,6 @@ class Maker(object):
         self.last_alloc = {}                 # key -> qty from the last ALLOCATE (SF-1 input)
         self.readings_line = 0               # SF-4: v5_readings.jsonl lines consumed
         self._readings_stat = None           # (mtime, size) — skip unchanged files
-        self.close_cache = {}                # ticker -> close_ts (halted closing pass)
         self.resolved = set()                # tickers whose market is determined/settled/
                                              # finalized: outcome fixed, no variance left, so
                                              # they hold no CLUSTER risk and never enter the
@@ -899,8 +898,6 @@ class Maker(object):
                 if s.program_end_ts is not None and s.window_h:
                     self.refill.set_window(s.ticker, s.side,
                                            s.program_end_ts - s.window_h * 3600.0)
-                if s.close_ts is not None:
-                    self.close_cache[s.ticker] = s.close_ts   # halted closing pass (SF-3)
             # NEW-1b: the SAME cluster cap the rails read, brought inside the plan — an
             # allocator that plans what `place()` must refuse is not a plan (264 refusals in
             # 90 cycles on a 4-rung ladder, every cycle, forever).
@@ -2047,62 +2044,27 @@ class Maker(object):
         for oid in list(self.orders):
             self.cancel(oid, now, lane="exit_cancel")
 
-    def halted_closing_pass(self, now):
-        """SF-3 — while HALTED, a closing-only requote pass so the book can LEAVE.
-
-        The halt/day-stop exemption in `place_allowed` admits only `fully_closing` orders;
-        this pass posts exactly those: one maker shed per held market, priced at the
-        opposing best (never crossing — G6 stays off), re-posted each halted-idle pass while
-        the position remains.  Without it a halted book holds its inventory to settlement —
-        the day stop's flatten cancels ORDERS but cannot exit POSITIONS, and the normal shed
-        path is dead because a halted iteration never reaches the requoter.
-
-        MIRROR (a halted book that cannot leave ↔ a halted book that keeps trading): the
-        fully_closing flag is the second end's guard — this pass can only REDUCE exposure,
-        and its book reads run on the book_poll lane at the halted-idle cadence (≤ one read
-        per held market per 30 s).
-        """
-        placed = 0
-        for ticker in sorted(self.positions):
-            net = self.net_position(ticker)
-            if abs(net) < 1.0 or ticker in self.frozen:
-                continue                      # dust cannot trade; frozen covers recycling
-            held = Q.held_leg_of(net)
-            side = Q.shed_side(held)
-            live = [o for o in self.orders.values()
-                    if o["ticker"] == ticker and o["side"] == side
-                    and o.get("remaining", 0) > 0 and not o.get("gone_404")]
-            if live:
-                continue                      # a shed already rests; let it work
-            admitted, _ = self.bucket.admit("book_poll", now)
-            if not admitted:
-                break
-            status, body = self.ex.book(ticker)
-            self.note_http(status, now)
-            if status != 200:
-                continue
-            yes_lv, no_lv = scan._book_levels(body)
-            yes_bid = max(p for p, _ in yes_lv) / 100.0 if yes_lv else None
-            no_bid = max(p for p, _ in no_lv) / 100.0 if no_lv else None
-            yes_ask = (1.0 - no_bid) if no_bid is not None else None
-            px = Q.shed_price(held, yes_bid, yes_ask)
-            if px is None:
-                R.log("shed_unpriced", ticker=ticker, side=side,
-                      why="halted_pass_crossed_or_one_sided")
-                continue
-            close = self.close_cache.get(ticker)
-            exp = int(close - C.CLOSE_MARGIN_S) if close \
-                else int(now + C.HALTED_SHED_TTL_S)
-            if exp <= now:
-                continue
-            ok, _reason, _ = self.place(ticker, side, round(px, 4), Q.shed_qty(net), exp,
-                                        now, fully_closing=True,
-                                        available_cash_usd=self._available_cash())
-            if ok:
-                placed += 1
-        if placed:
-            R.log("halted_closing_pass", placed=placed)
-        return placed
+    # ── THE HALTED CLOSING PASS IS GONE (owner decision, 2026-07-30). ────────────────────
+    # It was `halted_closing_pass`: while halted, one maker shed per held market at the
+    # OPPOSING best, re-posted every halted-idle pass, `fully_closing=True` and therefore
+    # exempt from every entry rail — no ceiling, no cluster cap, no market cap, no variance
+    # rail, not even the halt itself.
+    #
+    # WHAT THAT COST, measured 2026-07-30: a books-integrity bug halted the bot, and the halt
+    # armed this pass.  It sized its "sheds" from the books the halt had just declared WRONG —
+    # a 98-contract buy at 95c ($93) against a phantom short — and because the order was
+    # cap-EXEMPT nothing downstream could refuse it.  The GTC orders then outlived every
+    # restart, because the recovery sweep re-adopted whatever rested on the wire.
+    #
+    # THE DEFECT IS STRUCTURAL, NOT A SIZING BUG.  A halt is the statement "our books are not
+    # trustworthy".  A pass that reads those books to decide what to sell is asking the
+    # broken instrument for the reading, and it is doing it with the rails switched off.  The
+    # only coherent halt behaviour is to place NOTHING.
+    #
+    # WHERE THE POSITIONS GO NOW: to settlement, which is where they were going anyway — the
+    # D4 gate bounds every ride at ≤7 days, and the tape prices paying the spread to leave at
+    # −$40.30 (+2c leg) / −$123 (instant flatten).  The halt keeps its ONE action, `flatten`,
+    # which cancels our own resting ORDERS (exposure stops growing) and touches no position.
 
     # =========================================================================================
     # SHUTDOWN

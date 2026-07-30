@@ -388,17 +388,26 @@ class Runner(object):
         # heartbeat keeps publishing — a halted-but-alive v5 still holds inventory, and a
         # stale feed would page nestor's operator about a process that is fine.
         if self.m.halt.halted:
-            # NEW-2 — **A HALTED BOOK MUST STILL SEE ITS OWN FILLS.**  `poll_fills_due` lived
-            # only in `cycle()`, which a halted iteration never reaches, so the shed this very
-            # branch posts could FILL on the wire and stay in our books as a position AND as a
-            # live order for the whole halt — and `halted_closing_pass` would then decline to
-            # repost, because it still saw its own dead order as presence.  The halt's whole
-            # purpose is to LEAVE; leaving requires knowing we left.  Its own try/except (not
-            # the block below) so a failing fills read never costs the closing pass its turn —
-            # they are independent duties and coupling them would make the read that reports
-            # the exit able to prevent it.  The cadence is `poll_fills_due`'s own FILLS_POLL_S
-            # gate and the `verify` rate lane, unchanged: at HALTED_IDLE_S = 30 s this is at
-            # most one fills read per halted pass.
+            # ── THE HALT DOES EXACTLY ONE THING: CANCEL OUR OWN ORDERS, THEN NOTHING. ─────
+            # (Owner decision, 2026-07-30: "it's either running and placing orders, or it's
+            # not running.")  A halt is the statement "our books are not trustworthy".  Every
+            # action that reads those books to decide what to send is therefore disqualified,
+            # and the closing pass that used to live here was the worst case of it: it sized
+            # cap-EXEMPT closing orders from the books the halt had just condemned, and put a
+            # 98-contract $93 buy at 95c on the wire against a phantom short.
+            #
+            # WHAT SURVIVES AND WHY EACH ONE IS ALLOWED:
+            #   * `flatten` — cancels, once.  A cancel can only REDUCE exposure and is the
+            #     one act whose correctness does not depend on the books being right.  It is
+            #     scoped to `self.orders`, i.e. orders THIS process placed, so nestor's and
+            #     every other system's orders on the shared account are untouched.
+            #   * `poll_fills_due` — a READ.  The world keeps moving while we are halted
+            #     (resting orders can still fill before the cancel lands, positions settle);
+            #     refusing to learn that would make the halt a source of NEW book error.  Its
+            #     own try/except so a failing read cannot cost the heartbeat.
+            #   * the cash-feed heartbeat — a WRITE OF WHAT WE KNOW, no wire order.  A stale
+            #     feed pages nestor's operator about a process that is merely idle.
+            # Nothing here places.  Positions ride to settlement.
             try:
                 self.m.poll_fills_due(now)
             except Exception as exc:                          # noqa: BLE001 - no crash
@@ -408,12 +417,12 @@ class Runner(object):
                 if not self.m.halt_flatten_done:
                     self.m.flatten(now)
                     self.m.halt_flatten_done = True
+                    R.log("halted_own_orders_cancelled",
+                          remaining=len(self.m.orders),
+                          why="halt cancels only orders this process placed; then idle")
                 if self.m.publisher.due(now):
                     self.m.publisher.publish(now)
-                # SF-3: the closing-only pass — a halted book must still be able to LEAVE.
-                # Runs at the halted-idle cadence, posts only fully_closing sheds.
-                self.m.halted_closing_pass(now)
-            except Exception as exc:                          # noqa: BLE001 - SF-3: no crash
+            except Exception as exc:                          # noqa: BLE001 - no crash
                 R.log("halted_idle_error", err="%s: %s" % (type(exc).__name__, exc))
             R.log("iteration_skipped_halted", reason=self.m.halt.reason)
             return {"halted": True, "reason": self.m.halt.reason}
