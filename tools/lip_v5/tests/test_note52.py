@@ -461,3 +461,60 @@ class TestDisplacementCoversTheRescue(LipTestCase):
             owner_accrued={"KXEUR": 0.26})
         self.assertEqual(a[sib.key], 0, "the displaced rung was rescued back in")
         self.assertNotIn("P153", dropped)
+
+
+class TestExchangeEstimatesFeed(LipTestCase):
+    """SF-4c — the /v1 estimates feed (Ryan found it; the trading key signs /v1).  The
+    exchange's per-program accrued number re-anchors self.accrued each poll; the model
+    interpolates between polls; restarts replay TRUTH via accrual rows."""
+
+    def _maker(self):
+        from .test_engine import EngineCase
+        class T(EngineCase):
+            def runTest(self):
+                pass
+        t = T()
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        return t.maker()
+
+    def test_the_poll_reanchors_accrued_in_dollars(self):
+        import unittest.mock as mock
+        m = self._maker()
+        m.accrued["p-155"] = 0.063                    # the model's wrong number
+        m.ex.estimates_rows = [{"program_id": "p-155", "reward_centicents": 2553},
+                               {"program_id": "p-153", "reward_centicents": 244}]
+        with mock.patch.object(C, "KALSHI_USER_ID", "u-1"):
+            n = m.poll_estimates(1000.0)
+        self.assertEqual(n, 2)
+        self.assertAlmostEqual(m.accrued["p-155"], 0.2553, places=6)
+        self.assertAlmostEqual(m.accrued["p-153"], 0.0244, places=6)
+
+    def test_truth_persists_as_accrual_rows_for_replay(self):
+        import unittest.mock as mock
+        m = self._maker()
+        m.ex.estimates_rows = [{"program_id": "p-1", "reward_centicents": 2600}]
+        with mock.patch.object(C, "KALSHI_USER_ID", "u-1"):
+            m.poll_estimates(1000.0)
+        rows = [r for r in m.ledger.read()
+                if (r.get("k") or r.get("kind")) == "accrual"
+                and r.get("src") == "exchange_estimates"]
+        self.assertTrue(rows)
+        self.assertAlmostEqual(rows[-1]["accrued"], 0.26, places=6)
+
+    def test_no_user_id_is_loud_not_silent(self):
+        import unittest.mock as mock
+        from .. import runtime as RT_
+        m = self._maker()
+        RT_._LOGGED_ONCE.clear()                     # log_once dedupes per process; reset for capture
+        with mock.patch.object(C, "KALSHI_USER_ID", None):
+            self.assertEqual(m.poll_estimates(1000.0), 0)
+        self.assertTrue(self.logs_of("estimates_unwired"))
+
+    def test_the_cadence_holds(self):
+        import unittest.mock as mock
+        m = self._maker()
+        m.ex.estimates_rows = [{"program_id": "p-1", "reward_centicents": 100}]
+        with mock.patch.object(C, "KALSHI_USER_ID", "u-1"):
+            m.poll_estimates(1000.0)
+            self.assertEqual(m.poll_estimates(1030.0), 0)   # inside 60s: no re-poll

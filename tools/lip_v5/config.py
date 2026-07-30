@@ -1450,6 +1450,16 @@ FILLS_POLL_S = 15.0
 # Hand-written operator artifact (the v5_go.json pattern), consumed every cycle, REPLACES
 # the model value while present — the exchange's number is the payable truth and a wrong
 # model must not out-vote it in either direction.  Remove entries when stale.
+# SF-4c — THE EXCHANGE'S OWN ACCRUAL FEED (2026-07-30, Ryan found it in the web app).
+# /v1/incentives/users/{user_id}/estimates returns {program_id, reward_centicents} for every
+# program with accrual — THE number the UI popover shows, in 1e-4 dollars, and the trading
+# key's signature is honored on the /v1 prefix.  Polled each minute on the verify lane; each
+# poll RE-ANCHORS self.accrued to truth and the model integrates between polls.  This retires
+# the model as the decision input (note 45: it was measured 2-4x off in both directions) and
+# closes note 47 §8.1 — the reward-attribution capture the credits page could not give us.
+KALSHI_USER_ID = os.environ.get("KALSHI_USER_ID")
+ESTIMATES_PATH = "/v1/incentives/users/%s/estimates"
+ESTIMATES_POLL_S = 60.0
 ACCRUED_OVERRIDES_NAME = "v5_accrued_overrides.json"
 READINGS_NAME = "v5_readings.jsonl"
 READINGS_PATH = os.path.join(DATA_DIR, READINGS_NAME)

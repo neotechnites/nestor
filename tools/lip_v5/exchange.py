@@ -36,6 +36,10 @@ class Exchange(object):
             params["cursor"] = cursor
         return R.public_get("/incentive_programs", params=params)
 
+    def estimates(self, user_id):                            # pragma: no cover - network
+        """SF-4c — the /v1 accrued-rewards feed (see runtime.signed_v1's capture note)."""
+        return R.signed_v1(self.auth, "GET", C.ESTIMATES_PATH % user_id)
+
     def trades(self, ticker, min_ts=None, limit=1):          # pragma: no cover - network
         """Public trade tape — P6's evidence source ("does ANYONE ever trade here?").
         `limit=1` because P6 needs existence, not volume: one row answers the question."""
@@ -168,6 +172,10 @@ class FakeExchange(object):
         body["close_time"] = datetime.fromtimestamp(
             float(close), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         return 200, {"market": body}
+
+    def estimates(self, user_id):
+        return 200, {"estimates": list(getattr(self, "estimates_rows", []) or []),
+                     "updated_ts": None}
 
     def trades(self, ticker, min_ts=None, limit=1):
         if self.trades_rows is not None:

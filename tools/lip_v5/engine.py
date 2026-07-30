@@ -107,6 +107,7 @@ class Maker(object):
         # money rows (≤60 s crash loss) and recovers with replay.
         self.accrued = {}                    # program_id -> $ accrued (model, conditional)
         self.last_accrual_ts = None
+        self.last_estimates_poll = None      # SF-4c cadence clock
         self.last_accrual_write = 0.0
         self._accrual_written = {}           # program_id -> last persisted value
         # --- FINAL FIX ROUND state ---
@@ -804,6 +805,8 @@ class Maker(object):
 
         # --- SF-4: the operator's venue readings (credits ritual → ratchet) ---
         self.consume_readings(now)
+        # --- SF-4c: the exchange's OWN accrual feed re-anchors the model every minute ---
+        self.poll_estimates(now)
         # --- SF-4b: accrued overrides — the exchange's displayed pot outranks the model ---
         try:
             _ov = R.read_json(C.ACCRUED_OVERRIDES_PATH, default=None)
@@ -1013,6 +1016,42 @@ class Maker(object):
         out["rollback_clean"] = self.rollback.clean
         R.log("cycle", **{k: v for k, v in out.items() if k != "alloc"})
         return out
+
+    def poll_estimates(self, now):
+        """SF-4c — one /v1 estimates read per ESTIMATES_POLL_S on the verify lane.
+
+        Each poll RE-ANCHORS `self.accrued` to the exchange's own per-program number (the
+        UI popover's source, centicents = 1e-4 dollars); `integrate_accrual`'s model deltas
+        keep it moving between polls.  Changes ≥ half a cent persist as `accrual` money rows
+        (src=exchange) so restarts replay TRUTH, not the model.  The model was measured 2-4x
+        off in both directions on 2026-07-30 — it survives only as the between-polls
+        interpolator and the no-user-id fallback.
+        """
+        if not C.KALSHI_USER_ID:
+            R.log_once("estimates_unwired", note="KALSHI_USER_ID unset: accrual runs on the "
+                                                 "model alone, measured 2-4x off — set it")
+            return 0
+        if self.last_estimates_poll is not None and \
+                float(now) - self.last_estimates_poll < C.ESTIMATES_POLL_S:
+            return 0
+        admitted, _ = self.bucket.admit("verify", now)
+        if not admitted:
+            return 0
+        status, body = self.ex.estimates(C.KALSHI_USER_ID)
+        self.note_http(status, now)
+        if status != 200:
+            return 0
+        self.last_estimates_poll = float(now)
+        n = 0
+        for row in (body or {}).get("estimates") or []:
+            pid = str(row.get("program_id"))
+            usd = float(row.get("reward_centicents") or 0) * 1e-4
+            if abs(usd - float(self.accrued.get(pid, 0.0) or 0.0)) >= 0.005:
+                self.ledger.write("accrual", program_id=pid, accrued=round(usd, 6),
+                                  src="exchange_estimates")
+                n += 1
+            self.accrued[pid] = usd
+        return n
 
     def meter_tick(self, now, books):
         """1 Hz on a FIXED PHASE, never triggered by our own action (spec §2.1's mirror)."""

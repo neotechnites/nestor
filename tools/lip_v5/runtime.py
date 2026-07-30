@@ -342,6 +342,25 @@ def signed(auth, method, path, body=None, params=None):        # pragma: no cove
                 body=body, params=params)
 
 
+def signed_v1(auth, method, path, body=None, params=None):     # pragma: no cover - network
+    """Sign a RAW /v1 (web-API) path — no /trade-api/v2 prefix in the URL or the message.
+    CAPTURED 2026-07-30: the trading key's RSA-PSS signature is honored on /v1 — verified
+    200 on /v1/incentives/users/{id}/estimates, the per-program accrued-rewards feed the
+    trade API does not serve (23 paths probed 404).  The signature message is
+    ts + METHOD + path, same scheme, different prefix."""
+    import base64 as _b64
+    import time as _t
+    from cryptography.hazmat.primitives import hashes as _h
+    from cryptography.hazmat.primitives.asymmetric import padding as _p
+    ts = str(int(_t.time() * 1000))
+    sig = auth.sk.sign((ts + method.upper() + path).encode(),
+                       _p.PSS(mgf=_p.MGF1(_h.SHA256()),
+                              salt_length=_p.PSS.DIGEST_LENGTH), _h.SHA256())
+    hdrs = {"KALSHI-ACCESS-KEY": auth.key_id, "KALSHI-ACCESS-TIMESTAMP": ts,
+            "KALSHI-ACCESS-SIGNATURE": _b64.b64encode(sig).decode()}
+    return http(method, C.BASE + path, headers=hdrs, body=body, params=params)
+
+
 def public_get(path, params=None):                             # pragma: no cover - network
     return http("GET", C.BASE + C.PREFIX + path, params=params)
 
