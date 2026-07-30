@@ -8,7 +8,8 @@ added later fails the suite rather than passing review.
 
 import unittest
 
-from .. import alloc, config as C, engine as E, exchange as X, guards as G, runtime as R
+from .. import (alloc, config as C, engine as E, exchange as X, guards as G,
+                ratchet as RT, runtime as R)
 from .base import LipTestCase
 
 NOW = 1_000_000.0
@@ -662,6 +663,31 @@ class TestAdoptionAndTriage(EngineCase):
             "l_shed_h": 0.5, "t_hat": 1.0, "spread_c": 2}})
         self.assertEqual(len(verdicts), 1)
         self.assertEqual(verdicts[0]["decision"], "keep")
+
+
+class TestAdmitVenuesSurvivesAFloorlessVenue(EngineCase):
+    """The sole-qualifier crash: `venue_floor_usd` returns None whenever every slot of a
+    venue has S<=0 (nobody to share with — the state this book is TRYING to reach) or the
+    window has wound down past floor_q's answer.  admit_venues multiplied that None by
+    RUNG0_FLOOR_MULT, raised TypeError, and runner.iteration's except persisted an
+    iteration_error HALT.  None is a reading (UNPROBEABLE), never a crash."""
+
+    def test_a_venue_whose_slots_all_have_S_zero_does_not_crash(self):
+        m = self.maker()
+        m.venues["KXAAAGASD"] = RT.VenueState("KXAAAGASD")   # rung 0, unverified, live
+        caps = m.admit_venues(NOW, [slot("KXAAAGASD-1", S=0.0, venue="KXAAAGASD"),
+                                    slot("KXAAAGASD-2", S=0.0, venue="KXAAAGASD")])
+        self.assertEqual(m.venue_status.get("KXAAAGASD"), RT.UNPROBEABLE)
+        self.assertEqual(caps["KXAAAGASD"], 0.0)
+        self.assertEqual(m.venues["KXAAAGASD"].rung0_cap_usd, 0.0)
+
+    def test_the_unseen_venue_branch_takes_None_too(self):
+        # MIRROR: the st-is-None candidate path hands floor_usd straight to RT.admit; it must
+        # read UNPROBEABLE from the same None rather than raising somewhere else.
+        m = self.maker()
+        caps = m.admit_venues(NOW, [slot("KXAAAGASD-1", S=0.0, venue="KXAAAGASD")])
+        self.assertEqual(caps["KXAAAGASD"], 0.0)
+        self.assertNotIn("KXAAAGASD", m.venues)
 
 
 if __name__ == "__main__":

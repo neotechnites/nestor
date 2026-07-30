@@ -1244,7 +1244,20 @@ class Maker(object):
                 # asking for a multi-rung budget made every venue whose ladder wants more than
                 # the per-market bound report UNPROBEABLE, cap 0, and reject all its slots.
                 # Ask the probe question with the PROBE floor, then set the budget.
-                cap, status = RT.rung0_cap(floor_usd * C.RUNG0_FLOOR_MULT,
+                # NO FLOOR IS A READING, NOT A CRASH.  `venue_floor_usd` returns None for the
+                # ordinary states — every slot of the venue has S<=0 (the SOLE-QUALIFIER
+                # state, which is where this book WANTS to be) or the window has wound down
+                # far enough that `floor_q_contracts` no longer answers.  Multiplying that
+                # None by RUNG0_FLOOR_MULT raised TypeError inside the cycle, runner.iteration
+                # caught it, and the persisted iteration_error HALTED the bot — a halt whose
+                # trigger was a venue we were winning.  `rung0_cap` already reads None as
+                # UNPROBEABLE (ratchet.py:148), which is the honest answer: no measurable
+                # probe size, cap 0, try again next cycle.  MIRROR: the st-is-None branch a
+                # few lines above passes floor_usd through UNMULTIPLIED into RT.admit, which
+                # bottoms out in the same rung0_cap None-guard — the two consumers of
+                # `venue_floor_usd` now agree that None means UNPROBEABLE, not TypeError.
+                probe_floor = None if floor_usd is None else floor_usd * C.RUNG0_FLOOR_MULT
+                cap, status = RT.rung0_cap(probe_floor,
                                            self.slot_cap_usd, per_market)
                 if status != RT.UNPROBEABLE:
                     cap = min(per_market, max(cap, need * C.RUNGS_PER_VENUE))
