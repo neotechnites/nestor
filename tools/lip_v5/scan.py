@@ -21,6 +21,9 @@ timescale — far slower than the 1 Hz quoting loop.  That is the cadence's deri
 also why `classify` is degrade step 1: it is the cheapest requests to give up.
 """
 
+import json
+import os
+
 from . import alloc, clusters as CL, config as C, money as M, presence as P
 from . import runtime as R
 
@@ -152,11 +155,42 @@ class Classifier:
         self.last = {}                       # ticker -> ts
         # REAL market close (charter B): a market's settlement close is FIXED at listing, so
         # one fetch per ticker suffices — cached forever, never re-spent.
+        # ── PERSISTED (2026-07-30 morning).  "Forever" was one process long: the cache was
+        # memory-only, so every restart re-learned THOUSANDS of closes at ≤4 req/s — the
+        # measured hour-long ramp on each of tonight's three restarts, most of it spent
+        # re-discovering that the same far-settling markets are still far.  Closes are fixed
+        # at listing; the cache is append-only truth and loads in one read.
         self.close_ts = {}                   # ticker -> epoch s (market close, NOT program end)
         self.close_missing = set()           # tickers whose market object carried no close
+        self._close_cache_path = os.path.join(C.DATA_DIR, "v5_close_cache.json")
+        self._close_dirty = 0
+        try:
+            with open(self._close_cache_path) as f:
+                obj = json.load(f)
+            self.close_ts.update({str(k): float(v) for k, v in
+                                  (obj.get("close_ts") or {}).items()})
+            self.close_missing.update(obj.get("missing") or ())
+        except Exception:
+            pass                             # no cache yet: first run learns it
         # P6 — public-trade-tape existence, per ticker, re-checked at P6_RECHECK_S.
         self.p6 = {}                         # ticker -> bool (True = someone trades here)
         self.p6_ts = {}                      # ticker -> last check ts
+
+    def _persist_closes(self, every=25):
+        """Write-behind: one atomic dump per `every` new closes — cheap against the read
+        it saves (each entry is one REST call a restart never re-spends)."""
+        self._close_dirty += 1
+        if self._close_dirty < int(every):
+            return
+        self._close_dirty = 0
+        try:
+            tmp = self._close_cache_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"close_ts": self.close_ts,
+                           "missing": sorted(self.close_missing)}, f)
+            os.replace(tmp, self._close_cache_path)
+        except Exception:
+            pass                             # cache is an optimization, never a halt
 
     def due(self, ticker, now):
         t = self.last.get(ticker)
@@ -302,6 +336,7 @@ class Classifier:
                   note="falling back to program end_ts; carry may be UNDERSTATED")
         else:
             self.close_ts[ticker] = ts
+        self._persist_closes()
 
     def learn_p6(self, ex, bucket, ticker, now,
                  lookback_days=C.P6_LOOKBACK_DAYS, recheck_s=C.P6_RECHECK_S):
