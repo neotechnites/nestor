@@ -296,3 +296,62 @@ class TestRealWireFills(LipTestCase):
         self.assertTrue(m.book_fill_row(row, NOW))
         self.assertAlmostEqual(
             m.positions["KXUST10AD-26JUL30-T4.73"]["no"], 2.97, places=6)
+
+
+class TestPostFillCooldown(LipTestCase):
+    """Two burst-halts in one night (TRUMPSAY 23:47, APRPOTUS 00:54): the replenish
+    re-posted the instant a fill booked, straight back into the flow that ate it, and B14
+    halted the WHOLE book both times.  The cooldown lets the flow pass; exits are exempt."""
+
+    def _armed(self):
+        from .test_engine import EngineCase
+        from .test_runner import NOW as RNOW, program_body
+        from .. import exchange as X, runner as RUN
+
+        class T(EngineCase):
+            def runTest(self):
+                pass
+        t = T()
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        tk = "KXAAAGASD-26JUL29-T4.12"
+        ex = X.FakeExchange(balance_cents=1_000_000, now=RNOW)
+        ex.books[tk] = {"orderbook": {"orderbook_fp": {
+            "yes_dollars": [["0.06", "1200"]], "no_dollars": [["0.93", "1200"]]}}}
+        ex._programs = program_body(tickers=(tk,))
+        ex.programs = lambda cursor=None: (200, ex._programs)
+        ex.market_closes[tk] = RNOW + 16 * 3600
+        m = t.maker(ex=ex)
+        r = RUN.Runner(m, sleep=lambda _s: None)
+        r.init(RNOW, nestor_state={"open_order_tickers": [], "position_tickers": []})
+        r.iteration(RNOW + 1)
+        self.assertTrue(m.orders, "fixture never armed")
+        return r, ex, tk, RNOW
+
+    def test_a_fill_starts_the_cooldown_and_the_replenish_waits(self):
+        r, ex, tk, NOW_ = self._armed()
+        oid = list(r.m.orders)[0]
+        ex.take(oid, 999, now=NOW_ + 2)                   # the flow eats the whole lot
+        r.iteration(NOW_ + 3)                             # fill books via the fills poll
+        placed_before = len(ex.placed)
+        for k in range(4, 30):
+            r.iteration(NOW_ + k)                         # inside the 90s window
+        self.assertEqual(len(ex.placed), placed_before,
+                         "the replenish re-posted INSIDE the cooldown")
+        for k in range(0, 40):
+            r.iteration(NOW_ + 95 + k)                    # past the window
+        self.assertGreater(len(ex.placed), placed_before,
+                           "the replenish never returned after the cooldown")
+
+    def test_the_burst_breaker_is_unreachable_through_the_replenish(self):
+        """The property that ends the halt class: even a flow that eats every lot on
+        contact cannot draw 3 placements in 60s out of the requoter."""
+        r, ex, tk, NOW_ = self._armed()
+        t = NOW_ + 2
+        for _ in range(6):                                # eat every lot, immediately
+            for oid in list(ex.resting):
+                ex.take(oid, 999, now=t)
+            t += 1.0
+            r.iteration(t)
+        self.assertFalse(r.m.halt.halted,
+                         "the burst breaker fired: the cooldown is not binding")

@@ -118,6 +118,10 @@ class TestFillReplenishAtOneHz(FixRoundCase):
         for _ in range(2 * int(C.FILLS_POLL_S) + 5):       # true 1 Hz
             t += 1.0
             r.iteration(t)
+        t += C.POST_FILL_COOLDOWN_S                        # past the post-fill cooldown
+        for _ in range(5):
+            t += 1.0
+            r.iteration(t)
         self.assertGreater(ex.fills_calls, 0, "the fills API was NEVER polled")
         self.assertAlmostEqual(r.m.positions[TK]["yes"], n, places=6)
         self.assertNotIn(oid, r.m.orders, "the filled order is still counted as resting")

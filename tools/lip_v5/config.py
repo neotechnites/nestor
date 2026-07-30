@@ -1241,6 +1241,20 @@ DAILY_LOSS_LIMIT_USD = DAY_STOP_CAP_USD
 # emergency, and a human must look.  MIRROR (breaker too tight ↔ too loose): too tight halts a
 # legitimately busy slot — bounded, visible, and resumable by operator record; too loose is an
 # unbounded order count on a live account, which is what this cost us.
+# --- THE POST-FILL COOLDOWN (2026-07-30 morning, after two burst-halts in one night) ---
+# The replenish re-posted the INSTANT a fill booked - straight back into the flow that had
+# just eaten it.  KXTRUMPSAYMONTH (23:47 MT) and KXAPRPOTUS (00:54 MT) each ate three lots
+# inside a minute and B14 halted the whole book both times: the burst breaker was doing the
+# cooldown's job at the cost of every other venue's presence.  Banning families one at a
+# time is whack-a-mole; the structural fix is to let the flow PASS before re-posting.
+# 90s: longer than the B14 window (60s), so a replenish loop can never reach the breaker;
+# shorter than the 15-min kill cadence it feeds evidence into.  Costs at most 90s of
+# presence per fill on a healthy rung (~2% of a window at the measured fill rates).
+# MIRROR (cooldown too LONG - presence lost on rungs whose fills are benign - is bounded at
+# 90s per fill; too SHORT is the measured failure: two halts, five lost hours).  Sheds and
+# fully-closing orders are EXEMPT - a cooldown must never delay an exit.
+POST_FILL_COOLDOWN_S = 90.0
+
 PLACE_BURST_MAX = 3
 PLACE_BURST_WINDOW_S = 60.0
 # ...matching MAX_CONSEC_CANCEL_ANOMALIES' shape.

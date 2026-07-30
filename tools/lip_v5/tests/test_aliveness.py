@@ -167,8 +167,10 @@ class TestReplenish(EngineCase):
 
     def test_the_requoter_does_NOT_go_silent_after_the_fill(self):
         r, n = self._filled(self._runner())
-        for i in range(3):
+        for i in range(3):                    # inside the post-fill cooldown: waits
             r.iteration(NOW + 3 + i)
+        for i in range(3):                    # past it: the replenish returns
+            r.iteration(NOW + C.POST_FILL_COOLDOWN_S + 4 + i)
         self.assertGreater(len(r.m.ex.placed), 1, "SILENT AFTER THE FIRST FILL — v4's tape")
         self.assertTrue(r.m.orders, "nothing resting after the fill: presence died")
         self.assertTrue(r.m.ex.resting, "the exchange book is empty: accrual is dying")
@@ -179,6 +181,7 @@ class TestReplenish(EngineCase):
         cluster cap would then refuse, silencing the requoter through a guard)."""
         r, n = self._filled(self._runner())
         r.iteration(NOW + 3)
+        r.iteration(NOW + C.POST_FILL_COOLDOWN_S + 4)     # past the post-fill cooldown
         st = r.m.venues["KXAAAGASD"]
         vcap = st.cap_usd(0.25 * r.m.ceiling_usd, r.m.ceiling_usd)
         resting = sum(o["remaining"] * 0.02 for o in r.m.orders.values())
@@ -191,7 +194,7 @@ class TestReplenish(EngineCase):
         r, n = self._filled(self._runner())
         r.m.refill.filled[(ALIVE_TICKER, "bid")] = 1e9      # turnovers exhausted
         before = len(r.m.ex.placed)
-        r.iteration(NOW + 3)
+        r.iteration(NOW + C.POST_FILL_COOLDOWN_S + 3)       # past the cooldown: B9 refuses
         self.assertEqual(len(r.m.ex.placed), before)
         refused = [x for x in self.logs_of("place_refused")
                    if x.get("refused_by") == "refill_cap"]

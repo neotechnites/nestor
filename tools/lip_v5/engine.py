@@ -53,6 +53,7 @@ class Maker(object):
         self.refill = G.RefillTracker()
         self.unknown = G.UnknownOrders()
         self.dedupe = G.FillDedupe()
+        self.fill_cooldown = {}              # (ticker, side) -> ts of last fill (cooldown)
         self.skew_ok = True
         self.day_stopped = False
 
@@ -531,6 +532,7 @@ class Maker(object):
         if fee_usd:
             self.pay_fee(fee_usd)
         self.refill.note_fill(ticker, side, count, ts=now)    # SF-6: window-keyed
+        self.fill_cooldown[(ticker, side)] = float(now)       # post-fill cooldown clock
         self.meter.note_fill((ticker, side), count, count * unit)
         self.rollback.note_fill(ticker, leg, now)
         self.ledger.write("fill_obs", ticker=ticker, side=side, count=count,
@@ -1526,6 +1528,14 @@ class Maker(object):
             # exemptions apply to it; a combined earning+shed order is not exempt).
             room = abs(self.net_position(s.ticker))
             fully_closing = shed_q > 0 and q <= room + 1e-9
+            # POST-FILL COOLDOWN (config derivation): an entry re-post inside the window
+            # re-feeds the flow that just ate the lot.  Exits are exempt.
+            if not fully_closing and cur is None:
+                _cd = self.fill_cooldown.get(key)
+                if _cd is not None and (now - _cd) < C.POST_FILL_COOLDOWN_S:
+                    stats["skipped"] += 1
+                    self.slot_examined[key] = now
+                    continue
 
             our_c = int(round(cur["price"] * 100)) if cur else None
             best_c = int(round(price * 100))
