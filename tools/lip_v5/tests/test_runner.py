@@ -914,17 +914,20 @@ class TestPlumbingWakes(RunnerCase):
         out = r.iteration(NOW + 1)
         self.assertGreater(out["slots"], 0)
 
-    def test_venue_caps_bind_in_the_assembled_loop(self):
-        """§1.4 was dormant because `self.venues` was never populated.  Now every venue in
-        the slot table is capped: admitted at rung-0, or zero."""
+    def test_NO_venue_permission_binds_in_the_assembled_loop(self):
+        """REWRITTEN 2026-07-30 (stage 1) — was `test_venue_caps_bind_in_the_assembled_loop`,
+        which asserted §1.4's rung-0 cap bound the spend.  There is no rung, no probe and no
+        admission: a venue we have never touched competes on its numbers in the first cycle,
+        and what bounds the spend is the DOLLAR stack (cluster reserve, lot container,
+        ceiling).  A book that had to be granted permission could not be a pure function of
+        the world — it would also be a function of which venues we happened to probe first."""
         r = self.runner(ex=CheapScanExchange(balance_cents=1_000_000))
         r.init(NOW, nestor_state=self.NESTOR)
         out = r.iteration(NOW + 1)
-        self.assertIn("KXAAAGASD", r.m.venues)
-        st = r.m.venues["KXAAAGASD"]
+        self.assertFalse(hasattr(r.m, "venues"))
         spent = out["allocate"]["spent"]
-        self.assertGreater(spent, 0.0)
-        self.assertLessEqual(spent, st.rung0_cap_usd + 1e-6)
+        self.assertGreater(spent, 0.0, "a fresh venue must be fundable on sight")
+        self.assertLessEqual(spent, r.m.ceiling_usd + 1e-6)
 
 
 if __name__ == "__main__":

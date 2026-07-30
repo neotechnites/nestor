@@ -238,23 +238,16 @@ class Runner(object):
                 self.m.refill.note_fill(r.get("ticker"), r.get("side"),
                                         float(r.get("count") or 0.0),
                                         ts=float(r.get("ts") or 0.0))
-            # SF-4/ratchet: verification evidence is MONEY state and survives restart —
-            # rung, verified-ness, stand-down and the rung0 cap come back from the
-            # `ratchet` rows, and `readings_line` resumes past consumed file rows so no
-            # reading is ever applied twice.
-            elif kind == "ratchet" and r.get("venue"):
-                v = r["venue"]
-                st = self.m.venues.get(v)
-                if st is None:
-                    st = RT.VenueState(v)
-                    self.m.venues[v] = st
-                st.rung = int(r.get("rung_after", st.rung) or 0)
-                if r.get("verdict") == RT.VERIFY:
-                    st.verified = True
-                if r.get("stood_down") or r.get("stand_down"):
-                    st.stood_down = True
-                if r.get("rung0_cap"):
-                    st.rung0_cap_usd = float(r["rung0_cap"])
+            # STAGE 1 (2026-07-30) — THE LADDER IS NOT REPLAYED, BECAUSE IT NO LONGER
+            # EXISTS.  This rebuilt rung, verified-ness, stand-down and the rung-0 cap from
+            # the `ratchet` rows: a restart inheriting the PERMISSIONS the last process had
+            # climbed to, which is precisely "memory of our own past decisions as an input".
+            # Two processes on the same world would quote different books depending on which
+            # had probed longer.  What replay still takes from these rows is the MEASUREMENT
+            # bookkeeping: which lines of the operator's readings file have already been
+            # consumed, so one reading is never counted twice.  The measured DENY rebuilds
+            # itself from the readings the same way it was built the first time.
+            elif kind in ("ratchet", "venue_measured", "venue_denied_measured"):
                 if r.get("src") == "readings_file" and r.get("line_no"):
                     self.m.readings_line = max(self.m.readings_line, int(r["line_no"]))
 

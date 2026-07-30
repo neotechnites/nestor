@@ -53,12 +53,12 @@ class NewRoundCase(EngineCase):
         return RUN.Runner(m, sleep=lambda _s: None)
 
     def mature(self, m, series="KXAAAGASD", rung=5):
-        """A venue past its ramp: the §1.4 rung cap no longer binds, so the CLUSTER cap is
-        the guard under test rather than the ratchet."""
-        v = m.venues[series]
-        v.verified = True
-        v.rung = rung
-        return v
+        """STAGE 1, 2026-07-30: a NO-OP, kept as a seam.  It used to promote a venue past its
+        ratchet ramp so the CLUSTER cap was the guard under test rather than the rung cap.
+        There is no ramp and no rung: every candidate competes on its numbers from the first
+        cycle, and the cluster's DOLLARS are the only thing that was ever really guarding
+        these tests."""
+        return None
 
     def refusals(self, reason=None):
         rows = [r for r in self.logs if r.get("t") == "place_refused"]

@@ -106,10 +106,7 @@ class TestFillReplenishAtOneHz(FixRoundCase):
         self.assertEqual(len(ex.placed), 1)
         oid = list(r.m.orders)[0]
         n = r.m.orders[oid]["remaining"]
-        if verified:
-            st = r.m.venues["KXAAAGASD"]
-            st.verified = True
-            st.rung = 2
+        # (stage 1: `verified` has no referent — a venue holds no rung to promote)
         ex.take(oid, n, now=NOW + 2)                       # the taker eats the WHOLE order
         return r, ex, oid, n
 
@@ -277,7 +274,9 @@ class TestRescueUnverifiedVenue(FixRoundCase):
         reserve rescue mechanics stay covered in test_alloc's TestCliffRecovery."""
         r, ex = self._runner()
         r.iteration(NOW + 1)
-        self.assertEqual(r.m.venue_status.get("KXCLIFF"), RT.UNPROBEABLE)
+        # STAGE 1: there is no UNPROBEABLE status to read — the venue holds no permission
+        # state at all.  What refuses the $16 top-up is the DOLLAR stack that always did the
+        # real work: the lot container and the cluster reserve.
         self.assertEqual(self.logs_of("cliff_top_up"), [])
         self.assertEqual(len(ex.placed), 0)
 
@@ -288,15 +287,14 @@ class TestRescueUnverifiedVenue(FixRoundCase):
         self.assertEqual(self.logs_of("cliff_top_up"), [])
         self.assertEqual(len(ex.placed), 0)
 
-    def test_venue_floor_uses_the_rescue_target_not_the_entry_floor(self):
-        r, _ = self._runner()
-        r.iteration(NOW + 1)
-        s = [s for s in r.slots if s.side == "bid"][0]
-        floor = r.m.venue_floor_usd([s])
-        entry = RT.floor_q_usd(s.rho, s.S, s.p, s.hours_left)
-        self.assertIsNotNone(floor)
-        if entry is not None:
-            self.assertLess(floor, entry)                 # the exemption bought room
+    def test_the_rescue_target_exemption_DIED_WITH_THE_PROBE_FLOOR(self):
+        """DELETED-IN-PLACE 2026-07-30 (stage 1).  `venue_floor_usd` computed a per-venue
+        PROBE FLOOR so admission could size a rung-0 cap, and BLOCKER-2's exemption let
+        stranded accrual buy room inside that cap.  Both are gone: there is no probe, no
+        rung-0 cap and no venue floor.  Accrual still gets its say — `cliff_clearing_q`
+        subtracts it (`need = target - accrued`) so an earning rung is sized cheaper than a
+        fresh one, in the ALLOCATOR, where it is arithmetic rather than permission."""
+        self.assertFalse(hasattr(self.maker(), "venue_floor_usd"))
 
 
 # =============================================================================================
@@ -445,12 +443,14 @@ class TestReadingsFile(FixRoundCase):
         ex = CountingExchange(program_body(), {TK: cheap_book()})
         r = self.runner(ex)
         r.init(NOW, nestor_state=NESTOR)
-        r.iteration(NOW + 1)                               # venue admitted at rung 0
+        r.iteration(NOW + 1)
         self._write_reading(r, {"venue": "KXAAAGASD", "reading_usd": 3.0,
                                 "projection_usd": 4.0})
         r.iteration(NOW + 2)
-        self.assertEqual(r.m.venues["KXAAAGASD"].rung, 1)
-        self.assertTrue(r.m.venues["KXAAAGASD"].verified)
+        # STAGE 1: a reading MEASURES, it does not promote.  3 of 4 projected is inside the
+        # derived VERIFY band, so the venue is not denied and the measurement is recorded.
+        self.assertAlmostEqual(r.m.venue_measured["KXAAAGASD"]["ratio"], 0.75, places=6)
+        self.assertNotIn("KXAAAGASD", r.m.measured_deny)
 
     def test_a_consumed_reading_is_never_reapplied_across_restart(self):
         ex = CountingExchange(program_body(), {TK: cheap_book()})
@@ -460,12 +460,14 @@ class TestReadingsFile(FixRoundCase):
         self._write_reading(r, {"venue": "KXAAAGASD", "reading_usd": 3.0,
                                 "projection_usd": 4.0})
         r.iteration(NOW + 2)
-        self.assertEqual(r.m.venues["KXAAAGASD"].rung, 1)
+        self.assertIn("KXAAAGASD", r.m.venue_measured)
         r2 = RUN.Runner(self.maker(ex=ex), sleep=lambda _s: None)
         r2.init(NOW + 10, nestor_state=NESTOR)
-        self.assertEqual(r2.m.venues["KXAAAGASD"].rung, 1)  # replayed, not re-applied
         r2.iteration(NOW + 11)
-        self.assertEqual(r2.m.venues["KXAAAGASD"].rung, 1)  # file row consumed exactly once
+        # The consumed-line marker still survives restart: it is a fact about which rows of
+        # the WORLD we have already read, not a decision we made.  Applying the same reading
+        # twice would double-count a measurement.
+        self.assertGreaterEqual(r2.m.readings_line, 1)
 
     def test_N3_a_paid_credit_retires_accrued_unpaid(self):
         ex = CountingExchange(program_body(), {TK: cheap_book()})
@@ -493,7 +495,7 @@ class TestReadingsFile(FixRoundCase):
                                 "projection_usd": 4.0})
         r.iteration(NOW + 2)
         self.assertTrue(self.logs_of("reading_bad_row"))
-        self.assertEqual(r.m.venues["KXAAAGASD"].rung, 1)   # the good row still applied
+        self.assertIn("KXAAAGASD", r.m.venue_measured)      # the good row still applied
 
 
 # =============================================================================================

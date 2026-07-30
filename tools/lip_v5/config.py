@@ -1440,6 +1440,12 @@ V1_LEDGER_KINDS = ("place_req", "place_resp", "cancel_req", "cancel_resp", "fill
                    "position_divergence", "phantom_risk", "poison", "settlement",
                    "accrual", "coid_seq")
 V5_LEDGER_KINDS = ("cash_feed", "rate_yield", "ratchet", "venue_kill", "venue_out_of_reach",
+                   # STAGE 1 (2026-07-30): the venue LADDER died and the venue MEASUREMENT
+                   # replaced it.  `venue_measured` is one row per reading (what the exchange
+                   # paid vs what the plan projected); `venue_denied_measured` is the row that
+                   # takes a venue out of the universe on that evidence.  `ratchet` stays a
+                   # known kind so old tapes still replay.
+                   "venue_measured", "venue_denied_measured",
                    "shade_decision", "orphan_position", "adopt_basis_rejected",
                    "mbb_degraded", "rstar_no_converge", "cancel_share_exceeded",
                    "probe_oversized", "venue_rank", "allocate", "idle_capital",

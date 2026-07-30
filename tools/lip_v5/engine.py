@@ -66,9 +66,13 @@ class Maker(object):
         self.place_hist = {}                 # (ticker, side) -> [ts]  (B14 breaker)
         self._rate_refused = {}              # (ticker, side) -> last log ts
         self.frozen = set()
-        self.venues = {}                     # venue -> RT.VenueState (ADMITTED only; a venue
-                                             # absent here allocates ZERO — see admit_venues)
-        self.venue_status = {}               # venue -> last admission status (telemetry)
+        # MEASUREMENT, NOT PERMISSION (stage 1).  The only per-venue memory that survives
+        # is what the exchange told us it PAID us there: `venue_measured` keeps the last
+        # comparison and `measured_deny` the venues whose payment diverged hard below
+        # projection on consecutive settlement days.  Both are facts about the world.
+        self.venue_measured = {}             # venue -> last (reading, projection, ratio)
+        self.measured_deny = {}              # venue -> the evidence that denied it
+        self._venue_disagree = {}            # venue -> (consecutive days, last day key)
         self.health = {}                     # (ticker, side) -> P.SlotHealth
         self.rollback = cutover.RollbackState()
         self.coid_seq = LG.coid_seq_load()
@@ -860,7 +864,19 @@ class Maker(object):
                 G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd),
                 ceiling_usd=self.ceiling_usd)
             caps = alloc.Caps(inv_cap_usd=self.slot_cap_usd)
-            venue_caps = self.admit_venues(now, slots)
+            # ── STAGE 1 (2026-07-30): VENUE ADMISSION IS GONE FROM THE PLAN. ─────────
+            # `admit_venues` was a PERMISSION machine — probe floors, rungs,
+            # verified-ness, oversized slots, stand-downs — and every one of those is
+            # a memory of OUR OWN PAST DECISIONS being fed back in as an input.  A book
+            # that must be a pure function of the world cannot ask what rung it climbed
+            # yesterday; two processes with the same world and different histories would
+            # quote different books, which is the whole disease.  Every (market, side)
+            # now competes in ONE global ranking on expected net credit per dollar, and
+            # the only things that may refuse it are facts: the static deny list, a
+            # MEASURED divergence (see `venue_reading`), and the risk rails that bound
+            # dollars rather than permission — cluster reserve, market, lot, ceiling,
+            # variance, day stop, halt.
+            venue_caps = {}
             # SECOND AMENDMENT (a): held inventory attributed per slot leg, so the cap binds
             # NET exposure and the replenish target after a fill is n_cap − held — presence
             # continues, correctly sized, instead of the v4 tape's silence-to-settlement.
@@ -970,7 +986,6 @@ class Maker(object):
                                "converged": res.converged, "slots": len(slots),
                                "slot_cap_usd": self.slot_cap_usd,
                                "cluster_cap_usd": cluster_cap,
-                               "venues_admitted": len(self.venues),
                                "dropped_programs": sorted(str(d) for d in
                                                           (res.dropped or ()))}
             out["alloc"] = a
@@ -1211,156 +1226,6 @@ class Maker(object):
                 self.resolved.add(row.get("ticker"))
         return exch
 
-    # =========================================================================================
-    # VENUE ADMISSION (charter B: populate self.venues — wakes the §1.4 caps in allocation)
-    # =========================================================================================
-    def admit_venues(self, now, slots):
-        """Run §1.4's rung-0 admission over the venues the slot table names, and return the
-        `venue_caps` map ALLOCATE binds against.
-
-        THE CONTRACT THAT WAKES THE CAP: every venue in `slots` gets an entry — admitted
-        venues get their ratchet cap, everything else (queued, unprobeable, stood-down,
-        never-seen) gets 0.0.  A venue absent from the map would be UNCAPPED in ALLOCATE,
-        which is the dormant-guard state this round exists to end.
-
-        `floor_q` is computed over the REMAINING window (hours_left), not the full one: the
-        probe must clear ENTRY_FLOOR from NOW, or the forfeit gate drops the very program the
-        probe was sized for — a probe and a gate that disagree fund nothing forever.  For a
-        rung-0 unverified venue the cap TRACKS the floor upward as the window shrinks (spec:
-        "never shrink the probe below floor_q"); once the floor no longer fits under the
-        per-slot/per-market caps the venue reads UNPROBEABLE and its cap drops to 0 — the
-        runway death, arriving through the same door as `runway_ok`.
-        """
-        by_venue = {}
-        for s in slots:
-            by_venue.setdefault(s.venue, []).append(s)
-
-        per_market = C.PER_MARKET_BUDGET_FRAC * self.ceiling_usd
-        candidates = []
-        for venue, ss in sorted(by_venue.items()):
-            floor_usd = self.venue_floor_usd(ss)
-            st = self.venues.get(venue)
-            if st is None:
-                net0 = max(s.net_at(0, C.FLOOR_RATE_PER_H) for s in ss)
-                candidates.append((venue, floor_usd, net0))
-            elif st.rung == 0 and not st.verified and not st.stood_down:
-                # RUNG-0 IS SIZED TO MEASURE SHARE, NOT TO ASK WHETHER REWARDS EXIST.  The
-                # mechanism is verified by receipt ($7.482 credited, per-rung line items), so
-                # the opening size no longer needs to be the bare floor-clearing probe §1.4
-                # specifies for an unknown mechanism — a probe that can only just clear the
-                # $1 cliff cannot distinguish "this venue pays" from "we barely qualified".
-                # Still bounded by the per-rung cap and the per-market cap inside rung0_cap,
-                # and by the cluster cap, day stop and drawdown halt outside it.
-                # A VENUE CAP THAT CANNOT FUND ONE CLIFF-SIZED RUNG CAN NEVER EARN.
-                # `venue_floor_usd` takes the MIN across the venue's slots — the cheapest
-                # probe — which is right for "does this venue exist" and wrong for "hold
-                # enough share to clear $2".  Measured live: venue caps landed at $5-8 while
-                # the cliff needed ~$21 at mid prices, so every rung was zeroed for being
-                # unable to reach the cliff inside its own venue budget, and the book sat at
-                # $5.44 of a $300 ceiling with NOTHING refused and NOTHING dropped.
-                # The two numbers were computed from different assumptions (whole-side share
-                # vs the real rival score); this makes them agree.
-                need = 0.0
-                for sl in ss:
-                    q_c = alloc.cliff_clearing_q(sl)
-                    if q_c:
-                        need = max(need, q_c * sl.p)
-                # A VENUE HOLDS SEVERAL RUNGS.  `4 x probe-floor` is ~$1.20 on a cheap
-                # rung — exactly ONE cliff-sized order — so 40 venues x ~$1.50 = the $60 this
-                # book has been stuck at.  The probe floor answers "can this venue measure
-                # anything"; it was never meant to be the venue's whole budget.  Size the
-                # venue for RUNGS_PER_VENUE cliff-sized orders, still bounded by the
-                # per-market cap, with the cluster cap bounding the correlated group and the
-                # per-rung cap bounding any single order.
-                # PROBEABILITY and BUDGET are separate questions.  rung0_cap marks a venue
-                # UNPROBEABLE when the binding minimum falls below what was asked for — so
-                # asking for a multi-rung budget made every venue whose ladder wants more than
-                # the per-market bound report UNPROBEABLE, cap 0, and reject all its slots.
-                # Ask the probe question with the PROBE floor, then set the budget.
-                # NO FLOOR IS A READING, NOT A CRASH.  `venue_floor_usd` returns None for the
-                # ordinary states — every slot of the venue has S<=0 (the SOLE-QUALIFIER
-                # state, which is where this book WANTS to be) or the window has wound down
-                # far enough that `floor_q_contracts` no longer answers.  Multiplying that
-                # None by RUNG0_FLOOR_MULT raised TypeError inside the cycle, runner.iteration
-                # caught it, and the persisted iteration_error HALTED the bot — a halt whose
-                # trigger was a venue we were winning.  `rung0_cap` already reads None as
-                # UNPROBEABLE (ratchet.py:148), which is the honest answer: no measurable
-                # probe size, cap 0, try again next cycle.  MIRROR: the st-is-None branch a
-                # few lines above passes floor_usd through UNMULTIPLIED into RT.admit, which
-                # bottoms out in the same rung0_cap None-guard — the two consumers of
-                # `venue_floor_usd` now agree that None means UNPROBEABLE, not TypeError.
-                probe_floor = None if floor_usd is None else floor_usd * C.RUNG0_FLOOR_MULT
-                cap, status = RT.rung0_cap(probe_floor,
-                                           self.slot_cap_usd, per_market)
-                if status != RT.UNPROBEABLE:
-                    cap = min(per_market, max(cap, need * C.RUNGS_PER_VENUE))
-                # A VENUE HOLDS SEVERAL RUNGS.  The probe-sized cap above answers "can this
-                # venue measure anything" — keep its STATUS, but once probeable the venue's
-                # budget is the per-market bound, because the thing that must bound a
-                # correlated GROUP is the cluster cap and the thing that bounds one rung is
-                # the per-rung cap.  A per-venue cap sized for a single probe made $75 of
-                # treasury impossible: five UST series at ~$8 each is $40, spread over eight
-                # rungs, which is exactly the sub-cliff dust this book has been earning.
-                if status != RT.UNPROBEABLE:
-                    cap = max(cap, min(per_market, self.slot_cap_usd * 3.0))
-                st.rung0_cap_usd = cap        # tracks floor_q up; 0.0 when UNPROBEABLE
-                if status == RT.UNPROBEABLE:
-                    self.venue_status[venue] = RT.UNPROBEABLE
-
-        # Admission, ranked by net(0) (spec §1.4 "QUEUE it (ranked by net(0))").  Trying the
-        # queue every cycle IS the exploration-floor mirror: the moment the unverified bounds
-        # have room, the best queued venue is admitted.
-        unverified = [st for st in self.venues.values()
-                      if not st.verified and not st.stood_down]
-        # EXPOSURE IS MONEY, NOT PERMISSION.  This summed venue CAPS against the ceiling, so
-        # every generous cap throttled how many venues could be admitted — raising the cap to
-        # a workable size cut admissions from 39 to 15 and deployment to zero.  ratchet.py's
-        # own note says it: "Σ caps MAY exceed the ceiling; Σ ALLOCATED never does, because
-        # ALLOCATE's budget binds independently.  Caps are permissions, the budget is the
-        # money."  So the unverified bound counts committed dollars — held inventory plus
-        # resting collateral — which is the thing that can actually be lost.
-        committed = {}
-        for t, p_ in self.positions.items():
-            for leg in ("yes", "no"):
-                n = abs(p_.get(leg, 0.0))
-                if n > 0:
-                    v = self.venue_of(t)
-                    committed[v] = committed.get(v, 0.0) + n * self.entry_basis.get(
-                        (t, leg), 0.0)
-        for o in self.orders.values():
-            if o.get("remaining", 0) > 0 and not o.get("gone_404"):
-                v = self.venue_of(o["ticker"])
-                committed[v] = committed.get(v, 0.0) + float(o["remaining"]) * \
-                    R.unit_collateral(o["side"], o["price"])
-        expo = sum(committed.get(st.venue, 0.0) for st in unverified)
-        n_unver = len(unverified)
-        n_oversized = sum(1 for st in unverified if st.oversized)
-        for venue, floor_usd, _net0 in sorted(candidates, key=lambda kv: (-kv[2], kv[0])):
-            vs = RT.VenueState(venue)
-            status, cap, detail = RT.admit(vs, floor_usd, self.slot_cap_usd, per_market,
-                                           self.ceiling_usd, expo, n_unver, n_oversized)
-            prev = self.venue_status.get(venue)
-            if status != prev:
-                R.log("venue_admission", venue=venue, status=status, cap_usd=cap, **detail)
-                if status == RT.OVERSIZED:
-                    self.ledger.write("probe_oversized", venue=venue, cap_usd=cap)
-            self.venue_status[venue] = status
-            if status in (RT.ADMITTED, RT.OVERSIZED):
-                self.venues[venue] = vs
-                # `expo` is COMMITTED DOLLARS.  Adding the new venue's CAP re-mixed the two
-                # currencies, so a workable cap size made the accumulator hit the ceiling
-                # after a few admissions.  Admitting a venue commits nothing; ALLOCATE's
-                # budget is what spends, and the cluster/rung/day-stop caps are what bound
-                # the risk.  The unverified COUNT still binds breadth.
-                n_unver += 1
-                n_oversized += 1 if vs.oversized else 0
-
-        caps = {}
-        for venue in by_venue:
-            st = self.venues.get(venue)
-            caps[venue] = st.cap_usd(per_market, self.ceiling_usd) if st else 0.0
-        return caps
-
     def venue_retired(self, ticker):
         """True when a ticker is one the strategy has decided against — denied family, or a
         program whose window the scanner now refuses.  Distinct from "not in this cycle's
@@ -1376,100 +1241,71 @@ class Maker(object):
         orders alike, without needing a slot to be present in this cycle's table."""
         return str(ticker or "").split("-", 1)[0].upper()
 
-    def venue_floor_usd(self, venue_slots):
-        """The venue's probe floor in dollars — with BLOCKER-2's RESCUE_TARGET exemption.
-
-        `floor_q` normally sizes against ENTRY_FLOOR over the REMAINING window, so late in a
-        program the floor stops fitting and the venue reads UNPROBEABLE — the runway death.
-        `runway_ok` (the slot-table twin) already carries the exemption: with accrual A > 0
-        at stake, the reachability target is the forfeit CLIFF, not the entry floor.  The
-        MIRROR was applied to one twin and not the other, so venue admission zeroed the cap
-        at exactly the moment the cliff rescue needed room to fire (reviewer's P3).  Here:
-        when a slot's program has A > 0 and the cliff is REACHABLE at the ρ/2 ceiling, the
-        floor becomes the top-up itself — `RESCUE_TARGET − A` — which is the smallest probe
-        that still measures (it can pay: the stranded A makes it pay).  A venue whose cliff
-        is UNREACHABLE gets no exemption: dead accrual buys no cap room (the abandon end).
-
-        The exemption is a FALLBACK, never a discount: while the ENTRY floor still fits
-        under the caps, it stands — a probe sized only to clear $1.10 projects below
-        ENTRY_FLOOR and its reading would be OUT_OF_REACH, i.e. a cheaper probe that
-        cannot verify.  Only when the entry floor has died (unreachable pool, or no longer
-        fitting under the slot/market caps) does the rescue floor take over the runway.
-
-        ── THE SOLE-QUALIFIER FLOOR (2026-07-30, measured: 7 venues at cap $0). ──────────────
-        `floor_q` sizes a probe against a RIVAL SCORE.  With S <= 0 there is no rival score,
-        so it has nothing to solve and the slot was SKIPPED — and a venue whose every slot has
-        S <= 0 produced no floor at all, read None, and both consumers read None as
-        UNPROBEABLE with cap 0.  Measured live: KXUST2AD/7AD/10AD/30AD, KXH100WS, KXH200WS and
-        KXRTX5090WS, 288 open markets between them with zero quotes and zero trades from
-        anyone, all refused.  That is the wrong answer to the RIGHT question in the state we
-        most want to be in: no rival score means nothing splits the pool, so the whole ρ/2 is
-        addressable and the binding constraint is the FORFEIT CLIFF, not a share contest.
-
-        `alloc.cliff_clearing_q` is already exactly that question — the smallest lot whose
-        credit reaches the floor over the remaining window — and it already handles S <= 0.
-        Its answer there is ZERO (`ceil(S × share/(1−share))` with S = 0), which is
-        arithmetically right and operationally degenerate: a zero-contract probe rests
-        nothing, measures nothing and would hand `rung0_cap` a $0 floor, i.e. an ADMITTED
-        venue with a $0 cap — the same paralysis wearing a different status.  ONE CONTRACT is
-        the smallest thing that can actually be resting, and with no rival it takes the whole
-        side, so the floor is `max(1, q_c) × p`.
-
-        WINDOW-WOUND-DOWN KEEPS ITS UNPROBEABLE READING, and through the same call: when the
-        remaining pool can no longer pay the floor at ANY size, `cliff_clearing_q` returns
-        None, the slot contributes no floor, and a venue where that is true of every slot
-        reads None → UNPROBEABLE exactly as before.  The two cases were conflated only
-        because one skip served both.
-        """
-        per_market = C.PER_MARKET_BUDGET_FRAC * self.ceiling_usd
-        fits = min(self.slot_cap_usd, per_market)
-        floors = []
-        for s in venue_slots:
-            if s.p <= 0:
-                continue
-            if s.S <= 0:
-                q_c = alloc.cliff_clearing_q(s)
-                if q_c is not None:
-                    floors.append(max(1, int(q_c)) * s.p)
-                continue
-            f = RT.floor_q_usd(s.rho, s.S, s.p, s.hours_left)
-            if f is None or f > fits + 1e-9:
-                A = float(s.accrued)
-                if A > 0 and A + (s.rho / 2.0) * s.hours_left \
-                        >= C.RESCUE_TARGET_USD - 1e-12:
-                    f = RT.floor_q_usd(s.rho, s.S, s.p, s.hours_left,
-                                       entry_floor=max(0.0, C.RESCUE_TARGET_USD - A))
-            if f is not None:
-                floors.append(f)
-        return min(floors) if floors else None
-
     def venue_reading(self, venue, reading_usd, projection_usd, now, settlement_day=None,
                       src=None, line_no=None):
-        """§1.4's verification input (operator popover_estimate or paid credit).  Moves the
-        rung, writes the `ratchet` money row, pages on stand-down.  Fed by the SF-4 watched
-        file (`consume_readings`) or called directly.  The row carries `src`/`line_no` (so
-        a restart never re-applies a consumed reading) and `rung0_cap` (so replay can
-        rebuild a climbed venue's cap, not just its rung)."""
-        st = self.venues.get(venue)
-        if st is None:
-            # A reading about a venue not currently admitted still moves its ladder —
-            # verification evidence outlives admission (stand-downs and revives depend on
-            # it).  cap_usd stays 0 until admission funds it.
-            st = RT.VenueState(venue)
-            self.venues[venue] = st
-        verdict, ratio, detail = RT.apply_reading(st, reading_usd, projection_usd, ts=now,
-                                                  settlement_day=settlement_day)
-        fields = dict(detail)
-        fields.update(venue=venue, verdict=verdict, ratio=ratio, src=src, line_no=line_no,
-                      rung0_cap=st.rung0_cap_usd, stood_down=st.stood_down)
-        self.ledger.write("ratchet", **fields)
+        """A MEASUREMENT of what a venue actually paid us, and the only per-venue memory that
+        survives stage 1.
+
+        Ryan, 2026-07-30: "we can just ask kalshi how much we've earned there, we only need
+        to know that we've been there."  What died with venue admission is the LADDER — the
+        rung, the probe, the verified flag, the oversized slot — because a rung is a memory
+        of our own past decisions and the book may not be a function of those.  What survives
+        is the comparison itself: the exchange tells us what it paid, the plan tells us what
+        it projected, and a venue that takes our presence and does not pay for it is a FACT
+        about that venue, not a permission we granted or withheld.
+
+        `classify_reading` keeps its derived band (VERIFY_BAND) and OUT_OF_REACH rule
+        unchanged — they were always measurement, never permission.  DISAGREE on
+        STANDDOWN_DAYS consecutive settlement days (the same derived rule the ratchet used,
+        for the same reason: two disagreements inside one afternoon are one day's evidence
+        wearing two hats) writes a MEASURED DENY, which joins the static deny list as an
+        input to slot building.  It carries its evidence so an operator can argue with it.
+        MIRROR (denying on measurement ↔ never denying): a false deny costs the rate of one
+        venue and is visible in the row that created it; never denying is the PayPal geometry
+        — presence bought at a venue that has already told us, in dollars, that it does not
+        pay.  Nothing here funds anything: a venue not denied competes on its numbers like
+        every other, with no memory of having been "admitted".
+        """
+        verdict, ratio = RT.classify_reading(reading_usd, projection_usd)
+        self.venue_measured[venue] = {"reading": reading_usd,
+                                      "projection": projection_usd, "ratio": ratio}
+        fields = {"venue": venue, "verdict": verdict, "ratio": ratio,
+                  "reading": reading_usd, "projection": projection_usd,
+                  "src": src, "line_no": line_no}
         if verdict == RT.OUT_OF_REACH:
+            # The projection never cleared the entry floor, so the venue was never asked a
+            # question it could answer.  Silence is not a disagreement (ratchet.py's own
+            # note): no deny, no day counted.
+            self.ledger.write("venue_measured", **fields)
             self.ledger.write("venue_out_of_reach", venue=venue,
                               projection=projection_usd)
             R.ntfy("venue_out_of_reach", "lip_v5 venue out of reach: %s" % venue)
-        if st.stood_down:
-            R.ntfy("venue_stand_down", "lip_v5 venue stand-down: %s" % venue)
+            return verdict
+        days, last_day = self._venue_disagree.get(venue, (0, None))
+        if verdict == RT.VERIFY:
+            days, last_day = 0, None          # it paid: the count resets on evidence
+        else:
+            if settlement_day is None:
+                days += 1
+            elif settlement_day != last_day:
+                days = days + 1 if (last_day is not None
+                                    and RT._is_next_day(last_day, settlement_day)) else 1
+                last_day = settlement_day
+        self._venue_disagree[venue] = (days, last_day)
+        fields["disagree_days"] = days
+        if verdict != RT.VERIFY and days >= int(C.STANDDOWN_DAYS):
+            self.measured_deny[venue] = dict(fields)
+            fields["denied"] = True
+            self.ledger.write("venue_denied_measured", **fields)
+            R.ntfy("venue_stand_down",
+                   "lip_v5 venue DENIED on measurement: %s (paid %.4f of %.4f projected)"
+                   % (venue, float(reading_usd or 0.0), float(projection_usd or 0.0)))
+        self.ledger.write("venue_measured", **fields)
         return verdict
+
+    def venue_denied(self, ticker):
+        """The measured half of the deny test (`config.series_denied` is the static half)."""
+        return self.venue_of(ticker) in self.measured_deny
 
     def consume_readings(self, now):
         """SF-4 — the operator's entry point for venue readings: a WATCHED FILE

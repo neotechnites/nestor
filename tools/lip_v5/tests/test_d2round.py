@@ -379,14 +379,13 @@ class TestBreadthIsNotRationedByIgnorance(LipTestCase):
         self.assertAlmostEqual(C.OVERSIZED_PROBE_FRAC, C.MARKET_CAP_FRAC, places=12,
                                msg="a probe inside the per-market cap is not 'unusual'")
 
-    def test_the_PLANNED_rung_size_is_not_classified_as_oversized(self):
-        """The test that would have caught it: a threshold for 'unusually large' must sit above
-        what the plan normally asks for.  30 rungs on a $300 ceiling is $10 each."""
+    def test_the_oversized_PROBE_classification_is_gone_with_the_probe(self):
+        """Stage 1: there is no probe to call unusual.  The finding this test recorded — a
+        threshold for "unusually large" that sat BELOW the plan's own rung size — cannot
+        recur, because the classification it lived in no longer exists.  The constant stays
+        (the identity above still documents where the number came from)."""
         from .. import ratchet as RT
-        ceiling = 300.0
-        planned = ceiling / 30.0
-        self.assertFalse(RT.classify_probe(planned, ceiling),
-                         "the strategy's own rung size must not read as an oversized probe")
+        self.assertFalse(hasattr(RT, "classify_probe"))
 
 
 if __name__ == "__main__":

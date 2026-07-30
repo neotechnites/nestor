@@ -150,14 +150,14 @@ class TestVenueCaps(LipTestCase):
         a, spent, _ = alloc.allocate(slots, 300.0, RSTAR, venue_caps={"V": 5.0})
         self.assertLessEqual(spent, 5.0 + 0.10 + 1e-9)
 
-    def test_a_stood_down_venue_gets_a_zero_cap_and_others_keep_quoting(self):
-        """T-R5/T-D1 — a venue standing down must leave every other venue quoting."""
-        down = RT.VenueState("V1", rung=3, rung0_cap_usd=10.0)
-        down.stood_down = True
-        up = RT.VenueState("V2", rung=1, rung0_cap_usd=10.0)
-        caps = {"V1": down.cap_usd(100.0, 300.0), "V2": up.cap_usd(100.0, 300.0)}
+    def test_a_DENIED_venue_gets_no_dollars_and_others_keep_quoting(self):
+        """T-R5/T-D1 survives stage 1 with a new source of the zero: nothing STANDS DOWN any
+        more (that was permission state), but a venue the MEASUREMENT denied is out of the
+        universe — and the rest of the board must not notice.  Expressed here as the zero cap
+        it produces, which is all the allocator ever saw of a stand-down."""
         slots = [slot("M1", venue="V1", phi=0.001), slot("M2", venue="V2", phi=0.001)]
-        a, spent, _ = alloc.allocate(slots, 300.0, RSTAR, venue_caps=caps)
+        a, spent, _ = alloc.allocate(slots, 300.0, RSTAR,
+                                     venue_caps={"V1": 0.0, "V2": 10.0})
         self.assertEqual(a[("M1", "bid")], 0)
         self.assertGreater(a[("M2", "bid")], 0)
 

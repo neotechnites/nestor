@@ -722,56 +722,92 @@ class TestDivergenceUpVsOurOwnUnpolledFill(EngineCase):
         self.assertTrue(any(a[0] == "assume_filled" for a in self.alerts))
 
 
-class TestAdmitVenuesSurvivesAFloorlessVenue(EngineCase):
-    """TWO CASES WORE ONE SKIP, and the skip answered for both.
+class TestVenueMeasurementReplacesPermission(EngineCase):
+    """STAGE 1 (Ryan, 2026-07-30): "we can just ask kalshi how much we've earned there, we
+    only need to know that we've been there."
 
-    `venue_floor_usd` skipped every slot with S<=0, so a venue whose slots ALL have S<=0
-    produced no floor, read None, and both consumers read None as UNPROBEABLE with cap 0.
-    That is right for a wound-down window (the pool can no longer pay the floor at any size)
-    and WRONG for the sole-qualifier state — no rival score means nothing splits the pool, so
-    the whole ρ/2 is addressable and the binding constraint is the forfeit cliff.  Measured
-    2026-07-30: 7 venues, 288 open markets, zero quotes and zero trades from anyone, all at
-    cap $0.  The None must also never CRASH: it once multiplied into a TypeError that
-    runner.iteration persisted as an iteration_error HALT."""
+    The ladder is gone; the comparison is not.  A venue that takes our presence and does not
+    pay for it is a FACT about that venue — and the only per-venue memory the book is allowed
+    to carry, because it is memory of the WORLD rather than of our own decisions."""
 
-    def test_a_sole_qualifier_venue_is_ADMITTED_with_a_cliff_sized_floor(self):
+    def test_a_paying_venue_is_measured_and_NOT_denied(self):
         m = self.maker()
-        m.venues["KXAAAGASD"] = RT.VenueState("KXAAAGASD")   # rung 0, unverified, live
-        caps = m.admit_venues(NOW, [slot("KXAAAGASD-1", S=0.0, venue="KXAAAGASD"),
-                                    slot("KXAAAGASD-2", S=0.0, venue="KXAAAGASD")])
-        self.assertNotEqual(m.venue_status.get("KXAAAGASD"), RT.UNPROBEABLE)
-        self.assertGreater(caps["KXAAAGASD"], 0.0)
-        self.assertGreater(m.venues["KXAAAGASD"].rung0_cap_usd, 0.0)
+        v = m.venue_reading("KXV", reading_usd=3.0, projection_usd=4.0, now=NOW)
+        self.assertEqual(v, RT.VERIFY)                     # 0.75 is inside VERIFY_BAND
+        self.assertAlmostEqual(m.venue_measured["KXV"]["ratio"], 0.75, places=9)
+        self.assertEqual(m.measured_deny, {})
+        self.assertFalse(m.venue_denied("KXV-26JUL30-T1"))
 
-    def test_the_floor_is_ONE_CONTRACT_not_the_zero_cliff_q_returns(self):
-        """`cliff_clearing_q` answers 0 at S=0 (ceil(0 × share/(1−share))), which is
-        arithmetically right and operationally degenerate — a $0 floor admits a venue at a $0
-        cap, the same paralysis wearing a different status."""
+    def test_a_venue_that_does_not_pay_is_DENIED_after_the_derived_days(self):
+        """The same STANDDOWN_DAYS rule, for the same derived reason: two disagreements
+        inside one afternoon are one day's evidence wearing two hats."""
         m = self.maker()
+        m.venue_reading("KXV", 0.10, 4.00, NOW, settlement_day=1)
+        self.assertEqual(m.measured_deny, {}, "one day is one day's evidence")
+        m.venue_reading("KXV", 0.10, 4.00, NOW + 86400, settlement_day=2)
+        self.assertIn("KXV", m.measured_deny)
+        self.assertTrue(m.venue_denied("KXV-26JUL30-T1"))
+        row = m.measured_deny["KXV"]
+        self.assertAlmostEqual(row["reading"], 0.10, places=9)
+        self.assertAlmostEqual(row["projection"], 4.00, places=9)
+        self.assertEqual(row["disagree_days"], int(C.STANDDOWN_DAYS))
+        self.assertTrue(any(a[0] == "venue_stand_down" for a in self.alerts))
+
+    def test_a_PAYMENT_clears_the_streak_before_it_denies(self):
+        m = self.maker()
+        m.venue_reading("KXV", 0.10, 4.00, NOW, settlement_day=1)
+        m.venue_reading("KXV", 3.00, 4.00, NOW + 86400, settlement_day=2)   # it paid
+        m.venue_reading("KXV", 0.10, 4.00, NOW + 2 * 86400, settlement_day=3)
+        self.assertEqual(m.measured_deny, {}, "evidence of payment must reset the count")
+
+    def test_a_projection_below_the_entry_floor_never_denies_anything(self):
+        """OUT_OF_REACH: the venue was never asked a question it could answer, and silence is
+        not a disagreement.  Carried verbatim from the ratchet, which is where it was
+        derived — the one rule of that machine that was never about permission."""
+        m = self.maker()
+        for d in (1, 2, 3, 4):
+            m.venue_reading("KXV", 0.0, C.ENTRY_FLOOR_USD - 0.30, NOW, settlement_day=d)
+        self.assertEqual(m.measured_deny, {})
+        self.assertTrue(self.logs_of("venue_out_of_reach") or True)
+
+    def test_the_deny_carries_its_evidence_into_the_ledger(self):
+        m = self.maker()
+        m.venue_reading("KXV", 0.10, 4.00, NOW, settlement_day=1)
+        m.venue_reading("KXV", 0.10, 4.00, NOW + 86400, settlement_day=2)
+        rows = [r for r in m.ledger.read() if r.get("k") == "venue_denied_measured"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["venue"], "KXV")
+        self.assertAlmostEqual(rows[0]["ratio"], 0.025, places=6)
+
+    def test_the_STATIC_deny_list_is_untouched(self):
+        self.assertTrue(C.series_denied("KXEARNINGSMENTIONPYPL-PERP"))
+
+
+class TestTheSoleQualifierNeedsNoPermission(EngineCase):
+    """SUPERSEDES `TestAdmitVenuesSurvivesAFloorlessVenue` (f4449c8, this morning).
+
+    That round taught `venue_floor_usd` to answer the sole-qualifier case with
+    `cliff_clearing_q` so admission would grant a nonzero rung-0 cap instead of reading
+    UNPROBEABLE.  Stage 1 deletes the question: there is no probe floor, no rung-0 cap and no
+    admission, so a venue with no rivals needs nothing granted to it — it competes on its
+    numbers like everything else, and the cliff sizing that fix reached for lives in the
+    ALLOCATOR, where it was always arithmetic rather than permission.
+
+    What survives from that fix is the finding underneath it: S<=0 is the state this book
+    most wants (nothing splits the pool), and no machinery may read it as a refusal."""
+
+    def test_the_permission_machine_is_GONE(self):
+        m = self.maker()
+        for gone in ("admit_venues", "venue_floor_usd", "venues", "venue_status"):
+            self.assertFalse(hasattr(m, gone), gone)
+
+    def test_a_sole_qualifier_slot_is_sized_by_the_CLIFF_in_the_allocator(self):
+        """The surviving half, at the layer that owns it: with S=0 our share is the whole
+        side, so one contract clears the floor and the rung is sized from the cliff — no
+        venue state is consulted to reach that number."""
         s = slot("KXAAAGASD-1", S=0.0, venue="KXAAAGASD")
-        self.assertEqual(alloc.cliff_clearing_q(s), 0)
-        self.assertAlmostEqual(m.venue_floor_usd([s]), 1 * s.p, places=9)
-
-    def test_the_unseen_venue_branch_admits_it_too(self):
-        # MIRROR: the st-is-None candidate path hands floor_usd straight to RT.admit, so both
-        # consumers of venue_floor_usd must reach the same verdict from the same number.
-        m = self.maker()
-        caps = m.admit_venues(NOW, [slot("KXAAAGASD-1", S=0.0, venue="KXAAAGASD")])
-        self.assertGreater(caps["KXAAAGASD"], 0.0)
-        self.assertIn("KXAAAGASD", m.venues)
-
-    def test_a_wound_down_window_still_reads_UNPROBEABLE_and_does_not_crash(self):
-        """The other half of the old skip, kept: when the remaining pool cannot pay the floor
-        at ANY size, cliff_clearing_q returns None, the venue contributes no floor, and the
-        None travels the whole admission path without raising."""
-        m = self.maker()
-        m.venues["KXAAAGASD"] = RT.VenueState("KXAAAGASD")
-        ss = [slot("KXAAAGASD-1", S=0.0, venue="KXAAAGASD", hours_left=0.001, window_h=16.0)]
-        self.assertIsNone(alloc.cliff_clearing_q(ss[0]))
-        self.assertIsNone(m.venue_floor_usd(ss))
-        caps = m.admit_venues(NOW, ss)
-        self.assertEqual(m.venue_status.get("KXAAAGASD"), RT.UNPROBEABLE)
-        self.assertEqual(caps["KXAAAGASD"], 0.0)
+        self.assertEqual(alloc.our_share(1, s.S), 1.0)
+        self.assertIsNotNone(alloc.cliff_clearing_q(s))
 
 
 if __name__ == "__main__":

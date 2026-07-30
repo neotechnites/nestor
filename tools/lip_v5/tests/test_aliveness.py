@@ -16,7 +16,7 @@ sections is the classic home of the missing action.
 
 import unittest
 
-from .. import config as C, exchange as X, ratchet as RT, runner as RUN, runtime as R
+from .. import clusters as CL, config as C, exchange as X, ratchet as RT, runner as RUN, runtime as R
 from .base import LipTestCase
 from .test_engine import EngineCase
 from .test_runner import NOW, program_body
@@ -105,18 +105,20 @@ class TestOrdersAppear(EngineCase):
         self.assertGreater(r.m.cash.resting_collateral, 0.0)
         self.assertLess(r.m.cash.raw_delta, 0.0)          # published below truth, never above
 
-    def test_the_probe_is_floor_clearing_and_venue_capped(self):
-        """G3's read-out line: no venue funded below its floor_q, none above its rung-0 cap."""
+    def test_the_probe_is_bounded_by_DOLLARS_not_by_permission(self):
+        """REWRITTEN 2026-07-30 (stage 1): was
+        `test_the_probe_is_floor_clearing_and_venue_capped`, which asserted the rung-0 cap.
+        There is no rung and no probe any more — a first order at a venue is just the
+        best-ranked candidate — so what must bound it is the dollar stack that bounds
+        everything: the lot container, the cluster reserve and the ceiling."""
         r = self._runner()
         r.init(NOW, nestor_state=NESTOR)
         out = r.iteration(NOW + 1)
         q = out["alloc"][(ALIVE_TICKER, "bid")]
         spent = q * 0.06
         self.assertGreaterEqual(q, 1)
-        self.assertLessEqual(spent, 0.20 * r.m.ceiling_usd + 1e-9)   # unverified bound
-        st = r.m.venues["KXAAAGASD"]
-        self.assertEqual(st.rung, 0)
-        self.assertLessEqual(spent, st.rung0_cap_usd + 1e-9)
+        self.assertLessEqual(spent, out["allocate"]["cluster_cap_usd"] + 1e-9)
+        self.assertLessEqual(spent, r.m.ceiling_usd + 1e-9)
 
     def test_a_dying_allocation_cancels_the_resting_order(self):
         """The diff runs BOTH ways: when the target drops to zero the quote leaves."""
@@ -155,11 +157,8 @@ class TestReplenish(EngineCase):
         self.assertEqual(len(r.m.ex.placed), 1)
         oid = list(r.m.orders)[0]
         n = r.m.orders[oid]["remaining"]
-        # a filled probe is verified evidence in this fixture's world: promote the venue so
-        # the replenish is not the (correct) unverified-probe refusal
-        st = r.m.venues["KXAAAGASD"]
-        st.verified = True
-        st.rung = 2
+        # (stage 1: nothing to promote — a venue holds no rung, and the replenish is judged
+        # by the same law as any other candidate)
         r.m.ex.resting.pop(oid, None)
         r.m.book_fill(ALIVE_TICKER, "bid", n, 0.02, NOW + 2, fill_id="fill-1",
                       order_id=oid)
@@ -182,8 +181,8 @@ class TestReplenish(EngineCase):
         r, n = self._filled(self._runner())
         r.iteration(NOW + 3)
         r.iteration(NOW + C.POST_FILL_COOLDOWN_S + 4)     # past the post-fill cooldown
-        st = r.m.venues["KXAAAGASD"]
-        vcap = st.cap_usd(0.25 * r.m.ceiling_usd, r.m.ceiling_usd)
+        # stage 1: the bound is the CLUSTER's dollars (D5'), not a venue's permission.
+        vcap = CL.cluster_cap_usd(0.0, ceiling_usd=r.m.ceiling_usd)
         resting = sum(o["remaining"] * 0.02 for o in r.m.orders.values())
         held = abs(r.m.net_position(ALIVE_TICKER)) * 0.02
         self.assertGreater(resting, 0.0)
@@ -299,12 +298,10 @@ class TestLandGrabAppears(EngineCase):
         r = self._runner()
         r.init(NOW, nestor_state=NESTOR)
         out = r.iteration(NOW + 1)
-        st = r.m.venues.get("KXGRABALIVE")
-        if st is None:
-            self.assertEqual(r.m.venue_status.get("KXGRABALIVE"), RT.UNPROBEABLE)
-            self.assertEqual(out["allocate"]["spent"], 0.0)
-        else:
-            self.assertLessEqual(out["allocate"]["spent"], st.rung0_cap_usd + 1e-6)
+        # stage 1: no rung-0 cap exists to respect.  The lot container is what refuses a
+        # rung whose floor-clearing size cannot be reserved for.
+        self.assertLessEqual(out["allocate"]["spent"],
+                             out["allocate"]["cluster_cap_usd"] + 1e-6)
 
 
 class TestShedAppears(EngineCase):
