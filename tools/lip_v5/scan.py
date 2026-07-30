@@ -370,7 +370,17 @@ class Classifier:
         """One pass.  Returns the number of markets (re)classified."""
         books = books or {}
         n = 0
-        for rho, ticker, program in self.candidates(programs, now):
+        # DAILIES FIRST (Ryan, 2026-07-30).  The close-learn order used to be the ρ rank,
+        # which front-loads the far-settling giants: each costs one read before the gate can
+        # skip it, and the near board waits behind them.  Sort the sweep instead by
+        # (close unknown?, program end): markets whose close we KNOW and which end soonest
+        # classify first — the quoting set — then unknowns in soonest-ending order, because a
+        # program that ends tomorrow is the best prior that its market settles tomorrow (the
+        # dailies), and a 5-month program can wait its turn to be refused.
+        rows = sorted(self.candidates(programs, now),
+                      key=lambda r: (r[1] not in self.close_ts,
+                                     float(r[2].get("end_ts") or 0)))
+        for rho, ticker, program in rows:
             self.learn_close(ex, bucket, ticker, now)
             self.learn_p6(ex, bucket, ticker, now)
             if not self.due(ticker, now):

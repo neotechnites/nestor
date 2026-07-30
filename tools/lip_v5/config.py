@@ -416,6 +416,17 @@ COLLAPSE_STARVATION_FRAC = 0.20              # spec §8.7(b) — starvation is n
 # =============================================================================================
 # RATE BUDGET  (spec §3)
 # =============================================================================================
+# --- THE STARTUP BURST (Ryan, 2026-07-30 morning: "can we speed it up just on start up
+# to get orders out there?") ---
+# Cold start's job is DISCOVERY: closes, books, admissions.  For the first BOOST window the
+# cap runs at 7 Hz — inside the shared ~10 req/s account limit while nestor uses its ~3 —
+# then drops to the standing residual.  AIMD still governs: a 429 halves the budget wherever
+# the cap sits, so the boost can only ever be as aggressive as the exchange tolerates.
+# MIRROR (boost too LONG starves nestor's trade-critical calls ↔ too short re-creates the
+# hour-long ramp): 10 min covers a full classify sweep of the near board at 7 Hz with the
+# close cache warm; nestor's breaker tolerances were never rate-sensitive below 429 volume.
+RATE_CAP_HZ_STARTUP = 7.0
+RATE_CAP_STARTUP_S = 600.0
 RATE_CAP_HZ = 4.0                            # spec §3.1 — nestor's calls are trade-critical
                                              # and un-deferrable; v5's are deferrable, so the
                                              # deferrable consumer takes the RESIDUAL of the

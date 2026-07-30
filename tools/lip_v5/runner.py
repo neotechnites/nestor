@@ -35,6 +35,7 @@ class Runner(object):
         self._sleep = sleep or time.sleep
         self.slots = []
         self.iterations = 0
+        self.started_ts = None               # startup-burst clock (first iteration)
         self.last_cycle_ts = None
         self.started = False
         # --- BLOCKER-3: the book-poll lane ---
@@ -261,6 +262,16 @@ class Runner(object):
         """ONE pass of the outer loop.  Returns the cycle read-out (or a halt read-out)."""
         now = self.clock() if now is None else float(now)
         self.iterations += 1
+        # THE STARTUP BURST (config derivation): discovery runs at the boosted cap for the
+        # first RATE_CAP_STARTUP_S, then the standing residual.  AIMD still rules under it.
+        if self.started_ts is None:
+            self.started_ts = now
+        boost = (now - self.started_ts) < C.RATE_CAP_STARTUP_S
+        cap = C.RATE_CAP_HZ_STARTUP if boost else C.RATE_CAP_HZ
+        if self.m.bucket.cap_hz != cap:
+            self.m.bucket.cap_hz = cap
+            self.m.bucket.b = min(self.m.bucket.b if self.m.bucket.b > 0 else cap, cap)                 if not boost else cap
+            R.log("rate_cap_shift", cap_hz=cap, boost=boost)
 
         # (1) B5 FIRST — a halted process stops doing work, not just stops placing.
         # SF-3: every halt path flattens ONCE (the in-cycle halts already flattened; this
