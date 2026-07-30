@@ -404,7 +404,11 @@ class TestClusterOwnershipSeed(LipTestCase):
         so the cap sees them.  This pure-test path passes no seed, so the sibling gets the
         whole $10 — the same shape as the incident, minus the accrual that made it costly."""
         sibling = _slot("KXEUR-1-T1153")
-        common = dict(cluster_cap_usd=10.0, owner_seed={"KXEUR": ("KXEUR-1-T1155", "bid")})
+        # A reserve of exactly ONE lot: the slotless owner and the sibling want the same
+        # dollars, so the pot decides.  (With the full $10 reserve both fit and neither is
+        # touched — see TestRecallRequiresScarcity.)
+        common = dict(cluster_cap_usd=C.SLOT_LOT_CAP_USD,
+                      owner_seed={"KXEUR": ("KXEUR-1-T1155", "bid")})
         a_no_pot, _, _ = alloc.allocate([sibling], 300.0, RSTAR, **common)
         self.assertGreater(a_no_pot[sibling.key], 0)
         a_pot, _, _ = alloc.allocate([sibling], 300.0, RSTAR,
@@ -469,20 +473,150 @@ class TestOwnerDisplacement(LipTestCase):
         self.assertGreaterEqual(a[sib.key], 62)
 
 
+class TestRecallRequiresScarcity(LipTestCase):
+    """THE LIVE CANCEL WAVE, 2026-07-30 — the regression that must never come back.
+
+    D5\' retired the one-rung-per-cluster COUNT, and the accrual recall that survived it fired
+    on RANK ALONE: `owner_accrued[cluster] > slot.accrued`.  The estimates feed credits ONE
+    owner per cluster, so nearly every resting rung read as "poorer than the owner":
+    `pass2_refused` showed owner_recalled on 94 of 105 candidates and the requoter\'s q=0 path
+    cancelled the ENTIRE resting book, ~10 rungs.  No fills and no losses — and presence at
+    zero, which is the only thing this program sells.
+
+    THE ERROR WAS CATEGORY, NOT DEGREE.  "1.153 has earned one cent, 1.155 has earned 26 —
+    cancel 1.153, open 1.155" answers a question that only EXISTS when the two cannot both be
+    funded.  Under D5\' the cluster is bounded by dollars, so when the reserve affords both,
+    BOTH REST — that is the feature.  Accrual rank decides who wins a contest; it does not
+    create one.
+    """
+
+    def rungs(self, sib_p=0.10):
+        """Owner and sibling in one cluster at 10c, so the dollars are readable directly."""
+        owner = _slot("KXEUR-1-T1155", p=0.10, S=100.0, rho=6.25, accrued=0.30)
+        sib = _slot("KXEUR-1-T1153", p=sib_p, S=100.0, rho=6.25, accrued=0.0)
+        return owner, sib
+
+    def test_a_reserve_that_affords_BOTH_recalls_nothing(self):
+        """(a) $10 reserve; the owner already rests $5 of it; the sibling wants a $4 lot.
+        Nine dollars of a ten dollar reserve: no contest, no cancel, both rest."""
+        owner, sib = self.rungs()
+        a, _, _ = alloc.allocate([owner, sib], 300.0, RSTAR,
+                                 caps=alloc.Caps(inv_cap_usd=4.0),
+                                 cluster_cap_usd=10.0,
+                                 resting={owner.key: 50.0},          # 50 x $0.10 = $5.00
+                                 owner_seed={"KXEUR": owner.key},
+                                 owner_accrued={"KXEUR": 0.30})
+        self.assertGreater(a[sib.key], 0, "the sibling was cancelled with room to spare")
+        self.assertGreaterEqual(a[owner.key], 50)
+        self.assertEqual(self.logs_of("rung_recalled"), [])
+
+    def test_a_reserve_that_cannot_fund_the_OWNER_recalls_the_poorer_rung(self):
+        """(b) The owner\'s floor-clearing lot is $8 and the sibling rests $5 of a $10
+        reserve: keeping the sibling really does deny the owner, so the pot wins and the
+        freed dollars land on it."""
+        owner = _slot("KXEUR-1-T1155", p=0.10, S=720.0, rho=1.0, hours_left=24.0,
+                      window_h=24.0, accrued=0.30)
+        sib = _slot("KXEUR-1-T1153", p=0.10, S=100.0, rho=6.25, accrued=0.0)
+        self.assertAlmostEqual(alloc.cliff_clearing_q(owner) * owner.p, 8.00, places=6)
+        a, _, _ = alloc.allocate([owner, sib], 300.0, RSTAR,
+                                 caps=alloc.Caps(inv_cap_usd=8.0),
+                                 cluster_cap_usd=10.0,
+                                 resting={sib.key: 50.0},            # 50 x $0.10 = $5.00
+                                 owner_seed={"KXEUR": owner.key},
+                                 owner_accrued={"KXEUR": 0.30})
+        self.assertEqual(a[sib.key], 0, "the poorer rung must yield the contested dollars")
+        self.assertGreater(a[owner.key], 0, "…and the owner must actually get them")
+
+    def test_the_recall_says_who_took_the_seat_and_what_it_cost(self):
+        """The wave was diagnosed from a counter that could only say `owner_recalled`.  A
+        recall CANCELS A LIVE ORDER; one journal line must carry both accruals and the
+        dollars in dispute."""
+        owner = _slot("KXEUR-1-T1155", p=0.10, S=720.0, rho=1.0, hours_left=24.0,
+                      window_h=24.0, accrued=0.30)
+        sib = _slot("KXEUR-1-T1153", p=0.10, S=100.0, rho=6.25, accrued=0.02)
+        alloc.allocate([owner, sib], 300.0, RSTAR, caps=alloc.Caps(inv_cap_usd=8.0),
+                       cluster_cap_usd=10.0, resting={sib.key: 50.0},
+                       owner_seed={"KXEUR": owner.key}, owner_accrued={"KXEUR": 0.30})
+        rows = self.logs_of("rung_recalled")
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual((r["ticker"], r["side"]), ("KXEUR-1-T1153", "bid"))
+        self.assertEqual((r["kept"], r["kept_side"]), ("KXEUR-1-T1155", "bid"))
+        self.assertAlmostEqual(r["recalled_accrued"], 0.02, places=6)
+        self.assertAlmostEqual(r["kept_accrued"], 0.30, places=6)
+        self.assertAlmostEqual(r["cluster_cap_usd"], 10.0, places=6)
+        self.assertAlmostEqual(r["sibling_claim_usd"], 5.00, places=6)
+        self.assertAlmostEqual(r["owner_need_usd"], 8.00, places=6)
+        self.assertAlmostEqual(r["freed_usd"], 5.00, places=6)
+        self.assertLess(r["room_for_owner_usd"], r["owner_need_usd"])
+
+    def test_a_POSITION_is_never_recalled_because_a_cancel_frees_nothing(self):
+        """Held inventory rides.  A rung that holds and rests nothing cannot resolve any
+        contest, so ranking it against the owner is meaningless."""
+        owner, sib = self.rungs()
+        a, _, _ = alloc.allocate([owner, sib], 300.0, RSTAR,
+                                 caps=alloc.Caps(inv_cap_usd=8.0),
+                                 cluster_cap_usd=10.0,
+                                 held={sib.key: 50.0},
+                                 owner_seed={"KXEUR": owner.key},
+                                 owner_accrued={"KXEUR": 0.30})
+        self.assertEqual(self.logs_of("rung_recalled"), [])
+
+    def test_the_whole_book_is_not_cancelled_when_every_cluster_has_room(self):
+        """The wave\'s exact shape: ten rungs, ten clusters, one credited owner each, every
+        reserve roomy.  Zero recalls."""
+        slots, seeds, accs, rest = [], {}, {}, {}
+        for i in range(10):
+            ck = "KXV%d" % i
+            owner = _slot("%s-1-T155" % ck, p=0.10, S=100.0, rho=6.25, accrued=0.30)
+            sib = _slot("%s-1-T153" % ck, p=0.10, S=100.0, rho=6.25, accrued=0.0)
+            slots += [owner, sib]
+            seeds[ck] = owner.key
+            accs[ck] = 0.30
+            rest[sib.key] = 20.0                                     # $2.00 resting each
+        a, _, _ = alloc.allocate(slots, 300.0, RSTAR, caps=alloc.Caps(inv_cap_usd=4.0),
+                                 cluster_cap_usd=10.0, resting=rest,
+                                 owner_seed=seeds, owner_accrued=accs)
+        self.assertEqual(self.logs_of("rung_recalled"), [])
+        self.assertEqual(sum(1 for k in rest if a.get(k, 0) > 0), 10,
+                         "the resting book was cancelled: the wave is back")
+
+
 class TestOwnerRanksByAccruedDollars(LipTestCase):
     """Ryan: 1c may not tie with 26c — the AMOUNT is the weight.  And a program whose only
     claim is banked accrual (position predating the state archive) still owns its cluster,
     side-wildcard."""
 
-    def test_the_bigger_pot_wins_over_bigger_committed_basis(self):
+    def test_the_bigger_pot_wins_over_bigger_committed_basis_WHEN_CONTESTED(self):
+        """Ryan\'s ordering is intact — the pot outranks the stake — but it now answers a
+        question that has to EXIST first: the reserve here holds $7.44 of sibling against a
+        cap that cannot also fund the owner\'s floor-clearing lot."""
+        rich_pot = _slot("KXEUR-1-T1155", accrued=0.26)
+        big_stake = _slot("KXEUR-1-T1153", accrued=0.01)
+        a, _, _ = alloc.allocate([rich_pot, big_stake], 300.0, RSTAR, cluster_cap_usd=7.5,
+                                 resting={big_stake.key: 62.0},   # 62 x $0.12 = $7.44
+                                 owner_seed={"KXEUR": rich_pot.key},
+                                 owner_accrued={"KXEUR": 0.26})
+        self.assertEqual(a[big_stake.key], 0, "the 1c rung must be displaced")
+        self.assertGreater(a[rich_pot.key], 0, "the 26c rung must be funded")
+        row = self.logs_of("rung_recalled")[0]
+        self.assertEqual(row["ticker"], "KXEUR-1-T1153")
+        self.assertEqual(row["kept"], "KXEUR-1-T1155")
+        self.assertAlmostEqual(row["recalled_accrued"], 0.01, places=6)
+        self.assertAlmostEqual(row["kept_accrued"], 0.26, places=6)
+
+    def test_the_bigger_pot_takes_NOTHING_when_the_reserve_fits_both(self):
+        """The live wave, in one assertion: the same ranking, a reserve that affords both,
+        and no cancel."""
         rich_pot = _slot("KXEUR-1-T1155", accrued=0.26)
         big_stake = _slot("KXEUR-1-T1153", accrued=0.01)
         a, _, _ = alloc.allocate([rich_pot, big_stake], 300.0, RSTAR, cluster_cap_usd=10.0,
                                  resting={big_stake.key: 62.0},
                                  owner_seed={"KXEUR": rich_pot.key},
                                  owner_accrued={"KXEUR": 0.26})
-        self.assertEqual(a[big_stake.key], 0, "the 1c rung must be displaced")
-        self.assertGreater(a[rich_pot.key], 0, "the 26c rung must be funded")
+        self.assertGreaterEqual(a[big_stake.key], 62)
+        self.assertGreater(a[rich_pot.key], 0)
+        self.assertEqual(self.logs_of("rung_recalled"), [])
 
     def test_a_wildcard_owner_admits_either_side_of_its_ticker(self):
         bid = _slot("KXEUR-1-T1155")
@@ -491,12 +625,26 @@ class TestOwnerRanksByAccruedDollars(LipTestCase):
                                  owner_accrued={"KXEUR": 0.26})
         self.assertGreater(a[bid.key], 0, "the wildcard owner's own rung was refused")
 
-    def test_a_wildcard_owner_still_blocks_siblings(self):
+    def test_a_wildcard_owner_does_NOT_block_a_sibling_the_reserve_can_afford(self):
+        """REWRITTEN 2026-07-30 after the live cancel wave — was
+        `test_a_wildcard_owner_still_blocks_siblings`.  Outranking is not a reason to cancel:
+        with a $10 reserve, a slotless owner needing one $5 lot and a sibling taking one $5
+        lot, NOTHING is contested and both rest.  The old assertion is the incident's shape."""
         sib = _slot("KXEUR-1-T1153")
         a, _, _ = alloc.allocate([sib], 300.0, RSTAR, cluster_cap_usd=10.0,
                                  owner_seed={"KXEUR": ("KXEUR-1-T1155", None)},
                                  owner_accrued={"KXEUR": 0.26})
+        self.assertGreater(a[sib.key], 0)
+        self.assertEqual(self.logs_of("rung_recalled"), [])
+
+    def test_a_wildcard_owner_DOES_recall_when_the_reserve_holds_only_one_lot(self):
+        """The same pair, one lot of room: now the dollars really are claimed twice."""
+        sib = _slot("KXEUR-1-T1153")
+        a, _, _ = alloc.allocate([sib], 300.0, RSTAR, cluster_cap_usd=C.SLOT_LOT_CAP_USD,
+                                 owner_seed={"KXEUR": ("KXEUR-1-T1155", None)},
+                                 owner_accrued={"KXEUR": 0.26})
         self.assertEqual(a[sib.key], 0)
+        self.assertTrue(self.logs_of("rung_recalled"))
 
 
 class TestDisplacementCoversTheRescue(LipTestCase):

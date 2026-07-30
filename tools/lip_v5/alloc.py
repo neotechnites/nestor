@@ -695,6 +695,86 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
     # part of the old ownership gate that survives.  It is not a count — a cluster may hold
     # any number of rungs — it is "this rung's own settle source has a strictly richer pot
     # elsewhere, so its capital belongs there this period".
+    #
+    # ── SCARCITY IS THE PRECONDITION.  A RECALL RESOLVES A CONFLICT; IT IS NOT A PURGE. ────
+    # (2026-07-30, LIVE INCIDENT: the first cut fired on accrual RANK ALONE — `owner_accrued
+    # [ck] > slot.accrued` — and the estimates feed credits ONE owner per cluster, so nearly
+    # every resting rung read as "poorer than the owner".  `pass2_refused` showed
+    # owner_recalled on 94 of 105 candidates and the requoter's q=0 path cancelled the ENTIRE
+    # resting book, ~10 rungs.  No fills and no losses, but presence went to zero — the one
+    # thing this program is for.  Rolled back.)
+    # THE ERROR WAS CATEGORY, NOT DEGREE.  Ryan's rule ("1.153 has earned one cent, 1.155 has
+    # earned 26 — cancel 1.153, open 1.155") is an answer to a question that only EXISTS when
+    # the two rungs cannot both be funded.  Under D5′ the cluster is bounded by DOLLARS, so
+    # when the reserve can afford both, BOTH REST — that is the entire feature.  Accrual rank
+    # decides WHO WINS a contest; it does not create one.
+    # So the recall now needs a contest to resolve: keeping this rung must actually DENY the
+    # richer owner the lot it qualifies for.  Room is measured the way the cluster cap
+    # measures everything — dollars — and the owner's claim is bounded by the LOT container,
+    # the smallest presence it can re-post with, which is the conservative (fewer recalls)
+    # end of the mirror.
+    # MIRROR (recalling too EAGERLY ↔ never recalling): too eagerly is measured above, a book
+    # cancelled to zero by a rule that never asked whether anything was scarce; never
+    # recalling re-admits the 1.155 incident, where new capital funded a $0 pot while the
+    # earning rung drifted toward the forfeit cliff.  The seam between them is whether the
+    # SAME DOLLARS are being claimed twice.
+    # BUDGET-scarcity is deliberately NOT tested here: it is not knowable before the water
+    # level runs, and it already has its own resolver — the displacement pass at capacity,
+    # which ranks by expected credit with the banked pot on the incumbent's side.
+    slot_by_key = {}
+    for _s in slots:
+        slot_by_key.setdefault(_s.key, _s)
+
+    def _recall_conflict(s, ck, owner_key):
+        """Do this rung's dollars actually stand between the owner and a fundable lot?
+
+        Returns (contested, detail).  `detail` is logged with every recall so a future wave is
+        one journal line, not an archaeology project."""
+        if cluster_cap_usd is None:
+            return False, {}                  # no dollar bound ⇒ no contested dollar
+        cap = float(cluster_cap_usd)
+        # WHAT A RECALL WOULD ACTUALLY FREE — that, and not a cent more, is this rung's claim
+        # on the contested dollars.  Only RESTING dollars are recallable: a cancel returns
+        # collateral, a POSITION rides (2026-07-30, "positions RIDE"), so a rung that holds
+        # inventory and rests nothing can be cancelled all day and free nothing — there is no
+        # contest for it to resolve.  A rung with neither would take a fresh lot, so a lot is
+        # what it claims.  (Charging a resting rung for growth it MIGHT later be granted
+        # inflates every contest toward a recall, which is the direction the live wave went.)
+        sib_resting = float((resting or {}).get(s.key, 0.0)) * s.p
+        sib_held = float((held or {}).get(s.key, 0.0)) * s.p
+        if sib_resting > 0:
+            sib_claim = sib_resting
+        elif sib_held > 0:
+            return False, {}                  # nothing a cancel can free
+        else:
+            sib_claim = min(float(caps.inv_cap_usd), cap)
+        o_slot = slot_by_key.get(owner_key)
+        if o_slot is None and owner_key[1] is None:
+            o_slot = next((x for x in slots if x.ticker == owner_key[0]), None)
+        o_p = o_slot.p if o_slot is not None else s.p
+        o_hq = float((held or {}).get(owner_key, 0.0)) + \
+            float((resting or {}).get(owner_key, 0.0))
+        owner_committed = o_hq * o_p
+        if o_slot is not None:
+            q_o = cliff_clearing_q(o_slot)
+            owner_target = 0.0 if q_o is None else min(max(1, int(q_o)) * o_p,
+                                                       float(caps.inv_cap_usd))
+        else:
+            # The owner has no slot this cycle (the classification gap that WAS the 1.155
+            # incident).  It cannot be sized, so it is credited with exactly one lot — the
+            # minimum presence it needs when it reappears — and no more.
+            owner_target = float(caps.inv_cap_usd)
+        owner_need = max(0.0, owner_target - owner_committed)
+        others = max(0.0, per_cluster.get(ck, 0.0) - sib_resting)
+        room_for_owner = cap - others - sib_claim
+        contested = owner_need > 0.0 and room_for_owner + 1e-9 < owner_need
+        return contested, {"cluster": ck, "cluster_cap_usd": round(cap, 4),
+                           "committed_usd": round(per_cluster.get(ck, 0.0), 4),
+                           "sibling_claim_usd": round(sib_claim, 4),
+                           "owner_need_usd": round(owner_need, 4),
+                           "room_for_owner_usd": round(room_for_owner, 4),
+                           "freed_usd": round(sib_resting, 4)}
+
     recalled = set()
     elig = []
     for s in slots:
@@ -717,12 +797,33 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
         # level to decide only about the MARGIN.
         _ck0 = _cluster_key(s)
         _owner0 = cluster_owner.get(_ck0)
-        if _owner0 is not None and _owner0 != s.key and \
-                not (_owner0[1] is None and _owner0[0] == s.ticker) and \
-                float(_own_acc.get(_ck0, 0.0)) > float(getattr(s, "accrued", 0.0) or 0.0) + 1e-9:
+        _sib_acc = float(getattr(s, "accrued", 0.0) or 0.0)
+        _own_a = float(_own_acc.get(_ck0, 0.0))
+        _outranked = (_owner0 is not None and _owner0 != s.key
+                      and not (_owner0[1] is None and _owner0[0] == s.ticker)
+                      and _own_a > _sib_acc + 1e-9)
+        _contested, _detail = _recall_conflict(s, _ck0, _owner0) if _outranked else (False, {})
+        if _outranked and _contested:
             alloc[s.key] = int(q_alloc.get(s.key, 0))     # displaced: no resting seed ⇒
                                                           # the requoter recalls the order
             recalled.add(s.key)                           # …and nothing re-funds it today
+            # A RECALL IS A CANCEL, AND CANCELLED DOLLARS COME HOME.  Without this the
+            # cluster tally still counted the recalled rung's collateral, so the seat we
+            # just emptied was still full: the owner could not fund, and the book paid a
+            # cancel for nothing — strictly worse than leaving the rung alone.  Held
+            # inventory is NOT returned (it rides; only resting collateral is freed).
+            _freed = float((resting or {}).get(s.key, 0.0)) * s.p
+            if _freed > 0:
+                per_cluster[_ck0] = max(0.0, per_cluster.get(_ck0, 0.0) - _freed)
+                per_cluster_px[_ck0] = max(0.0,
+                                           per_cluster_px.get(_ck0, 0.0) - _freed * s.p)
+            # ONE LINE, BOTH SIDES, AND THE DOLLARS IN DISPUTE.  The live wave was diagnosed
+            # from a pass2_refused counter that could only say "owner_recalled"; a recall is a
+            # CANCEL of a live order and must say who took the seat and what it cost.
+            R.log("rung_recalled", ticker=s.ticker, side=s.side,
+                  recalled_accrued=round(_sib_acc, 6),
+                  kept=_owner0[0], kept_side=_owner0[1],
+                  kept_accrued=round(_own_a, 6), **_detail)
         else:
             alloc[s.key] = max(int(q_alloc.get(s.key, 0)),
                                int(float((resting or {}).get(s.key, 0.0))))
