@@ -205,13 +205,28 @@ class FakeExchange(object):
         return 200, {"settlements": list(self.settlement_rows)}
 
     def orders(self):
+        # THE WIRE'S DIALECT, not ours.  The fake used to hand back a bare `price` key and a
+        # `side` of "bid"/"ask" — our INTERNAL axis, invented here and present in no payload —
+        # which is precisely why the recovery sweep's `row.get("price")` looked correct while
+        # recovering every swept order at $0.00 collateral against the live account.  A
+        # resting order states its price as `yes_price_dollars`/`no_price_dollars` (the same
+        # dollar-string shift as `count_fp` on fills), its remainder as `remaining_count_fp`,
+        # and its direction as (side, action) — an ask on the YES book is side "yes" with
+        # action "sell", which the old parser read as a BID.  The fake speaks only that
+        # dialect, so a parser regression to the invented fields fails the suite instead of
+        # the account.
         rows = []
         for oid, body in sorted(self.resting.items()):
+            yes_p = float(body.get("price", 0))
+            our_side = body.get("side")                   # the fake's own book: "bid"/"ask"
             rows.append({"order_id": oid,
                          "client_order_id": body.get("client_order_id"),
-                         "ticker": body.get("ticker"), "side": body.get("side"),
-                         "price": body.get("price"),
-                         "remaining_count": float(body.get("count", 0))})
+                         "ticker": body.get("ticker"),
+                         "side": "yes",
+                         "action": "buy" if our_side == "bid" else "sell",
+                         "yes_price_dollars": "%.4f" % yes_p,
+                         "no_price_dollars": "%.4f" % (1.0 - yes_p),
+                         "remaining_count_fp": "%.2f" % float(body.get("count", 0))})
         return 200, {"orders": rows}
 
     # -- writes ------------------------------------------------------------------------

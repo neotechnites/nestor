@@ -328,6 +328,7 @@ class Runner(object):
                     o["remaining"] * R.unit_collateral(o["side"], o["price"])
 
         # --- step-4 sweep against the exchange ---
+        # (the wire's dialect for a resting order is parsed by `parse_order_row` below)
         admitted, _ = self.m.bucket.admit("verify", now)
         if not admitted:
             return
@@ -345,10 +346,7 @@ class Runner(object):
         for oid, row in sorted(exch.items()):
             if oid in self.m.orders:
                 continue
-            remaining = float(row.get("remaining_count") or 0.0)
-            price = float(row.get("price") or 0.0)
-            side = row.get("side") if row.get("side") in ("bid", "ask") else \
-                ("bid" if str(row.get("side")).lower() == "yes" else "ask")
+            remaining, price, side = self.parse_order_row(row)
             o = {"order_id": oid, "coid": row.get("client_order_id"),
                  "ticker": row.get("ticker"), "side": side, "price": price,
                  "size": remaining, "remaining": remaining, "placed_ts": 0.0}
@@ -366,6 +364,55 @@ class Runner(object):
             self.m.unknown.note(oid, o["ticker"], o["side"], o.get("remaining", 0.0), now)
             R.log("recovery_order_gone", order_id=oid, ticker=o["ticker"],
                   why="replay says live; exchange does not show it")
+
+    @staticmethod
+    def parse_order_row(row):
+        """One resting-order row from `GET /portfolio/orders` → (remaining, yes_price, side).
+
+        THE SWEEP WAS READING A DIALECT THE WIRE DOES NOT SPEAK.  It parsed a bare `price`
+        key, and there is no such key: the 2026-07-30 wire states an order's price as
+        `yes_price_dollars` / `no_price_dollars` (the same shift that made `count_fp` replace
+        `count` on fills — see engine.book_fill_row's captured-payload note).  So EVERY swept
+        order recovered at price 0.0, and the consequences all run through that zero:
+
+          * its collateral registered as `remaining × unit_collateral(side, 0)` — $0 for a
+            bid — so the cash feed published delta_dollars ABOVE truth while the exchange
+            held the real dollars (the §5.3 invariant, inverted);
+          * B10's ladder later books it as filled at a ZERO BASIS, which mis-states
+            inventory cost, the caps sized from it, and the P&L that feeds the day stop.
+
+        And the side derivation ignored `action`, so a SELL of YES — our ask — recovered as
+        a bid: the collateral is then taken as p instead of 1−p, and the requoter believes it
+        holds presence on the side it does not.  Parsed here with the same ladders
+        book_fill_row uses: `*_fp` and `*_dollars` FIRST, the legacy cents/floats second, and
+        `book_side` honored ahead of the (side, action) derivation because it states OUR side
+        of the book directly.  MIRROR: `remaining_count_fp` and `remaining_count` are both
+        read (v4's `do_cancel` refresh reads the same pair), fp first, because a fractional
+        remainder truncated to the int field would under-count collateral — the same
+        direction as the zero.
+        """
+        rfp = row.get("remaining_count_fp")
+        remaining = float(rfp) if rfp is not None else float(row.get("remaining_count") or 0.0)
+        ypd, npd, ypc = (row.get("yes_price_dollars"), row.get("no_price_dollars"),
+                         row.get("yes_price"))
+        if ypd is not None:
+            price = float(ypd)
+        elif npd is not None:
+            price = 1.0 - float(npd)              # the YES axis is the one we book on
+        elif ypc is not None:
+            price = float(ypc) / 100.0            # legacy cents
+        else:
+            price = float(row.get("price") or 0.0)
+        bs = row.get("book_side")
+        if bs in ("bid", "ask"):
+            side = bs
+        elif row.get("side") in ("bid", "ask"):
+            side = row["side"]
+        else:
+            leg_, sign_ = cutover.normalize_fill(row.get("side"), row.get("action", "buy"))
+            ask_like = (leg_ == "bid" and sign_ < 0) or (leg_ == "ask" and sign_ > 0)
+            side = "ask" if ask_like else "bid"
+        return remaining, price, side
 
     # =========================================================================================
     # THE LOOP

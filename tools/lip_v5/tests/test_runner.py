@@ -547,6 +547,65 @@ class TestRecoveryOrders(RunnerCase):
         self.assertTrue(self.logs_of("recovery_order_gone"))
 
 
+class TestTheSweepSpeaksTheWiresDialect(RunnerCase):
+    """The recovery sweep parsed a bare `price` key that no payload carries, so every swept
+    order recovered at $0.00 — collateral published ABOVE truth, and a later assume-fill
+    booked at a zero basis.  It also ignored `action`, recovering a sell-YES as a bid."""
+
+    NESTOR = {"open_order_tickers": [], "position_tickers": []}
+
+    def test_the_fake_emits_no_invented_price_key(self):
+        """Structural: the fake is the engine's contract with the wire.  A `price` key here
+        would let the old parser pass a green suite against a wire that has none."""
+        ex = ScanExchange(balance_cents=1_000_000)
+        ex.resting["x9"] = {"ticker": "T", "side": "bid", "count": 7, "price": "0.4000",
+                            "client_order_id": "v5-lipm-T-y-99"}
+        _, body = ex.orders()
+        row = body["orders"][0]
+        self.assertNotIn("price", row)
+        self.assertNotIn("remaining_count", row)
+        self.assertEqual(row["yes_price_dollars"], "0.4000")
+
+    def test_a_swept_bid_recovers_at_the_TRUE_price_and_collateral(self):
+        r = self.runner()
+        r.m.ex.resting["x9"] = {"ticker": "T", "side": "bid", "count": 7, "price": "0.4000",
+                                "client_order_id": "v5-lipm-T-y-99"}
+        r.init(NOW, nestor_state=self.NESTOR)
+        o = r.m.orders["x9"]
+        self.assertEqual(o["side"], "bid")
+        self.assertAlmostEqual(o["price"], 0.40, places=9)
+        self.assertAlmostEqual(o["remaining"], 7.0, places=9)
+        self.assertAlmostEqual(r.m.cash.resting_collateral, 2.8, places=9)
+
+    def test_a_swept_sell_of_YES_recovers_as_an_ASK(self):
+        """(side="yes", action="sell") is an ask-shaped order: its collateral is 1−p, and the
+        requoter must not believe it holds presence on the bid."""
+        r = self.runner()
+        r.m.ex.resting["x9"] = {"ticker": "T", "side": "ask", "count": 10, "price": "0.4000",
+                                "client_order_id": "v5-lipm-T-n-99"}
+        r.init(NOW, nestor_state=self.NESTOR)
+        o = r.m.orders["x9"]
+        self.assertEqual(o["side"], "ask")
+        self.assertAlmostEqual(r.m.cash.resting_collateral, 6.0, places=9)   # 10 × (1−0.40)
+
+    def test_the_parser_ladder_takes_fp_and_dollars_first(self):
+        parse = RUN.Runner.parse_order_row
+        # the 2026-07-30 dialect, fractional remainder
+        self.assertEqual(parse({"remaining_count_fp": "2.97", "remaining_count": 2,
+                                "yes_price_dollars": "0.1300", "side": "yes",
+                                "action": "sell"}), (2.97, 0.13, "ask"))
+        # no_price_dollars alone still lands on the YES axis
+        self.assertEqual(parse({"remaining_count": 5, "no_price_dollars": "0.8700",
+                                "side": "no", "action": "buy"}), (5.0, 0.13, "ask"))
+        # book_side, when the wire states it, wins outright
+        self.assertEqual(parse({"remaining_count": 5, "yes_price_dollars": "0.1300",
+                                "book_side": "bid", "side": "no",
+                                "action": "buy"}), (5.0, 0.13, "bid"))
+        # legacy cents/floats remain the last rung of the ladder
+        self.assertEqual(parse({"remaining_count": 5, "yes_price": 13,
+                                "side": "bid"}), (5.0, 0.13, "bid"))
+
+
 class TestCrashGapDoesNotReBookTheTape(RunnerCase):
     """B8's dedupe is IN-MEMORY and reborn empty every process, while the crash-gap window is
     overlapping BY CONSTRUCTION — so recovery re-booked fills the dying process had already
