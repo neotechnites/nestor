@@ -1102,7 +1102,13 @@ class Maker(object):
             return None
         exch = {}
         for row in (body.get("market_positions") or []):
-            exch[row.get("ticker")] = float(row.get("position", 0))
+            # 2026-07-30 wire dialect: `position_fp` (fractional dollar-string) replaced
+            # `position` — the old read returned 0 for EVERY market, which BLINDED the
+            # divergence check exactly while phantom inventory (~$198 of assume_filled
+            # double-books from the broken-fills era) starved the budget.  Same class as
+            # count_fp; found from Ryan's portfolio screenshot.
+            _pfp = row.get("position_fp")
+            exch[row.get("ticker")] = float(_pfp) if _pfp is not None                 else float(row.get("position", 0))
         for t, n in exch.items():
             ours = self.positions.get(t, {})
             our_net = ours.get("yes", 0.0) - ours.get("no", 0.0)

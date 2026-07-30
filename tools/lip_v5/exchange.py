@@ -183,7 +183,11 @@ class FakeExchange(object):
         return 200, {"trades": [{"ticker": ticker, "created_time": self.now}]}
 
     def positions(self):
-        return 200, {"market_positions": list(self._positions)}
+        # the 2026-07-30 wire dialect: position_fp fractional dollar-strings
+        rows = [{"ticker": p.get("ticker"),
+                 "position_fp": "%.2f" % float(p.get("position", 0))}
+                for p in self._positions]
+        return 200, {"market_positions": rows}
 
     def programs(self, cursor=None):
         return 200, {"incentive_programs": [], "next_cursor": None}

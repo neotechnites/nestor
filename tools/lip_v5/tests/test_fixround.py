@@ -74,7 +74,8 @@ class TestFakeFidelity(LipTestCase):
         self.assertEqual(row["fee_cost"], "0.000000")
         self.assertTrue(row["trade_id"])
         self.assertNotIn(oid, ex.resting)                  # gone: only fills can teach it
-        self.assertEqual(ex.positions()[1]["market_positions"][0]["position"], 10.0)
+        self.assertEqual(
+            float(ex.positions()[1]["market_positions"][0]["position_fp"]), 10.0)
         self.assertEqual(ex.cancel(oid)[0], 404)
 
     def test_the_public_book_reflects_our_own_resting_orders(self):
