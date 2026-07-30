@@ -246,7 +246,8 @@ def run_live(args, now=None):                                # pragma: no cover 
             return 2
         exchange_positions = {}
         for row in (pb or {}).get("market_positions") or []:
-            net = float(row.get("position", 0))
+            _pfp = row.get("position_fp")     # 2026-07-30 wire dialect (see engine.reconcile)
+            net = float(_pfp) if _pfp is not None else float(row.get("position", 0))
             if net > 0:
                 exchange_positions[(row.get("ticker"), "yes")] = net
             elif net < 0:
