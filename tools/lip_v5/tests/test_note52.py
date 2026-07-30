@@ -720,81 +720,36 @@ class TestExchangeEstimatesFeed(LipTestCase):
             self.assertEqual(m.poll_estimates(1030.0), 0)   # inside 60s: no re-poll
 
 
-class TestBookReinstatement(LipTestCase):
-    """SF-4d (Ryan: capital deployed in 5 minutes, not 5 hours).  The resting book is
-    STATE: snapshotted every 30s, replayed through the cheap safety checks and the normal
-    rails on init.  Discovery is for NEW rungs; recovery is replay."""
+class TestReplayIsGone(LipTestCase):
+    """STAGE 5, 2026-07-30 — `TestBookReinstatement` and its whole feature are deleted.
 
-    TKR = "KXAAAGASD-26JUL29-T4.12"
+    SF-4d snapshotted the resting book and re-placed it on init, so the book became a
+    function of what the book used to be: two processes on the same world would quote
+    differently depending on which one had a snapshot.  Ryan's concept forbids exactly this —
+    "it comes to the exact same conclusions it had, and places all the same orders, as a
+    symptom of how it works, not as a directed rule."
 
-    def _rig(self, snapshot=None, snapshot_age=60.0, close_h=16.0):
-        from .test_engine import EngineCase
-        from .test_runner import NOW as RNOW, program_body
-        from .. import exchange as X, runner as RUN, runtime as RT_
+    The motivation was real (capital deployed in minutes, not hours) and is answered from the
+    other side: derivation must be fast and complete enough to reproduce the book by itself.
+    The acceptance test in test_convergence.py is what holds that promise now.  Memory of the
+    WORLD survives untouched — the close cache is still persisted, still flushed on age."""
 
-        class T(EngineCase):
-            def runTest(self):
-                pass
-        t = T()
-        t.setUp()
-        self.logs = t.logs
-        self.addCleanup(t.doCleanups)
-        tk = self.TKR
-        ex = X.FakeExchange(balance_cents=1_000_000, now=RNOW)
-        ex.books[tk] = {"orderbook": {"orderbook_fp": {
-            "yes_dollars": [["0.06", "1200"]], "no_dollars": [["0.93", "1200"]]}}}
-        ex._programs = program_body(tickers=(tk,))
-        ex.programs = lambda cursor=None: (200, ex._programs)
-        ex.market_closes[tk] = RNOW + 16 * 3600
-        m = t.maker(ex=ex)
-        # the snapshot path is derived from DATA_DIR at import; repoint it at the tmpdir
-        import unittest.mock as mock
-        p = mock.patch.object(C, "BOOK_SNAPSHOT_PATH", t.path("v5_book_snapshot.json"))
-        p.start()
-        self.addCleanup(p.stop)
-        if snapshot is not None:
-            RT_.atomic_write_json(C.BOOK_SNAPSHOT_PATH,
-                                  {"ts": RNOW - snapshot_age, "rungs": snapshot})
-        r = RUN.Runner(m, sleep=lambda _s: None)
-        r.classifier.close_ts[tk] = RNOW + close_h * 3600
-        return r, ex, tk, RNOW
+    def test_the_runner_cannot_replay_a_book(self):
+        from .. import runner as RUN
+        for gone in ("reinstate", "reinstate_pass", "pending_reinstate"):
+            self.assertFalse(hasattr(RUN.Runner, gone), gone)
 
-    def test_a_fresh_snapshot_reinstates_through_the_rails(self):
-        r, ex, tk, NOW_ = self._rig(snapshot=[{"ticker": self.TKR, "side": "bid",
-                                               "price": 0.06, "q": 40}])
-        ok, _ = r.init(NOW_, nestor_state={"open_order_tickers": [],
-                                           "position_tickers": []})
-        self.assertTrue(ok)
-        self.assertTrue(ex.placed, "the snapshot rung never reached the wire")
-        self.assertAlmostEqual(float(ex.placed[0]["price"]), 0.06, places=6)
-        self.assertTrue(self.logs_of("reinstated"))
+    def test_the_cycle_persists_no_resting_book(self):
+        from .. import engine as E
+        import inspect
+        src = inspect.getsource(E.Maker.cycle)
+        self.assertNotIn("BOOK_SNAPSHOT_PATH", src)
 
-    def test_a_stale_snapshot_is_refused(self):
-        r, ex, tk, NOW_ = self._rig(snapshot=[{"ticker": self.TKR, "side": "bid",
-                                               "price": 0.06, "q": 40}],
-                                    snapshot_age=C.REINSTATE_MAX_AGE_S + 60)
-        r.init(NOW_, nestor_state={"open_order_tickers": [], "position_tickers": []})
-        self.assertEqual(ex.placed, [], "a stale book must re-derive, not replay")
-
-    def test_a_denied_or_far_settling_rung_is_skipped(self):
-        r, ex, tk, NOW_ = self._rig(
-            snapshot=[
-                {"ticker": "KXEARNINGSMENTIONX-1-T1", "side": "bid",
-                 "price": 0.06, "q": 10},
-                {"ticker": self.TKR, "side": "bid", "price": 0.06, "q": 40}],
-            close_h=C.SETTLE_HORIZON_H + 100)
-        r.init(NOW_, nestor_state={"open_order_tickers": [], "position_tickers": []})
-        self.assertEqual(ex.placed, [], "denied/far rungs must not reinstate")
-
-    def test_the_snapshot_is_written_by_the_cycle(self):
-        from .. import runtime as RT_
-        r, ex, tk, NOW_ = self._rig()
-        r.init(NOW_, nestor_state={"open_order_tickers": [], "position_tickers": []})
-        r.iteration(NOW_ + 1)
-        r.iteration(NOW_ + 40)                 # past BOOK_SNAPSHOT_S
-        snap = RT_.read_json(C.BOOK_SNAPSHOT_PATH, default=None)
-        self.assertTrue(snap and snap.get("rungs"),
-                        "the cycle never persisted the resting book")
+    def test_world_memory_is_UNTOUCHED(self):
+        """The line the concept draws: the close cache is a fact about markets, not about
+        us, and it stays."""
+        from .. import scan
+        self.assertTrue(hasattr(scan.Classifier, "_persist_closes"))
 
 
 from .. import runtime as R_

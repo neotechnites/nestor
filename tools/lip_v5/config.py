@@ -1497,16 +1497,17 @@ ESTIMATES_POLL_S = 60.0
 # restart needs only the cheap safety re-checks (live program, settle horizon, deny list,
 # quotable book) and the normal placement rails, which enforce every cap regardless.
 # Snapshot every 30 s; reinstate on init; discovery runs behind it for new rungs.
-BOOK_SNAPSHOT_NAME = "v5_book_snapshot.json"
+# STAGE 5 (2026-07-30): the book snapshot itself is gone — it persisted OUR OWN resting
+# rungs so a restart could replay them, and a book that is a function of what the book used
+# to be is the defect this refactor removes.  BOOK_SNAPSHOT_S survives as a DERIVATION
+# SOURCE only: it is this program's standing answer to "how much work may a restart
+# destroy", and `scan._persist_closes` inherits it for the close cache (world memory, which
+# is legal) rather than inventing a second opinion.
 BOOK_SNAPSHOT_S = 30.0
-# Stale-book bound: past this age the board has moved enough that re-derivation is the
-# honest path (a full program period could have rolled).  2 h ≈ several classify sweeps.
-REINSTATE_MAX_AGE_S = 2 * 3600.0
 ACCRUED_OVERRIDES_NAME = "v5_accrued_overrides.json"
 READINGS_NAME = "v5_readings.jsonl"
 READINGS_PATH = os.path.join(DATA_DIR, READINGS_NAME)
 ACCRUED_OVERRIDES_PATH = os.path.join(DATA_DIR, ACCRUED_OVERRIDES_NAME)
-BOOK_SNAPSHOT_PATH = os.path.join(DATA_DIR, BOOK_SNAPSHOT_NAME)
 # SF-3: the halted closing pass posts fully-closing sheds so a halted book can LEAVE.  When
 # the market's close is UNKNOWN (halt before the classify sweep learned it) the expiration
 # backstop cannot discharge its real job, so the order's life is bounded by the halt's own

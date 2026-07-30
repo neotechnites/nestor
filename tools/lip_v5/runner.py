@@ -76,112 +76,16 @@ class Runner(object):
                   keep=sum(1 for v in verdicts if v["decision"] == cutover.KEEP),
                   shed=sum(1 for v in verdicts if v["exit_path"] == cutover.MAKER_SHED),
                   cross=sum(1 for v in verdicts if v["decision"] == cutover.TAKER_CROSS))
-        self.reinstate(now)
+        # ── STAGE 5 (2026-07-30): REINSTATE IS GONE. ──────────────────────────────────
+        # It replayed the last snapshot of OUR OWN RESTING BOOK through the safety checks
+        # and re-placed it — the most direct possible violation of the concept: the book
+        # became a function of what the book used to be.  Its motivation (capital deployed
+        # in minutes, not hours) is real and is answered the other way round, by making
+        # DERIVATION fast and complete enough that the same world reproduces the same book
+        # on its own.  If re-derivation is slow, that is the bug to fix; replay only hid it.
 
         self.started = True
         return True, []
-
-    def reinstate(self, now):
-        """SF-4d — put the last-known-healthy book BACK on the wire in seconds.
-
-        THE CONCEPT (Ryan, 2026-07-30): the resting book is state.  Re-DERIVING it after
-        every restart runs the whole discovery chain — built for finding NEW rungs — and
-        took the better part of an hour; a rung that was healthy 30 s ago needs only the
-        cheap safety re-checks, and the placement rails enforce every cap regardless:
-          * snapshot fresh (≤ REINSTATE_MAX_AGE_S — past that, re-derive honestly),
-          * not denied, not frozen, not already resting (a KILL-restart keeps the wire),
-          * its program still LIVE and unpaid (one programs pull — already fetched),
-          * settles inside the horizon (close cache, disk, no request),
-          * its book still quotable: one read — join the current same-side best, never
-            cross, and the side must still QUALIFY (scored from the same read, free).
-        Then place through `Maker.place` — halt, day stop, caps, variance, ceiling all
-        still refuse exactly as they would any order.  ~2 requests per rung: a 25-rung
-        book is back in under 30 s at the startup burst rate.
-        """
-        m = self.m
-        if m.halt.halted:
-            return 0
-        snap = R.read_json(C.BOOK_SNAPSHOT_PATH, default=None)
-        if not isinstance(snap, dict) or not snap.get("rungs"):
-            return 0
-        age = float(now) - float(snap.get("ts") or 0)
-        if age > C.REINSTATE_MAX_AGE_S:
-            R.log("reinstate_stale", age_s=round(age, 1))
-            return 0
-        programs = self.scanner.scan(m.ex, m.bucket, now)
-        live_prog = {}
-        for p in programs:
-            if not p.get("paid_out") and float(p["end_ts"]) > float(now) >= float(p["start_ts"]):
-                for tk in p["tickers"]:
-                    live_prog[tk] = p
-        resting_now = {(o["ticker"], o["side"]) for o in m.orders.values()
-                       if o.get("remaining", 0) > 0 and not o.get("gone_404")}
-        placed = 0
-        # No silent caps (Ryan, 2026-07-30, third instance of this disease today): a
-        # reinstate that replays 0 of 40 rungs must say WHICH gate ate each one, or the
-        # book's recovery is an archaeology project instead of a grep.
-        why = {}
-
-        def _skip(reason):
-            why[reason] = why.get(reason, 0) + 1
-        for rung in snap["rungs"]:
-            tk, side = rung.get("ticker"), rung.get("side")
-            if side not in ("bid", "ask") or (tk, side) in resting_now:
-                _skip("already_resting")
-                continue
-            if C.series_denied(tk) or tk in m.frozen:
-                _skip("denied_or_frozen")
-                continue
-            prog = live_prog.get(tk)
-            if prog is None:
-                _skip("no_live_program")
-                continue
-            close = self.classifier.close_ts.get(tk)
-            if close is None or (float(close) - float(now)) / 3600.0 > C.SETTLE_HORIZON_H:
-                _skip("close_unknown_or_horizon")
-                continue                      # unknown close refuses, same as the D4 gate
-            admitted, _ = m.bucket.admit("book_poll", now)
-            if not admitted:
-                _skip("rate_budget_exhausted")
-                break                         # out of budget: the loop finds the rest
-            status, body = m.ex.book(tk)
-            m.note_http(status, now)
-            if status != 200:
-                _skip("book_http_%d" % status)
-                continue
-            rec = self.classifier.classify_one(tk, body, prog, now)
-            sd = rec["sides"][side]
-            if not sd.get("qualifies") or sd.get("p") in (None, 0) or not sd.get("legal"):
-                _skip("side_not_quotable")
-                continue                      # the free-ride gate's own test, same read
-            p = float(sd["p"])
-            price = p if side == "bid" else round(1.0 - p, 4)
-            other = rec["sides"]["ask" if side == "bid" else "bid"].get("p")
-            yes_bid = p if side == "bid" else other
-            yes_ask = (1.0 - p) if side == "ask" else ((1.0 - other) if other else None)
-            from . import quote as Q
-            if Q.would_cross(side, price, yes_bid, yes_ask):
-                _skip("would_cross")
-                continue
-            unit = price if side == "bid" else round(1.0 - price, 4)
-            q = min(float(rung.get("q") or 0),
-                    int(C.SLOT_LOT_CAP_USD / max(unit, 0.01)))
-            if q < 1:
-                _skip("lot_below_one")
-                continue
-            exp = int(float(close) - C.CLOSE_MARGIN_S)
-            if exp <= now:
-                _skip("expiry_past")
-                continue
-            ok, _reason, _resp = m.place(tk, side, price, q, exp, now,
-                                         available_cash_usd=m._available_cash())
-            if ok:
-                placed += 1
-            else:
-                _skip("place_%s" % (_reason or "refused"))
-        R.log("reinstated", rungs=placed, snapshot_age_s=round(age, 1),
-              refused=why or None)
-        return placed
 
     def recover(self, now):
         """v1 §9.4's restart procedure, in the order that makes each step's evidence available
