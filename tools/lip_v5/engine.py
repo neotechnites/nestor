@@ -83,6 +83,7 @@ class Maker(object):
         self.stopping = False
         self.last_meter_tick = None
         self.last_recon = 0.0
+        self.last_orders_sync = 0.0   # the wire's resting book vs ours (see sync_orders)
         self.cycles = 0
 
         # --- requoter state (charter A) ---
@@ -1039,6 +1040,8 @@ class Maker(object):
         if now - self.last_recon >= C.RECON_POSITIONS_S:
             if self.reconcile(now) is not None:
                 self.last_recon = now
+        # …and the other half of the same question: does the wire still hold our ORDERS?
+        self.sync_orders(now)
 
         # --- health read-out ---
         out["clusters"] = CL.cluster_report(
@@ -1129,6 +1132,60 @@ class Maker(object):
             rows = self.meter.flush(now)
             self.persist.write(self.presence_log.write_rows, rows, now)
         return True
+
+    def sync_orders(self, now):
+        """THE WIRE'S RESTING BOOK IS THE TRUTH ABOUT WHAT RESTS.
+
+        Found by the convergence acceptance test, 2026-07-30: cancel every order
+        exchange-side and the book NEVER CAME BACK.  Not because re-derivation was wrong —
+        it was never asked.  `self.orders` was written once at recovery and thereafter only
+        by our own actions, so a hand flatten, an exchange sweep or a cancel-all from
+        another console left us believing we still had presence we did not have.  The
+        requoter saw that phantom presence and declined to re-place, forever.
+
+        That is the disease in its purest form and in the last place anyone looked: our own
+        order book is MEMORY OF OUR OWN PAST DECISIONS, and it was the one piece of state
+        never checked against the world.  Positions had `reconcile`; orders had nothing.
+
+        A resting order the exchange's own complete list does not carry is exactly the
+        evidence a 404 on cancel gives, so it goes through the SAME §9.4a disambiguation
+        rather than a second one: fills explain it (book them), or two clean reads 36 s apart
+        say expired (collateral home, order terminal).  Never popped silently — a phantom
+        fill and a phantom order are both books that disagree with the wire.
+        CADENCE, DERIVED: `RECON_POSITIONS_S`.  This asks the same question `reconcile` asks
+        — does the wire agree with our books — about the other half of the same book, so it
+        inherits that answer rather than inventing a second one.  The same window doubles as
+        the propagation margin: an order placed inside the last cadence is not yet expected
+        to appear, and is skipped.
+        """
+        if float(now) - self.last_orders_sync < C.RECON_POSITIONS_S:
+            return None
+        admitted, _ = self.bucket.admit("verify", now)
+        if not admitted:
+            return None                       # a cadence is spent by a READ, not an attempt
+        status, body = self.ex.orders()
+        self.note_http(status, now)
+        if status != 200:
+            return None
+        self.last_orders_sync = float(now)
+        seen = set()
+        for row in (body or {}).get("orders") or []:
+            if R.owns_coid(row.get("client_order_id") or ""):
+                seen.add(str(row.get("order_id")))
+        gone = 0
+        for oid in sorted(set(self.orders) - seen):
+            o = self.orders[oid]
+            placed = float(o.get("placed_ts", 0.0) or 0.0)
+            if placed == 0.0 or o.get("gone_404"):
+                continue
+            if float(now) - placed < C.RECON_POSITIONS_S:
+                continue                      # inside the propagation margin
+            R.log("order_gone_from_wire", order_id=oid, ticker=o.get("ticker"),
+                  side=o.get("side"), remaining=o.get("remaining"),
+                  why="the exchange's resting list does not carry it")
+            self.note_cancel_404(oid, o, now)
+            gone += 1
+        return gone
 
     def reconcile(self, now):
         admitted, _ = self.bucket.admit("verify", now)
