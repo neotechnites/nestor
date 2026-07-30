@@ -172,13 +172,38 @@ class HaltState(object):
         self.ts = None
         self.detail = {}
 
+    UNREADABLE = "halt_file_unreadable"
+
     def load(self):
+        """ABSENT IS NOT THE SAME AS UNREADABLE.  `runtime.read_json` swallows EVERY
+        exception and hands back the default, so a truncated write, a permissions change or
+        a half-copied file all arrived here indistinguishable from "no halt has ever been
+        recorded" — and the bot came back up UN-HALTED, into the condition that halted it.
+        That is the exact failure this class was written against ("a halt that a restart
+        clears is not a halt"), reached through the reader instead of through the state.
+
+        So the file's EXISTENCE is consulted separately from its contents: present but
+        unparseable ⇒ HALTED, reason `halt_file_unreadable`.  FAIL CLOSED — the cost of the
+        false positive is that an operator must look at a file and resume explicitly, which
+        is precisely what a halt asks for; the cost of the false negative is a bot trading
+        through a day stop or a drawdown breach nobody remembers recording.
+        MIRROR (halting on nothing ↔ resuming into a breach): a MISSING file still means no
+        halt — that is a fresh install, the common case — and only a file that exists and
+        cannot be read is treated as a halt.
+        """
         obj = R.read_json(self.path, default=None)
         if isinstance(obj, dict) and obj.get("halted"):
             self.halted = True
             self.reason = obj.get("reason")
             self.ts = obj.get("ts")
             self.detail = obj.get("detail") or {}
+        elif not isinstance(obj, dict) and os.path.exists(self.path):
+            self.halted = True
+            self.reason = self.UNREADABLE
+            self.detail = {"path": self.path}
+            R.log("halt_file_unreadable", path=self.path)
+            R.ntfy("halt", "lip_v5 HALT: halt file exists but is unreadable (%s) — "
+                           "read it by hand, then resume explicitly" % self.path)
         return self
 
     def halt(self, reason, now, detail=None, persist=True):
@@ -220,13 +245,38 @@ class PeakRecord(object):
     def __init__(self, path=None, max_drawdown_frac=None):
         self.path = path or os.path.join(C.DATA_DIR, "v5_peak.json")
         self.peak = None
+        self.unreadable = False
         self.max_drawdown_frac = (C.MAX_DRAWDOWN_FRAC if max_drawdown_frac is None
                                   else float(max_drawdown_frac))
 
     def load(self):
+        """THE BLEED MUST NOT BE ALLOWED TO ERASE ITS OWN EVIDENCE.  `runtime.read_json`
+        returns the default for a missing file AND for an unreadable one, so a truncated
+        peak record read as "no peak yet" — and the very first `observe` would then write
+        TODAY's (lower) equity as the all-time peak, taking the drawdown to zero.  A slow
+        bleed corrupts nothing; a crashed write during one is ordinary.  The two together
+        silently disarmed the only guard that can see the bleed at all.
+
+        Absent ⇒ no peak yet (a fresh install; the first observe writes it, as before).
+        Present but unparseable ⇒ we hold NO trustworthy peak and refuse to OVERWRITE the
+        one on disk: `observe` still tracks a peak in memory (so this session's drawdown is
+        measured against this session's high, never against nothing), but persists nothing
+        until an operator restores or removes the file.  FAIL CLOSED WITHOUT CRASHING — a
+        raise here would take the whole binary down over a guard's bookkeeping, which is the
+        halt-by-side-effect this codebase keeps paying for; the page is the loud part.
+        MIRROR (a peak too HIGH ↔ too LOW): too high halts a healthy book and an operator
+        clears it; too low is invisible and lets an account bleed to zero, so the direction
+        we refuse to move without evidence is DOWN.
+        """
         obj = R.read_json(self.path, default=None)
         if isinstance(obj, dict) and obj.get("peak") is not None:
             self.peak = float(obj["peak"])
+        elif os.path.exists(self.path):
+            self.unreadable = True
+            R.log("peak_file_unreadable", path=self.path)
+            R.ntfy("peak_file_unreadable",
+                   "lip_v5 peak record unreadable (%s) — the drawdown peak is NOT being "
+                   "persisted; restore or remove it by hand" % self.path)
         return self
 
     def observe(self, equity_usd, now, persist=True):
@@ -234,7 +284,13 @@ class PeakRecord(object):
         eq = float(equity_usd)
         if self.peak is None or eq > self.peak:
             self.peak = eq
-            if persist:
+            if persist and self.unreadable:
+                # The file on disk may hold a HIGHER peak than anything this session has
+                # seen; writing over it would make the drawdown that is happening right now
+                # unmeasurable forever.  Track in memory, page, persist nothing.
+                R.log_once("peak_not_persisted", path=self.path, peak=self.peak,
+                           why="peak file unreadable; refusing to overwrite it")
+            elif persist:
                 R.atomic_write_json(self.path, {"peak": self.peak, "ts": float(now)})
             return 0.0, False
         if self.peak <= 0:

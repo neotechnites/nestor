@@ -88,6 +88,23 @@ class TestB5HaltStateMachine(LipTestCase):
         self._halt().halt("day_stop", now=1.0)
         self.assertTrue(any(a[0] == "halt" for a in self.alerts))
 
+    def test_an_UNREADABLE_halt_file_is_a_HALT_not_a_clean_start(self):
+        """`runtime.read_json` swallows every exception, so a truncated halt file used to be
+        indistinguishable from "no halt was ever recorded" — and the bot came back up
+        trading, into the condition that halted it."""
+        p = self.path("v5_halt.json")
+        with open(p, "w") as fh:
+            fh.write('{"halted": true, "reason": "day_st')   # a torn write
+        h = G.HaltState(p).load()
+        self.assertTrue(h.halted)
+        self.assertEqual(h.reason, G.HaltState.UNREADABLE)
+        self.assertTrue(any(a[0] == "halt" for a in self.alerts))
+
+    def test_an_ABSENT_halt_file_is_still_a_clean_start(self):
+        """The mirror: a missing file is a fresh install, the common case.  Only a file that
+        EXISTS and cannot be read fails closed."""
+        self.assertFalse(G.HaltState(self.path("nothing_here.json")).load().halted)
+
     def test_a_halted_book_can_still_close(self):
         h = self._halt().halt("day_stop", now=1.0)
         ctx = G.PlaceContext(halt_state=h)
@@ -101,6 +118,35 @@ class TestB3Drawdown(LipTestCase):
         p.observe(1000.0, now=1.0)
         reloaded = G.PeakRecord(self.path("peak.json")).load()
         self.assertAlmostEqual(reloaded.peak, 1000.0)
+
+    def test_an_UNREADABLE_peak_file_is_never_overwritten_by_a_lower_peak(self):
+        """The bleed erasing its own evidence, via the READER: a truncated peak record read
+        as "no peak yet", so the first observe wrote TODAY's lower equity as the all-time
+        peak and the drawdown went to zero — silently, exactly during the bleed."""
+        p = self.path("peak.json")
+        G.PeakRecord(p).observe(1000.0, now=1.0)
+        with open(p, "w") as fh:
+            fh.write('{"peak": 10')                          # a torn write
+        rec = G.PeakRecord(p).load()
+        self.assertTrue(rec.unreadable)
+        self.assertIsNone(rec.peak)
+        self.assertTrue(any(a[0] == "peak_file_unreadable" for a in self.alerts))
+        rec.observe(600.0, now=2.0)                          # the bleed's low equity
+        with open(p) as fh:
+            self.assertEqual(fh.read(), '{"peak": 10')       # NOT overwritten
+        self.assertTrue(self.logs_of("peak_not_persisted"))
+
+    def test_the_in_memory_peak_still_tracks_so_the_session_is_measured(self):
+        """Fail closed WITHOUT crashing: refusing to persist must not also refuse to
+        measure — this session's drawdown is taken against this session's high."""
+        p = self.path("peak.json")
+        with open(p, "w") as fh:
+            fh.write("not json at all")
+        rec = G.PeakRecord(p).load()
+        rec.observe(1000.0, now=1.0)
+        dd, breached = rec.observe(600.0, now=2.0)
+        self.assertAlmostEqual(dd, 0.40, places=9)
+        self.assertTrue(breached)
 
     def test_drawdown_from_peak_breaches(self):
         p = G.PeakRecord(self.path("peak.json"))
