@@ -820,6 +820,71 @@ class TestTheSoleQualifierNeedsNoPermission(EngineCase):
         self.assertGreater(n.total_usd, 0.0)
 
 
+class TestPlanFlapCannotTripB14(EngineCase):
+    """FINAL-ROUND REVIEW (2026-07-30; production halted at 18:33 MT on B14 place_burst,
+    KXTRUMPSAYCOMPANY bid — the second night-halt of this class this week).  The reviewer's
+    repro: with the plan flapping fund/unfund at 1 Hz, the zero-target branch cancelled a
+    seconds-old order and the next flap re-placed BLIND — placements at t=0,2,4, three
+    inside five seconds, B14's trip count reached exactly, surviving only because the
+    cancel-share rail's parameters happened to refuse the next cancel.  The allocator must
+    bound same-rung placement frequency BELOW B14's trip BY CONSTRUCTION: a plan-driven
+    zero now respects MIN_RESTING_LIFE_S, so blind placements are >= 30 s apart and at most
+    two land strictly inside any 60 s window."""
+
+    def _slot(self):
+        return slot(S=90.0, p=0.10, phi=0.0, cum_size=2000.0, hours_left=8.0,
+                    close_ts=NOW + 8 * 3600, program_end_ts=NOW + 8 * 3600)
+
+    def test_a_1hz_plan_flap_places_30s_apart_and_never_halts(self):
+        """The repro as a test.  Assertion (ii) is the load-bearing one: the pre-fix code
+        PASSES a bare no-halt assertion by another rail's luck, but its placements at
+        t=0,2,4 violate the 30 s spacing.  Mutation: remove the min-life gate in the
+        zero-target branch and this fails on the spacing."""
+        m = self.maker()
+        s = self._slot()
+        placed_at = []
+        resting_mid_flap = None
+        for i in range(121):                                   # >= 120 s at 1 Hz
+            t = NOW + float(i)
+            plan = {s.key: 50} if i % 2 == 0 else {s.key: 0}
+            before = len(m.ex.placed)
+            m.requote_pass(t, [s], plan)
+            if len(m.ex.placed) > before:
+                placed_at.append(i)
+            if i == 5:
+                resting_mid_flap = dict(m.ex.resting)
+        # (i) the book never halts — B14 is unreachable through plan oscillation
+        self.assertFalse(m.halt.halted, m.halt.reason)
+        # (ii) every pair of placements on the rung is >= MIN_RESTING_LIFE_S apart
+        self.assertGreaterEqual(len(placed_at), 2, placed_at)
+        for a, b in zip(placed_at, placed_at[1:]):
+            self.assertGreaterEqual(b - a, C.MIN_RESTING_LIFE_S,
+                                    "placements %s violate the 30 s bound" % placed_at)
+        # ...and therefore at most TWO strictly inside any 60 s window (B14 trips at 3)
+        for i in range(len(placed_at)):
+            inside = [x for x in placed_at if placed_at[i] <= x < placed_at[i] + 60]
+            self.assertLessEqual(len(inside), 2, placed_at)
+        # (iii) the young order SURVIVES the flap: presence is kept, which is also the
+        # revenue-correct behavior (accrual samples the book)
+        self.assertTrue(resting_mid_flap,
+                        "the 1-second-old order was cancelled for a plan flap")
+        # ...and the deferral is instrumented, once per order — no silent skips
+        deferred = self.logs_of("plan_exit_deferred")
+        self.assertTrue(deferred)
+        self.assertEqual(deferred[0]["why"], "plan_zero_under_min_life")
+
+    def test_a_MATURE_order_is_still_released_by_a_plan_zero(self):
+        """The mirror: the gate is anti-churn, not a lock.  Past MIN_RESTING_LIFE_S a
+        plan-driven zero cancels normally — capital the law moved must still come home."""
+        m = self.maker()
+        s = self._slot()
+        m.requote_pass(NOW, [s], {s.key: 50})
+        self.assertEqual(len(m.ex.resting), 1)
+        out = m.requote_pass(NOW + C.MIN_RESTING_LIFE_S + 1.0, [s], {s.key: 0})
+        self.assertEqual(out["cancelled"], 1)
+        self.assertEqual(m.ex.resting, {})
+
+
 class TestFillSelectionTripwire(EngineCase):
     """Owner, 2026-07-30: fills are adverse-selected samples of orders (cheap orders fill
     more), so average POSITION price runs below average ORDER price; the bucket phis already

@@ -121,7 +121,16 @@ class TestFillReplenishAtOneHz(FixRoundCase):
         measures a scorching phi, so the law re-prices it UNAFFORDABLE (W x T >> $10) — no
         re-post, with the arithmetic in the log, never silence.  A hot market is exactly
         what the affordability screen exists to refuse ("if it doesn't fit in there, we
-        can't afford it")."""
+        can't afford it").
+
+        ONE MORE BEAT since the B14 fix (final-round review, 2026-07-30): between the fill
+        and the tape's verdict there is a window where the presence rows are not yet
+        decisive, phi is still the SEED, and the law briefly re-funds a small lot — which
+        the measured-hot verdict then zeroes ONE SECOND later.  A plan-driven zero now
+        respects the minimum resting life (the anti-churn gate this round added), so the
+        exit is DEFERRED and lands once the order is 30 s old — the test runs past that
+        deferral and asserts the whole sequence: deferral logged, then the mature recall
+        empties the book."""
         r, ex, oid, n = self._filled_runner(verified=True)
         # G3: the seed-phi order was tranched at the lot container, not the whole $10
         self.assertLessEqual(float(ex.placed[0]["count"]) * 0.06,
@@ -131,7 +140,7 @@ class TestFillReplenishAtOneHz(FixRoundCase):
             t += 1.0
             r.iteration(t)
         t += C.POST_FILL_COOLDOWN_S                        # past the post-fill cooldown
-        for _ in range(5):
+        for _ in range(int(C.MIN_RESTING_LIFE_S) + 10):    # ...and past the deferred exit
             t += 1.0
             r.iteration(t)
         self.assertGreater(ex.fills_calls, 0, "the fills API was NEVER polled")

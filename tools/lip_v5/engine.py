@@ -1670,6 +1670,38 @@ class Maker(object):
                         stats["skipped"] += 1
                         self.slot_examined[key] = now
                         continue
+                    # ── A PLAN-DRIVEN ZERO RESPECTS THE MINIMUM RESTING LIFE (2026-07-30,
+                    # final-round review; production halted twice this week on B14
+                    # place_burst, 18:33 MT on KXTRUMPSAYCOMPANY the latest).  This branch
+                    # cancelled a 1-second-old order because the ALLOCATOR flapped — DONE,
+                    # unaffordable this pass, budget moved, cluster seat lost — and the
+                    # next flap re-placed BLIND: measured, blind placements at t=0,2,4,
+                    # three inside five seconds, which is B14's trip count reached exactly,
+                    # with the surviving margin supplied by the cancel-share rail's
+                    # parameters rather than by design.  The trigger path already embodies
+                    # the principle (plan triggers are stripped under MIN_RESTING_LIFE_S;
+                    # only book events override) and a plan-driven zero is not a book event
+                    # either.
+                    # THE BOUND, derived: place at t ⇒ earliest plan-driven cancel t+30 ⇒
+                    # earliest blind re-place after t+30, so a rung's blind placements are
+                    # >= 30 s apart — at most TWO strictly inside any 60 s window, and B14
+                    # (3 in 60, strict) is unreachable through plan oscillation BY
+                    # CONSTRUCTION, not by another rail's grace.
+                    # SAFETY PATHS ARE EXPLICITLY UNAFFECTED: halt/shutdown `flatten`, the
+                    # day stop, and the retired-venue recall (exit_cancel lanes) never pass
+                    # through this branch — a cancel that REDUCES RISK must never wait on
+                    # an anti-churn timer.  This gate delays only the plan's own
+                    # change-of-mind about an order it placed seconds ago.
+                    age_s = now - float(cur.get("placed_ts", now))
+                    if age_s < C.MIN_RESTING_LIFE_S:
+                        if not cur.get("plan_exit_deferred_logged"):
+                            cur["plan_exit_deferred_logged"] = True    # once per order
+                            R.log("plan_exit_deferred", ticker=s.ticker, side=s.side,
+                                  age_s=round(age_s, 3),
+                                  remaining=cur["remaining"], why="plan_zero_under_min_life")
+                        stats["skipped"] += 1
+                        self.slot_examined[key] = now
+                        continue
                     ok, _ = self.cancel(cur["order_id"], now, lane="requote_cancel")
                     if ok:
                         stats["cancelled"] += 1
