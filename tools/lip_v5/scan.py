@@ -647,9 +647,32 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                 # illegal price can reach here.  MIRROR (entering an empty book ↔ entering a
                 # book that is empty because the market is dead): P6 is that guard, and it is
                 # applied before this loop.
+                #
+                # ── THE EMPTY SIDE WAS PRICED WHERE ITS OWN BAND ALWAYS REFUSES IT. ─────────
+                # (2026-07-30, measured: the 7 sole-qualifier venues, 288 markets, zero quotes
+                # and zero trades from anyone.)  This priced the empty side at
+                # LAND_GRAB_PRICE_C = 1c, and the ENTRY BAND below — armed since 2026-07-29 —
+                # refuses any unmeasured entry outside ENTRY_BAND_LO_C..HI_C = 6c..99c.  So
+                # scan built a slot at a price scan itself then threw away, every cycle, for
+                # every empty book: `entry_band_refused` is the FIRST thing an empty market
+                # hits, before the free-ride gate ever speaks.  A module cannot both price a
+                # thing and refuse its own price.
+                # The cheap EDGE OF THE BAND is the honest anchor and it is the only one
+                # available without inventing a number: the band already answers "what is the
+                # cheapest price we are willing to enter at", the empty side has no best to
+                # anchor to, and 1c is the price the band exists to refuse (note 47 §3, n =
+                # 8,240: 2c realised 0.00% on 765 markets).  On the ask side this is 6c of NO,
+                # i.e. a YES ask at 94c — cheap in its OWN collateral currency, which is the
+                # axis the band is indexed by.  NEVER-CROSS is trivially satisfied: there is
+                # nothing in the book to cross.
+                # CARRIED SCOPE — this `p` is also what a HELD empty-book market is priced,
+                # sized and shed at (both gates below are entry-only, D1), so held rungs on an
+                # empty book move from a 1c basis to a 6c one.  Neither is a market price:
+                # there is no best on an empty side, and `p` is a fiction chosen by us either
+                # way.  6c is the fiction we are willing to trade at.
                 if rec["pinned"]:
                     continue
-                p = C.LAND_GRAB_PRICE_C / 100.0
+                p = C.ENTRY_BAND_LO_C / 100.0
             elif not sd["legal"]:
                 continue
             key = (ticker, side)

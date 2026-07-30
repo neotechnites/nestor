@@ -662,6 +662,71 @@ class TestTheEmptyBookIsEnterable(FixRoundCase if 'FixRoundCase' in dir() else _
         self.assertEqual(slots, [],
                          "an empty side cannot reach target_size, so it scores zero: refuse it")
 
+    EMPTY_TABLE = {"ticker": "KXEMPTY-26JUL29-T1", "program_id": "p1", "series": "KXEMPTY",
+                   "pinned": False, "target_size": 1000.0, "yes_mid": None, "ts": 0.0,
+                   "sides": {"bid": {"S": 0.0, "qualifies": False, "cum_size": 0.0,
+                                     "p": None, "legal": False},
+                             "ask": {"S": 0.0, "qualifies": False, "cum_size": 0.0,
+                                     "p": None, "legal": False}}}
+
+    def _empty(self, now):
+        prog = {"program_id": "p1", "series": "KXEMPTY", "tickers": ["KXEMPTY-26JUL29-T1"],
+                "period_reward": 1000000, "start_ts": now - 3600, "end_ts": now + 36000,
+                "window_h": 11.0, "rho": 9.0, "target_size": 1000.0, "paid_out": False}
+        # a KNOWN, near settlement close: the note-52 D4 gate refuses an unknown one, and
+        # that refusal is not what these two tests are about.
+        rec = dict(self.EMPTY_TABLE, ts=now, close_ts=now + 20 * 3600.0)
+
+        class C0(object):
+            table = {"KXEMPTY-26JUL29-T1": rec}
+        return prog, C0()
+
+    def test_the_empty_side_is_priced_INSIDE_the_band_it_must_pass(self):
+        """A module cannot both price a thing and refuse its own price.  The empty side was
+        priced at LAND_GRAB_PRICE_C = 1c while the armed entry band refuses anything under
+        ENTRY_BAND_LO_C = 6c, so `entry_band_refused` was the FIRST thing every empty market
+        hit — before the free-ride gate ever spoke.  Observed on the held path, where both
+        entry gates are skipped (D1) and this price is what the market is really sized,
+        requoted and shed at."""
+        import time
+        from lip_v5 import scan, config as C
+        now = time.time()
+        prog, cls = self._empty(now)
+        slots = scan.build_slots([prog], cls, now, p6=lambda t: True,
+                                 held={"KXEMPTY-26JUL29-T1"})
+        self.assertEqual(len(slots), 2)
+        for s in slots:
+            self.assertAlmostEqual(s.p, C.ENTRY_BAND_LO_C / 100.0, places=9)
+            self.assertLessEqual(C.ENTRY_BAND_LO_C, int(round(s.p * 100)))
+            self.assertLessEqual(int(round(s.p * 100)), C.ENTRY_BAND_HI_C)
+
+    def test_the_band_no_longer_refuses_an_empty_book_on_ENTRY_either(self):
+        """With the price inside the band, the band is silent — and the free-ride gate is left
+        as the SOLE remaining refusal (see TestTheEmptyBookFork below for the arithmetic)."""
+        import time
+        import unittest.mock as mock
+        from lip_v5 import scan, config as C, runtime as R
+        now = time.time()
+        prog, cls = self._empty(now)
+        logs = []
+        R.set_log_sink(logs.append)
+        self.addCleanup(R.set_log_sink, None)
+        with mock.patch.object(C, "FREE_RIDE_ONLY", False):
+            slots = scan.build_slots([prog], cls, now, p6=lambda t: True)
+        self.assertEqual([l for l in logs if l.get("t") == "entry_band_refused"], [])
+        self.assertEqual(len(slots), 2)
+        # both sides cheap IN THEIR OWN CURRENCY: the bid is 6c of YES, the ask is 6c of NO
+        # (= a YES ask at 94c).  Nothing to cross in an empty book, so both stand.
+        self.assertEqual(sorted(int(round(s.p * 100)) for s in slots),
+                         [C.ENTRY_BAND_LO_C, C.ENTRY_BAND_LO_C])
+        # UNTOUCHED, AND INCONSISTENT ON PURPOSE: `land_grab_price_c` is the LAND GRAB's own
+        # price, and the land grab is dead under FREE_RIDE_ONLY (it is forced to 0).  With the
+        # gate off, as here, the qualification pass would buy at 1c/99c while the slot is
+        # priced at 6c — flagged, not silently reconciled, because which of the two is right
+        # depends on the qualification decision that is NOT ours to take (see the fork below).
+        self.assertEqual(sorted(s.land_grab_price_c for s in slots),
+                         [C.LAND_GRAB_PRICE_C, 100 - C.LAND_GRAB_PRICE_C])
+
     def test_a_pinned_empty_book_is_still_refused(self):
         import time
         from lip_v5 import scan
@@ -680,6 +745,90 @@ class TestTheEmptyBookIsEnterable(FixRoundCase if 'FixRoundCase' in dir() else _
                                   "p": None, "legal": False}}}}
 
         self.assertEqual(scan.build_slots([prog], C0(), now, p6=lambda t: True), [])
+
+
+class TestTheEmptyBookFork(__import__('unittest').TestCase):
+    """THE FORK, MEASURED AND PINNED — do not resolve this in code without Ryan.
+
+    Pricing the empty side inside the entry band (above) clears the FIRST of three gates
+    between the 7 sole-qualifier venues and a dollar.  The other two are not oversights, and
+    they rest on one arithmetic fact this suite now states out loud:
+
+        CREDIT IS A STEP FUNCTION OF SIZE, NOT THE SMOOTH q/(q+S) THE SIZING MODEL USES.
+
+    `alloc.score_side` implements the CFTC filing: the qualifying walk must reach
+    `target_size`, and `if not qualifies: S = 0`.  Our own resting size counts toward that
+    walk (the classified book contains our orders; `rival_S` subtracts them afterwards).  So
+    on a book nobody else quotes:
+
+        q  <  target_size   ⇒  credit 0        (we are not a qualifying set)
+        q  >= target_size   ⇒  credit pool/2   (we are the WHOLE qualifying set)
+
+    while `cliff_clearing_q` — the function every sizing decision asks — answers ONE CONTRACT
+    at S = 0, because `our_share(1, 0) = 1`.  The model believes one contract earns half the
+    pool.  The filing says it earns nothing.  Both are in this repo today.
+
+    WHAT QUALIFYING WOULD COST, at the live target of 1,000 contracts:
+        at LAND_GRAB_PRICE_C = 1c   ->  $10.00  == the whole cluster reserve (ceiling/N)
+        at ENTRY_BAND_LO_C  = 6c   ->  $60.00  == 12x the $5 lot, 6x the reserve, over the
+                                                  per-venue cap and the per-market cap
+    So the band edge, which is what makes the slot legal, is also what makes qualifying
+    unaffordable — and 1c, which is what makes qualifying affordable, is the price the band
+    exists to refuse on measured EV (note 47 3, n = 8,240: 2c realised 0.00% on 765 markets).
+    That is the fork.  It is the same trade FREE_RIDE_ONLY was armed to refuse on 2026-07-29
+    ("we were buying 1,000 contracts of a worthless contract to qualify a side that still
+    would not have paid"), now arriving from the opposite direction.
+
+    THE THREE GATES, in the order an empty market meets them:
+      1. the entry price band            — CLEARED by pricing the empty side at the band edge
+      2. FREE_RIDE_ONLY                  — refuses: an empty side never qualifies without us
+      3. alloc.allocate's `s.S <= 0`     — the slot is not even ELIGIBLE for water-filling
+    Gate 3 also means the sole-qualifier VENUE CAP (fixed this round) funds nothing on its
+    own: the cap is necessary and nowhere near sufficient.
+    """
+
+    def _empty_slot(self, **kw):
+        from lip_v5 import alloc
+        kw.setdefault("rho", 9.0); kw.setdefault("S", 0.0); kw.setdefault("p", 0.06)
+        kw.setdefault("hours_left", 11.0); kw.setdefault("window_h", 11.0)
+        return alloc.Slot("KXEMPTY-1", "bid", venue="KXEMPTY", **kw)
+
+    def test_the_model_says_ONE_CONTRACT_earns_half_the_pool(self):
+        from lip_v5 import alloc
+        s = self._empty_slot()
+        self.assertEqual(alloc.our_share(1, s.S), 1.0)
+        self.assertEqual(alloc.cliff_clearing_q(s), 0)      # i.e. "any size at all clears"
+
+    def test_the_FILING_says_a_sub_target_side_scores_zero(self):
+        from lip_v5 import alloc
+        # 999 contracts of our own against a 1,000 target: the walk does not reach target.
+        sc = alloc.score_side([(6, 999.0)], target_size=1000.0)
+        self.assertFalse(sc.qualifies)
+        self.assertEqual(sc.S, 0.0)
+        self.assertEqual(sc.reason, "target_size_not_reached")
+        # one more contract and the same side is the WHOLE qualifying set
+        sc2 = alloc.score_side([(6, 1000.0)], target_size=1000.0)
+        self.assertTrue(sc2.qualifies)
+        self.assertGreater(sc2.S, 0.0)
+
+    def test_what_qualifying_costs_at_each_price(self):
+        from lip_v5 import config as C
+        import lip_v5.clusters as CL
+        target = 1000.0
+        self.assertAlmostEqual(target * C.LAND_GRAB_PRICE_C / 100.0, 10.00, places=9)
+        self.assertAlmostEqual(target * C.ENTRY_BAND_LO_C / 100.0, 60.00, places=9)
+        # $10 is exactly the cluster reserve; $60 is six of them.
+        self.assertAlmostEqual(CL.cluster_cap_usd(0.0, ceiling_usd=300.0), 10.00, places=9)
+
+    def test_gate_3_the_allocator_refuses_an_S_zero_slot_outright(self):
+        """So a nonzero venue cap on a sole-qualifier venue funds NOTHING by itself."""
+        from lip_v5 import alloc
+        a, spent, _ = alloc.allocate([self._empty_slot()], 234.0, 0.0625,
+                                     caps=alloc.Caps(inv_cap_usd=5.0),
+                                     cluster_cap_usd=10.0, ceiling_usd=300.0,
+                                     venue_caps={"KXEMPTY": 30.0})
+        self.assertEqual(a.get(("KXEMPTY-1", "bid"), 0), 0)
+        self.assertEqual(spent, 0.0)
 
 
 class TestNoDuplicateOrderLoop(__import__('unittest').TestCase):
