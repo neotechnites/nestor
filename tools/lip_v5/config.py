@@ -487,7 +487,15 @@ DENY_SERIES = {
 #   strict: the real series are KXRAINAUSM / KXRAINHOUM / … and stopped matching entirely, so
 #   rain came back into a live book on 2026-07-28.  A family that was banned by measurement
 #   must not be un-banned by a string-matching refinement.
-DENY_SUBSTRINGS = ("MENTION", "KXRAIN")
+# "KXTRUMPSAY": the mention MECHANISM wearing a non-MENTION ticker, measured live
+#   2026-07-30 ~01:07 MT on the note-52 deploy's first night: KXTRUMPSAYMONTH-26AUG01-PELO
+#   ate three consecutive replenish lots inside three seconds — one fill at 7c against our
+#   8c bid, i.e. the ask collapsed THROUGH our price and our maker bids were crossing into
+#   informed flow.  B14 halted it at 3 placements (~$15 bounded by the cluster rail).  A
+#   Trump-says market resolves off a news event exactly as an earnings mention does; the
+#   family is denied for the same one mechanism (note 43 §4), by substring so MONTH/COMPANY
+#   and future variants are all covered.
+DENY_SUBSTRINGS = ("MENTION", "KXRAIN", "KXTRUMPSAY")
 
 
 def family_denied(ticker):
