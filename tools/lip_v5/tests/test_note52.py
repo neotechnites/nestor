@@ -474,7 +474,8 @@ class TestExchangeEstimatesFeed(LipTestCase):
             def runTest(self):
                 pass
         t = T()
-        t.setUp()
+        t.setUp()                             # its setUp re-points the log sink at ITS list
+        self.logs = t.logs                    # share it, so self.logs_of() sees the capture
         self.addCleanup(t.doCleanups)
         return t.maker()
 
