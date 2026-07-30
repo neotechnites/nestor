@@ -706,6 +706,7 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
         _ck0 = _cluster_key(s)
         _owner0 = cluster_owner.get(_ck0)
         if _owner0 is not None and _owner0 != s.key and \
+                not (_owner0[1] is None and _owner0[0] == s.ticker) and \
                 float(_own_acc.get(_ck0, 0.0)) > float(getattr(s, "accrued", 0.0) or 0.0) + 1e-9:
             alloc[s.key] = int(q_alloc.get(s.key, 0))     # displaced: no resting seed ⇒
                                                           # the requoter recalls the order
@@ -800,7 +801,9 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
                 # TICKER (see the ownership note above the loop).
                 _ck = _cluster_key(s)
                 _owner = cluster_owner.get(_ck)
-                if _owner is not None and _owner != s.key:
+                # a side-wildcard owner (side None) claims the TICKER, either side
+                if _owner is not None and _owner != s.key and \
+                        not (_owner[1] is None and _owner[0] == s.ticker):
                     _why["cluster_owned"] = _why.get("cluster_owned", 0) + 1
                     continue
                 # D11 — the plan-side variance test, charged at the CLUSTER RESERVE: a funded

@@ -416,3 +416,33 @@ class TestOwnerDisplacement(LipTestCase):
                                  owner_seed={"KXEUR": ("KXEUR-1-T1155", "bid")},
                                  owner_accrued={"KXEUR": 0.26})
         self.assertGreaterEqual(a[sib.key], 62)
+
+
+class TestOwnerRanksByAccruedDollars(LipTestCase):
+    """Ryan: 1c may not tie with 26c — the AMOUNT is the weight.  And a program whose only
+    claim is banked accrual (position predating the state archive) still owns its cluster,
+    side-wildcard."""
+
+    def test_the_bigger_pot_wins_over_bigger_committed_basis(self):
+        rich_pot = _slot("KXEUR-1-T1155", accrued=0.26)
+        big_stake = _slot("KXEUR-1-T1153", accrued=0.01)
+        a, _, _ = alloc.allocate([rich_pot, big_stake], 300.0, RSTAR, cluster_cap_usd=10.0,
+                                 resting={big_stake.key: 62.0},
+                                 owner_seed={"KXEUR": rich_pot.key},
+                                 owner_accrued={"KXEUR": 0.26})
+        self.assertEqual(a[big_stake.key], 0, "the 1c rung must be displaced")
+        self.assertGreater(a[rich_pot.key], 0, "the 26c rung must be funded")
+
+    def test_a_wildcard_owner_admits_either_side_of_its_ticker(self):
+        bid = _slot("KXEUR-1-T1155")
+        a, _, _ = alloc.allocate([bid], 300.0, RSTAR, cluster_cap_usd=10.0,
+                                 owner_seed={"KXEUR": ("KXEUR-1-T1155", None)},
+                                 owner_accrued={"KXEUR": 0.26})
+        self.assertGreater(a[bid.key], 0, "the wildcard owner's own rung was refused")
+
+    def test_a_wildcard_owner_still_blocks_siblings(self):
+        sib = _slot("KXEUR-1-T1153")
+        a, _, _ = alloc.allocate([sib], 300.0, RSTAR, cluster_cap_usd=10.0,
+                                 owner_seed={"KXEUR": ("KXEUR-1-T1155", None)},
+                                 owner_accrued={"KXEUR": 0.26})
+        self.assertEqual(a[sib.key], 0)

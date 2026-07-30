@@ -893,30 +893,43 @@ class Maker(object):
             # started; presence on a sibling starts a new pot at $0 while the accrued one
             # drifts to the forfeit cliff.  Ties: larger committed basis, then name.
             _cand = {}
+            # (a) tickers where we HOLD or REST — the leg names the side (an acquired YES
+            #     came from our bid, NO from our ask; D9: one SIDE per cluster).
             for _p in list(_pc.positions) + list(_pc.resting_basis):
                 _t = _p["ticker"]
                 _usd = float(_p.get("n", 0)) * float(_p.get("basis", 0.0))
                 if _usd <= 0:
                     continue
-                # the leg names the slot side: an acquired YES came from our bid, NO from
-                # our ask — the owner key carries the side the money is actually on (D9:
-                # one rung per cluster stays one SIDE per cluster)
                 _key = (_t, "bid" if _p.get("side") == "yes" else "ask")
                 _acc = float(self.accrued.get(self.ticker_program.get(_t), 0.0) or 0.0)
                 _ck = CL.cluster_of(_t)
                 _prev = _cand.get(_ck)
-                _score = (_acc > 0.0, _usd)
+                # RANK BY ACCRUED DOLLARS (Ryan: 1c may not tie with 26c — the AMOUNT is
+                # the weight), then committed basis, then name.
+                _score = (_acc, _usd)
                 if _prev is None or _score > _prev[0] or (
                         _score == _prev[0] and _key < _prev[1]):
                     _cand[_ck] = (_score, _key)
+            # (b) programs with BANKED ACCRUAL and no tracked money at all — the 1.155 case:
+            #     the position predated the state archive, so the book had nothing to rank,
+            #     but the $0.26 in the accrual ledger is the strongest claim in the cluster.
+            #     Side unknown ⇒ wildcard (None): any side of that ticker may own the seat.
+            _prog_tickers = {}
+            for _t2, _pid in self.ticker_program.items():
+                _prog_tickers.setdefault(_pid, []).append(_t2)
+            for _pid, _acc in self.accrued.items():
+                _acc = float(_acc or 0.0)
+                if _acc <= 0.0:
+                    continue
+                for _t2 in sorted(_prog_tickers.get(_pid, ())):
+                    _ck = CL.cluster_of(_t2)
+                    _prev = _cand.get(_ck)
+                    _score = (_acc, 0.0)
+                    if _prev is None or _score > _prev[0]:
+                        _cand[_ck] = (_score, (_t2, None))
             owner_seed = {ck: k for ck, (_sc, k) in _cand.items()}
             # displacement input: the owner's accrued dollars per cluster
-            owner_accrued = {}
-            for _ck, (_sc, _k) in _cand.items():
-                _acc = float(self.accrued.get(
-                    self.ticker_program.get(_k[0]), 0.0) or 0.0)
-                if _acc > 0.0:
-                    owner_accrued[_ck] = _acc
+            owner_accrued = {ck: sc[0] for ck, (sc, _k) in _cand.items() if sc[0] > 0.0}
             cluster_seed = {}
             cluster_seed_px = {}              # D11 — Σ usd·basis, the variance ledger's
                                               # price side, from the SAME book as the rail
