@@ -541,7 +541,7 @@ def rescue(A, rate_now, h, rho, S, q, p, r_star, C_slot, phi, d,
 def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE_PER_H,
              venue_caps=None, step_fraction=C.STEP_FRACTION, held=None, resting=None,
              cluster_cap_usd=None, cluster_seed=None, cluster_seed_px=None,
-             ceiling_usd=None):
+             ceiling_usd=None, owner_seed=None):
     """Marginal-rate water-filling under (★).  Returns (alloc, spent, marginal_at_stop).
 
     ── NOTE 52 (2026-07-29 night): three strategy rules now live INSIDE the plan. ───────────
@@ -617,8 +617,20 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
     per_cluster = dict(cluster_seed or {})
     # D11 — the price side of the variance ledger: Σ usd·p per cluster, so p̄ = usd_px/usd.
     per_cluster_px = dict(cluster_seed_px or {})
-    # D5 — the cluster's OWNER: the one key allowed to carry this settle source's rung.
-    cluster_owner = {}
+    # D5 — the cluster's OWNER: the one TICKER allowed to carry this settle source's rung.
+    # ── OWNERSHIP IS TICKER-LEVEL AND SEEDED FROM THE REAL BOOK (2026-07-30, the 1.155
+    # incident).  The first cut derived owners from the held/resting SLOT keys — but a held
+    # market can transiently produce no slot (unclassified right after a restart, a crossed
+    # book), and in that gap a SIBLING rung took the cluster's seat: v5 held 3 lots of
+    # EURUSD 1.155 with $0.26 accrued in its pool and funded 1.153 from zero.  Accrual is per
+    # MARKET, so presence moved to a rung whose pot starts at $0 while the accrued one
+    # drifted toward the forfeit cliff — the exact inversion of "capital on an already-
+    # earning rung is worth more" (note 52 D6, Ryan's own derivation).  `owner_seed`
+    # ({cluster: ticker}) comes from the caller's positions+orders — the book that survives
+    # restarts and never depends on classification timing — with accrued rungs preferred.
+    # Owner values are (ticker, side) KEYS: one rung per cluster stays one SIDE too (D9 —
+    # one-sided for now), and the seed carries the side straight from the position's leg.
+    cluster_owner = dict(owner_seed or {})
     for k, v in sorted(list((held or {}).items()) + list((resting or {}).items())):
         if float(v) > 0:
             cluster_owner.setdefault(CL.cluster_of(k[0]), k)
@@ -768,7 +780,8 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
                         per_cluster.get(_cluster_key(s), 0.0) + s.p > float(cluster_cap_usd) + 1e-9:
                     _why["cluster_cap"] = _why.get("cluster_cap", 0) + 1
                     continue
-                # D5 — ONE RUNG PER CLUSTER: a settle source's reserve belongs to one key.
+                # D5 — ONE RUNG PER CLUSTER: a settle source's reserve belongs to one
+                # TICKER (see the ownership note above the loop).
                 _ck = _cluster_key(s)
                 _owner = cluster_owner.get(_ck)
                 if _owner is not None and _owner != s.key:
@@ -833,7 +846,7 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
             per_venue[best.venue] = per_venue.get(best.venue, 0.0) + step * best.p
             per_cluster[best_ck] = per_cluster.get(best_ck, 0.0) + step * best.p
             per_cluster_px[best_ck] = per_cluster_px.get(best_ck, 0.0) + step * best.p * best.p
-            cluster_owner.setdefault(best_ck, best.key)       # D5 — the funded key owns it
+            cluster_owner.setdefault(best_ck, best.key)       # D5 — the funded rung owns it
             last_rate = best_rate
         # ---- THE CLIFF PASS.  A rung under $2 of projected accrual pays ZERO. ------------
         # Water-filling maximises RATE and is blind to the forfeit cliff, so it happily leaves
@@ -897,7 +910,7 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
             ck = _cluster_key(sl)
             per_cluster[ck] = max(0.0, per_cluster.get(ck, 0.0) - freed)
             per_cluster_px[ck] = max(0.0, per_cluster_px.get(ck, 0.0) - freed * sl.p)
-            if cluster_owner.get(ck) == key:
+            if cluster_owner.get(ck) == sl.key:
                 cluster_owner.pop(ck, None)               # D5 — a zeroed rung frees its
                                                           # cluster for another candidate
             cliff_dead.add(key)
@@ -1017,7 +1030,7 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
                                venue_caps=None, max_passes=C.MAX_GATE_PASSES, held=None,
                                resting=None,
                                cluster_cap_usd=None, cluster_seed=None,
-                               cluster_seed_px=None, ceiling_usd=None):
+                               cluster_seed_px=None, ceiling_usd=None, owner_seed=None):
     """v1 §2.4 lines 12-15 — the forfeit gate is per PROGRAM-PERIOD, applied AFTER
     water-filling, and a dropped program's dollars are RE-WATER-FILLED.
 
@@ -1047,7 +1060,7 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
                                           cluster_cap_usd=cluster_cap_usd,
                                           cluster_seed=cluster_seed,
                                           cluster_seed_px=cluster_seed_px,
-                                          ceiling_usd=ceiling_usd)
+                                          ceiling_usd=ceiling_usd, owner_seed=owner_seed)
         by_prog = {}
         for s in live:
             by_prog.setdefault(s.program_id, []).append(s)
@@ -1137,7 +1150,7 @@ def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
                         floor_rate=C.ADMIT_FLOOR_RATE_PER_H, venue_caps=None, held=None,
                         resting=None,
                         cluster_cap_usd=None, cluster_seed=None,
-                        cluster_seed_px=None, ceiling_usd=None):
+                        cluster_seed_px=None, ceiling_usd=None, owner_seed=None):
     """The full cycle: solve spec §1.3's r* fixpoint around ALLOCATE — the FORFEIT-GATED
     ALLOCATE, because the allocation the requoter diffs against must be the post-gate one
     (finish-round charter A): quoting a program the gate would drop posts collateral into a
@@ -1159,7 +1172,7 @@ def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
             slots, budget_usd, r_star, caps, floor_rate=floor_rate, venue_caps=venue_caps,
             held=held, resting=resting, cluster_cap_usd=cluster_cap_usd,
             cluster_seed=cluster_seed, cluster_seed_px=cluster_seed_px,
-            ceiling_usd=ceiling_usd)
+            ceiling_usd=ceiling_usd, owner_seed=owner_seed)
         return (a, sp, dropped), (marg if marg > 0 else floor_rate)
 
     res = M.solve_rstar(lambda r: run(r), r0)

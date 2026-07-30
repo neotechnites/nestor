@@ -355,3 +355,34 @@ class TestPostFillCooldown(LipTestCase):
             r.iteration(t)
         self.assertFalse(r.m.halt.halted,
                          "the burst breaker fired: the cooldown is not binding")
+
+
+class TestClusterOwnershipSeed(LipTestCase):
+    """The 1.155 incident (2026-07-30): v5 held 3 lots of EURUSD 1.155 with $0.26 accrued in
+    its pool and funded sibling rung 1.153 from zero — the held rung produced no slot that
+    cycle (post-restart classification gap) and slot-derived ownership let the sibling take
+    the cluster's seat.  Ownership now seeds from the REAL book via `owner_seed`."""
+
+    def test_a_held_but_slotless_rung_still_owns_its_cluster(self):
+        sibling = _slot("KXEUR-1-T1153")
+        a, _, _ = alloc.allocate([sibling], 300.0, RSTAR, cluster_cap_usd=10.0,
+                                 owner_seed={"KXEUR": ("KXEUR-1-T1155", "bid")})
+        self.assertEqual(a[sibling.key], 0,
+                         "the sibling took a cluster whose rung is merely unclassified")
+
+    def test_the_owner_rung_itself_still_funds(self):
+        owner = _slot("KXEUR-1-T1155")
+        a, _, _ = alloc.allocate([owner], 300.0, RSTAR, cluster_cap_usd=10.0,
+                                 owner_seed={"KXEUR": owner.key})
+        self.assertGreater(a[owner.key], 0)
+
+    def test_one_side_per_cluster_still_holds_under_ticker_seeding(self):
+        """D9: the owner key carries a SIDE — the same ticker's other leg is refused."""
+        bid = _slot("KXEUR-1-T1155")
+        ask = alloc.Slot("KXEUR-1-T1155", "ask", rho=6.25, S=100.0, p=0.12,
+                         phi=0.001, d=0.0, l_eff=8.0, hours_left=16.0, window_h=16.0,
+                         venue="KXEUR")
+        a, _, _ = alloc.allocate([bid, ask], 300.0, RSTAR, cluster_cap_usd=10.0,
+                                 owner_seed={"KXEUR": bid.key})
+        self.assertGreater(a[bid.key], 0)
+        self.assertEqual(a[ask.key], 0)

@@ -54,6 +54,7 @@ class Maker(object):
         self.unknown = G.UnknownOrders()
         self.dedupe = G.FillDedupe()
         self.fill_cooldown = {}              # (ticker, side) -> ts of last fill (cooldown)
+        self.ticker_program = {}             # ticker -> program_id, from every slot seen
         self.skew_ok = True
         self.day_stopped = False
 
@@ -881,7 +882,34 @@ class Maker(object):
             # by both or by neither.  Measured: without this, arming FREE_RIDE_ONLY dropped one
             # rung of a ladder and the plan breached the cluster cap 61 times in 90 cycles while
             # resting $56.16 where four slots had rested $75.00.
+            for s in slots:
+                if s.program_id is not None:
+                    self.ticker_program[s.ticker] = s.program_id
             _pc = self.place_context()
+            # ── THE OWNER SEED (the 1.155 incident, 2026-07-30).  One TICKER owns each
+            # cluster's rung, chosen from the REAL book (positions + live orders — survives
+            # restarts, independent of classification timing), preferring the rung whose
+            # program already holds ACCRUED credit: presence there compounds a pot that has
+            # started; presence on a sibling starts a new pot at $0 while the accrued one
+            # drifts to the forfeit cliff.  Ties: larger committed basis, then name.
+            _cand = {}
+            for _p in list(_pc.positions) + list(_pc.resting_basis):
+                _t = _p["ticker"]
+                _usd = float(_p.get("n", 0)) * float(_p.get("basis", 0.0))
+                if _usd <= 0:
+                    continue
+                # the leg names the slot side: an acquired YES came from our bid, NO from
+                # our ask — the owner key carries the side the money is actually on (D9:
+                # one rung per cluster stays one SIDE per cluster)
+                _key = (_t, "bid" if _p.get("side") == "yes" else "ask")
+                _acc = float(self.accrued.get(self.ticker_program.get(_t), 0.0) or 0.0)
+                _ck = CL.cluster_of(_t)
+                _prev = _cand.get(_ck)
+                _score = (_acc > 0.0, _usd)
+                if _prev is None or _score > _prev[0] or (
+                        _score == _prev[0] and _key < _prev[1]):
+                    _cand[_ck] = (_score, _key)
+            owner_seed = {ck: k for ck, (_sc, k) in _cand.items()}
             cluster_seed = {}
             cluster_seed_px = {}              # D11 — Σ usd·basis, the variance ledger's
                                               # price side, from the SAME book as the rail
@@ -897,7 +925,8 @@ class Maker(object):
                                                       cluster_cap_usd=cluster_cap,
                                                       cluster_seed=cluster_seed,
                                                       cluster_seed_px=cluster_seed_px,
-                                                      ceiling_usd=self.ceiling_usd)
+                                                      ceiling_usd=self.ceiling_usd,
+                                                      owner_seed=owner_seed)
             self.last_alloc = dict(a)
             out["allocate"] = {"spent": spent, "r_star": res.r_star,
                                "converged": res.converged, "slots": len(slots),
