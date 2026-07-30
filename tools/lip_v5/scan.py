@@ -884,16 +884,21 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             # rate) — phi only, never a refusal.
             quiet = (p6 is not None and not p6(ticker))
             m_phi = measured_phi(fills, rest_ch)
+            # `phi_source` rides the Slot (G3, grafted 2026-07-30 from the allocator-law
+            # branch): the oversize decision needs to know whether phi is a FACT (measured
+            # here, or borrowed from a measured neighborhood) or the seed — i.e. whether we
+            # know phi is low or merely never looked.
             if m_phi is not None:
-                phi = m_phi
+                phi, phi_source = m_phi, "measured"
             elif _phi_buckets.get(phi_bucket(p)):
                 _b = _phi_buckets[phi_bucket(p)]
-                phi = _b[0] / _b[1]
+                phi, phi_source = _b[0] / _b[1], "bucket"
             elif _phi_global[1] > 0:
-                phi = _phi_global[0] / _phi_global[1]
+                phi, phi_source = _phi_global[0] / _phi_global[1], "global"
             else:
                 phi = M.phi_estimate(fills, rest_ch,
                                      p=(C.PHI_CHEAP_PRICE_CUT / 2.0) if quiet else p)
+                phi_source = "seed"
             d = M.d_estimate(t.get("drift_samples"), p)
             l_eff = M.l_eff_h(close_ts, now,
                               (l_shed or {}).get(key), settled=False)
@@ -927,7 +932,7 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             slots.append(alloc.Slot(
                 ticker, side, rho=prog["rho"], S=S_riv, p=p, venue=rec["series"],
                 pinned=rec["pinned"], legal_price_exists=legal,
-                phi=phi, d=d, l_eff=l_eff, t_hat=t_hat,
+                phi=phi, phi_source=phi_source, d=d, l_eff=l_eff, t_hat=t_hat,
                 program_id=prog["program_id"], window_h=prog["window_h"],
                 hours_left=hours_left, hours_to_start=hours_to_start,
                 target_size=rec["target_size"], cum_size=sd["cum_size"],

@@ -24,65 +24,79 @@ def slot(ticker="KXLAW-26JUL30-T1", side="bid", rho=1.25, S=180.0, p=0.10, phi=0
                       land_grab_price_c=C.ENTRY_BAND_LO_C, **kw)
 
 
-class TestTheOwnersThreeExamples(LipTestCase):
-    """The sizing law, his numbers.  (Ryan, 2026-07-30, verbatim in the alloc.py header.)"""
+class TestTheOwnersRulingOnSizing(LipTestCase):
+    """THE OWNER'S RULING (2026-07-30), which SUPERSEDES his examples' literal arithmetic —
+    he set the examples aside where they conflict and ruled from the machine:
 
-    def test_example_1_five_dollar_hours_phi_2_5(self):
-        """"if it costs 5 dollar-hours to earn 1.5, and phi is 2.5, we will put in 5
-        dollars, and requote when it fills."
+      1. ORDER = W, the full resting size the share-math demands.  Never shrunk to stretch
+         across turnovers.
+      2. Turnovers enter ONLY the affordability screen: W x max(1, T) <= $10, else SKIP with
+         the numbers logged.  The screen compares the UNROUNDED W.
+      3. Oversize beyond W only on MEASURED-low phi (tested in
+         TestOversizeRequiresAMeasurement below).
 
-        Constructed so the resting need is $2.00 (q_rest = 20 at 10c) and phi = 2.5
-        turnovers over the 24h horizon: total need = 2.00 x 2.5 = the owner's $5 — funded,
-        with the remainder of the $10 allocation as the requote budget."""
-        s = slot(phi=2.5 / 24.0)                  # codebase phi is per-hour: T = phi x 24
+    Fixtures pin the ruling's own four cases (a)-(d)."""
+
+    def test_a_W5_at_T2_5_is_SKIPPED_unaffordable_with_the_numbers(self):
+        """(a) need $5 resting, T = 2.5: total $12.50 > $10 ⇒ SKIP.  NOTE: this INVERTS the
+        owner's old example 1 ("we will put in 5 dollars") — the ruling wins, explicitly:
+        turnovers are an affordability screen, and $5 x 2.5 does not fit the allocation."""
+        s = slot(p=0.25, phi=2.5 / 24.0)          # q_rest = 20 @ 25c ⇒ W = $5; T = 2.5
         n = alloc.law_need(s)
-        self.assertEqual(n.reason, "")
-        self.assertEqual(n.q_rest, 20)
-        self.assertAlmostEqual(n.rest_usd, 2.00, places=9)
+        self.assertAlmostEqual(n.rest_usd, 5.0, places=9)
         self.assertAlmostEqual(n.turnovers, 2.5, places=9)
-        self.assertAlmostEqual(n.total_usd, 5.00, places=9)   # ← his "5 dollar-hours"
+        self.assertAlmostEqual(n.total_usd, 12.5, places=9)
         a, spent, rep = alloc.allocate_law([s], budget_usd=300.0)
-        self.assertGreaterEqual(a[s.key], n.q_rest)
-        # The whole $10 envelope is committed: the order plus its expected requotes.
-        self.assertAlmostEqual(spent, 10.0, places=6)
+        self.assertEqual(a[s.key], 0)
+        self.assertEqual(spent, 0.0)
+        self.assertEqual(rep["reasons"].get("unaffordable"), 1)
+        ex = self.logs_of("law_example")
+        self.assertTrue(ex and ex[0]["rest_usd"] == 5.0 and ex[0]["turnovers"] == 2.5
+                        and ex[0]["total_usd"] == 12.5,
+                        "the skip must carry W, T and the total: %s" % ex)
 
-    def test_example_2_ten_dollar_hours_phi_24(self):
-        """"if phi is 24, and it costs 10 dollar-hours, we will put in 1000/24 cents, 24
-        times."
-
-        q_rest = 20 at 2c ⇒ resting need $0.40; T = 24 turnovers ⇒ total = $9.60 (his
-        round "$10").  The ORDER is env / T = $10/24 = 1000/24 cents — his number exactly —
-        and 24 requotes of it consume the allocation."""
-        s = slot(rho=0.625, S=80.0, p=0.02, phi=1.0)          # T = 1.0/h x 24h = 24
+    def test_b_W5_at_T2_funds_at_order_exactly_5(self):
+        """(b) the same market at T = 2.0: total $10.00 fits, and the ORDER IS W — five
+        dollars exactly, never oversized (T > 1) and never shrunk (rule 1)."""
+        s = slot(p=0.25, phi=2.0 / 24.0)
         n = alloc.law_need(s)
-        self.assertEqual(n.q_rest, 20)
-        self.assertAlmostEqual(n.turnovers, 24.0, places=9)
-        self.assertAlmostEqual(n.total_usd, 9.60, places=9)
-        a, spent, rep = alloc.allocate_law([s], budget_usd=300.0)
-        order_usd = a[s.key] * s.p
-        # 1000/24 cents = $0.41667; integer contracts at 2c land within one contract of it.
-        self.assertAlmostEqual(order_usd, 10.0 / 24.0, delta=s.p)
-        self.assertLessEqual(order_usd * 24.0, 10.0 + 1e-9)   # 24 requotes fit the $10
+        self.assertAlmostEqual(n.total_usd, 10.0, places=9)
+        a, spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
+        self.assertEqual(a[s.key], 20)
+        self.assertAlmostEqual(a[s.key] * s.p, 5.0, places=9)
 
-    def test_example_3_awesome_market_puts_all_ten(self):
-        """"if somehow this market is awesome and we can earn a dollar in 24 hours with only
-        one dollar, we will put all 10, because that capital can't go to any other rung or it
-        would be too consolidated."
-
-        Resting need $1.00 (q_rest = 10 at 10c), phi ~ 0: the order is OVERSIZED to the full
-        $10 allocation."""
-        s = slot(rho=1.25, S=90.0, p=0.10, phi=0.0)
+    def test_c_the_example_2_boundary_funds_the_42c_order(self):
+        """(c) the owner's example-2 world with integer rounding: q_raw = 20.83 at 2c rounds
+        to a 21-contract, 42c order whose ROUNDED consumption is $10.08.  The affordability
+        screen compares the UNROUNDED W x T (= $10.00 exactly) against the allocation —
+        stated choice, per the ruling: a skip caused by rounding one contract up would
+        refuse the owner's own example-2 market.  MUST FUND, at order 42c."""
+        s = slot(rho=0.625, S=83.3333333333, p=0.02, phi=1.0)     # T = 24
         n = alloc.law_need(s)
-        self.assertAlmostEqual(n.total_usd, 1.0, places=9)    # ← "with only one dollar"
-        a, spent, rep = alloc.allocate_law([s], budget_usd=300.0)
+        self.assertEqual(n.q_rest, 21)
+        self.assertAlmostEqual(n.rest_usd, 0.42, places=9)
+        self.assertAlmostEqual(n.total_usd, 10.0, places=6)       # unrounded, exactly
+        a, _spent, rep = alloc.allocate_law([s], budget_usd=300.0)
+        self.assertEqual(a[s.key], 21)
+        self.assertAlmostEqual(a[s.key] * s.p, 0.42, places=9)
+        self.assertEqual(rep["reasons"], {})
+
+    def test_d_measured_low_phi_small_need_puts_all_ten(self):
+        """(d) = the owner's example 3, now measurement-gated (G3): "we can earn a dollar in
+        24 hours with only one dollar, we will put all 10."  phi here is a measured FACT of
+        zero, so the oversize stands."""
+        s = slot(rho=1.25, S=90.0, p=0.10, phi=0.0)               # phi_source defaults
+        n = alloc.law_need(s)                                     # "measured": a given fact
+        self.assertAlmostEqual(n.total_usd, 1.0, places=9)
+        a, spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
         self.assertAlmostEqual(a[s.key] * s.p, 10.0, places=6)
         self.assertAlmostEqual(spent, 10.0, places=6)
 
     def test_unaffordable_is_skipped_with_numbers_never_silent(self):
-        """"if it doesn't fit in there, we can't afford it."  total need $12 > $10 ⇒ SKIP,
-        and the skip carries its arithmetic (three silent-refusal incidents on 2026-07-30
-        are why this is load-bearing, not cosmetic)."""
-        s = slot(phi=6.0 / 24.0)                  # T = 6: total = 2.00 x 6 = $12
+        """"if it doesn't fit in there, we can't afford it" — the ruling KEEPS this screen
+        verbatim (three silent-refusal incidents on 2026-07-30 are why the numbers ride
+        every skip)."""
+        s = slot(phi=6.0 / 24.0)                  # W = $2, T = 6: total = $12
         n = alloc.law_need(s)
         self.assertAlmostEqual(n.total_usd, 12.0, places=9)
         a, spent, rep = alloc.allocate_law([s], budget_usd=300.0)
@@ -90,8 +104,51 @@ class TestTheOwnersThreeExamples(LipTestCase):
         self.assertEqual(spent, 0.0)
         self.assertEqual(rep["reasons"].get("unaffordable"), 1)
         self.assertTrue(self.logs_of("law_reasons"))
-        ex = self.logs_of("law_example")
-        self.assertTrue(ex and ex[0]["total_usd"] == 12.0, ex)
+
+
+class TestOversizeRequiresAMeasurement(LipTestCase):
+    """G3, grafted 2026-07-30 from the allocator-law branch, confirmed by the owner's
+    ruling rule 3: example 3 is conditioned on a KNOWN low phi, not on ignorance."""
+
+    def _big_need(self, **kw):
+        # q_raw = 60 @ 10c ⇒ W = $6 > the $5 lot container
+        kw.setdefault("rho", 1.25); kw.setdefault("S", 540.0); kw.setdefault("p", 0.10)
+        return slot(**kw)
+
+    def test_a_seed_phi_slot_never_orders_above_the_lot_container(self):
+        """Unmeasured ⇒ tranche at SLOT_LOT_CAP_USD (the per-source reserve halved so one
+        re-post is guaranteed — an existing derivation, no new constant): a never-rested
+        market can never be one fill from done-for-the-day."""
+        s = self._big_need(phi=0.001, phi_source="seed")
+        a, _spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
+        self.assertGreater(a[s.key], 0)
+        self.assertLessEqual(a[s.key] * s.p, C.SLOT_LOT_CAP_USD + 1e-9)
+
+    def test_a_measured_zero_phi_slot_still_oversizes_to_the_envelope(self):
+        s = self._big_need(phi=0.0, phi_source="measured")
+        a, _spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
+        self.assertAlmostEqual(a[s.key] * s.p, 10.0, places=6)
+
+    def test_bucket_and_global_phis_count_as_measurement(self):
+        for src_ in ("bucket", "global"):
+            s = self._big_need(phi=0.0, phi_source=src_)
+            a, _spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
+            self.assertAlmostEqual(a[s.key] * s.p, 10.0, places=6, msg=src_)
+
+    def test_the_phi_source_rides_the_funded_log_line(self):
+        s = self._big_need(phi=0.001, phi_source="seed")
+        alloc.allocate_law([s], budget_usd=300.0)
+        funded = self.logs_of("law_funded")
+        self.assertTrue(funded and funded[0]["phi_source"] == "seed", funded)
+
+    def test_a_self_qualifying_walk_posts_the_walk_exactly(self):
+        """The walk is ALL-OR-NOTHING (the filing's step function): a sub-walk order scores
+        zero, so the qualify case posts q_rest exactly — no seed tranche (which would buy a
+        worthless sub-walk) and no oversize (at S = 0 extra size buys no share)."""
+        s = slot(S=0.0, cum_size=0.0, target_size=100, p=0.06, rho=1.25,
+                 phi=0.001, phi_source="seed")
+        a, _spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
+        self.assertEqual(a[s.key], 101)
 
 
 class TestRankingAndAccrual(LipTestCase):

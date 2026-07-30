@@ -110,15 +110,22 @@ class TestFillReplenishAtOneHz(FixRoundCase):
         ex.take(oid, n, now=NOW + 2)                       # the taker eats the WHOLE order
         return r, ex, oid, n
 
-    def test_fill_learned_and_a_consumed_allocation_ends_presence_there(self):
-        """REWRITTEN under the owner's law §4 (2026-07-30).  WAS `..._and_replenished`,
-        asserting the reserve stack re-posted a lot after a full fill.  Under the law the
-        $10 per-market allocation IS the requote budget: a fill that consumes the whole
-        envelope ends that market's presence for the window — `allocation_exhausted`, with
-        numbers, never silent — the position RIDES, and a restart re-derives the same state
-        from exchange positions alone.  The requote-on-fill path (partial consumption) is
-        `test_a_partial_fill_...` below and test_law's TestTheRequoteBudget."""
+    def test_fill_learned_and_the_tape_reprices_the_market_out(self):
+        """REWRITTEN under the owner's RULING + G3 (2026-07-30).  WAS `..._and_replenished`
+        (the reserve stack re-posted a lot), then briefly `..._consumed_allocation...`.
+
+        The ruled behavior on this fixture, end to end: the fresh venue's phi chain bottoms
+        out at the SEED, so the first order is W tranched at the lot container (never the
+        whole $10 — G3: one fill may not end the market's day).  The taker eats it in
+        seconds; the fill is learned through the fills API; and the market's OWN TAPE now
+        measures a scorching phi, so the law re-prices it UNAFFORDABLE (W x T >> $10) — no
+        re-post, with the arithmetic in the log, never silence.  A hot market is exactly
+        what the affordability screen exists to refuse ("if it doesn't fit in there, we
+        can't afford it")."""
         r, ex, oid, n = self._filled_runner(verified=True)
+        # G3: the seed-phi order was tranched at the lot container, not the whole $10
+        self.assertLessEqual(float(ex.placed[0]["count"]) * 0.06,
+                             C.SLOT_LOT_CAP_USD + 0.06)
         t = NOW + 2
         for _ in range(2 * int(C.FILLS_POLL_S) + 5):       # true 1 Hz
             t += 1.0
@@ -131,10 +138,10 @@ class TestFillReplenishAtOneHz(FixRoundCase):
         self.assertAlmostEqual(r.m.positions[TK]["yes"], n, places=6)
         self.assertNotIn(oid, r.m.orders, "the filled order is still counted as resting")
         self.assertEqual(ex.resting, {},
-                         "the $10 envelope is consumed: nothing may re-post here")
-        self.assertTrue(any(rec.get("allocation_exhausted")
+                         "a measured-hot market must not be re-entered")
+        self.assertTrue(any(rec.get("unaffordable") or rec.get("allocation_exhausted")
                             for rec in self.logs_of("law_reasons")),
-                        "a consumed allocation must say so — no silent refusals")
+                        "the refusal must carry its reason — no silent paths")
         self.assertNotIn(TK, r.m.frozen)
 
     def test_the_fill_updates_collateral_so_the_feed_stays_true(self):

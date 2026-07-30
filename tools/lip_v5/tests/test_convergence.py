@@ -190,6 +190,40 @@ class TestTheMultiMarketBookIsAPureFunctionOfTheWorld(ConvergenceCase):
                                    msg="rung %s came back at a different size" % (key,))
 
 
+class TestPlanGrowthReachesTheWire(ConvergenceCase):
+    """G1's spine half (grafted 2026-07-30 from the allocator-law branch): the plan can
+    move while the book sits still — here, the phi chain crossing from SEED to MEASURED
+    flips the order from the lot-container tranche to the full allocation — and the refill
+    trigger is one-directional, silent at exactly this boundary: the tranche (83 contracts)
+    is precisely half the grown plan (166), and 83 < 0.5 x 166 is FALSE.  Only trigger (f)
+    TARGET_MOVED carries the growth to the wire; without it the wire is a function of WHEN
+    the measurement arrived, not of the world."""
+
+    def test_the_seed_to_measured_growth_is_carried_by_trigger_f(self):
+        # reward tuned so W = ~$5.40 at 6c: the seed tranche posts $5.00 = 83 contracts,
+        # and the measured-zero oversize posts the $10 envelope = 166 — the rival branch's
+        # exact measured pair, reproduced from the world instead of asserted.
+        ex = ConvergenceExchange(program_body(tickers=(TK_A,), reward=287_000),
+                                 {TK_A: cheap_book()})
+        ex.market_closes[TK_A] = NOW + 16 * 3600
+        m = self.maker(ex=ex)
+        r = RUN.Runner(m, sleep=lambda _s: None)
+        r.classifier.close_ts[TK_A] = NOW + 16 * 3600
+        ok, refusals = r.init(NOW, nestor_state=NESTOR)
+        self.assertTrue(ok, refusals)
+        t = self.settle(r, NOW, n=60)                     # 60 s: tape still under 2 c·h
+        early = self.fingerprint(ex)
+        self.assertEqual(early.get((TK_A, "bid")), 83.0,
+                         "the seed tranche must rest first: %s" % early)
+        # ...the book does not move; only the TAPE does (2 contract-hours of quiet resting
+        # measures phi = 0), and the plan doubles.  83 is EXACTLY half of 166, so the
+        # refill trigger's strict inequality stays silent — (f) is what reaches the wire.
+        t = self.settle(r, t, n=60, step=5.0)             # to ~360 s: decisively measured
+        grown = self.fingerprint(ex)
+        self.assertEqual(grown.get((TK_A, "bid")), 166.0,
+                         "the measured plan never reached the wire: %s" % grown)
+
+
 class TestTheRiskRailsSurviveConvergence(ConvergenceCase):
     """Convergence may not be bought by removing a rail.  Every one of these bounds the book
     in DOLLARS and none of them remembers a decision."""

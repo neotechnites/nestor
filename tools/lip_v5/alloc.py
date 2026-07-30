@@ -117,13 +117,18 @@ class Slot(object):
     # only — a slot cannot carry a refusal flag for a gate that no longer exists — and the
     # assume-filled freeze already acts through `frozen` at slot-build, not through the plan.
     __slots__ = ("ticker", "side", "venue", "rho", "S", "p", "pinned", "denied",
-                 "legal_price_exists", "phi", "d", "l_eff", "t_hat", "program_id",
-                 "window_h", "hours_left", "hours_to_start", "accrued",
+                 "legal_price_exists", "phi", "phi_source", "d", "l_eff", "t_hat",
+                 "program_id", "window_h", "hours_left", "hours_to_start", "accrued",
                  "target_size", "cum_size", "land_grab_size", "land_grab_price_c",
                  "moneyness", "close_ts", "program_end_ts", "rung")
 
+    # `phi_source` — which rung of the law §6 chain produced `phi`: "measured" | "bucket" |
+    # "global" | "seed".  `scan.build_slots` ALWAYS stamps it; the default is "measured"
+    # because a directly-constructed slot's phi is given by its caller as a fact, which is
+    # exactly the condition the oversize gate tests (G3, grafted 2026-07-30).
     def __init__(self, ticker, side, rho, S, p, venue=None, pinned=False, denied=False,
-                 legal_price_exists=True, phi=0.0, d=None, l_eff=C.SETTLE_LAG_H,
+                 legal_price_exists=True, phi=0.0, phi_source="measured", d=None,
+                 l_eff=C.SETTLE_LAG_H,
                  t_hat=1.0, program_id=None, window_h=16.0, hours_left=None,
                  hours_to_start=0.0, accrued=0.0, target_size=1000,
                  cum_size=0.0, land_grab_size=0, land_grab_price_c=C.ENTRY_BAND_LO_C,
@@ -138,6 +143,7 @@ class Slot(object):
         self.denied = denied
         self.legal_price_exists = legal_price_exists
         self.phi = float(phi)
+        self.phi_source = str(phi_source)
         self.d = M.d_estimate(None, p) if d is None else float(d)
         self.l_eff = float(l_eff)
         self.t_hat = float(t_hat)
@@ -235,28 +241,28 @@ def t0_qualification_size(cum_size, target_size, min_floor_q=0):
 #      because that capital can't go to any other rung or it would be too consolidated."
 #   5. FLOOR — $1.50 per 24 hours AND never below $1.00 by window end.
 #
-# THE READING OF §4, stated once so the arithmetic can be argued with (the three examples are
-# reproduced numerically in tests/test_law.py):
-#   * "dollar-hours" is the TOTAL capital the market consumes over the horizon: the resting
-#     lot, replaced each time a fill converts it into inventory.  phi in his examples counts
-#     TURNOVERS of the lot over the horizon; in this codebase phi is fills/hour/resting-
-#     contract, so turnovers T = phi x h (fills scale linearly with size, so T is
-#     size-independent).  Total consumption of a lot L held through the horizon is
-#     L x max(1, T): the lot itself, T times over ("1000/24 cents, 24 times" = $10 total at
-#     T = 24; "put in 5 dollars, and requote when it fills" = $5 total at T = 2.5).
-#   * the NEED is the smallest lot that earns the target: W = q_rest x p from the share
-#     equation below.  total_need = W x max(1, T) (+ self-qualification where the side does
-#     not qualify on rival depth — law §7a).  total_need > $10 ⇒ we can't afford it: SKIP,
-#     logged with the numbers, never silent.
-#   * the ORDER is OVERSIZED up to the envelope: lot = env / max(1, T) where env = min($10,
-#     budget room, $10 − basis already bought here).  At T <= 1 that is the whole $10 ("we
-#     will put all 10") and at T = 24 it is 1000/24 cents; affordability (total_need <= env)
-#     guarantees lot >= W, so the order never undershoots the need.  Oversizing is free in
-#     the owner's frame because the excess "can't go to any other rung [of this cluster] or
-#     it would be too consolidated" — and share is monotone in q, so the extra size earns.
-#   * env shrinks as fills accumulate basis in the market (market_spent), so the remainder of
-#     the $10 IS the requote budget, consumed as fills happen, with no bookkeeping beyond the
-#     positions the exchange already confirms — restart-safe by construction.
+# THE RULING ON §4 (the owner, 2026-07-30 — supersedes the examples' literal arithmetic;
+# the owner explicitly set the examples aside where they conflict and ruled from the machine):
+#   1. ORDER SIZE = W, the full resting size the share-math demands (q_rest x p).  NEVER
+#      shrunk to stretch across turnovers — a shrunk order under-earns every hour and misses
+#      the target with certainty.
+#   2. TURNOVERS ENTER ONLY THE AFFORDABILITY SCREEN: W x max(1, T) <= the $10 allocation,
+#      else SKIP with the number logged ("if it doesn't fit in there, we can't afford it").
+#      T = phi x h (phi is fills/hour/resting-contract here, so T — the lot's expected
+#      turnovers over the horizon — is size-independent).  The screen compares the UNROUNDED
+#      W (see law_need): a skip caused by rounding one contract up would refuse the owner's
+#      own example-2 market.  The requote budget is the allocation minus consumed basis
+#      (market_spent, read off the exchange's own positions — restart-safe); refills re-post
+#      at full W until the allocation is spent.
+#   3. OVERSIZE beyond W toward the full $10 ONLY on MEASURED-low phi (G3, grafted from the
+#      allocator-law branch): example 3 is conditioned on a FACT ("its phi is very low"),
+#      not on the absence of one.  A seed-phi market tranches at the LOT CONTAINER instead —
+#      derivation in law_order_q.
+# HISTORY, kept honest: before the ruling this header carried a "total-need" reading under
+# which the order was env/max(1,T) — it reproduced example 2's "1000/24 cents, 24 times"
+# exactly but posted $4 where example 1 said "we will put in 5 dollars".  No single formula
+# reproduces both examples; the owner resolved the fork BY RULE (order = W), and the old
+# example-1 arithmetic is set aside with this note as the record.
 # =============================================================================================
 LAW_HORIZON_H = 24.0                          # "in the next 24 hours" — the law's own horizon
 
@@ -292,7 +298,8 @@ class Need(object):
     """One candidate's LAW arithmetic — every number a skip or a fund line must cite."""
 
     __slots__ = ("slot", "cluster", "target_usd", "need_usd", "h", "q_rest", "rest_usd",
-                 "turnovers", "qualify_q", "qualify_usd", "unit_usd", "total_usd", "reason")
+                 "turnovers", "qualify_q", "qualify_usd", "unit_usd", "total_usd",
+                 "phi_source", "reason")
 
     def __init__(self, slot, cluster, target_usd, need_usd, h, q_rest=0, rest_usd=0.0,
                  turnovers=0.0, qualify_q=0, qualify_usd=0.0, unit_usd=0.0, total_usd=0.0,
@@ -308,7 +315,10 @@ class Need(object):
         self.qualify_q = int(qualify_q)
         self.qualify_usd = qualify_usd
         self.unit_usd = unit_usd                  # collateral $/contract at the ORDER's price
-        self.total_usd = total_usd                # THE RANKING NUMBER (law §1)
+        self.total_usd = total_usd                # THE RANKING NUMBER (law §1) — computed
+                                                  # from the UNROUNDED resting need (ruling)
+        self.phi_source = getattr(slot, "phi_source", "measured")   # G3 (grafted): which
+                                                  # rung of the §6 chain produced phi
         self.reason = reason
 
     def numbers(self):
@@ -318,7 +328,8 @@ class Need(object):
                 "h": round(self.h, 2), "q_rest": self.q_rest,
                 "rest_usd": round(self.rest_usd, 4), "turnovers": round(self.turnovers, 3),
                 "qualify_q": self.qualify_q, "qualify_usd": round(self.qualify_usd, 4),
-                "total_usd": round(self.total_usd, 4), "accrued": round(self.slot.accrued, 4)}
+                "total_usd": round(self.total_usd, 4), "phi_source": self.phi_source,
+                "accrued": round(self.slot.accrued, 4)}
 
 
 def law_need(slot):
@@ -375,7 +386,13 @@ def law_need(slot):
         return Need(slot, ck, target, need, h, q_rest=q_rest, rest_usd=rest, turnovers=T,
                     qualify_q=qual_gap, qualify_usd=qual_gap * unit, unit_usd=unit,
                     total_usd=total)
-    q_rest = max(1, int(math.ceil(float(slot.S) * s_needed / (1.0 - s_needed))))
+    # THE AFFORDABILITY NUMBER USES THE UNROUNDED NEED (owner's ruling, 2026-07-30): the
+    # order posts whole contracts (q_rest = ceil), but a skip caused by rounding ONE
+    # CONTRACT up would refuse the owner's own example-2 market (q_raw = 20.83 -> 21
+    # contracts pushes 24 x W from exactly $10.00 to $10.08).  So `total_usd` — the ranking
+    # AND the screen — is q_raw x p x max(1, T), and the rounding lives only in the order.
+    q_raw = max(1.0, float(slot.S) * s_needed / (1.0 - s_needed))
+    q_rest = max(1, int(math.ceil(q_raw)))
     unit = float(slot.p)
     rest = q_rest * unit
     qual_usd = 0.0
@@ -388,7 +405,8 @@ def law_need(slot):
         qual_usd = qual_gap * unit
         q_rest = max(q_rest, qual_gap)            # the order covers the gap, so the gap's
         rest = q_rest * unit                      # cost is inside `rest` from here on
-    total = rest * max(1.0, T)
+        q_raw = max(q_raw, float(qual_gap))
+    total = q_raw * unit * max(1.0, T)
     return Need(slot, ck, target, need, h, q_rest=q_rest, rest_usd=rest, turnovers=T,
                 qualify_q=qual_gap, qualify_usd=qual_usd, unit_usd=unit, total_usd=total)
 
@@ -400,18 +418,52 @@ def law_rank(needs):
 
 
 def law_order_q(need, env_usd):
-    """The ORDER, oversized up to the envelope (law §4, reading in the header):
+    """THE ORDER IS W (owner's RULING, 2026-07-30 — supersedes the examples' literal
+    arithmetic; the ruling is derivation-first, and the owner set the examples aside where
+    they conflict):
 
-        lot = env / max(1, T)   — the largest lot whose T expected turnovers still fit the
-                                  envelope, i.e. the whole $10 at T <= 1 ("we will put all
-                                  10") and 1000/24 cents at T = 24.
-
-    Affordability (total_need <= env) guarantees lot >= W, so the floor at q_rest below is a
-    rounding guard, not a second policy."""
+      1. ORDER SIZE = W, the full resting size the share-math demands (q_rest).  NEVER
+         shrunk to stretch across turnovers — a shrunk order under-earns every hour and
+         misses the target with certainty.  (The previous `env / max(1, T)` tranche formula
+         is RULED OUT and deleted.)
+      2. Turnovers enter ONLY the affordability screen (law_need's total_usd, unrounded);
+         the requote budget is the allocation minus consumed basis, and refills re-post at
+         full W until the allocation is spent.
+      3. OVERSIZE beyond W toward the full envelope ONLY on MEASURED-low phi (G3, grafted
+         from the allocator-law branch): example 3 is conditioned on a FACT — "somehow this
+         market is awesome and [its phi is very low]" — not on the absence of one.
+         Measured (or bucket/global — a measurement borrowed from the neighborhood) with
+         T <= 1 means the lot is not expected to turn over inside the horizon, so the whole
+         envelope can rest safely.  When the chain bottomed out at the SEED we do not know
+         phi is low — we know we have never looked — so the order additionally tranches at
+         the LOT CONTAINER (SLOT_LOT_CAP_USD, the per-source reserve halved so at least one
+         re-post is guaranteed; an existing derivation, no new constant): a never-rested
+         market can never put its whole $10 one fill from done-for-the-day.
+    MIRROR (oversizing ↔ tranching): oversizing buys share on a rung the measurement says
+    is safe, bounded by the envelope; tranching keeps a re-post alive on a rung nobody has
+    measured, bounded below by one contract.  Both ends are the same $10."""
     if need.unit_usd <= 0:
         return 0
-    lot_usd = float(env_usd) / max(1.0, need.turnovers)
-    return max(need.q_rest, int(lot_usd / need.unit_usd + 1e-9))
+    measured = need.phi_source in ("measured", "bucket", "global")
+    if need.qualify_q > 0:
+        # THE WALK IS ALL-OR-NOTHING (the filing's step function): a sub-walk order scores
+        # ZERO, so the seed tranche may not undercut it (it would buy a worthless sub-walk),
+        # and at S = 0 extra size buys no share, so the oversize may not inflate it
+        # (t0_qualification_size: "the minimum qualifying size is the maximum of the
+        # objective").  The qualify order is q_rest, exactly.
+        q = need.q_rest
+    elif not measured:
+        lot_usd = min(need.rest_usd, float(C.SLOT_LOT_CAP_USD), float(env_usd))
+        q = max(1, int(lot_usd / need.unit_usd + 1e-9))
+    elif need.turnovers <= 1.0 + 1e-12:
+        lot_usd = max(need.rest_usd, float(env_usd))
+        q = max(need.q_rest, int(lot_usd / need.unit_usd + 1e-9))
+    else:
+        q = need.q_rest                           # rule 1: the order is W, full stop
+    # The ENVELOPE is a hard bound (law §3 — the allocation, not a turnover shrink): a W
+    # whose ceil-rounding lands a fraction of a contract past what remains posts what the
+    # allocation can hold, so the plan never proposes an order the $10 rail must refuse.
+    return max(1, min(q, int(float(env_usd) / need.unit_usd + 1e-9)))
 
 
 def allocate_law(slots, budget_usd, market_spent=None, alloc_cap_usd=None,
