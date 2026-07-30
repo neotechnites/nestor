@@ -72,6 +72,29 @@ class TestScanStage(LipTestCase):
         s.scan(ex, b, NOW + C.SCAN_REFRESH_S + 1)
         self.assertEqual(ex.program_calls, 2)
 
+    def test_a_scan_that_DRAINED_the_feed_reports_itself_complete(self):
+        """Absence is only evidence once the map that would have carried it finished
+        arriving — the precondition every pure re-derivation needs before it may read a
+        missing ticker as "the world does not contain it"."""
+        ex = ScanExchange()
+        s = scan.Scanner()
+        from .. import ratelimit as RL
+        self.assertFalse(s.last_scan_complete)               # nothing asked yet
+        s.scan(ex, RL.Bucket(NOW), NOW)
+        self.assertTrue(s.last_scan_complete)
+
+    def test_a_scan_still_PAGINATING_reports_itself_incomplete(self):
+        ex = ScanExchange()
+        body = dict(program_body())
+        body["next_cursor"] = "more"
+        ex.programs = lambda cursor=None: (200, body)
+        s = scan.Scanner()
+        from .. import ratelimit as RL
+        b = RL.Bucket(NOW)
+        b.tokens, b.b = 1.0, 1.0                             # one page, then the lane closes
+        s.scan(ex, b, NOW)
+        self.assertFalse(s.last_scan_complete)
+
     def test_the_scan_draws_from_the_rate_budget_and_defers_when_empty(self):
         ex = ScanExchange()
         s = scan.Scanner()

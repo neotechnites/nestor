@@ -103,6 +103,14 @@ class Scanner(object):
         self.refresh_s = float(refresh_s)
         self.last_scan = None
         self.programs = []
+        # DID THE MAP FINISH ARRIVING?  A scan that deferred on rate, errored, or ran out of
+        # pages with a cursor still open returns a PARTIAL table — correct-but-narrow for
+        # discovery (we simply see fewer venues) and NOT evidence of absence for anyone who
+        # reads a missing ticker as a judgement.  Measured 2026-07-30: 10 s after boot the
+        # feed was still paginating and 16 healthy markets read as "no live program".
+        # A pure re-derivation needs this: "the world does not contain X" is only a fact
+        # about the world once the map that would have contained X finished arriving.
+        self.last_scan_complete = False
 
     def due(self, now):
         return self.last_scan is None or (float(now) - self.last_scan) >= self.refresh_s
@@ -111,6 +119,7 @@ class Scanner(object):
         if not self.due(now):
             return self.programs
         pages, cursor, collected = 0, None, []
+        complete = False
         while pages < int(max_pages):
             ok, _ = bucket.admit("classify_sweep", now)
             if not ok:
@@ -129,10 +138,12 @@ class Scanner(object):
             cursor = (body or {}).get("next_cursor") or (body or {}).get("cursor")
             pages += 1
             if not cursor:
+                complete = True               # the feed drained: this map is the whole board
                 break
         if collected:
             self.programs = collected
             self.last_scan = float(now)
+            self.last_scan_complete = complete
         return self.programs
 
 
