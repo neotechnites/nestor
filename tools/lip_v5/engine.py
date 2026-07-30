@@ -1503,7 +1503,7 @@ class Maker(object):
             reason = None
             if ticker in self.triage_shed:
                 reason = "cutover_triage"
-            else:
+            elif C.INVENTORY_AUTO_SHED:
                 s = by_key.get((ticker, "bid" if held == "yes" else "ask"))
                 if s is not None:
                     fails_star = not M.admits(s.net_at(abs(net), r_star))

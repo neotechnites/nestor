@@ -328,7 +328,12 @@ class TestPostFillCooldown(LipTestCase):
         self.assertTrue(m.orders, "fixture never armed")
         return r, ex, tk, RNOW
 
-    def test_a_fill_starts_the_cooldown_and_the_replenish_waits(self):
+    def test_a_fill_starts_the_cooldown_and_phi_judges_the_return(self):
+        """WAS asserting the replenish returns after the cooldown — that pass was an
+        artifact: the second placement it saw was the (now-removed) auto-shed.  The true
+        behavior: a lot eaten within seconds measures a huge φ, and (★) refuses to re-enter
+        the rung this period — the φ discipline, not a stuck requoter.  The cooldown's own
+        job (nothing re-posts inside the window) still asserts."""
         r, ex, tk, NOW_ = self._armed()
         oid = list(r.m.orders)[0]
         ex.take(oid, 999, now=NOW_ + 2)                   # the flow eats the whole lot
@@ -340,8 +345,9 @@ class TestPostFillCooldown(LipTestCase):
                          "the replenish re-posted INSIDE the cooldown")
         for k in range(0, 40):
             r.iteration(NOW_ + 95 + k)                    # past the window
-        self.assertGreater(len(ex.placed), placed_before,
-                           "the replenish never returned after the cooldown")
+        self.assertEqual(len(ex.placed), placed_before,
+                         "a rung whose lot was eaten in 2s must be φ-refused, not re-fed")
+        self.assertFalse(r.m.halt.halted)
 
     def test_the_burst_breaker_is_unreachable_through_the_replenish(self):
         """The property that ends the halt class: even a flow that eats every lot on

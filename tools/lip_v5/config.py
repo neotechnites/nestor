@@ -1396,6 +1396,16 @@ ADOPT_BASIS_MARK_MULT = 2.0                  # the cash feed all wrong in the sa
 # vs riding; +2c leg −$40.30), and the whole book settles ≤7 days by the D4 gate, so the
 # ride is short by construction.  Positions RIDE; kills and the day stop are the only exits.
 CUTOVER_TRIAGE_ENABLED = False               # the decision + maker-shed path
+# ── OFF (Ryan, 2026-07-30 ~08:35 MT — the shed storm).  update_shed_targets carried a
+# SECOND auto-exit path independent of triage: inventory whose venue fails (★) NOW is shed
+# at the opposing best.  Its own docstring argues the carry term "changes nothing about
+# where the dollars should be" — WRONG: exit costs the SPREAD, and the tape prices that at
+# −$40.30 (+2c leg) and −$123 (instant flatten).  Live today it crossed to a 95c ask to
+# close an 18c-basis NO (guaranteed −$2.80) and offered 26 Skubal at 2c against 16c basis.
+# Under the D4 settlement gate every ride is ≤7 days, so the worst case of HOLDING is
+# bounded and measured cheaper than paying spreads.  POSITIONS RIDE.  The remaining exits:
+# the day stop's flatten, the halt's closing pass, and settlement itself.
+INVENTORY_AUTO_SHED = False
 TAKER_FEE_RATE = 0.07                        # v1 §5.1 F = ceil(0.07·n·p·(1−p)) up to the cent
 TAKER_EXIT_MAX_SLIPPAGE_C = 3                # v1 — a MARKETABLE LIMIT, never a market order:
                                              # §8.8 aborts on "a fill at a price we did not
