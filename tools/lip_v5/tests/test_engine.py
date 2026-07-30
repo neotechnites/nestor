@@ -723,28 +723,55 @@ class TestDivergenceUpVsOurOwnUnpolledFill(EngineCase):
 
 
 class TestAdmitVenuesSurvivesAFloorlessVenue(EngineCase):
-    """The sole-qualifier crash: `venue_floor_usd` returns None whenever every slot of a
-    venue has S<=0 (nobody to share with — the state this book is TRYING to reach) or the
-    window has wound down past floor_q's answer.  admit_venues multiplied that None by
-    RUNG0_FLOOR_MULT, raised TypeError, and runner.iteration's except persisted an
-    iteration_error HALT.  None is a reading (UNPROBEABLE), never a crash."""
+    """TWO CASES WORE ONE SKIP, and the skip answered for both.
 
-    def test_a_venue_whose_slots_all_have_S_zero_does_not_crash(self):
+    `venue_floor_usd` skipped every slot with S<=0, so a venue whose slots ALL have S<=0
+    produced no floor, read None, and both consumers read None as UNPROBEABLE with cap 0.
+    That is right for a wound-down window (the pool can no longer pay the floor at any size)
+    and WRONG for the sole-qualifier state — no rival score means nothing splits the pool, so
+    the whole ρ/2 is addressable and the binding constraint is the forfeit cliff.  Measured
+    2026-07-30: 7 venues, 288 open markets, zero quotes and zero trades from anyone, all at
+    cap $0.  The None must also never CRASH: it once multiplied into a TypeError that
+    runner.iteration persisted as an iteration_error HALT."""
+
+    def test_a_sole_qualifier_venue_is_ADMITTED_with_a_cliff_sized_floor(self):
         m = self.maker()
         m.venues["KXAAAGASD"] = RT.VenueState("KXAAAGASD")   # rung 0, unverified, live
         caps = m.admit_venues(NOW, [slot("KXAAAGASD-1", S=0.0, venue="KXAAAGASD"),
                                     slot("KXAAAGASD-2", S=0.0, venue="KXAAAGASD")])
-        self.assertEqual(m.venue_status.get("KXAAAGASD"), RT.UNPROBEABLE)
-        self.assertEqual(caps["KXAAAGASD"], 0.0)
-        self.assertEqual(m.venues["KXAAAGASD"].rung0_cap_usd, 0.0)
+        self.assertNotEqual(m.venue_status.get("KXAAAGASD"), RT.UNPROBEABLE)
+        self.assertGreater(caps["KXAAAGASD"], 0.0)
+        self.assertGreater(m.venues["KXAAAGASD"].rung0_cap_usd, 0.0)
 
-    def test_the_unseen_venue_branch_takes_None_too(self):
-        # MIRROR: the st-is-None candidate path hands floor_usd straight to RT.admit; it must
-        # read UNPROBEABLE from the same None rather than raising somewhere else.
+    def test_the_floor_is_ONE_CONTRACT_not_the_zero_cliff_q_returns(self):
+        """`cliff_clearing_q` answers 0 at S=0 (ceil(0 × share/(1−share))), which is
+        arithmetically right and operationally degenerate — a $0 floor admits a venue at a $0
+        cap, the same paralysis wearing a different status."""
+        m = self.maker()
+        s = slot("KXAAAGASD-1", S=0.0, venue="KXAAAGASD")
+        self.assertEqual(alloc.cliff_clearing_q(s), 0)
+        self.assertAlmostEqual(m.venue_floor_usd([s]), 1 * s.p, places=9)
+
+    def test_the_unseen_venue_branch_admits_it_too(self):
+        # MIRROR: the st-is-None candidate path hands floor_usd straight to RT.admit, so both
+        # consumers of venue_floor_usd must reach the same verdict from the same number.
         m = self.maker()
         caps = m.admit_venues(NOW, [slot("KXAAAGASD-1", S=0.0, venue="KXAAAGASD")])
+        self.assertGreater(caps["KXAAAGASD"], 0.0)
+        self.assertIn("KXAAAGASD", m.venues)
+
+    def test_a_wound_down_window_still_reads_UNPROBEABLE_and_does_not_crash(self):
+        """The other half of the old skip, kept: when the remaining pool cannot pay the floor
+        at ANY size, cliff_clearing_q returns None, the venue contributes no floor, and the
+        None travels the whole admission path without raising."""
+        m = self.maker()
+        m.venues["KXAAAGASD"] = RT.VenueState("KXAAAGASD")
+        ss = [slot("KXAAAGASD-1", S=0.0, venue="KXAAAGASD", hours_left=0.001, window_h=16.0)]
+        self.assertIsNone(alloc.cliff_clearing_q(ss[0]))
+        self.assertIsNone(m.venue_floor_usd(ss))
+        caps = m.admit_venues(NOW, ss)
+        self.assertEqual(m.venue_status.get("KXAAAGASD"), RT.UNPROBEABLE)
         self.assertEqual(caps["KXAAAGASD"], 0.0)
-        self.assertNotIn("KXAAAGASD", m.venues)
 
 
 if __name__ == "__main__":

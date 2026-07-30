@@ -1395,12 +1395,42 @@ class Maker(object):
         ENTRY_FLOOR and its reading would be OUT_OF_REACH, i.e. a cheaper probe that
         cannot verify.  Only when the entry floor has died (unreachable pool, or no longer
         fitting under the slot/market caps) does the rescue floor take over the runway.
+
+        ── THE SOLE-QUALIFIER FLOOR (2026-07-30, measured: 7 venues at cap $0). ──────────────
+        `floor_q` sizes a probe against a RIVAL SCORE.  With S <= 0 there is no rival score,
+        so it has nothing to solve and the slot was SKIPPED — and a venue whose every slot has
+        S <= 0 produced no floor at all, read None, and both consumers read None as
+        UNPROBEABLE with cap 0.  Measured live: KXUST2AD/7AD/10AD/30AD, KXH100WS, KXH200WS and
+        KXRTX5090WS, 288 open markets between them with zero quotes and zero trades from
+        anyone, all refused.  That is the wrong answer to the RIGHT question in the state we
+        most want to be in: no rival score means nothing splits the pool, so the whole ρ/2 is
+        addressable and the binding constraint is the FORFEIT CLIFF, not a share contest.
+
+        `alloc.cliff_clearing_q` is already exactly that question — the smallest lot whose
+        credit reaches the floor over the remaining window — and it already handles S <= 0.
+        Its answer there is ZERO (`ceil(S × share/(1−share))` with S = 0), which is
+        arithmetically right and operationally degenerate: a zero-contract probe rests
+        nothing, measures nothing and would hand `rung0_cap` a $0 floor, i.e. an ADMITTED
+        venue with a $0 cap — the same paralysis wearing a different status.  ONE CONTRACT is
+        the smallest thing that can actually be resting, and with no rival it takes the whole
+        side, so the floor is `max(1, q_c) × p`.
+
+        WINDOW-WOUND-DOWN KEEPS ITS UNPROBEABLE READING, and through the same call: when the
+        remaining pool can no longer pay the floor at ANY size, `cliff_clearing_q` returns
+        None, the slot contributes no floor, and a venue where that is true of every slot
+        reads None → UNPROBEABLE exactly as before.  The two cases were conflated only
+        because one skip served both.
         """
         per_market = C.PER_MARKET_BUDGET_FRAC * self.ceiling_usd
         fits = min(self.slot_cap_usd, per_market)
         floors = []
         for s in venue_slots:
-            if s.S <= 0 or s.p <= 0:
+            if s.p <= 0:
+                continue
+            if s.S <= 0:
+                q_c = alloc.cliff_clearing_q(s)
+                if q_c is not None:
+                    floors.append(max(1, int(q_c)) * s.p)
                 continue
             f = RT.floor_q_usd(s.rho, s.S, s.p, s.hours_left)
             if f is None or f > fits + 1e-9:
