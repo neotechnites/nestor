@@ -656,6 +656,101 @@ class TestStartupAdoptsNoOrders(RunnerCase):
         self.assertFalse(hasattr(RUN.Runner, "parse_order_row"))
 
 
+class TestCancelAllIsScopedToOurOwnOrders(RunnerCase):
+    """**THE SHARED-ACCOUNT LAW.** (Owner decision, 2026-07-30: "it's either running and
+    placing orders, or it's not running.")  nestor and other systems trade this same Kalshi
+    account.  Every cancel this program issues must name an order THIS PROCESS placed —
+    identified by membership of `self.orders`, which since the startup adoption sweep was
+    deleted contains exactly that and nothing else.  There is no account-wide cancel endpoint
+    call anywhere in this binary, and there must never be one: an account-wide sweep would
+    silently flatten another system's book, and the halt is exactly the moment we are least
+    entitled to act on a wide reading of the world.
+
+    WHY THIS CLASS EXISTS.  `flatten()` is correct and always was — it iterates `self.orders`
+    — but correctness with no test is a property that survives only until the next edit.  The
+    scope evidence that existed covered STARTUP only (`test_the_prefix_sweep_is_gone_...`
+    asserts `ex.cancelled == []` at init, which is before any flatten runs), so an
+    account-wide sweep appended to `flatten` shipped through a fully green suite.  These tests
+    close that: they exercise the two paths that actually call `flatten` — the HALT and
+    SHUTDOWN — with foreign orders resting on the wire.
+
+    TWO KINDS OF FOREIGN ORDER, deliberately, because they fail differently:
+      * `nestors-1` wears someone else's coid.  A prefix check catches it.
+      * `ours-but-stale-1` wears OUR OWN prefix but was placed by a previous process, so it is
+        NOT in `self.orders`.  A prefix check does NOT catch it — only membership does — and
+        it is the one the deleted recovery sweep used to adopt.  It is also not ours to
+        cancel: startup neither adopts NOR cancels what it finds.
+    """
+
+    NESTOR = {"open_order_tickers": [], "position_tickers": []}
+    FOREIGN = {"nestors-1": {"ticker": "T", "side": "bid", "count": 5, "price": "0.5000",
+                             "client_order_id": "nestor-abc-1"},
+               "ours-but-stale-1": {"ticker": "T", "side": "bid", "count": 9,
+                                    "price": "0.5000",
+                                    "client_order_id": "v5-lipm-T-y-77"}}
+
+    def _armed_with_one_of_ours_and_two_foreign(self):
+        """One order WE placed this process, plus the two foreign ones, all resting."""
+        r = self.runner()
+        r.init(NOW, nestor_state=self.NESTOR)
+        ok, why, _ = r.m.place("T", "bid", 0.40, 10, int(NOW + 3600), NOW,
+                               available_cash_usd=100_000.0)
+        self.assertTrue(ok, why)
+        ours = sorted(r.m.orders)[0]
+        for oid, body in self.FOREIGN.items():
+            r.m.ex.resting[oid] = dict(body)
+        return r, ours
+
+    def _assert_foreign_untouched(self, r):
+        for oid in self.FOREIGN:
+            self.assertIn(oid, r.m.ex.resting,
+                          "%s was cancelled off a SHARED account" % oid)
+            self.assertNotIn(oid, r.m.ex.cancelled,
+                             "we sent a cancel for %s, which is not ours" % oid)
+            self.assertNotIn(oid, r.m.orders)
+
+    def test_the_HALT_cancels_ours_and_leaves_both_foreign_orders_resting(self):
+        r, ours = self._armed_with_one_of_ours_and_two_foreign()
+        r.m.halt.halt("books_integrity", NOW + 1)
+        for i in range(4):
+            r.iteration(NOW + 2 + i * 30.0)
+        self.assertIn(ours, r.m.ex.cancelled, "the halt did not cancel our own order")
+        self.assertNotIn(ours, r.m.ex.resting)
+        self._assert_foreign_untouched(r)
+        # ...and the halt placed nothing, pass after pass (clause 2's other half).
+        self.assertEqual(len(r.m.ex.placed), 1)               # only the pre-halt quote
+
+    def test_SHUTDOWN_cancels_ours_and_leaves_both_foreign_orders_resting(self):
+        r, ours = self._armed_with_one_of_ours_and_two_foreign()
+        r.shutdown(NOW + 5, reason="sigterm")
+        self.assertIn(ours, r.m.ex.cancelled, "shutdown did not cancel our own order")
+        self.assertNotIn(ours, r.m.ex.resting)
+        self._assert_foreign_untouched(r)
+
+    def test_flatten_itself_names_only_ids_in_our_book(self):
+        """The unit statement under the two integration ones: whatever `flatten` sends, the
+        set of ids is a SUBSET of `self.orders` as it stood on entry.  A future account-wide
+        sweep appended anywhere in the call fails here even if it is added below the loop."""
+        r, ours = self._armed_with_one_of_ours_and_two_foreign()
+        before = set(r.m.orders)
+        r.m.flatten(NOW + 5)
+        self.assertTrue(set(r.m.ex.cancelled) <= before,
+                        "flatten cancelled ids it never placed: %s"
+                        % (set(r.m.ex.cancelled) - before))
+        self.assertEqual(set(r.m.ex.cancelled), {ours})
+
+    def test_the_day_stop_flatten_is_scoped_the_same_way(self):
+        """The third caller of `flatten` — `cycle()`'s day-stop branch — is the one that runs
+        while the loop is otherwise healthy, so it gets its own statement rather than
+        inheriting the halt's."""
+        r, ours = self._armed_with_one_of_ours_and_two_foreign()
+        r.m.position_cost["T"] = 1000.0                       # crush the mark: day stop trips
+        out = r.iteration(NOW + 2)
+        self.assertTrue(out.get("day_stop"))
+        self.assertIn(ours, r.m.ex.cancelled)
+        self._assert_foreign_untouched(r)
+
+
 class TestSyncOrdersReconcilesOneDirectionOnly(RunnerCase):
     """`sync_orders` runs on the reconcile cadence and its MEANING changed with the law
     (2026-07-30): it may drop from our books what the wire says is gone, and it may NEVER
