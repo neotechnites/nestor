@@ -117,28 +117,42 @@ class Runner(object):
         resting_now = {(o["ticker"], o["side"]) for o in m.orders.values()
                        if o.get("remaining", 0) > 0 and not o.get("gone_404")}
         placed = 0
+        # No silent caps (Ryan, 2026-07-30, third instance of this disease today): a
+        # reinstate that replays 0 of 40 rungs must say WHICH gate ate each one, or the
+        # book's recovery is an archaeology project instead of a grep.
+        why = {}
+
+        def _skip(reason):
+            why[reason] = why.get(reason, 0) + 1
         for rung in snap["rungs"]:
             tk, side = rung.get("ticker"), rung.get("side")
             if side not in ("bid", "ask") or (tk, side) in resting_now:
+                _skip("already_resting")
                 continue
             if C.series_denied(tk) or tk in m.frozen:
+                _skip("denied_or_frozen")
                 continue
             prog = live_prog.get(tk)
             if prog is None:
+                _skip("no_live_program")
                 continue
             close = self.classifier.close_ts.get(tk)
             if close is None or (float(close) - float(now)) / 3600.0 > C.SETTLE_HORIZON_H:
+                _skip("close_unknown_or_horizon")
                 continue                      # unknown close refuses, same as the D4 gate
             admitted, _ = m.bucket.admit("book_poll", now)
             if not admitted:
+                _skip("rate_budget_exhausted")
                 break                         # out of budget: the loop finds the rest
             status, body = m.ex.book(tk)
             m.note_http(status, now)
             if status != 200:
+                _skip("book_http_%d" % status)
                 continue
             rec = self.classifier.classify_one(tk, body, prog, now)
             sd = rec["sides"][side]
             if not sd.get("qualifies") or sd.get("p") in (None, 0) or not sd.get("legal"):
+                _skip("side_not_quotable")
                 continue                      # the free-ride gate's own test, same read
             p = float(sd["p"])
             price = p if side == "bid" else round(1.0 - p, 4)
@@ -147,20 +161,26 @@ class Runner(object):
             yes_ask = (1.0 - p) if side == "ask" else ((1.0 - other) if other else None)
             from . import quote as Q
             if Q.would_cross(side, price, yes_bid, yes_ask):
+                _skip("would_cross")
                 continue
             unit = price if side == "bid" else round(1.0 - price, 4)
             q = min(float(rung.get("q") or 0),
                     int(C.SLOT_LOT_CAP_USD / max(unit, 0.01)))
             if q < 1:
+                _skip("lot_below_one")
                 continue
             exp = int(float(close) - C.CLOSE_MARGIN_S)
             if exp <= now:
+                _skip("expiry_past")
                 continue
             ok, _reason, _resp = m.place(tk, side, price, q, exp, now,
                                          available_cash_usd=m._available_cash())
             if ok:
                 placed += 1
-        R.log("reinstated", rungs=placed, snapshot_age_s=round(age, 1))
+            else:
+                _skip("place_%s" % (_reason or "refused"))
+        R.log("reinstated", rungs=placed, snapshot_age_s=round(age, 1),
+              refused=why or None)
         return placed
 
     def recover(self, now):
