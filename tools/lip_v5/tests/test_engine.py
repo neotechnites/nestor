@@ -665,6 +665,63 @@ class TestAdoptionAndTriage(EngineCase):
         self.assertEqual(verdicts[0]["decision"], "keep")
 
 
+class TestReconCadenceIsSpentByAREAD(EngineCase):
+    """`reconcile` returns None for the two states that mean IT NEVER LOOKED — the verify
+    lane refused the admit, or positions did not come back 200 — and the cycle charged both
+    the full 120 s anyway.  One refused attempt blinded the truth-reader for two minutes,
+    under exactly the pressure that makes divergence likely."""
+
+    def test_a_refused_reconcile_does_not_burn_the_window(self):
+        m = self.maker()
+        m.ex.positions = lambda: (500, {})
+        m.cycle(NOW + C.RECON_POSITIONS_S + 1, slots=[])
+        self.assertEqual(m.last_recon, 0.0)                    # unchanged: retry next cycle
+
+    def test_a_rate_refused_reconcile_does_not_burn_it_either(self):
+        m = self.maker()
+        m.bucket.tokens = 0.0
+        m.bucket.b = 0.0                                       # the verify lane has no room
+        m.cycle(NOW + C.RECON_POSITIONS_S + 1, slots=[])
+        self.assertEqual(m.last_recon, 0.0)
+
+    def test_a_reconcile_that_READ_still_costs_the_full_cadence(self):
+        # The other end of the mirror: a successful read must NOT re-ask every cycle.
+        m = self.maker()
+        t = NOW + C.RECON_POSITIONS_S + 1
+        m.cycle(t, slots=[])
+        self.assertEqual(m.last_recon, t)
+        # and an empty portfolio is a READ ({} is not None), not a refusal
+        m.ex._positions = []
+        t2 = t + C.RECON_POSITIONS_S + 1
+        m.cycle(t2, slots=[])
+        self.assertEqual(m.last_recon, t2)
+
+
+class TestDivergenceUpVsOurOwnUnpolledFill(EngineCase):
+    """The mirror of the recon-cadence fix: a refused reconcile now retries next cycle, which
+    puts recon INSIDE the window between a taker's fill and our fills poll.  Excess that fits
+    our own resting size is that unpolled fill, not an unexplained acquisition."""
+
+    def test_excess_that_fits_our_resting_size_defers_to_the_fills_poll(self):
+        m = self.maker()
+        m.orders["o1"] = {"order_id": "o1", "ticker": "GHOST", "side": "bid",
+                          "price": 0.40, "remaining": 25.0}
+        m.ex._positions = [{"ticker": "GHOST", "position": 25}]
+        m.reconcile(NOW)
+        self.assertNotIn("GHOST", m.frozen)
+        self.assertTrue(self.logs_of("position_divergence_deferred"))
+        self.assertEqual(self.logs_of("position_divergence"), [])
+
+    def test_excess_LARGER_than_our_resting_size_still_freezes_and_pages(self):
+        m = self.maker()
+        m.orders["o1"] = {"order_id": "o1", "ticker": "GHOST", "side": "bid",
+                          "price": 0.40, "remaining": 5.0}
+        m.ex._positions = [{"ticker": "GHOST", "position": 25}]
+        m.reconcile(NOW)
+        self.assertIn("GHOST", m.frozen)
+        self.assertTrue(any(a[0] == "assume_filled" for a in self.alerts))
+
+
 class TestAdmitVenuesSurvivesAFloorlessVenue(EngineCase):
     """The sole-qualifier crash: `venue_floor_usd` returns None whenever every slot of a
     venue has S<=0 (nobody to share with — the state this book is TRYING to reach) or the

@@ -1019,9 +1019,20 @@ class Maker(object):
             self.unknown.resolved(oid)
 
         # --- recon (the truth-reader; never dropped, only slowed) ---
+        # A CADENCE IS SPENT BY A READ, NOT BY AN ATTEMPT.  `last_recon` advanced even when
+        # reconcile() returned None — which it does for the two states that mean IT NEVER
+        # LOOKED: the verify lane rate-refused the admit, or the positions call did not come
+        # back 200.  Both were charged the full RECON_POSITIONS_S, so a single refused
+        # attempt blinded the truth-reader for 120 s, and a lane under sustained pressure
+        # (exactly when divergence is most likely) could burn window after window without
+        # ever reading the exchange.  The comment above already says the rule — "never
+        # dropped, only slowed" — the clock just wasn't keeping it.  MIRROR (recon too OFTEN
+        # ↔ too rarely): the rate bucket is what bounds the retries, so a refused reconcile
+        # re-asks next cycle and is refused cheaply until the lane has room, while a
+        # SUCCESSFUL read still costs the full cadence.
         if now - self.last_recon >= C.RECON_POSITIONS_S:
-            self.reconcile(now)
-            self.last_recon = now
+            if self.reconcile(now) is not None:
+                self.last_recon = now
 
         # --- health read-out ---
         out["clusters"] = CL.cluster_report(
@@ -1161,6 +1172,28 @@ class Maker(object):
                                   exchange=n, action="trued_down")
                 R.log("position_trued_down", ticker=t, ours=our_net, exchange=n)
             else:
+                # OUR OWN RESTING SIZE IS NOT AN UNEXPLAINED ACQUISITION.  The UP direction
+                # means the exchange shows MORE than we book, which is dangerous — EXCEPT in
+                # the one window every fill passes through: the taker crosses, the exchange's
+                # position moves immediately, and we only learn it FILLS_POLL_S later.  Any
+                # excess no larger than what we currently believe is RESTING on this ticker
+                # is exactly that unpolled fill, so it defers to the fills poll instead of
+                # freezing the market the fill just made productive (test_fixround: "a fill
+                # NEVER freezes its own market" — the reviewer's original repro).  This mirror
+                # was previously supplied by ACCIDENT: a rate-refused reconcile burned the
+                # whole 120 s cadence, which usually skipped past the propagation window; now
+                # that a refusal retries next cycle, the guard has to be real.  It cannot hide
+                # a true divergence: once the fill IS observed the order is gone from
+                # self.orders, resting drops to 0, and any remaining excess freezes and pages
+                # on the next pass.
+                resting = sum(float(o.get("remaining", 0.0))
+                              for o in self.orders.values()
+                              if o.get("ticker") == t and not o.get("gone_404"))
+                if abs(n - our_net) <= resting + 0.5:
+                    R.log("position_divergence_deferred", ticker=t, ours=our_net,
+                          exchange=n, resting=resting,
+                          why="excess fits our unpolled resting size")
+                    continue
                 R.log("position_divergence", ticker=t, ours=our_net, exchange=n)
                 R.ntfy("assume_filled", "lip_v5 position divergence %s" % t)
                 self.frozen.add(t)
