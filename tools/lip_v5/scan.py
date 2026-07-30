@@ -184,14 +184,14 @@ class Classifier:
             hours_to_start = max(0.0, (float(prog["start_ts"]) - float(now)) / 3600.0)
             if not preposition_ok(hours_to_start):
                 continue                       # not open yet — a pre-start quote earns zero
-            # CAPITAL EFFICIENCY, not profitability: a long window spreads the same pool over
-            # many more hours, so its return per capital-DAY is a fraction of a daily's, and
-            # under a binding ceiling the dollars it locks cannot recycle.  Refused before a
-            # request is spent on it.
-            if float(prog.get("window_h") or 0) > C.MAX_WINDOW_MULT * C.PAYOUT_HORIZON_H:
-                R.log("window_too_long", program_id=prog.get("program_id"),
-                      window_h=round(float(prog["window_h"]), 1))
-                continue
+            # ── THE WINDOW FILTER IS GONE (note 52 D4, 2026-07-29 night). ────────────────
+            # `MAX_WINDOW_MULT × PAYOUT_HORIZON_H` (48h) stood here and it was the mechanism
+            # of the correlation disaster: MEASURED, it left ELEVEN eligible clusters (TWO at
+            # 24h — gas and the treasury curve), so $300 of "diversification" was two settle
+            # sources.  The horizon that matters is the MARKET'S SETTLEMENT, gated per ticker
+            # below and hard-gated in `build_slots` — a program's window length carries no
+            # information about how long a fill traps capital (KXGDPYEAR-32: a 123.9h program
+            # on a market settling in 2032).
             # NO RUNWAY CHECK HERE, deliberately.  Accrual is per (market, side) and unknown
             # until `build_slots`; a program sitting at $0.87 needs only $0.23 more to clear the
             # cliff, so ANY from-scratch floor applied here would starve the rescue of exactly
@@ -201,6 +201,15 @@ class Classifier:
             # ones that were costing the whole budget.
             for tk in prog["tickers"]:
                 if C.series_denied(tk):
+                    continue
+                # Settlement pre-filter, REQUEST-FREE: once `learn_close` has cached a
+                # ticker's market close, a far-settling ticker stops consuming classify
+                # budget (book reads every 15 min, forever, on markets `build_slots` will
+                # always refuse).  Unknown closes stay IN — the sweep is what learns them;
+                # the hard gate at slot-build refuses entry until the close is known.
+                known_close = self.close_ts.get(tk)
+                if known_close is not None and \
+                        (float(known_close) - float(now)) / 3600.0 > C.SETTLE_HORIZON_H:
                     continue
                 rows.append((prog["rho"], tk, prog))
         # RANK BY CLUSTER DIVERSITY, NOT BY RAW POOL.  Sorting on rho alone loads the whole
@@ -552,6 +561,25 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
         # understates carry, and is the reason the classify sweep fetches the real one.
         market_close = rec.get("close_ts")
         close_ts = market_close if market_close is not None else prog["end_ts"]
+        # ── THE SETTLEMENT GATE (note 52 D4).  ENTRY-ONLY; held is exempt (D1). ────────────
+        # A fill is capital committed until settlement or an exit someone must take, so the
+        # market's close is the worst-case time-to-liquidity of every contract bought here.
+        # Enter only what settles inside SETTLE_HORIZON_H.  An UNKNOWN close REFUSES — the
+        # fallback `close_ts = prog.end_ts` above makes a 2032 market wearing a 5-day program
+        # look NEAR, which is exactly the wrong direction for this gate; the classify sweep
+        # fetches the real close within one cadence, so the refusal costs one sweep of entry
+        # latency, not the venue.
+        if not is_held:
+            if market_close is None:
+                R.log_once("settle_close_unknown", ticker=ticker)
+                continue
+            settle_h = (float(market_close) - float(now)) / 3600.0
+            if settle_h > C.SETTLE_HORIZON_H:
+                # log_once per ticker: a far close is a PROPERTY of the market, not an
+                # event — measured on the live probe, plain log emitted it 359x/cycle.
+                R.log_once("settle_horizon_refused", ticker=ticker,
+                           max_h=C.SETTLE_HORIZON_H)
+                continue
         for side in ("bid", "ask"):
             sd = rec["sides"][side]
             p = sd["p"]

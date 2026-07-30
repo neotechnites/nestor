@@ -108,7 +108,8 @@ class TestCap(LipTestCase):
 
 
 class TestAdmission(LipTestCase):
-    CAP = 52.5                                    # cluster_cap_usd(day_stop = 105)
+    CAP = 10.0                                    # cluster_cap_usd(·, ceiling=$300) —
+                                                  # the note-52 D5 reserve, ceiling/N
 
     def test_15_same_direction_rungs_across_3_series_REFUSE_at_the_bound(self):
         """The required test: rungs spread across SEPARATE SERIES still hit one cluster bound,
@@ -163,10 +164,10 @@ class TestAdmission(LipTestCase):
         morning = []
         for i in range(15):
             s = ("KXUST2AD", "KXUST5AD", "KXUST10AD")[i % 3]
-            morning.append(pos("%s-26JUL28-T%.2f" % (s, 4.00 + 0.05 * i), "yes", 20, 0.50))
-        self.assertAlmostEqual(CL.gross_basis_usd(morning), 150.0, places=6)
+            morning.append(pos("%s-26JUL28-T%.2f" % (s, 4.00 + 0.05 * i), "yes", 5, 0.50))
+        self.assertAlmostEqual(CL.gross_basis_usd(morning), 37.5, places=6)
 
-        # every rung passes the per-market cap on its own: $10 of basis each
+        # every rung passes the per-order lot container on its own: $2.50 of basis each
         for p in morning:
             self.assertLessEqual(p["n"] * p["basis"], C.INV_CAP_USD + 1e-9)
 

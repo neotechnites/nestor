@@ -16,7 +16,7 @@ sections is the classic home of the missing action.
 
 import unittest
 
-from .. import config as C, exchange as X, runner as RUN, runtime as R
+from .. import config as C, exchange as X, ratchet as RT, runner as RUN, runtime as R
 from .base import LipTestCase
 from .test_engine import EngineCase
 from .test_runner import NOW, program_body
@@ -60,6 +60,8 @@ class TestOrdersAppear(EngineCase):
     def _runner(self):
         ex = AliveExchange(program_body(tickers=(ALIVE_TICKER,)),
                            {ALIVE_TICKER: cheap_book()})
+        ex.market_closes[ALIVE_TICKER] = NOW + 16 * 3600  # the gas shape: settles at its
+                                                          # program end, not the +24h default
         m = self.maker(ex=ex)
         return RUN.Runner(m, sleep=lambda _s: None)
 
@@ -141,6 +143,8 @@ class TestReplenish(EngineCase):
     def _runner(self):
         ex = AliveExchange(program_body(tickers=(ALIVE_TICKER,)),
                            {ALIVE_TICKER: cheap_book()})
+        ex.market_closes[ALIVE_TICKER] = NOW + 16 * 3600  # the gas shape: settles at its
+                                                          # program end, not the +24h default
         m = self.maker(ex=ex)
         return RUN.Runner(m, sleep=lambda _s: None)
 
@@ -202,6 +206,8 @@ class TestAccrualIntegration(EngineCase):
     def _runner(self):
         ex = AliveExchange(program_body(tickers=(ALIVE_TICKER,)),
                            {ALIVE_TICKER: cheap_book()})
+        ex.market_closes[ALIVE_TICKER] = NOW + 16 * 3600  # the gas shape: settles at its
+                                                          # program end, not the +24h default
         m = self.maker(ex=ex)
         return RUN.Runner(m, sleep=lambda _s: None)
 
@@ -283,11 +289,19 @@ class TestLandGrabAppears(EngineCase):
                         "the refusal must be INSTRUMENTED, not silent")
 
     def test_the_grab_respects_the_venue_rung0_cap(self):
+        """Under the note-52 lot container ($2.50) this venue's only quotable side carries a
+        floor-clearing lot of ~$13 (deep NO side, ~93c) — it does not fit, so the venue reads
+        UNPROBEABLE and nothing is spent on it.  That is D6 refusing a rung it cannot reserve
+        for, one stage earlier than the rung0 cap used to."""
         r = self._runner()
         r.init(NOW, nestor_state=NESTOR)
         out = r.iteration(NOW + 1)
-        st = r.m.venues["KXGRABALIVE"]
-        self.assertLessEqual(out["allocate"]["spent"], st.rung0_cap_usd + 1e-6)
+        st = r.m.venues.get("KXGRABALIVE")
+        if st is None:
+            self.assertEqual(r.m.venue_status.get("KXGRABALIVE"), RT.UNPROBEABLE)
+            self.assertEqual(out["allocate"]["spent"], 0.0)
+        else:
+            self.assertLessEqual(out["allocate"]["spent"], st.rung0_cap_usd + 1e-6)
 
 
 class TestShedAppears(EngineCase):

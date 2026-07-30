@@ -656,24 +656,29 @@ class TestPlumbingWakes(RunnerCase):
 
     def test_the_slot_carries_the_MARKET_close_not_the_program_end(self):
         ex = ScanExchange(balance_cents=1_000_000)
-        ex.market_closes[self.TICKER] = NOW + 90 * 86400  # settles MONTHS later (PYPL shape)
+        # settles 5 DAYS past its 16h program: inside SETTLE_HORIZON_H, so it is admitted —
+        # and the slot must carry the MARKET close so (★)'s carry term prices the 5-day gap
+        ex.market_closes[self.TICKER] = NOW + 120 * 3600
         r = self.runner(ex=ex)
         r.init(NOW, nestor_state=self.NESTOR)
         r.iteration(NOW + 1)
         s = [s for s in r.slots if s.side == "bid"][0]
-        self.assertAlmostEqual(s.close_ts, NOW + 90 * 86400, places=3)
+        self.assertAlmostEqual(s.close_ts, NOW + 120 * 3600, places=3)
         self.assertAlmostEqual(s.program_end_ts, NOW + 16 * 3600, places=3)
-        self.assertGreater(s.l_eff, 2000.0)               # carry runs to the REAL horizon
+        self.assertGreater(s.l_eff, 100.0)                # carry runs to the REAL horizon
 
     def test_the_horizon_exclusion_wakes_on_the_real_close(self):
-        """T_settle ≫ H_prog + 24 h: the exact PYPL geometry, now visible to ALLOCATE."""
-        from .. import alloc
+        """The PYPL geometry (T_settle ≫ program end) is refused at the SETTLEMENT GATE
+        now (note 52 D4) — before a slot even exists, which is one stage earlier than the
+        old ALLOCATE exclusion and strictly cheaper."""
         ex = ScanExchange(balance_cents=1_000_000)
         ex.market_closes[self.TICKER] = NOW + 90 * 86400
         r = self.runner(ex=ex)
         r.init(NOW, nestor_state=self.NESTOR)
         out = r.iteration(NOW + 1)
-        for key, q in out["alloc"].items():
+        self.assertEqual([s for s in r.slots if s.ticker == self.TICKER], [])
+        self.assertTrue(self.logs_of("settle_horizon_refused"))
+        for key, q in (out.get("alloc") or {}).items():
             self.assertEqual(q, 0, key)
 
     def test_P6_a_market_nobody_trades_IS_a_slot_and_is_recorded(self):

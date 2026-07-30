@@ -540,8 +540,32 @@ def rescue(A, rate_now, h, rho, S, q, p, r_star, C_slot, phi, d,
 # =============================================================================================
 def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE_PER_H,
              venue_caps=None, step_fraction=C.STEP_FRACTION, held=None, resting=None,
-             cluster_cap_usd=None, cluster_seed=None):
+             cluster_cap_usd=None, cluster_seed=None, cluster_seed_px=None,
+             ceiling_usd=None):
     """Marginal-rate water-filling under (★).  Returns (alloc, spent, marginal_at_stop).
+
+    ── NOTE 52 (2026-07-29 night): three strategy rules now live INSIDE the plan. ───────────
+    D5  ONE RUNG PER CLUSTER.  A settle source gets one (ticker, side); the reserve
+        architecture (cluster cap = lot × (1+refills)) is per-cluster, so a second rung in
+        the same cluster spends the first rung's refill reserve — the fills then convert the
+        reserve into inventory and presence dies mid-period.  A cluster's owner is whichever
+        key already has money in it (held/resting), else the first key the water level funds.
+    D11 THE VARIANCE INSTRUMENT IS A PLAN INPUT, NOT ONLY A RAIL.  `place()`'s B18 refusal
+        arms no degrade, so a plan the rail must refuse re-offers forever — the same
+        plan-⊄-rail deadlock as NEW-1/D2, one guard later.  The plan therefore tests V (per
+        cluster, weights against the CEILING, each candidate charged at its full lot
+        container n_cap·p — conservative: the most this slot could ever hold) and skips a
+        slot whose funding would breach PORTFOLIO_VAR_MAX.  Skipped ≠ refused-forever: every
+        pass retests, and a higher-priced candidate in the same cluster can pass where a
+        cheap one was skipped — this is the mechanism that steers the book's AVERAGE price
+        (Ryan: "instead of a hard cap just track our average variance").  `ceiling_usd=None`
+        (pure tests) disables the test; the rail still backstops.
+    D12 THE PERIOD LOCK.  A key in `locked` (= any key with money resting or held — funded
+        this period by definition, rebuilt each cycle, restart-safe with no new state) is
+        never zeroed by the cliff pass and its program is never dropped by the forfeit gate's
+        entry test: cancelling a funded rung mid-period forfeits the whole $1.00 for a
+        fraction.  Shed, kill, day-stop and the rescue's ABANDON still override — those are
+        exit decisions, not re-planning.
 
     `venue_caps`: {venue: cap_usd} from the ratchet (spec §1.4).  MIRROR (ratchet raises venue
     caps ↔ Σ venue caps vs the global ceiling): Σ caps MAY exceed the ceiling; **Σ ALLOCATED
@@ -591,6 +615,13 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
     # own basis, which is why it must come from the caller: a market with no slot has no `s.p`
     # for the plan to price it with.
     per_cluster = dict(cluster_seed or {})
+    # D11 — the price side of the variance ledger: Σ usd·p per cluster, so p̄ = usd_px/usd.
+    per_cluster_px = dict(cluster_seed_px or {})
+    # D5 — the cluster's OWNER: the one key allowed to carry this settle source's rung.
+    cluster_owner = {}
+    for k, v in sorted(list((held or {}).items()) + list((resting or {}).items())):
+        if float(v) > 0:
+            cluster_owner.setdefault(CL.cluster_of(k[0]), k)
     seen_cluster_held = set()
     for s in slots:
         if cluster_seed is not None:
@@ -605,10 +636,41 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
             seen_cluster_held.add(s.key)
             ck = _cluster_key(s)
             per_cluster[ck] = per_cluster.get(ck, 0.0) + h_q * s.p
+            per_cluster_px[ck] = per_cluster_px.get(ck, 0.0) + h_q * s.p * s.p
     q_alloc, q_spent = qualification_pass(slots, budget_usd, caps, venue_caps=venue_caps,
                                           cluster_cap_usd=cluster_cap_usd,
                                           per_cluster=per_cluster)
     budget_usd_rem = max(0.0, budget_usd - q_spent)
+
+    # D12 — the funded set: any key with money resting or held.  Rebuilt every call from the
+    # same inputs the caps read, so it needs no persistence and survives restart for free.
+    locked = {k for k, v in list((held or {}).items()) + list((resting or {}).items())
+              if float(v) > 0}
+
+    def _plan_var(add_ck=None, add_usd=0.0, add_px=0.0):
+        """D11 — V = Σ wᵢ²(1−p̄ᵢ)/p̄ᵢ over clusters, weights against the CEILING (the
+        forward-looking denominator, same argument as guards.portfolio_variance), with an
+        optional candidate charged on top.  p̄ is the capital-weighted price.
+
+        EVERY cluster with money is charged at its RESERVE, not its current dollars: a
+        funded rung refills to (1+refills) lots through the requoter without re-entering
+        this loop, so what a cluster holds today understates what it is committed to
+        becoming.  Charging incumbents at actuals and candidates at reserves double-counts
+        nothing and under-counts everything — measured: it admitted forty 2c clusters where
+        the reserve charge stops at four."""
+        v = 0.0
+        for ck in set(per_cluster) | ({add_ck} if add_ck else set()):
+            usd = per_cluster.get(ck, 0.0) + (add_usd if ck == add_ck else 0.0)
+            px = per_cluster_px.get(ck, 0.0) + (add_px if ck == add_ck else 0.0)
+            if usd <= 0:
+                continue
+            p_bar = px / usd
+            if not (0.0 < p_bar < 1.0):
+                continue                      # unpriceable leg: the rail logs it; skip here
+            usd_eff = max(usd, float(cluster_cap_usd)) if cluster_cap_usd else usd
+            w = usd_eff / float(ceiling_usd)
+            v += w * w * (1.0 - p_bar) / p_bar
+        return v
 
     elig = []
     for s in slots:
@@ -668,6 +730,7 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
     for _cliff_pass in range(int(C.MAX_GATE_PASSES)):
         elig = [x for x in elig if x.key not in cliff_dead]
         unaffordable = set()
+        var_blocked = set()         # D11 — retested every pass, never a permanent refusal
         _why, _ex = {}, []          # WHY each slot was passed over — one line per cycle
         last_rate = 0.0
         guard = 0
@@ -680,8 +743,14 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
                 if s.key in unaffordable:
                     continue
                 q = alloc[s.key]
-                # v1 §8.1: the per-slot cap binds NET exposure — held inventory + resting.
-                if held.get(s.key, 0.0) + q + 1 > n_cap(s.p, caps):
+                # ── SUPERSEDED 2026-07-29 night (note 52 D6): the per-slot cap bounds THE
+                # RESTING LOT, not net exposure.  v1 §8.1's NET form (held + resting ≤ n_cap)
+                # killed the replenish by construction: a fully-filled lot left zero room, so
+                # presence died on the first fill — the exact failure the reserve exists to
+                # prevent.  Cumulative acquisition is the CLUSTER RESERVE's job now: the
+                # cluster term below is seeded with held + resting, so after (1 + refills)
+                # lots the cluster is at cap and the re-post is refused THERE, cleanly.
+                if q + 1 > n_cap(s.p, caps):
                     _why["slot_cap"] = _why.get("slot_cap", 0) + 1
                     continue
                 if per_market.get(s.ticker, 0.0) + s.p > market_cap_usd(s, budget_usd, caps) + 1e-9:
@@ -698,6 +767,29 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
                 if cluster_cap_usd is not None and \
                         per_cluster.get(_cluster_key(s), 0.0) + s.p > float(cluster_cap_usd) + 1e-9:
                     _why["cluster_cap"] = _why.get("cluster_cap", 0) + 1
+                    continue
+                # D5 — ONE RUNG PER CLUSTER: a settle source's reserve belongs to one key.
+                _ck = _cluster_key(s)
+                _owner = cluster_owner.get(_ck)
+                if _owner is not None and _owner != s.key:
+                    _why["cluster_owned"] = _why.get("cluster_owned", 0) + 1
+                    continue
+                # D11 — the plan-side variance test, charged at the CLUSTER RESERVE: a funded
+                # rung's cluster can grow to (1+refills) lots through the requoter's re-posts
+                # without ever passing this loop again, so the conservative charge is what the
+                # cluster can BECOME, not the first lot.  (Charging one lot passes 73 clusters
+                # of 2c rungs; charging the reserve stops at ~4 — computed, and the reserve is
+                # the number the rail actually permits.)
+                if ceiling_usd and s.key not in var_blocked:
+                    _reserve = float(cluster_cap_usd) if cluster_cap_usd else \
+                        n_cap(s.p, caps) * s.p * (1.0 + C.RUNG_REFILLS)
+                    _cont = max(0.0, _reserve - per_cluster.get(_ck, 0.0))
+                    if _plan_var(_ck, _cont, _cont * s.p) > C.PORTFOLIO_VAR_MAX + 1e-12:
+                        var_blocked.add(s.key)
+                        _why["plan_var"] = _why.get("plan_var", 0) + 1
+                        continue
+                elif s.key in var_blocked:
+                    _why["plan_var"] = _why.get("plan_var", 0) + 1
                     continue
                 # ---- THE ONE SUBSTITUTION (spec §1.3): (★) replaces v1 §2.2's hurdle line ----
                 r = s.net_at(q, r_star)
@@ -720,8 +812,7 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
             if best is None:
                 break
             step = max(1, int(round(step_fraction * budget_usd / best.p)))    # v1 §2.5
-            step = min(step, n_cap(best.p, caps) - int(held.get(best.key, 0.0))
-                       - alloc[best.key])
+            step = min(step, n_cap(best.p, caps) - alloc[best.key])   # lot container (D6)
             room = market_cap_usd(best, budget_usd, caps) - per_market.get(best.ticker, 0.0)
             step = min(step, int(room / best.p + 1e-9))
             vcap = venue_caps.get(best.venue)
@@ -741,6 +832,8 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
             per_market[best.ticker] = per_market.get(best.ticker, 0.0) + step * best.p
             per_venue[best.venue] = per_venue.get(best.venue, 0.0) + step * best.p
             per_cluster[best_ck] = per_cluster.get(best_ck, 0.0) + step * best.p
+            per_cluster_px[best_ck] = per_cluster_px.get(best_ck, 0.0) + step * best.p * best.p
+            cluster_owner.setdefault(best_ck, best.key)       # D5 — the funded key owns it
             last_rate = best_rate
         # ---- THE CLIFF PASS.  A rung under $2 of projected accrual pays ZERO. ------------
         # Water-filling maximises RATE and is blind to the forfeit cliff, so it happily leaves
@@ -760,6 +853,12 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
             sl = slot_of.get(key)
             if sl is None:
                 continue                                  # land-grab rungs: sized by §4.5
+            if key in locked and alloc.get(key, 0) > 0:
+                continue                                  # D12 — a FUNDED rung is locked for
+                                                          # its period: zeroing it cancels the
+                                                          # resting order and forfeits the
+                                                          # whole $1.00 for a fraction.  Shed,
+                                                          # kill and day-stop still override.
             if float(getattr(sl, "accrued", 0.0) or 0.0) > 0:
                 continue                                  # accrued dollars are the RESCUE's
                                                           # business: it prices the recovery
@@ -787,6 +886,7 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
                     per_market[sl.ticker] = per_market.get(sl.ticker, 0.0) + cost
                     per_venue[sl.venue] = per_venue.get(sl.venue, 0.0) + cost
                     per_cluster[ck] = per_cluster.get(ck, 0.0) + cost
+                    per_cluster_px[ck] = per_cluster_px.get(ck, 0.0) + cost * sl.p
                     continue
             # cannot reach the cliff here — free the capital for a rung that can
             freed = q_now * sl.p
@@ -796,6 +896,10 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
             per_venue[sl.venue] = max(0.0, per_venue.get(sl.venue, 0.0) - freed)
             ck = _cluster_key(sl)
             per_cluster[ck] = max(0.0, per_cluster.get(ck, 0.0) - freed)
+            per_cluster_px[ck] = max(0.0, per_cluster_px.get(ck, 0.0) - freed * sl.p)
+            if cluster_owner.get(ck) == key:
+                cluster_owner.pop(ck, None)               # D5 — a zeroed rung frees its
+                                                          # cluster for another candidate
             cliff_dead.add(key)
             freed_any = freed_any or freed > 0
             R.log("below_cliff_dropped", ticker=sl.ticker, side=sl.side, had=q_now,
@@ -891,7 +995,8 @@ def _cliff_decision(ps, alloc, r_star, caps, venue_caps, held, budget_room, per_
     A = max([s.accrued for s in ps] or [0.0])
     C_prog = sum(alloc.get(s.key, 0) * s.p for s in ps)
     h = max(0.0, best.hours_left)
-    max_q = n_cap(best.p, caps) - int(held.get(best.key, 0.0))
+    max_q = n_cap(best.p, caps)          # the LOT container bounds the top-up order (D6);
+                                         # cumulative acquisition is the cluster reserve's job
     vcap = (venue_caps or {}).get(best.venue)
     if vcap is not None:
         room = max(0.0, float(vcap) - per_venue_spend.get(best.venue, 0.0))
@@ -911,7 +1016,8 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
                                floor_usd=C.ENTRY_FLOOR_USD, floor_rate=C.ADMIT_FLOOR_RATE_PER_H,
                                venue_caps=None, max_passes=C.MAX_GATE_PASSES, held=None,
                                resting=None,
-                               cluster_cap_usd=None, cluster_seed=None):
+                               cluster_cap_usd=None, cluster_seed=None,
+                               cluster_seed_px=None, ceiling_usd=None):
     """v1 §2.4 lines 12-15 — the forfeit gate is per PROGRAM-PERIOD, applied AFTER
     water-filling, and a dropped program's dollars are RE-WATER-FILLED.
 
@@ -927,13 +1033,21 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
     caps = caps or Caps()
     held = held or {}
     dropped = set()
+    # D12 — programs carrying a FUNDED key (money resting or held) are exempt from the
+    # entry-floor drop below: dropping a funded program cancels its resting order mid-period
+    # and forfeits the whole $1.00.  The rescue's ABANDON (A > 0) is untouched — that is an
+    # exit decision with the stranded accrual priced, not an entry re-litigation.
+    funded_keys = {k for k, v in list((held or {}).items()) + list((resting or {}).items())
+                   if float(v) > 0}
     alloc, spent, marginal = {}, 0.0, 0.0
     for _ in range(int(max_passes)):
         live = [s for s in slots if s.program_id not in dropped]
         alloc, spent, marginal = allocate(live, budget_usd, r_star, caps, floor_rate,
                                           venue_caps, held=held, resting=resting,
                                           cluster_cap_usd=cluster_cap_usd,
-                                          cluster_seed=cluster_seed)
+                                          cluster_seed=cluster_seed,
+                                          cluster_seed_px=cluster_seed_px,
+                                          ceiling_usd=ceiling_usd)
         by_prog = {}
         for s in live:
             by_prog.setdefault(s.program_id, []).append(s)
@@ -950,6 +1064,8 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
                 continue
             A = max([s.accrued for s in ps] or [0.0])
             if A <= 0.0:
+                if any(s.key in funded_keys for s in ps):
+                    continue                                 # D12: funded ⇒ never re-litigated
                 if proj > 0.0:
                     newly.append(pid)                        # pure entry: the floor decides
                 continue
@@ -957,6 +1073,21 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
                                          budget_usd - spent, pv_spend,
                                          cluster_cap_usd, pc_spend)
             if res.action == ABANDON:
+                # ── D12 × note 49 R1: AN UNMEASURED PROBABILITY MAY NOT EVICT A FUNDED RUNG.
+                # `rescue`'s p_recover is an input nobody measures, so it defaults to 0 — and
+                # at p_recover = 0, ABANDON beats HOLD for every funded-but-below-floor rung,
+                # which turns the gate into a churn engine: rivals deepen the book, the floor
+                # recedes, and the gate cancels a resting order mid-period, forfeiting the
+                # accrual for a fraction.  While the cliff is still REACHABLE at the ρ/2
+                # ceiling, "we cannot price the recovery" is a reason to HOLD what is funded,
+                # not to evict it.  A cliff unreachable at the ceiling is different in kind:
+                # that p_recover = 0 is COMPUTED, not defaulted, and the abandon stands.
+                reachable = A + (float(_best.rho) / 2.0) * max(0.0, float(_best.hours_left)) \
+                    >= C.RESCUE_TARGET_USD - 1e-12
+                if reachable and any(s.key in funded_keys for s in ps):
+                    R.log("cliff_hold_funded", program_id=str(pid), accrued=A,
+                          proj=res.proj, note="unmeasured p_recover; funded rung holds")
+                    continue
                 newly.append(pid)
                 R.log("cliff_abandon", program_id=str(pid), accrued=A, proj=res.proj,
                       abandon_value=res.abandon_value, hold_value=res.hold_value)
@@ -1005,7 +1136,8 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
 def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
                         floor_rate=C.ADMIT_FLOOR_RATE_PER_H, venue_caps=None, held=None,
                         resting=None,
-                        cluster_cap_usd=None, cluster_seed=None):
+                        cluster_cap_usd=None, cluster_seed=None,
+                        cluster_seed_px=None, ceiling_usd=None):
     """The full cycle: solve spec §1.3's r* fixpoint around ALLOCATE — the FORFEIT-GATED
     ALLOCATE, because the allocation the requoter diffs against must be the post-gate one
     (finish-round charter A): quoting a program the gate would drop posts collateral into a
@@ -1026,7 +1158,8 @@ def allocate_with_rstar(slots, budget_usd, caps=None, trailing_rate=None,
         a, sp, marg, dropped = allocate_with_forfeit_gate(
             slots, budget_usd, r_star, caps, floor_rate=floor_rate, venue_caps=venue_caps,
             held=held, resting=resting, cluster_cap_usd=cluster_cap_usd,
-            cluster_seed=cluster_seed)
+            cluster_seed=cluster_seed, cluster_seed_px=cluster_seed_px,
+            ceiling_usd=ceiling_usd)
         return (a, sp, dropped), (marg if marg > 0 else floor_rate)
 
     res = M.solve_rstar(lambda r: run(r), r0)

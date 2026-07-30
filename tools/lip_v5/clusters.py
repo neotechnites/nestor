@@ -296,9 +296,20 @@ def cluster_cap_usd(day_stop_threshold_usd, inv_cap_usd=C.INV_CAP_USD,
     # we just measured — a book that cannot enter any venue, which earns nothing and therefore
     # never raises the day stop that would have unblocked it.  Once we ARE earning, the
     # reward-derived term overtakes the floor and this stops binding.
+    # ── SUPERSEDED IN DERIVATION 2026-07-29 night (note 52 D5).  The cluster cap IS the
+    # per-settle-source reserve: `ceiling / N_TARGET_CLUSTERS` — one lot resting plus
+    # RUNG_REFILLS re-posts as fills convert resting into positions.  The rail that enforces
+    # this cap over positions+resting basis is thereby the mechanism that implements the
+    # (1 + phi*W) capital multiplier of note 51 §1: after (1+refills) lots of cumulative
+    # acquisition the cluster is at cap and the next re-post is refused.
+    # The day-stop statement above still holds TRANSITIVELY: ceiling/N ≤ 0.5 × day_stop for
+    # every N ≥ 10 (day stop floors at 20% of the ceiling), asserted in test_config.
+    # The old max(INV_CAP, 0.5×day_stop, frac×ceiling) form is kept below for ceiling-less
+    # callers (pure tests); every live call passes ceiling_usd.
+    if ceiling_usd:
+        return float(ceiling_usd) / float(C.N_TARGET_CLUSTERS)
     reward_derived = 0.5 * float(day_stop_threshold_usd)
-    capital_floor = (float(max_frac) * float(ceiling_usd)) if ceiling_usd else 0.0
-    return max(float(inv_cap_usd), reward_derived, capital_floor)
+    return max(float(inv_cap_usd), reward_derived)
 
 
 ADMIT, REFUSE_SIGNED, REFUSE_WORST = "admit", "cluster_signed_cap", "cluster_worst_case_cap"

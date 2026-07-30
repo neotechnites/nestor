@@ -79,12 +79,12 @@ class TestAllocate(LipTestCase):
         self.assertEqual(spent, 0.0)
 
     def test_per_slot_inventory_cap_binds(self):
-        """v1 §8.1 — floor($10/p) on NET."""
+        """The note-52 LOT CONTAINER ($5.00 = reserve/2): floor(5.00/p)."""
         s = slot("T", p=0.50)
         a, _, _ = alloc.allocate([s], 10_000.0, RSTAR)
         self.assertLessEqual(a[("T", "bid")], alloc.n_cap(0.50))
-        self.assertEqual(alloc.n_cap(0.50), 20)
-        self.assertEqual(alloc.n_cap(0.02), 500)
+        self.assertEqual(alloc.n_cap(0.50), 10)
+        self.assertEqual(alloc.n_cap(0.02), 250)
 
     def test_no_lazy_under_fill(self):
         """v1 T5 — an expensive slot that cannot afford one more contract must not abandon the
@@ -175,11 +175,15 @@ class TestDerivedSlotCap(LipTestCase):
     stop — no single rung's worst case may trip it alone (0.5×, the cluster/series factor)."""
 
     def test_the_cap_derives_from_the_day_stop(self):
-        self.assertAlmostEqual(C.slot_cap_usd(20.0), 10.0, places=9)    # floor day
-        self.assertAlmostEqual(C.slot_cap_usd(100.0), 50.0, places=9)   # Ryan's $50
-        self.assertAlmostEqual(C.slot_cap_usd(150.0), 75.0, places=9)   # at the day-stop cap
-        # the surviving constant is the FLOOR, and the floor itself is derived
-        self.assertAlmostEqual(C.INV_CAP_USD, 0.5 * C.DAY_STOP_FLOOR_USD, places=9)
+        """SUPERSEDED IN DERIVATION (note 52 D6): the per-order cap is the LOT CONTAINER —
+        ceiling/(N × (1+refills)) — and no longer moves with the day stop; the day-stop bound
+        holds transitively through the cluster reserve (asserted in test_config)."""
+        self.assertAlmostEqual(C.slot_cap_usd(20.0), C.SLOT_LOT_CAP_USD, places=9)
+        self.assertAlmostEqual(C.slot_cap_usd(150.0), C.SLOT_LOT_CAP_USD, places=9)
+        self.assertAlmostEqual(C.slot_cap_usd(0.0, ceiling_usd=300.0), 5.00, places=9)
+        self.assertAlmostEqual(C.slot_cap_usd(0.0, ceiling_usd=600.0), 10.00, places=9)
+        # the surviving constant IS the lot container, and the identity is the derivation
+        self.assertAlmostEqual(C.INV_CAP_USD, C.SLOT_LOT_CAP_USD, places=9)
 
     def test_a_contested_rung_is_bounded_by_the_PER_MARKET_cap_not_the_slot_cap(self):
         """WAS `test_a_contested_rung_whose_reward_supports_50_gets_50`, asserting $50.
@@ -196,7 +200,8 @@ class TestDerivedSlotCap(LipTestCase):
         """
         from .. import clusters as CL
         s = slot("KXBIG-1", p=0.50, S=50, phi=0.01)      # contested share, thin fill risk
-        caps = alloc.Caps(inv_cap_usd=C.slot_cap_usd(100.0))   # day stop $100 ⇒ slot cap $50
+        caps = alloc.Caps(inv_cap_usd=50.0)   # explicit $50: tests the CAP HIERARCHY, not
+                                              # the constant (the live lot container is $2.50)
         a, spent, _ = alloc.allocate([s], 300.0, RSTAR, caps=caps)
         self.assertAlmostEqual(spent, C.MARKET_CAP_FRAC * 300.0, places=6)
         self.assertLess(spent, 50.0, "the per-market cap must bind before the slot cap here")
@@ -210,7 +215,8 @@ class TestDerivedSlotCap(LipTestCase):
         """Amendment T2: sizing is bought by MARGINAL reward — owning the book pays nothing
         more (note 43 §7 saturation), so a thin-S rung stops by arithmetic, not by cap."""
         s = slot("KXSAT-1", p=0.50, S=2, phi=0.08)
-        caps = alloc.Caps(inv_cap_usd=C.slot_cap_usd(100.0))   # cap $50: NOT the binder
+        caps = alloc.Caps(inv_cap_usd=50.0)   # explicit $50 so the cap is NOT the binder —
+                                              # this test is about saturation arithmetic
         a, spent, _ = alloc.allocate([s], 300.0, RSTAR, caps=caps)
         self.assertGreater(spent, 0.0)
         # SATURATION, not the cap, is what stops it: the rung takes ~$18 of a $50 cap and
@@ -326,7 +332,8 @@ class TestCliffRecovery(LipTestCase):
         and the program is still NOT dropped, because 70¢ is at stake and $1.10 is
         reachable: the top-up Δq is applied so the requoter posts it."""
         s = self._cliff_slot()
-        caps = alloc.Caps(inv_cap_usd=C.slot_cap_usd(100.0))
+        caps = alloc.Caps(inv_cap_usd=50.0)   # explicit: this tests the GATE, not the
+                                              # live lot container (which is $2.50)
         a, spent, marg, dropped = alloc.allocate_with_forfeit_gate([s], 300.0, RSTAR,
                                                                    caps=caps)
         self.assertNotIn("PC", dropped)
@@ -368,20 +375,27 @@ class TestCliffRecovery(LipTestCase):
 
 
 class TestHeldAwareAllocation(LipTestCase):
-    """SECOND AMENDMENT (a): v1 §8.1's cap binds NET exposure — held + resting — so the
-    replenish target after a fill is n_cap − held, not a fresh full-size order."""
+    """── SUPERSEDED SEMANTICS (note 52 D6).  v1 §8.1 bound NET exposure (held + resting ≤
+    n_cap), which killed the replenish by construction: a fully-filled lot left zero room and
+    presence died on the first fill.  The per-slot cap now bounds THE RESTING LOT; cumulative
+    acquisition is the CLUSTER RESERVE's job (cap = lot × (1 + refills)), seeded from held +
+    resting so the re-post after the last refill is refused at the cluster, cleanly."""
 
-    def test_held_inventory_shrinks_the_resting_target(self):
-        s = slot("TSY")                                   # n_cap = 20 at 50c under $10
-        a_flat, _, _ = alloc.allocate([s], 300.0, RSTAR)
-        a_held, _, _ = alloc.allocate([s], 300.0, RSTAR, held={s.key: 12})
-        self.assertEqual(a_flat[s.key], 20)
-        self.assertEqual(a_held[s.key], 8)                # 20 − 12 held
+    def test_held_inventory_does_NOT_shrink_the_replenish_lot(self):
+        s = slot("TSY")                                   # n_cap = 10 at 50c under $5.00
+        a_flat, _, _ = alloc.allocate([s], 300.0, RSTAR, cluster_cap_usd=10.0)
+        a_held, _, _ = alloc.allocate([s], 300.0, RSTAR, held={s.key: 3},
+                                      cluster_cap_usd=10.0)
+        self.assertEqual(a_flat[s.key], 10)
+        self.assertEqual(a_held[s.key], 10)               # the SAME lot re-posts (D6)
 
-    def test_a_full_position_allocates_zero_resting(self):
+    def test_a_consumed_cluster_reserve_ends_the_replenish(self):
+        """held = 3 lots + the resting lot = the whole reserve: the NEXT lot is refused at
+        the cluster term — that is (1 + refills) enforced by the rail the plan mirrors."""
         s = slot("TSY")
-        a, spent, _ = alloc.allocate([s], 300.0, RSTAR, held={s.key: 20})
-        self.assertEqual(a[s.key], 0)
+        a, spent, _ = alloc.allocate([s], 300.0, RSTAR, held={s.key: 18},
+                                     cluster_cap_usd=10.0)   # $9 held of a $10 reserve
+        self.assertLessEqual(a[s.key] * 0.50, 1.0 + 1e-9)    # ≤ the $1 of reserve room
 
     def test_held_inventory_counts_against_the_venue_cap(self):
         """A filled probe IS the venue's exposure: replenish must fit under what remains."""
@@ -429,9 +443,10 @@ class TestTheCliffSetsMinimumSize(LipTestCase):
 
     def test_the_cliff_size_matches_the_closed_form(self):
         s = self._rung("KXV-1")
-        # Targets ENTRY_FLOOR ($2 = 2x the cliff), which is margin for fills, rival
-        # dilution and model error — see the docstring.  The bare-cliff size is half it.
-        self.assertEqual(alloc.cliff_clearing_q(s), 42)
+        # Targets ENTRY_FLOOR ($1.50 = CREDIT_TARGET x MARGIN, note 52 D7), margin for
+        # fills, rival dilution and model error.  share = 1.5/50 = 3%;
+        # q = ceil(1000 x 0.03/0.97) = 31.
+        self.assertEqual(alloc.cliff_clearing_q(s), 31)
         self.assertEqual(alloc.cliff_clearing_q(s, 1.0), 21)
 
     def test_an_unreachable_cliff_returns_None(self):
@@ -479,7 +494,7 @@ class TestTheRungCapMustExceedTheCliff(LipTestCase):
                             venue="KXV", window_h=16.0)]
         caps = alloc.Caps(inv_cap_usd=30.0)
         a, _, _ = alloc.allocate(rungs, 300.0, 0.0625, caps=caps, cluster_cap_usd=75.0)
-        self.assertGreaterEqual(a[("KXV-0", "bid")], 42)
+        self.assertGreaterEqual(a[("KXV-0", "bid")], 31)
 
 
 class TestPrunedCapitalIsRedeployed(LipTestCase):
@@ -489,8 +504,10 @@ class TestPrunedCapitalIsRedeployed(LipTestCase):
     deployed of $300 with nothing refused and nothing over-cap."""
 
     def _good(self, i):
-        return alloc.Slot("KXA-%d" % i, "bid", rho=9.0, S=800.0, p=0.30, hours_left=16.0,
-                          venue="KXA", window_h=16.0)
+        # One series per good rung: under note 52 D5 (one rung per cluster) three rungs of
+        # one series are ONE fundable slot, and this test is about REDEPLOYMENT, not D5.
+        return alloc.Slot("KXA%d-%d" % (i, i), "bid", rho=9.0, S=800.0, p=0.30,
+                          hours_left=16.0, venue="KXA%d" % i, window_h=16.0)
 
     def _hopeless(self, i):
         return alloc.Slot("KXB-%d" % i, "bid", rho=0.4, S=5000.0, p=0.30, hours_left=16.0,

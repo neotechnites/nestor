@@ -42,6 +42,10 @@ class EngineCase(LipTestCase):
         for name in CONFIG_PATHS[1:]:
             setattr(C, name, self.path(self._saved[name].rsplit("/", 1)[-1]))
         ex = kw.pop("ex", None) or X.FakeExchange(balance_cents=100_000)
+        if not getattr(ex, "now", 0.0):
+            ex.now = NOW                     # the fake's default market close is now+24h;
+                                             # a zero clock puts every close in 1970 and the
+                                             # expiration backstop refuses the whole board
         m = E.Maker(ex, NOW, data_dir=self.tmp, **kw)
         m.halt.path = self.path("v5_halt.json")
         m.peak.path = self.path("v5_peak.json")
@@ -371,13 +375,15 @@ class TestCycle(EngineCase):
         self.assertTrue(m.skew_ok)
 
     def test_the_cycle_derives_the_slot_cap_from_the_day_stop(self):
-        """Charter amendment: the per-rung cap is re-derived every cycle from the funded day
-        stop (0.5×), so a $300/day book quotes $52.50 rungs and a floor-day book $10 ones."""
+        """SUPERSEDED IN DERIVATION (note 52 D6): the per-order cap is the LOT CONTAINER
+        (ceiling/(N×(1+refills)) = $2.50 at $300) and does NOT move with the day stop — a
+        bigger reward day buys more RUNGS, never bigger lots."""
         m = self.maker()
-        m.projected_day_reward = 300.0        # day stop = min(150, 0.35×300) = 105 ⇒ 52.50
+        m.projected_day_reward = 300.0
         out = m.cycle(NOW, slots=[slot()], yes_mids={})
-        self.assertAlmostEqual(out["allocate"]["slot_cap_usd"], 52.5, places=9)
-        self.assertAlmostEqual(m.slot_cap_usd, 52.5, places=9)
+        want = C.slot_cap_usd(0.0, ceiling_usd=m.ceiling_usd)
+        self.assertAlmostEqual(out["allocate"]["slot_cap_usd"], want, places=9)
+        self.assertAlmostEqual(m.slot_cap_usd, want, places=9)
 
     def test_the_cash_feed_heartbeat_fires(self):
         m = self.maker()

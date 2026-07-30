@@ -150,6 +150,13 @@ PAYOUT_HORIZON_H = 24.0
 # more clusters, not from longer windows; the diversity ranking already finds them.  If dailies
 # ever run out this is the first constant to relax, and the `window_too_long` count says so.
 #
+# ── SUPERSEDED 2026-07-29 night (note 52 D4/§6): NO CALL SITES, kept as the derivation
+# record.  The window filter was the correlation disaster's mechanism — at 2x24h the eligible
+# universe was ELEVEN clusters — and its premise ("a treasury daily returns ~11-40x a weekly
+# per capital-hour") is NOT SUPPORTED by the live feed: gas is 6.26 $/h on a 16h window, two
+# 166h programs are 6.03 $/h.  The variation is POOL SIZE, not window length; dailies looked
+# special because dailies were all this filter let us see.  The horizon that actually matters
+# is the market's SETTLEMENT date — see SETTLE_HORIZON_H.
 MAX_WINDOW_MULT = 2.0
 # DAILIES ONLY — DERIVED, STAGED-INERT, NOT SWITCHED ON (2026-07-28).  The argument for 1.0:
 # 2.0 was derived when the only cost of a long window was capital EFFICIENCY ("2x the horizon
@@ -218,9 +225,33 @@ SETTLE_LAG_H = 0.7                           # R171 measured 41 min.  BLOCKER-gr
 PAST_DUE_ESCALATION = 2.0                    # spec §1.2; the no-information DIRECTION is
                                              # derived, the coefficient is UNDERIVED §9.4
 L_SHED_TRAILING = 20                         # spec §1.2 "trailing 20 completed sheds"
-HORIZON_GRACE_H = 24.0                       # spec §1.2 hard horizon exclusion, "+24 h grace
-                                             # covers same-day-after settlement".
-                                             # UNDERIVED §9.4.
+# ── THE SETTLEMENT HORIZON (note 52 D4, settled with Ryan 2026-07-29 night). ────────────────
+# THERE ARE TWO CLOCKS AND THE OLD FILTER READ THE WRONG ONE.  The program WINDOW is how long
+# we can earn; the market SETTLEMENT is how long a fill traps the money — and they are only
+# weakly coupled (KXGDPYEAR-32 carries a 123.9h program on a market settling in 2032).  The
+# old `MAX_WINDOW_MULT` filter bounded the program window at 48h, and MEASURED 2026-07-29 that
+# left ELEVEN eligible clusters (TWO at 24h: gas and the treasury curve) — the mechanism of
+# the -$195 correlation night.  We did not fail to diversify; the filter deleted the board.
+# The entry gate is therefore on the MARKET's close: settle within 168h or we do not enter.
+# 168h is where measured supply supports the book: 54 clusters settle inside 7 days, ~38 can
+# clear $1.00 at half presence — against N_TARGET_CLUSTERS = 30 (note 52 §3b).  A fill in
+# this universe is capital committed for AT MOST a week, and the program pays THROUGH the
+# hold, which is what makes the hold rentable at all.
+# MIRROR (horizon too SHORT ↔ too long): too short is the old filter — a two-cluster book;
+# too long readmits the PYPL geometry (inventory that outlives its subsidy by months).  An
+# UNKNOWN close refuses entry — the markets this gate exists for are exactly the ones whose
+# close is far from their program, so "unknown" may not default to admit (held is exempt; a
+# market we are inside is not asking an entry question).
+SETTLE_HORIZON_H = 168.0
+HORIZON_GRACE_H = SETTLE_HORIZON_H           # spec §1.2 hard horizon exclusion.  Was 24h
+                                             # ("same-day-after settlement"), which excluded
+                                             # most of the ≤7d universe the settlement gate
+                                             # deliberately admits: any market settling more
+                                             # than a day after its program ended was refused
+                                             # even though the gate bounds the carry at 168h
+                                             # and (★)'s carry term PRICES the gap.  The
+                                             # exclusion survives as the backstop BEHIND the
+                                             # settlement gate, at the same 168h boundary.
 HORIZON_EXEMPT_RUNG = 2                      # spec §1.2 "unless ratchet rung ≥ 2"
 
 # =============================================================================================
@@ -228,7 +259,13 @@ HORIZON_EXEMPT_RUNG = 2                      # spec §1.2 "unless ratchet rung �
 # MIRROR (ratchet up ↔ ratchet down ↔ revive): up-1/down-2 is the down end; the revive end is
 # REVIVE_REQUIRES_NEW_PERIOD + the T̂-posterior predicate.  Nothing revives on a timer.
 # =============================================================================================
-ENTRY_FLOOR_USD = 2.00                       # v1 §3.1 = 2× the $1.00 payout cliff.
+# ── RECONCILED 2026-07-29 night (note 52 D7).  v1 §3.1 set this at $2.00 ("2x the cliff");
+# the sizing rule sets the credit target at CREDIT_TARGET_USD x CREDIT_TARGET_MARGIN = $1.50.
+# TWO different targets for one floor make the cliff pass zero the very rung the lot funds —
+# the lot clears $1.50 and the cliff pass demands $2.00, so every correctly-sized rung reads
+# sub-cliff and is dropped.  One number, and the sizing rule's is the derived one (margin 1.5
+# = half a floor of headroom, note 52 D7).  `test_config` asserts the identity.
+ENTRY_FLOOR_USD = 1.50                       # == CREDIT_TARGET_USD x CREDIT_TARGET_MARGIN.
                                              # UNDERIVED §9.5 (recalibrate to
                                              # $1.00/q05(actual/projected) after 5 periods)
 # SECOND CHARTER AMENDMENT (Ryan) — the forfeit CLIFF.  Payout is $0 below $1.00, so accrual
@@ -276,7 +313,12 @@ N_UNVERIFIED_MAX = 40                        # breadth is the strategy (note 43 
 # an opening probe inside the per-rung cap while making it large enough that its accrual is
 # distinguishable from the $1 forfeit cliff — a probe that can only just clear the floor
 # cannot tell "this venue pays" from "we barely qualified".
-RUNG0_FLOOR_MULT = 4.0
+# ── CORRECTED 2026-07-29 night (note 52 D6).  Under the presence-reserve stack the per-order
+# bound IS the lot ($2.50), so a 4x probe exceeds its own container and `rung0_cap` reads
+# every venue UNPROBEABLE — the whole book refuses to open.  The distinguishability the 4x
+# bought is already carried by CREDIT_TARGET_MARGIN: the lot targets $1.50 against a $1.00
+# cliff, so a credited lot is 50% above the forfeit boundary — measurable, not marginal.
+RUNG0_FLOOR_MULT = 1.0
 # How many cliff-sized rungs one venue may hold.  A venue is a SERIES and a series carries a
 # ladder of strikes, each strike its own pool with its own $1 cliff — so the earning shape is
 # several rungs per venue, not one.  4 keeps a venue's budget meaningfully below the cluster
@@ -484,7 +526,14 @@ DEGRADE_NEVER = ("exit_cancel", "t3_close_sweep", "day_stop_flatten", "cash_feed
 CLASSIFY_HZ = 5.0                            # spec §3.4 step 1 from
 CLASSIFY_HZ_DEGRADED = 1.0                   # spec §3.4 step 1 to
 CLASSIFY_REFRESH_S = 900.0                   # v4-proven; pinned-ness timescale
-CLASSIFY_MAX_MARKETS = 200                   # bound the cold-start sweep.  ρ DOES rank ACROSS
+# ── WIDENED 2026-07-29 night (note 52 D4's cost).  The candidates rank is by ρ across ALL
+# live programs, and most of the top of that rank settles FAR (measured: of the top 40
+# clusters by ρ, 24 settle >30 days out) — each far ticker costs one close-learn before the
+# request-free pre-filter can drop it, so the budget that reaches the NEAR universe is the
+# tail of this bound.  400 at the classify lane's own amortization (400/900 s ≈ 0.44 req/s)
+# stays far inside the 4 Hz budget and lets the ≤7-day universe (54 clusters, note 52 §3b)
+# fill in within a few sweeps instead of a few hours.
+CLASSIFY_MAX_MARKETS = 400                   # bound the cold-start sweep.  ρ DOES rank ACROSS
                                              # events (different pools); it only fails WITHIN
                                              # one, which is why the rank that matters is
                                              # computed AFTER classification, not before.
@@ -851,6 +900,67 @@ DAY_STOP_FRAC = 0.35                         # v1 §8.4.  UNDERIVED §9.5.
 DAY_STOP_FLOOR_USD = 20.0
 DAY_STOP_CAP_USD = 150.0
 
+# =============================================================================================
+# THE PRESENCE-RESERVE CAP STACK  (enchiridion note 52, D5/D6/D7 — settled with Ryan
+# 2026-07-29 night).  One derivation produces every number in this block; nothing here is
+# independently tunable, which is the point.
+#
+# THE STRATEGY'S SHAPE: ~N uncorrelated settle sources; per source ONE rung, sized to its own
+# floor-clearing LOT; capital reserved to RE-POST the lot after each fill rather than posting
+# a bigger order (Ryan: a 3x order holds 3x the inventory on its first fill; a 3x reserve
+# holds one lot's worth and re-posts — same presence, a third of the inventory risk).
+#
+#     RUNG_REFILLS   = 3                     Ryan: "say on average we need to buy back 3
+#                                            times to hold presence" — charitable phi, D8;
+#                                            measured phi replaces it (the lipband capture).
+#                                            A PRIOR for planning, not a per-rung guarantee —
+#                                            see the lot cap below.
+#     CLUSTER_RESERVE = ceiling / N          = $10 — the per-settle-source budget.  The
+#                                            existing cluster rail (positions + resting basis
+#                                            vs the cap) IMPLEMENTS the reserve: fills convert
+#                                            resting into positions, re-posts keep coming
+#                                            until the cluster is at cap — exactly the
+#                                            (1 + phi*W) capital multiplier of note 51 §1,
+#                                            in cap form.
+#     SLOT_LOT_CAP   = CLUSTER_RESERVE / 2   = $5.00 — the LOT CONTAINER.  A rung whose
+#                                            floor-clearing lot does not fit is REFUSED,
+#                                            never shrunk ("fewer rungs, never smaller lots",
+#                                            D6: below floor-clearing size a rung earns ZERO).
+#                                            WHY /2 AND NOT /(1+refills): the first cut used
+#                                            $2.50 (a fixed 4-lot reserve) and the LIVE BOARD
+#                                            refused every venue — note 47 §4's own number is
+#                                            a MEDIAN cost-to-clear of $3.68 in the emptiest
+#                                            band, so a $2.50 container refuses the median
+#                                            rung on the board.  /2 guarantees at least ONE
+#                                            re-post for the largest admissible lot; a $2 lot
+#                                            gets 4.  REFILLS PER RUNG ARE EMERGENT from the
+#                                            fixed reserve (reserve/lot − 1), which is Ryan's
+#                                            own tolerance: "we'll do 5 to be conservative,
+#                                            and if that's too much we'll just earn slightly
+#                                            less rewards."
+#     N_TARGET_CLUSTERS = ceiling / CLUSTER_RESERVE = 30 at $300.
+#
+# WHY N IS DERIVED AND NOT CHOSEN: supply, MEASURED 2026-07-29 (note 52 §3b), is ~38 clusters
+# that both settle inside SETTLE_HORIZON_H and can clear $1.00 at HALF presence — so 30 fits
+# inside measured supply with margin.  If the ceiling rises, N rises with it and the supply
+# number is the thing to re-measure first.
+# MIRROR (N too HIGH ↔ too low): too high shrinks the reserve below the lot and every rung is
+# refused as unfundable — the book deploys nothing, visible as `lot_unfundable` counts.  Too
+# low concentrates: at N=2 (the old 48h window filter's real universe) it is the -$195 night.
+# RUIN CHECK (note 52 §4): at N=30 equal weights, V <= PORTFOLIO_VAR_MAX = 0.25 requires
+# average price >= 1/(1 + N/4) ~= 12c; the plan-side variance instrument (D11) enforces the
+# average, the 6c ENTRY_BAND floors the measured-EV cohort, and neither is a per-rung price
+# cap (p_min = k/bankroll stays refuted).
+RUNG_REFILLS = 3
+N_TARGET_CLUSTERS = 30
+SLOT_LOT_CAP_USD = 5.00                      # == (300 / N_TARGET_CLUSTERS) / 2; test_config
+                                             # asserts the identity at the live ceiling
+# The day-stop-derived risk statement ("no single correlated bet may trip the global day
+# stop") still holds and is STRICTLY LOOSER: 0.5 x day_stop >= 0.5 x max($20, 0.2 x ceiling)
+# = $30 at $300, and ceiling/N = $10 <= $30 whenever N_TARGET_CLUSTERS >= 10.
+# `test_config` asserts the identity lot x (1+refills) == ceiling/N so the three constants
+# cannot silently drift apart.
+
 # --- the PER-RUNG size bound, DERIVED (charter amendment, Ryan, finish round) ---
 # The flat $10 `INV_CAP_USD` was INHERITED, NOT DERIVED — it predates knowing pools run
 # ~$100/rung, and it refused $50 on rungs whose reward supported it.  Per-rung size now
@@ -871,14 +981,27 @@ DAY_STOP_CAP_USD = 150.0
 # MIRROR (cap too LOOSE ↔ too TIGHT): loose is bounded by the day stop it derives from and by
 # the cluster cap at place(); tight is the old defect — refusing reward-supported size — and
 # is what this derivation removes.
-# INV_CAP_USD survives ONLY as the FLOOR, and the floor itself is now derived:
-# 0.5 × DAY_STOP_FLOOR_USD = $10, i.e. the slot cap at the smallest fundable day.
-INV_CAP_USD = 0.5 * DAY_STOP_FLOOR_USD       # = $10 — the slot cap's FLOOR, not the cap
+# ── SUPERSEDED 2026-07-29 night (note 52 D6).  INV_CAP_USD is now the LOT CONTAINER: the
+# per-order dollar bound equals SLOT_LOT_CAP_USD, because the presence-reserve stack sizes a
+# resting order at its floor-clearing LOT and holds (1+RUNG_REFILLS)x that per cluster.  The
+# old $10 form let one order eat the whole cluster reserve, which converts the reserve into
+# inventory on the first fill — the exact failure the reserve exists to prevent.
+INV_CAP_USD = SLOT_LOT_CAP_USD               # = $2.50 — the LOT container (note 52 D6)
 
 
-def slot_cap_usd(day_stop_threshold_usd, floor_usd=None):
-    """The derived per-rung collateral cap: `max(floor, 0.5 × day_stop)`.  Same shape as
-    `cap_series_usd`/`cluster_cap_usd` at the same factor, one level finer.
+def slot_cap_usd(day_stop_threshold_usd, floor_usd=None, ceiling_usd=None):
+    """── SUPERSEDED IN DERIVATION 2026-07-29 night (note 52 D5/D6): the per-order cap is the
+    LOT CONTAINER, `ceiling / (N_TARGET_CLUSTERS × (1 + RUNG_REFILLS))` = SLOT_LOT_CAP_USD at
+    the $300 ceiling.  The presence-reserve stack replaces the day-stop derivation below: the
+    unit that must not trip the day stop is the CLUSTER, the cluster reserve is ceiling/N, and
+    the per-ORDER bound is the reserve divided by (1 + refills) so one fill converts at most a
+    quarter of the reserve into inventory.  The day-stop bound survives transitively (see the
+    N_TARGET_CLUSTERS block): ceiling/N ≤ 0.5 × day_stop for every N ≥ 10.
+    `day_stop_threshold_usd` is kept in the signature for its call sites but no longer moves
+    the answer; `ceiling_usd=None` returns the $300-era constant.
+
+    The ORIGINAL derivation, kept because R1 (nesting) still governs and R4's degeneracy
+    argument is why the reserve lives at the CLUSTER and not the slot:
 
     ── NEW-1: `slot_cap_usd == cluster_cap_usd` IS DELIBERATE.  THE DERIVATION. ──────────
     The re-verify established the identity exactly (day stops $20/$40/$100/$150/$300) and
@@ -935,8 +1058,9 @@ def slot_cap_usd(day_stop_threshold_usd, floor_usd=None):
     rung becomes reachable at a day stop ≥ $100" still holds and now reads "$50 per CLUSTER",
     which is what the risk statement always said.
     """
-    f = INV_CAP_USD if floor_usd is None else float(floor_usd)
-    return max(f, 0.5 * float(day_stop_threshold_usd))
+    if ceiling_usd is not None:
+        return float(ceiling_usd) / (N_TARGET_CLUSTERS * 2.0)
+    return SLOT_LOT_CAP_USD
 
 
 PER_MARKET_POOL_MULT = 4.0                   # v1 §8.2 never risk 4× a market's own max prize

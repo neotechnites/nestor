@@ -549,9 +549,11 @@ class TestB16ThePerMarketAcquisitionCap(LipTestCase):
             self.assertGreaterEqual(
                 C.market_leg_cap_usd(ceiling, day_stop) + 1e-9, C.slot_cap_usd(day_stop),
                 "market cap inverted under the slot cap at ceiling $%.0f" % ceiling)
-        # and the bare fraction really does invert, so the `max` is load-bearing, not padding
-        self.assertLess(C.MARKET_CAP_FRAC * 45.0,
-                        C.slot_cap_usd(G.day_stop_usd(0.0, ceiling_usd=45.0)))
+        # and the bare fraction inverts below slot_cap/MARKET_CAP_FRAC of ceiling — at the
+        # $2.50 lot container that boundary is $25 of ceiling, so the `max` is load-bearing
+        # exactly there (a $45 book no longer inverts; a $20 one does)
+        self.assertLess(C.MARKET_CAP_FRAC * 20.0,
+                        C.slot_cap_usd(G.day_stop_usd(0.0, ceiling_usd=20.0)))
 
     def test_the_cap_is_PER_LEG_so_a_full_bid_leg_does_not_refuse_the_ask(self):
         """D2's side half.  Exactly one outcome pays, so worst-case market loss is

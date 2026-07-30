@@ -259,17 +259,19 @@ class TestRescueUnverifiedVenue(FixRoundCase):
         r.m.accrued["prog-1"] = 0.87                      # the stranded accrual
         return r, ex
 
-    def test_the_top_up_reaches_the_wire_with_no_venue_state(self):
+    def test_a_rescue_bigger_than_the_lot_container_is_REFUSED(self):
+        """WAS `test_the_top_up_reaches_the_wire_with_no_venue_state`, asserting a ~$16
+        top-up (271 contracts against S=1200 rivals) reached the wire.  Note 52 D6 refuses it
+        BY DESIGN: the cluster reserve is $10 and the lot container $2.50, and "fewer rungs,
+        never smaller lots" applies to rescues too — recovering $0.87 of stranded accrual is
+        not worth 1.6x a whole settle-source's reserve.  The venue reads UNPROBEABLE (its
+        cheapest fitting lot does not exist) and nothing reaches the wire.  The fitting-
+        reserve rescue mechanics stay covered in test_alloc's TestCliffRecovery."""
         r, ex = self._runner()
-        out = r.iteration(NOW + 1)
-        self.assertIn(r.m.venue_status.get("KXCLIFF"), (RT.ADMITTED, RT.OVERSIZED))
-        self.assertTrue(self.logs_of("cliff_top_up"), "the rescue never fired")
-        self.assertGreater(len(ex.placed), 0, "NO RESCUE ORDER REACHED THE WIRE")
-        q = out["alloc"][(CLIFF_TK, "bid")]
-        # the size reaches the cliff: A + share·(ρ/2)·h ≥ $1.10
-        s = [s for s in r.slots if s.side == "bid"][0]
-        proj = 0.87 + (q / (q + s.S)) * (s.rho / 2.0) * s.hours_left
-        self.assertGreaterEqual(proj, C.RESCUE_TARGET_USD - 1e-6)
+        r.iteration(NOW + 1)
+        self.assertEqual(r.m.venue_status.get("KXCLIFF"), RT.UNPROBEABLE)
+        self.assertEqual(self.logs_of("cliff_top_up"), [])
+        self.assertEqual(len(ex.placed), 0)
 
     def test_dead_accrual_gets_no_cap_room(self):
         """The mirror: a cliff UNREACHABLE at the ρ/2 ceiling earns no exemption."""
@@ -578,20 +580,32 @@ class TestBooksWired(FixRoundCase):
         self.assertIn("HELD-1", out)
         self.assertIn("ORD-2", out)
 
-    def test_trigger_e_fires_for_a_slot_whose_examination_lapsed(self):
+    def test_trigger_e_is_SUPPRESSED_at_the_touch_and_fires_off_it(self):
+        """WAS `test_trigger_e_fires_for_a_slot_whose_examination_lapsed`, asserting a lapsed
+        AT-TOUCH slot re-places.  The no-change suppression (2026-07-29, the presence lever:
+        median order life was 1.9 s and 73.9% of re-posts were at the SAME price) deliberately
+        drops (e) at the touch — an identical cancel/replace surrenders queue position and
+        buys nothing.  The stale end stays guarded: off the touch, (a) fires immediately."""
         ex = CountingExchange(program_body(), {TK: cheap_book()})
         r = self.runner(ex)
         r.init(NOW, nestor_state=NESTOR)
-        r.iteration(NOW + 1)
+        for k in (1, 40, 80):                 # let the target and the venue cap settle;
+            r.iteration(NOW + k)              # min-resting-life spaces the top-up re-posts
         placed_before = len(ex.placed)
         key = (TK, "bid")
-        # simulate a lapse: the slot was last examined > SAFETY_RESYNC_S ago
-        r.m.slot_examined[key] = NOW + 1 - C.SAFETY_RESYNC_S - 5
-        # age the order past MIN_RESTING_LIFE so (e) is not suppressed by P1
-        r.m.orders[list(r.m.orders)[0]]["placed_ts"] = NOW - C.MIN_RESTING_LIFE_S - 10
-        r.iteration(NOW + 2)
+        r.m.slot_examined[key] = NOW + 80 - C.SAFETY_RESYNC_S - 5
+        for o in r.m.orders.values():
+            o["placed_ts"] = NOW - C.MIN_RESTING_LIFE_S - 10
+        r.iteration(NOW + 81)
+        self.assertEqual(len(ex.placed), placed_before,
+                         "an identical requote at the touch must be suppressed")
+        # ...and off the touch the stale quote is re-proven at once (trigger (a))
+        ex.books[TK] = {"orderbook": {"orderbook_fp": {
+            "yes_dollars": [["0.07", "1200"]], "no_dollars": [["0.92", "1200"]]}}}
+        for k in range(82, 85):
+            r.iteration(NOW + k)
         self.assertGreater(len(ex.placed), placed_before,
-                           "trigger (e) is still dead: the lapsed slot was not re-proven")
+                           "a stale quote OFF the touch was never re-proven")
 
     def test_a_requote_pass_does_NOT_reset_resync_globally(self):
         """The defect: `last_resync = now` every pass.  Now per-slot: an untouched slot's

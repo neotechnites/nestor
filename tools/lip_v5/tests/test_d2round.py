@@ -24,13 +24,17 @@ def prog(pid="p1", series="KXBAND", tickers=(TK,), reward=1_000_000,
 
 
 class Table(object):
-    """A classifier stand-in: one ticker, both sides, with the knobs each test needs."""
+    """A classifier stand-in: one ticker, both sides, with the knobs each test needs.
+
+    `close_ts` defaults NEAR (now + 16 h): the real wire always carries a close, and the
+    settlement gate (note 52 D4) refuses entry on an UNKNOWN close by design — a stub without
+    one models the pathological missing-payload case, which gets its own test."""
 
     def __init__(self, ticker=TK, pid="p1", bid_p=0.12, ask_p=0.85,
-                 qualifies=True, cum=1200.0, S=500.0):
+                 qualifies=True, cum=1200.0, S=500.0, close_ts=NOW + 16 * 3600):
         self.table = {ticker: {
             "ticker": ticker, "program_id": pid, "series": "KXBAND", "pinned": False,
-            "target_size": 1000.0, "yes_mid": 0.135, "ts": NOW, "close_ts": None,
+            "target_size": 1000.0, "yes_mid": 0.135, "ts": NOW, "close_ts": close_ts,
             "sides": {"bid": {"S": S, "qualifies": qualifies, "cum_size": cum,
                               "p": bid_p, "legal": True},
                       "ask": {"S": S, "qualifies": qualifies, "cum_size": cum,
@@ -254,18 +258,21 @@ class TestB15B16FireThroughTheRealPlaceContext(EngineCase):
             m.entry_basis[(tk, "yes")] = basis
 
     def test_the_CEILING_refuses_through_engine_place_context(self):
+        # 32 clusters × $9.20 = $294.40: every cluster INSIDE its $10 reserve (note 52 D5),
+        # so the only rail left standing between a $9 order and the wire is B15 itself —
+        # the cheaper cluster refusal must not be what this test exercises.
         m = self._armed(300.0)
-        self._fill_book(m, ("AAA", "BBB", "CCC", "DDD"), 70.0)        # $280 of $300
+        self._fill_book(m, tuple("C%02d" % i for i in range(32)), 9.20)
         ctx = m.place_context(available_cash_usd=10_000.0)
         self.assertAlmostEqual(ctx.ceiling_usd, 300.0, places=6)
         ok, reason, detail = G.place_allowed(ctx, {"ticker": "EEE-1", "side": "yes",
-                                                  "n": 50, "basis": 0.50,
+                                                  "n": 18, "basis": 0.50,
                                                   "fully_closing": False})
         self.assertFalse(ok)
         self.assertEqual(reason, "ceiling", detail)
         # a book at its ceiling must always be able to LEAVE
         ok2, reason2, _ = G.place_allowed(ctx, {"ticker": "EEE-1", "side": "yes",
-                                                "n": 50, "basis": 0.50,
+                                                "n": 18, "basis": 0.50,
                                                 "fully_closing": True})
         self.assertTrue(ok2, reason2)
 

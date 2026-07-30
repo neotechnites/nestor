@@ -200,10 +200,16 @@ class TestAllocateCarriesTheClusterTerm(LipTestCase):
         self.assertEqual(spent, 0.0)
         self.assertEqual(sum(a.values()), 0)
 
-    def test_no_cluster_cap_is_the_old_behaviour(self):
+    def test_no_cluster_cap_is_ONE_RUNG_not_the_old_spray(self):
+        """WAS `test_no_cluster_cap_is_the_old_behaviour`, asserting spent > $10 across a
+        ladder.  Note 52 D5 supersedes the old behaviour deliberately: one rung per cluster,
+        so even with NO cluster cap the plan funds a single rung and stops at its container —
+        the ladder can never again be sprayed rung-by-rung."""
         a, spent, _ = alloc.allocate(self.slots(), 300.0, 0.0,
                                      caps=alloc.Caps(inv_cap_usd=10.0))
-        self.assertGreater(spent, 10.0)
+        self.assertAlmostEqual(spent, 10.0, places=6)
+        self.assertEqual(sum(1 for q in a.values() if q > 0), 1,
+                         "one rung per cluster (note 52 D5)")
 
 
 class TestTheGuardHierarchy(LipTestCase):

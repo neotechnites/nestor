@@ -112,7 +112,8 @@ class FakeExchange(object):
         self.cancel_status = 200
         self.fills_rows = []
         self.settlement_rows = []
-        self.market_closes = {}              # ticker -> close_ts (epoch s); optional
+        self.market_closes = {}              # ticker -> close_ts (epoch s); default now+24h
+        self.market_close_missing = set()    # tickers whose market payload carries NO close
         self.trades_rows = None              # None => "one recent trade" (P6 admits)
         self.now = now
 
@@ -155,11 +156,17 @@ class FakeExchange(object):
 
     def market(self, ticker):
         body = {"status": "active", "ticker": ticker}
-        close = self.market_closes.get(ticker)
-        if close is not None:
-            from datetime import datetime, timezone
-            body["close_time"] = datetime.fromtimestamp(
-                float(close), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # REAL-WIRE FIDELITY: every live market carries a `close_time` — it is not optional
+        # on the wire, so a fake market without one models a market that does not exist.
+        # Default = now + 24 h, i.e. the common near-settling case the settlement gate
+        # (note 52 D4) admits; tests exercising the gate's REFUSE end set `market_closes`
+        # explicitly (or `market_close_missing` for the pathological no-close payload).
+        if ticker in getattr(self, "market_close_missing", ()):
+            return 200, {"market": body}
+        close = self.market_closes.get(ticker, float(self.now) + 24 * 3600.0)
+        from datetime import datetime, timezone
+        body["close_time"] = datetime.fromtimestamp(
+            float(close), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         return 200, {"market": body}
 
     def trades(self, ticker, min_ts=None, limit=1):

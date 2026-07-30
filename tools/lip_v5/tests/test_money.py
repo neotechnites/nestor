@@ -123,7 +123,11 @@ class TestHorizonAndFloor(LipTestCase):
         self.assertAlmostEqual(M.l_shed_median_h([1.0, 2.0, 3.0, 4.0]), 2.5)
 
     def test_hard_horizon_exclusion_is_the_pypl_geometry(self):
-        """§1.2 — exclude iff `T_settle > H_prog + 24`, unless rung ≥ 2."""
+        """§1.2 — exclude iff `T_settle > H_prog + grace`, unless rung ≥ 2.  The grace is
+        now SETTLE_HORIZON_H (note 52 D4): the settlement gate at slot-build is the entry
+        guard, and this exclusion survives as the backstop BEHIND it at the same boundary —
+        so a market settling a week past its program is excluded, one settling a day past
+        it is priced by (★)'s carry term instead of amputated."""
         now = 0.0
         prog_end = 30 * 24 * 3600.0                    # program ends in 30 days
         close_far = 200 * 24 * 3600.0                  # market closes DEC 31: PYPL
@@ -131,9 +135,11 @@ class TestHorizonAndFloor(LipTestCase):
         self.assertTrue(M.horizon_excluded(close_far, now, prog_end))
         self.assertFalse(M.horizon_excluded(close_near, now, prog_end))
         self.assertFalse(M.horizon_excluded(close_far, now, prog_end, rung=2))
-        # the +24h grace covers same-day-after settlement
-        self.assertFalse(M.horizon_excluded(prog_end + 20 * 3600.0, now, prog_end))
-        self.assertTrue(M.horizon_excluded(prog_end + 30 * 3600.0, now, prog_end))
+        # inside the grace: settling a day after the program is a carry question, not a ban
+        self.assertFalse(M.horizon_excluded(prog_end + 30 * 3600.0, now, prog_end))
+        # past it: the PYPL geometry, excluded
+        self.assertTrue(M.horizon_excluded(prog_end + C.SETTLE_HORIZON_H * 3600.0
+                                           + 30 * 3600.0, now, prog_end))
 
 
 class TestPhiAndD(LipTestCase):
@@ -297,7 +303,11 @@ class TestS0Qualification(LipTestCase):
         s = alloc.Slot("EMPTY", "bid", rho=6.25, S=0.0, p=0.50, phi=0.08, d=0.07, l_eff=8.0,
                        target_size=1000, cum_size=200, land_grab_size=800,
                        land_grab_price_c=1)
-        a, spent, _ = alloc.allocate([s], 100.0, RSTAR)
+        a, spent, _ = alloc.allocate([s], 100.0, RSTAR,
+                                     caps=alloc.Caps(inv_cap_usd=10.0))
+        # explicit $10 container: the live lot container ($2.50) cannot hold an 800-lot
+        # grab, and this test is about the QUALIFICATION mechanism, not the live constant
+        # (under FREE_RIDE_ONLY the grab path is dead in production anyway).
         # 800 contracts at 1c = $8.00, inside the 0.25 land-grab fraction of a $100 budget
         self.assertEqual(a[("EMPTY", "bid")], 800)
         self.assertAlmostEqual(spent, 8.00, places=6)

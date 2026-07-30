@@ -97,9 +97,9 @@ class Maker(object):
         self.shed_completed_h = {}           # (ticker, held_leg) -> [hours open->flat]
         # --- SF-3 ---
         self.halt_flatten_done = False       # every halt path flattens ONCE
-        # Charter amendment: per-rung cap, derived per cycle from the day stop; the FLOOR
-        # before the first cycle (conservative — no reward projection exists yet).
-        self.slot_cap_usd = C.INV_CAP_USD
+        # Note 52 D6: the per-order LOT container, from the ceiling — same value the cycle
+        # recomputes; no reward projection needed.
+        self.slot_cap_usd = C.slot_cap_usd(0.0, ceiling_usd=self.ceiling_usd)
         # --- SECOND AMENDMENT (b): accrued projected payout, per program.  The cliff
         # decision is only as good as the A it remembers, so this persists via `accrual`
         # money rows (≤60 s crash loss) and recovers with replay.
@@ -798,10 +798,13 @@ class Maker(object):
 
         # --- allocate → REQUOTE (charter A: the stage that was never written) ---
         if slots:
-            # Charter amendment: the per-rung cap DERIVES from the day stop each cycle
-            # (0.5×, floored at $10); the reward side of sizing is (★)'s own saturation.
+            # Note 52 D6: the per-ORDER cap is the LOT CONTAINER — the cluster reserve
+            # (ceiling/N) divided by (1+refills) — so one fill converts at most a quarter of
+            # a settle source's reserve into inventory.  Scales with the ceiling, not the
+            # day stop (the day-stop bound holds transitively; see config.N_TARGET_CLUSTERS).
             self.slot_cap_usd = C.slot_cap_usd(
-                G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd))
+                G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd),
+                ceiling_usd=self.ceiling_usd)
             caps = alloc.Caps(inv_cap_usd=self.slot_cap_usd)
             venue_caps = self.admit_venues(now, slots)
             # SECOND AMENDMENT (a): held inventory attributed per slot leg, so the cap binds
@@ -844,15 +847,21 @@ class Maker(object):
             # resting $56.16 where four slots had rested $75.00.
             _pc = self.place_context()
             cluster_seed = {}
+            cluster_seed_px = {}              # D11 — Σ usd·basis, the variance ledger's
+                                              # price side, from the SAME book as the rail
             for _p in list(_pc.positions) + list(_pc.resting_basis):
                 _ck = CL.cluster_of(_p["ticker"])
-                cluster_seed[_ck] = cluster_seed.get(_ck, 0.0) + \
-                    float(_p.get("n", 0)) * float(_p.get("basis", 0.0))
+                _usd = float(_p.get("n", 0)) * float(_p.get("basis", 0.0))
+                cluster_seed[_ck] = cluster_seed.get(_ck, 0.0) + _usd
+                cluster_seed_px[_ck] = cluster_seed_px.get(_ck, 0.0) + \
+                    _usd * float(_p.get("basis", 0.0))
             a, spent, res = alloc.allocate_with_rstar(slots, budget, caps=caps,
                                                       venue_caps=venue_caps, held=held,
                                                       resting=resting_by_slot,
                                                       cluster_cap_usd=cluster_cap,
-                                                      cluster_seed=cluster_seed)
+                                                      cluster_seed=cluster_seed,
+                                                      cluster_seed_px=cluster_seed_px,
+                                                      ceiling_usd=self.ceiling_usd)
             self.last_alloc = dict(a)
             out["allocate"] = {"spent": spent, "r_star": res.r_star,
                                "converged": res.converged, "slots": len(slots),
