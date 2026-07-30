@@ -95,13 +95,16 @@ class Maker(object):
         # live constant.  Resync tracks when each slot was last EXAMINED with fresh data.
         self.slot_examined = {}              # (ticker, side) -> ts last examined
         self.land_grabbed = set()            # log land_grab once per (ticker, side)
-        # --- the shed path (charter A) ---
-        self.triage_shed = set()             # tickers the cutover triage sentenced to shed
-        self.pending_triage = []             # adopted positions awaiting a venue reading
-        self.shed_target = {}                # (ticker, shed_side) -> contracts to unwind
-        self.shed_since = {}                 # ticker -> ts the shed began (l_shed's clock)
-        self.shed_held = {}                  # ticker -> held leg at shed start
-        self.shed_completed_h = {}           # (ticker, held_leg) -> [hours open->flat]
+        # ── THE SHED PATH IS GONE (owner decision, 2026-07-30).  THE BOT NEVER SELLS. ────
+        # There is no `triage_shed`, `shed_target`, `shed_since`, `shed_held` or
+        # `shed_completed_h`, because there is no state a shed could be in.  A position
+        # leaves this book exactly one way: SETTLEMENT.  The D4 gate bounds every ride at
+        # ≤7 days, and our own tape prices the alternative — paying the spread to exit — at
+        # −$40.30 (the +2c leg) and −$123 (instant flatten).  See `requote_pass`.
+        # NOTE the distinction this deletion does NOT touch: an ASK is still quoted, all day,
+        # on every eligible slot.  An ask is NO-side collateral posted as an OPENING maker
+        # quote — it is half of how the pool is earned — and it is not a sale of anything.
+        # What died is orders whose PURPOSE is to reduce a position we hold.
         # --- SF-3 ---
         self.halt_flatten_done = False       # every halt path flattens ONCE
         # Note 52 D6: the per-order LOT container, from the ceiling — same value the cycle
@@ -207,12 +210,17 @@ class Maker(object):
             self.ledger.write("adopt", ticker=a["ticker"], side=leg, net=a["net"],
                               basis=a["basis"])
         self.rollback.set_adopted(res["adopted"])
-        self.pending_triage = list(res["adopted"])     # triaged when a venue reading exists
         R.log("adopt", adopted=len(res["adopted"]), excluded=len(res["excluded"]),
               orphans=len(res["orphans"]))
         return res
 
     def triage(self, now, venues, r_star=C.FLOOR_RATE_PER_H):
+        """CLASSIFICATION ONLY — it returns verdicts and NOTHING CONSUMES THEM (owner
+        decision, 2026-07-30: the bot never sells).  `cutover.triage` still computes, for the
+        record, whether a position's venue passes (★) and what leaving would cost, because
+        that is a measurement worth having on the tape.  There is no longer any code path
+        from a MAKER_SHED verdict to `place()`: the field that carried it (`triage_shed`) and
+        the pass that read it (`update_shed_targets`) are both deleted."""
         adopted = [{"ticker": t, "side": ("yes" if p.get("yes", 0) else "no"),
                     "net": p.get("yes", 0) or p.get("no", 0),
                     "basis": self.entry_basis.get(
@@ -1426,17 +1434,10 @@ class Maker(object):
         self.entry_basis.pop((ticker, "yes"), None)
         self.entry_basis.pop((ticker, "no"), None)
         self.position_cost.pop(ticker, None)
-        # SETTLEMENT IS NOT A SHED COMPLETION.  update_shed_targets records hours-to-flat
-        # into L_shed when a shedding ticker reaches flat; a settlement reaching flat is
-        # the exchange's clock, not liquidity evidence, and a sample from it would teach
-        # the carry model that illiquid books exit quickly.  Drop the shed state quietly.
-        self.shed_since.pop(ticker, None)
-        self.shed_held.pop(ticker, None)
-        self.triage_shed.discard(ticker)
-        for key in [k for k in self.shed_target if k[0] == ticker]:
-            self.shed_target.pop(key, None)
-        self.pending_triage = [pt for pt in self.pending_triage
-                               if pt.get("ticker") != ticker]
+        # SETTLEMENT IS NOW THE ONLY EXIT, so there is no shed state to unwind here and no
+        # L_shed sample to suppress.  (The old code had to be careful that a settlement's
+        # reach-flat was not mistaken for shed evidence; with no sheds the question is moot.)
+
     def venue_retired(self, ticker):
         """True when a ticker is one the strategy has decided against — denied family, or a
         program whose window the scanner now refuses.  Distinct from "not in this cycle's
@@ -1579,110 +1580,53 @@ class Maker(object):
         return paid
 
     # =========================================================================================
-    # THE SHED PATH (charter A): triage verdicts + inventory whose venue fails (★) ongoing
+    # POSITIONS (there is no exit path here — see `requote_pass`)
     # =========================================================================================
     def net_position(self, ticker):
         p = self.positions.get(ticker) or {}
         return float(p.get("yes", 0.0)) - float(p.get("no", 0.0))
 
-    def run_pending_triage(self, now, slots, r_star):
-        if not C.CUTOVER_TRIAGE_ENABLED:
-            if self.pending_triage:
-                R.log_once("triage_disabled", pending=len(self.pending_triage),
-                           note="positions ride to settlement (Ryan 2026-07-30)")
-                self.pending_triage = []
-            return
-        """Adopted positions are triaged as soon as a venue reading exists — the slot table
-        IS the reading (rho, S, p, phi, d, close/program end all live there).  Triage at
-        adoption time would run with NO readings and sentence the whole book to shed on
-        `no_venue_reading`; deferring until the classify sweep has spoken judges each
-        position on evidence.  MIRROR (never judged ↔ judged blind): a position whose market
-        never classifies again stays pending — reported every cycle in the read-out, held,
-        and ridden to settlement rather than shed at a price nobody derived."""
-        if not self.pending_triage:
-            return
-        by_key = {s.key: s for s in slots}
-        still = []
-        for pos in self.pending_triage:
-            leg = pos.get("side")
-            s = by_key.get((pos["ticker"], "bid" if leg == "yes" else "ask"))
-            if s is None:
-                still.append(pos)
-                continue
-            venue = {"rho": s.rho, "S": s.S, "p": s.p, "phi": s.phi, "d": s.d,
-                     "close_ts": s.close_ts, "program_end_ts": s.program_end_ts,
-                     "l_shed_h": None, "t_hat": s.t_hat}
-            v = cutover.triage_position(pos, venue, now, r_star)
-            R.log("cutover_triage", **v)
-            if v.get("exit_path") == cutover.MAKER_SHED:
-                self.triage_shed.add(pos["ticker"])
-        self.pending_triage = still
-
-    def update_shed_targets(self, now, slots, r_star):
-        """Recompute the shed set each cycle:
-          (1) cutover-triage verdicts (permanent for the position they judged), and
-          (2) inventory whose venue fails (★) NOW — the same equation that would refuse the
-              entry, applied to capital already inside (the carry term is forward-looking;
-              that the dollars are already there changes nothing about where they should be).
-        Completed sheds (position reaches flat, or untradeable dust) feed the `l_shed`
-        measurement — spec §1.2's liquidity horizon learns from its own exits.
-        """
-        by_key = {s.key: s for s in slots}
-        for ticker in sorted(set(self.positions) | set(self.shed_since)):
-            net = self.net_position(ticker)
-            if abs(net) < 1.0:
-                # Flat (or dust, which cannot trade — v4 T1).  If a shed was running, it
-                # COMPLETED: record hours open→flat for L_shed.
-                if ticker in self.shed_since:
-                    dur_h = (float(now) - self.shed_since.pop(ticker)) / 3600.0
-                    held = self.shed_held.pop(ticker, "yes")
-                    self.shed_completed_h.setdefault((ticker, held), []).append(dur_h)
-                    self.shed_target.pop((ticker, Q.shed_side(held)), None)
-                    R.log("shed_complete", ticker=ticker, hours=round(dur_h, 4),
-                          dust=abs(net) > 1e-9)
-                continue
-            if ticker in self.frozen:
-                continue                      # assume_filled freeze covers RECYCLING (§9.4b)
-            held = Q.held_leg_of(net)
-            reason = None
-            if ticker in self.triage_shed:
-                reason = "cutover_triage"
-            elif C.INVENTORY_AUTO_SHED:
-                s = by_key.get((ticker, "bid" if held == "yes" else "ask"))
-                if s is not None:
-                    fails_star = not M.admits(s.net_at(abs(net), r_star))
-                    horizon = (s.close_ts is not None and s.program_end_ts is not None and
-                               M.horizon_excluded(s.close_ts, now, s.program_end_ts, s.rung))
-                    if fails_star or horizon:
-                        reason = "horizon_excluded" if horizon else "venue_fails_star"
-                # No slot this cycle: KEEP the previous verdict rather than judging blind —
-                # a transient classify gap must not start (or stop) a shed.
-                elif ticker in self.shed_since:
-                    reason = "held_from_last_reading"
-            key = (ticker, Q.shed_side(held))
-            if reason:
-                if ticker not in self.shed_since:
-                    self.shed_since[ticker] = float(now)
-                    self.shed_held[ticker] = held
-                    R.log("shed_started", ticker=ticker, held=held, net=net, reason=reason)
-                self.shed_target[key] = Q.shed_qty(net)
-            else:
-                if self.shed_target.pop(key, None) is not None:
-                    R.log("shed_stopped", ticker=ticker, reason="venue_passes_star_again")
-                self.shed_since.pop(ticker, None)
-                self.shed_held.pop(ticker, None)
+    # ── `run_pending_triage` AND `update_shed_targets` ARE GONE. ─────────────────────────
+    # They were the two auto-exit paths, and both are deleted by the same decision (owner,
+    # 2026-07-30: "it's either running and placing orders, or it's not running").
+    #
+    # `run_pending_triage` converted a cutover verdict of MAKER_SHED into membership of
+    # `triage_shed`.  Measured live 2026-07-30 morning: after the truth-resync adoption it
+    # sentenced freshly-adopted positions to leave at the opposing best — 26 Skubal YES
+    # offered at 3c against a 16c basis.
+    #
+    # `update_shed_targets` was the SECOND, independent path: any inventory whose venue fails
+    # (★) NOW gets a shed target.  Its own docstring argued that the carry term is
+    # forward-looking so "the dollars are already there changes nothing about where they
+    # should be".  That is wrong in the one term it omits: LEAVING COSTS THE SPREAD, and the
+    # spread is not in (★).  Priced on our tape, exiting cost −$40.30 on the +2c leg and
+    # −$123 to flatten instantly; the same day it crossed to a 95c ask to close an 18c-basis
+    # NO (a guaranteed −$2.80).
+    #
+    # THE MIRROR THAT USED TO JUSTIFY THEM ("locked inventory ↔ paying to leave") is answered
+    # by the D4 settlement gate, not by an exit: every position this book can hold settles
+    # within 7 days, so the worst case of HOLDING is bounded and is measured cheaper than the
+    # worst case of SELLING.  Positions ride.  L_shed can therefore never be measured again,
+    # which `money.l_eff_h` already handles exactly right: `l_shed_h is None ⇒ ∞`, so `l_eff`
+    # falls back to the real horizon (close + settle lag), which is now the truth.
 
     # =========================================================================================
     # THE REQUOTING STAGE (charter A) — diff the post-forfeit-gate allocation against the
     # resting book; every emission goes through place()/cancel(), the rails stay the one path.
     # =========================================================================================
     def requote_pass(self, now, slots, alloc_map, r_star):
-        """One requote pass.  Returns the read-out {placed, cancelled, sheds, skipped}."""
-        self.run_pending_triage(now, slots, r_star)
-        self.update_shed_targets(now, slots, r_star)
+        """One requote pass.  Returns the read-out {placed, cancelled, skipped}.
 
-        stats = {"placed": 0, "cancelled": 0, "sheds": 0, "skipped": 0,
-                 "pending_triage": len(self.pending_triage)}
+        **EVERY ORDER THIS PASS EMITS IS AN OPENING MAKER QUOTE.**  There is no exit branch,
+        no shed target and no closing size (owner decision, 2026-07-30).  `q` is the
+        allocation, full stop — it used to be `max(alloc, shed)`, and the shed half is gone.
+
+        THE DISTINCTION THAT MUST NOT BE LOST: a slot whose side is "ask" is still quoted
+        exactly as before.  An ask is NO-side collateral posted to earn the NO half of the
+        pool; it opens a position, it does not close one.  What was deleted is the case where
+        the SIZE came from inventory we hold and the PRICE came from the opposing best —
+        that, and only that, was the sale."""
+        stats = {"placed": 0, "cancelled": 0, "skipped": 0}
         slot_by_key = {s.key: s for s in slots}
         live_by_slot = {}
         for oid, o in sorted(self.orders.items()):
@@ -1692,11 +1636,9 @@ class Maker(object):
                 live_by_slot.setdefault((o["ticker"], o["side"]), []).append(o)
 
         def target_q(s):
-            """The size this pass intends for `s` — the same `max(alloc, shed)` the loop
-            computes, hoisted so the ORDER of application can be derived from it."""
-            shed = Q.shed_qty(self.net_position(s.ticker), self.shed_target.get(s.key)) \
-                if s.key in self.shed_target else 0
-            return max(int(alloc_map.get(s.key, 0)), shed)
+            """The size this pass intends for `s`, hoisted so the ORDER of application can be
+            derived from it (see `release_first`).  It is the allocation and nothing else."""
+            return int(alloc_map.get(s.key, 0))
 
         def release_first(s):
             """NEW-1's residual: **RELEASES PRECEDE CLAIMS.**  An allocation is a
@@ -1735,10 +1677,7 @@ class Maker(object):
             cur = cur_list[-1] if cur_list else None
 
             q_alloc = int(alloc_map.get(key, 0))
-            shed_q = Q.shed_qty(self.net_position(s.ticker),
-                                self.shed_target.get(key)) \
-                if key in self.shed_target else 0
-            q = max(q_alloc, shed_q)
+            q = q_alloc
             if q <= 0:
                 if cur is not None:
                     if s.S <= 0 and float(s.cum_size) >= float(s.target_size):
@@ -1759,29 +1698,17 @@ class Maker(object):
 
             # Price, on the YES axis (order bodies speak YES; `s.p` is the SAME-SIDE best in
             # its own collateral currency, so the ask converts).
-            if s.is_land_grab and 0 < q_alloc <= s.land_grab_size and q == q_alloc:
+            if s.is_land_grab and 0 < q_alloc <= s.land_grab_size:
                 price = s.land_grab_price_c / 100.0
                 if key not in self.land_grabbed:
                     self.land_grabbed.add(key)
                     R.log("land_grab", ticker=s.ticker, side=s.side, size=q,
                           price_c=s.land_grab_price_c, target_size=s.target_size,
                           cum_size=s.cum_size)
-            elif shed_q > 0:
-                # v1 §5.4: the shed joins the OPPOSING queue and NEVER crosses (G6 stays
-                # off).  `shed_price` refuses a crossed/locked book outright — joining a
-                # crossed book would in fact take.
-                bid_s = slot_by_key.get((s.ticker, "bid"))
-                ask_s = slot_by_key.get((s.ticker, "ask"))
-                px = Q.shed_price(self.shed_held.get(s.ticker, "yes"),
-                                  bid_s.p if bid_s else None,
-                                  (1.0 - ask_s.p) if ask_s else None)
-                if px is None:
-                    R.log("shed_unpriced", ticker=s.ticker, side=s.side,
-                          why="crossed_or_one_sided_book")
-                    stats["skipped"] += 1
-                    continue
-                price = px
             else:
+                # THE ONLY REMAINING PRICE IS THE SAME-SIDE BEST.  The branch removed here
+                # priced from the OPPOSING best, which is what a seller does; there is no
+                # seller in this program any more.
                 price = s.p if s.side == "bid" else (1.0 - s.p)
             price = round(price, 4)
             # A MAKER NEVER TAKES (quote.would_cross).  Checked against the OPPOSING slot's
@@ -1804,13 +1731,11 @@ class Maker(object):
                 stats["skipped"] += 1
                 continue
 
-            # Fully-closing iff the WHOLE order reduces inventory (the halt/day-stop/cap
-            # exemptions apply to it; a combined earning+shed order is not exempt).
-            room = abs(self.net_position(s.ticker))
-            fully_closing = shed_q > 0 and q <= room + 1e-9
             # POST-FILL COOLDOWN (config derivation): an entry re-post inside the window
-            # re-feeds the flow that just ate the lot.  Exits are exempt.
-            if not fully_closing and cur is None:
+            # re-feeds the flow that just ate the lot.  EVERY order is an entry now, so the
+            # cooldown has no exemption left to grant — the `fully_closing` escape that used
+            # to sit here was for exits, and there are none.
+            if cur is None:
                 _cd = self.fill_cooldown.get(key)
                 if _cd is not None and (now - _cd) < C.POST_FILL_COOLDOWN_S:
                     stats["skipped"] += 1
@@ -1834,21 +1759,12 @@ class Maker(object):
             self.qual_ref[key] = qualifies_now
             self.slot_examined[key] = now
             if cur is None or trig:
-                placed = self._requote_slot(key, s.ticker, s.side, price, q, exp, now,
-                                            fully_closing, shed_q, cur)
+                placed = self._requote_slot(key, s.ticker, s.side, price, q, exp, now, cur)
                 if placed:
                     stats["placed"] += 1
-                    if shed_q > 0:
-                        stats["sheds"] += 1
                 else:
                     stats["skipped"] += 1
-        # A shed target whose opposing slot vanished from the table cannot be priced this
-        # cycle.  Say so — a shed that silently never posts is the locked-inventory state
-        # the shed path exists to end.
         slot_keys = {s.key for s in slots}
-        for key in sorted(set(self.shed_target) - slot_keys):
-            R.log("shed_unpriced", ticker=key[0], side=key[1],
-                  target=self.shed_target[key])
         # BLOCKER-3's other half: an ORDER whose slot vanished from the table is examined
         # by nobody above.  Surface every such order past the resync deadline — the runner's
         # poll set always contains ordered tickers, so the fix is a fresh classify, and this
@@ -1863,8 +1779,9 @@ class Maker(object):
             # closed — and until now the order simply rested on, unmanaged, holding capital in
             # a venue the strategy has decided against.  Cancelling releases it to a venue that
             # is still eligible; the cancel lane is never refused, and a cancel cannot increase
-            # exposure.  (Held INVENTORY is different — it is the shed path's business, not
-            # this one.)
+            # exposure.  (Held INVENTORY is untouched by this and by everything else: it
+            # rides to settlement.  Recalling an ORDER releases capital; selling a POSITION
+            # pays the spread, and that is the act this program no longer performs.)
             if self.venue_retired(key[0]):
                 ok, _ = self.cancel(orders_[0]["order_id"], now, lane="exit_cancel")
                 if ok:
@@ -1877,10 +1794,16 @@ class Maker(object):
                       since_s=round(now - last, 1))
         return stats
 
-    def _requote_slot(self, key, ticker, side, price, q, exp, now, fully_closing, shed_q,
-                      cur):
-        """MAKE-BEFORE-BREAK (v1 §4.1) with the §4.2 automatic cancel-first degrade, plus
-        v4's C4 shed retry.  Returns True iff a new order is resting.
+    def _requote_slot(self, key, ticker, side, price, q, exp, now, cur):
+        """MAKE-BEFORE-BREAK (v1 §4.1) with the §4.2 automatic cancel-first degrade.
+        Returns True iff a new order is resting.
+
+        v4's C4 SHED RETRY IS GONE (owner decision, 2026-07-30).  It existed because a
+        COMBINED order (earning tail + shed) could fail a cap as one order and take the shed
+        down with it, locking the inventory; the retry re-sent the shed alone as
+        `fully_closing=True`, which passed BECAUSE closing orders were cap-exempt.  With no
+        closing orders there is no combined order, no locked inventory to rescue, and — this
+        is the part that mattered on 2026-07-30 — no order that a cap cannot refuse.
 
         MIRROR (make-before-break ↔ break-before-make): an insufficient-balance reject on
         the make leg latches THIS SLOT to cancel-first for one SAFETY_RESYNC_S period (v4
@@ -1902,7 +1825,6 @@ class Maker(object):
 
         if C.MAKE_BEFORE_BREAK and degraded_ts is None:
             ok, reason, resp = self.place(ticker, side, price, q, exp, now,
-                                          fully_closing=fully_closing,
                                           available_cash_usd=self._available_cash(),
                                           replacing_order_id=replacing)
             if ok:
@@ -1915,20 +1837,6 @@ class Maker(object):
                                   cancel_first_period_s=C.CANCEL_FIRST_PERIOD_S,
                                   why="make_leg_insufficient_balance")
                 # fall through to cancel-first NOW (v4's shape): the quote must not freeze
-            elif shed_q > 0 and q > shed_q and reason not in ("shadow",):
-                # C4 (v4): the COMBINED order (earning tail + shed) can fail a cap as one
-                # order and the shed inside it then vanishes — the inventory locks.  A
-                # closing-only order passes by netting; the earning tail is forgone this
-                # cycle, unwinding the inventory is not.
-                R.log("shed_retry_after_combined_reject", ticker=ticker, side=side,
-                      combined=q, shed_only=shed_q, refused_by=reason)
-                ok2, _, _ = self.place(ticker, side, price, shed_q, exp, now,
-                                       fully_closing=True,
-                                       available_cash_usd=self._available_cash(),
-                                       replacing_order_id=replacing)
-                if ok2 and cur is not None:
-                    self.cancel(cur["order_id"], now, lane="requote_cancel")
-                return ok2
             else:
                 return False
 
@@ -1942,7 +1850,6 @@ class Maker(object):
             if not ok:
                 return False                  # stale quote stands; a rate loss, not a risk
         ok, reason, _resp = self.place(ticker, side, price, q, exp, now,
-                                       fully_closing=fully_closing,
                                        available_cash_usd=self._available_cash())
         return ok
 

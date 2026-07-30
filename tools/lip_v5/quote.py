@@ -85,45 +85,17 @@ def requote_triggers(our_price_c, best_price_c, remaining, target_q, S_now, S_re
     return trig
 
 
-def shed_side(held_leg):
-    """v1 §5.4 / v4 D4 — the shed of a YES position is an ASK order, which IS a NO bid: it
-    still scores, needs no fresh collateral (the position covers it), and unwinds the
-    inventory.  The shed is not a separate action; it is the OPPOSING slot's quote."""
-    return "ask" if held_leg == "yes" else "bid"
-
-
-def held_leg_of(net_yes):
-    """Which leg a net-YES position holds.  net > 0 holds YES; net < 0 holds NO."""
-    return "yes" if float(net_yes) > 0 else "no"
-
-
-def shed_price(held_leg, yes_bid, yes_ask):
-    """The shed's price on the YES axis: the OPPOSING side's best — joining that queue, never
-    crossing (G6 stays off; a crossing exit is a Ryan-gated spend).
-
-    MIRROR (a shed that crosses ↔ a shed that never fills): pricing at the opposing best is
-    the never-cross guard, and the CROSSED-BOOK refusal below is its assert — if best ask ≤
-    best bid the book is broken and any "join" would in fact cross, so we refuse to price at
-    all.  The never-fills end is bounded by settlement: `expiration_ts` backstops the order
-    and L_eff already prices the wait.
-
-    Returns the YES-axis price in dollars, or None when it cannot be priced safely.
-    """
-    if yes_bid is None or yes_ask is None:
-        return None
-    if float(yes_ask) <= float(yes_bid):
-        return None                           # crossed/locked book: nothing joins safely
-    return float(yes_ask) if held_leg == "yes" else float(yes_bid)
-
-
-def shed_qty(net_yes, target=None):
-    """C8 (v4, kept): clamp the shed at |net| so it can never FLIP the position — a 40-lot
-    shed against 20 held is not a shed, it is a fresh opposite position wearing a shed's
-    name.  Sub-contract dust is untradeable and reports as 0."""
-    n = abs(float(net_yes))
-    if target is not None:
-        n = min(n, abs(float(target)))
-    return int(n)                             # floor: never round UP into a flip
+# ── `shed_side`, `held_leg_of`, `shed_price` AND `shed_qty` ARE GONE. ────────────────────────
+# They were the whole geometry of an exit: which slot a held leg sells into, which leg is
+# held, what price joins the OPPOSING queue, and how many contracts unwind without flipping.
+# The bot never sells (owner decision, 2026-07-30), so none of the four has a question left to
+# answer.  Deleting them is also the structural guarantee: `engine` cannot accidentally
+# re-derive an exit price, because there is no function in this module that computes one.
+#
+# NOT AFFECTED, and the confusion worth naming: an ASK is not a shed.  `would_cross` below
+# still guards ask-side quoting, and the requoter still prices an ask at its own same-side
+# best.  An ask posts NO-side collateral to OPEN a position and earn the NO half of the pool.
+# A shed posted at the opposing best to REDUCE one.  Same wire verb, opposite acts.
 
 
 def same_second(now, placed_ts):

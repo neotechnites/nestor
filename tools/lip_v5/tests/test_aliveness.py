@@ -304,15 +304,24 @@ class TestLandGrabAppears(EngineCase):
                              out["allocate"]["cluster_cap_usd"] + 1e-6)
 
 
-class TestShedAppears(EngineCase):
-    def setUp(self):
-        super().setUp()
-        import unittest.mock as mock
-        p = mock.patch.object(C, "CUTOVER_TRIAGE_ENABLED", True)
-        p.start(); self.addCleanup(p.stop)
+class TestNoShedEverAppears(EngineCase):
+    """LAW CHANGE (owner decision, 2026-07-30: "it's either running and placing orders, or
+    it's not running").  THE BOT NEVER SELLS.
 
-    """A failing adopted position → a maker-shed order appears, fully closing, never
-    crossing, and its completion feeds l_shed."""
+    THIS CLASS WAS `TestShedAppears`, and its docstring read: "A failing adopted position → a
+    maker-shed order appears, fully closing, never crossing, and its completion feeds
+    l_shed."  Same fixture, opposite assertion.  The position below is adopted onto a venue
+    that FAILS (★) — the exact input the shed path existed to act on — and the required
+    outcome is now that NOTHING reaches the wire for it.
+
+    WHY THE OLD LAW LOST.  A shed pays the spread to leave.  Our own tape prices that at
+    −$40.30 (the +2c leg) and −$123 (instant flatten), and on 2026-07-30 this path crossed to
+    a 95c ask to close an 18c-basis NO — a guaranteed −$2.80 — while its sibling path, the
+    halted closing pass, put a cap-EXEMPT 98-contract $93 buy on the wire against a phantom
+    short.  Holding is bounded instead: the D4 gate settles every position within 7 days.
+
+    `l_shed` is therefore permanently unmeasured, which `money.l_eff_h` already treats
+    correctly (`l_shed_h is None ⇒ ∞`, so `l_eff` is the real close+settle horizon)."""
 
     ADOPT = {"positions": [{"ticker": SHED_TICKER, "side": "yes", "net": 20.0,
                             "basis": 0.40}]}
@@ -333,49 +342,47 @@ class TestShedAppears(EngineCase):
         self.assertTrue(ok, refusals)
         return r
 
-    def test_a_shed_order_appears(self):
+    def test_NO_shed_order_reaches_the_exchange(self):
         r = self._armed()
         for i in range(3):
             r.iteration(NOW + 1 + i)
-        sheds = [b for b in r.m.ex.placed if b["side"] == "ask"]
-        self.assertTrue(sheds, "NO SHED ORDER REACHED THE EXCHANGE")
-        body = sheds[0]
-        self.assertEqual(body["ticker"], SHED_TICKER)
-        self.assertAlmostEqual(float(body["count"]), 20.0, places=6)   # exactly |net| (C8)
-        # joins the ask queue at 1 − no_bid = 0.42: NEVER crosses the 0.40 bid (G6 off)
-        self.assertAlmostEqual(float(body["price"]), 0.42, places=6)
-        self.assertGreater(float(body["price"]), 0.40)
-        self.assertIn(SHED_TICKER, r.m.triage_shed)
+        # The old law's assertion was `assertTrue(sheds)` at price 0.42 (the opposing best),
+        # size 20 (exactly |net|).  Nothing may close this position now.
+        closing = [b for b in r.m.ex.placed
+                   if b["ticker"] == SHED_TICKER and b["side"] == "ask"]
+        self.assertEqual(closing, [],
+                         "an order was placed against held inventory: the bot sold")
 
-    def test_the_shed_holds_no_fresh_collateral(self):
+    def test_the_position_simply_rides(self):
+        """No exit means the inventory basis stays booked, cycle after cycle, and no
+        proceeds are ever realized against it."""
         r = self._armed()
-        r.iteration(NOW + 1)
-        # inventory basis is counted; the fully-closing shed adds NO resting collateral
-        self.assertAlmostEqual(r.m.cash.resting_collateral, 0.0, places=9)
+        for i in range(3):
+            r.iteration(NOW + 1 + i)
+        self.assertAlmostEqual(r.m.positions[SHED_TICKER]["yes"], 20.0, places=9)
         self.assertAlmostEqual(r.m.cash.inventory_basis, 8.0, places=9)
+        self.assertAlmostEqual(r.m.cash.realized_pnl, 0.0, places=9)
 
-    def test_a_completed_shed_feeds_l_shed(self):
+    def test_there_is_no_shed_state_to_hold_a_verdict(self):
+        """Structural, not behavioural: the fields the shed path used are gone, so a future
+        edit cannot half-revive it by setting one."""
         r = self._armed()
-        r.iteration(NOW + 1)
-        oid = list(r.m.orders)[0]
-        # the taker arrives: the shed fills completely
-        r.m.book_fill(SHED_TICKER, "ask", 20, 0.42, NOW + 3600, fill_id="shed-fill",
-                      closing=True, order_id=oid, proceeds=0.42)
-        r.m.ex._positions = [{"ticker": SHED_TICKER, "position": 0}]
-        r.iteration(NOW + 3601)
-        key = (SHED_TICKER, "yes")
-        self.assertIn(key, r.m.shed_completed_h)
-        self.assertAlmostEqual(r.m.shed_completed_h[key][0], 1.0, places=2)
-        self.assertTrue(self.logs_of("shed_complete"))
+        for gone in ("triage_shed", "shed_target", "shed_since", "shed_held",
+                     "shed_completed_h", "pending_triage"):
+            self.assertFalse(hasattr(r.m, gone),
+                             "engine.%s survived the shed rip-out" % gone)
+        self.assertFalse(hasattr(r.m, "update_shed_targets"))
+        self.assertFalse(hasattr(r.m, "halted_closing_pass"))
 
-    def test_an_assume_filled_freeze_blocks_the_shed(self):
-        """§9.4b: the freeze covers RECYCLING — acting on unverified inventory converts a
-        bookkeeping ambiguity into a real naked short."""
+    def test_an_assume_filled_freeze_still_blocks_quoting(self):
+        """§9.4b is untouched by the law change: a frozen market is refused for QUOTING too,
+        because acting on unverified inventory converts a bookkeeping ambiguity into a real
+        naked short."""
         r = self._armed()
         r.m.frozen.add(SHED_TICKER)
         for i in range(3):
             r.iteration(NOW + 1 + i)
-        self.assertEqual([b for b in r.m.ex.placed if b["side"] == "ask"], [])
+        self.assertEqual([b for b in r.m.ex.placed if b["ticker"] == SHED_TICKER], [])
 
 
 if __name__ == "__main__":

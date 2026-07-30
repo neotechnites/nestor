@@ -408,11 +408,13 @@ class TestRunnerInit(RunnerCase):
         r.init(NOW, nestor_state=self.NESTOR)
         self.assertNotIn("T", r.m.frozen)                     # agrees, so no freeze
 
-    def test_triage_runs_at_init_when_adopting(self):
-        import unittest.mock as mock
-        p = mock.patch.object(C, "CUTOVER_TRIAGE_ENABLED", True)
-        p.start()
-        self.addCleanup(p.stop)
+    def test_adopting_with_venues_triages_NOTHING_into_an_order(self):
+        """LAW CHANGE (owner decision, 2026-07-30).  This was
+        `test_triage_runs_at_init_when_adopting`, and it asserted `cutover_triage_summary` on
+        the log — the summary of an init pass that fed MAKER_SHED verdicts into
+        `m.triage_shed` so the requoter could post cap-exempt closing orders.  That block and
+        its `C.CUTOVER_TRIAGE_ENABLED` gate (patched True here) are deleted.  Init still
+        ADOPTS positions; it no longer judges them into an exit."""
         r = self.runner()
         adopt = {"positions": [{"ticker": "KXUST10AD-1", "side": "yes", "net": 20.0,
                                 "basis": 0.50}]}
@@ -425,7 +427,9 @@ class TestRunnerInit(RunnerCase):
                            "close_ts": NOW + 8 * 3600, "program_end_ts": NOW + 30 * 86400,
                            "l_shed_h": 0.5, "t_hat": 1.0, "spread_c": 2, "mark": 0.52}})
         self.assertTrue(ok)
-        self.assertTrue(self.logs_of("cutover_triage_summary"))
+        self.assertFalse(self.logs_of("cutover_triage_summary"))
+        self.assertAlmostEqual(r.m.positions["KXUST10AD-1"]["yes"], 20.0)  # adopted, riding
+        self.assertEqual(r.m.ex.placed, [])                               # and untouched
 
 
 class TestRunnerLoop(RunnerCase):

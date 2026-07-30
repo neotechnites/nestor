@@ -287,15 +287,16 @@ class TestAdoptionGate(LipTestCase):
 
 
 class TestTriage(LipTestCase):
-    def setUp(self):
-        super().setUp()
-        import unittest.mock as mock
-        p = mock.patch.object(C, "CUTOVER_TRIAGE_ENABLED", True)
-        p.start(); self.addCleanup(p.stop)
+    """CUTOVER TRIAGE — v5 judges every adopted position against its OWN net-rate equation.
 
-    """CUTOVER TRIAGE — v5 re-judges every adopted position against its OWN net-rate equation
-    and actively leaves the ones that fail.  Adoption without triage would inherit v4's book
-    wholesale, INCLUDING precisely the venues (★) exists to refuse."""
+    LAW CHANGE (owner decision, 2026-07-30: "it's either running and placing orders, or it's
+    not running").  These tests once described a path to the wire: triage judged, and the ones
+    that failed were ACTIVELY LEFT via a maker shed, armed by `C.CUTOVER_TRIAGE_ENABLED`
+    (which this class used to patch True).  That constant is deleted along with the execution
+    path, and the tests below are unchanged in substance for one reason: the ARITHMETIC is
+    still worth having on the tape.  What they no longer imply is that a MAKER_SHED verdict
+    causes an order.  Nothing consumes a verdict; positions ride to settlement.
+    `triage(..., enabled=False)` survives as an explicit caller-supplied parameter only."""
 
     NOW = 1_000_000.0
 

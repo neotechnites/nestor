@@ -480,8 +480,11 @@ def triage(adopted, venues, now, r_star, floor_rate=C.FLOOR_RATE_PER_H,
     list; every entry is written to the ledger as a `cutover_triage` row so the cutover is
     auditable after the fact.  `venues` maps ticker → the venue dict of `triage_position`."""
     if enabled is None:
-        enabled = C.CUTOVER_TRIAGE_ENABLED    # resolved at CALL time: an import-time
-                                              # default froze the flag and made it untunable
+        enabled = True                        # CLASSIFICATION ALWAYS COMPUTES.  This used to
+                                              # resolve `C.CUTOVER_TRIAGE_ENABLED` at call
+                                              # time; that constant is deleted with the shed
+                                              # path.  The verdicts are a measurement written
+                                              # to the tape — nothing places from them.
     if not enabled:
         return []
     out = []

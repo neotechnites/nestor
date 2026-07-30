@@ -619,11 +619,11 @@ class TestShadowReadout(EngineCase):
 
 
 class TestAdoptionAndTriage(EngineCase):
-    def setUp(self):
-        super().setUp()
-        import unittest.mock as mock
-        p = mock.patch.object(C, "CUTOVER_TRIAGE_ENABLED", True)
-        p.start(); self.addCleanup(p.stop)
+    """LAW CHANGE (owner decision, 2026-07-30): this class used to patch
+    `C.CUTOVER_TRIAGE_ENABLED` True, because the constant gated triage's MAKER-SHED
+    EXECUTION.  The constant is deleted with that path.  `Maker.triage` remains as pure
+    classification — it returns verdicts and nothing consumes them — so the test below is
+    now a statement about arithmetic, not about orders."""
 
     ADOPT = {"positions": [{"ticker": "KXUST10AD-1", "side": "yes", "net": 20.0,
                             "basis": 0.50}]}
@@ -663,6 +663,9 @@ class TestAdoptionAndTriage(EngineCase):
             "l_shed_h": 0.5, "t_hat": 1.0, "spread_c": 2}})
         self.assertEqual(len(verdicts), 1)
         self.assertEqual(verdicts[0]["decision"], "keep")
+        # ...and the verdict is INERT: no shed set exists for it to land in.
+        self.assertFalse(hasattr(m, "triage_shed"))
+        self.assertFalse(hasattr(m, "shed_target"))
 
 
 class TestReconCadenceIsSpentByAREAD(EngineCase):

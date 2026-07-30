@@ -1399,25 +1399,16 @@ ADOPT_BASIS_MARK_MULT = 2.0                  # the cash feed all wrong in the sa
                                              # tolerance the ratchet uses, one-sided.
 
 # --- CUTOVER TRIAGE (see cutover.triage) ---
-# Runs ONCE at adoption: every adopted position is re-judged against (★) and the ones that
-# fail are exited.  v4's orders are already gone (its SIGTERM cancel-all is the proven path),
-# so triage decides only about POSITIONS.
-# ── OFF (Ryan, 2026-07-30 morning).  After the truth-resync adoption, triage began
-# shedding freshly-adopted positions at the opposing best — 26 Skubal YES offered at 3c
-# against a 16c basis.  Our own measurements refuted paying to exit (instant-flatten −$123
-# vs riding; +2c leg −$40.30), and the whole book settles ≤7 days by the D4 gate, so the
-# ride is short by construction.  Positions RIDE; kills and the day stop are the only exits.
-CUTOVER_TRIAGE_ENABLED = False               # the decision + maker-shed path
-# ── OFF (Ryan, 2026-07-30 ~08:35 MT — the shed storm).  update_shed_targets carried a
-# SECOND auto-exit path independent of triage: inventory whose venue fails (★) NOW is shed
-# at the opposing best.  Its own docstring argues the carry term "changes nothing about
-# where the dollars should be" — WRONG: exit costs the SPREAD, and the tape prices that at
-# −$40.30 (+2c leg) and −$123 (instant flatten).  Live today it crossed to a 95c ask to
-# close an 18c-basis NO (guaranteed −$2.80) and offered 26 Skubal at 2c against 16c basis.
-# Under the D4 settlement gate every ride is ≤7 days, so the worst case of HOLDING is
-# bounded and measured cheaper than paying spreads.  POSITIONS RIDE.  The remaining exits:
-# the day stop's flatten, the halt's closing pass, and settlement itself.
-INVENTORY_AUTO_SHED = False
+# Runs at adoption and judges every adopted position against (★).  It is a MEASUREMENT and
+# nothing more: as of 2026-07-30 no code path leads from a verdict to an order.
+# ── `CUTOVER_TRIAGE_ENABLED` was the flag that armed the maker-shed execution of a verdict,
+# and `INVENTORY_AUTO_SHED` was the flag on the SECOND, independent auto-exit path in
+# `update_shed_targets` (inventory whose venue fails (★) NOW).  Both were already False, and
+# both are now DELETED along with the code they gated, because a flag that could turn selling
+# back on is exactly what the owner's decision removes: "it's either running and placing
+# orders, or it's not running."  Turning the paths back on is a code change with a review,
+# not a constant flip.  `cutover.triage(..., enabled=)` keeps its own explicit parameter for
+# the classification tests; it no longer reads a module-level switch.
 TAKER_FEE_RATE = 0.07                        # v1 §5.1 F = ceil(0.07·n·p·(1−p)) up to the cent
 TAKER_EXIT_MAX_SLIPPAGE_C = 3                # v1 — a MARKETABLE LIMIT, never a market order:
                                              # §8.8 aborts on "a fill at a price we did not

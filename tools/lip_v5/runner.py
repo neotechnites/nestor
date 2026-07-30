@@ -1,7 +1,7 @@
 """
 lip_v5.runner — THE OUTER LOOP.  The systemd-shaped entry: what `ExecStart` actually runs.
 
-    init      refusals → ledger replay → RECOVERY sweep → adoption gate + triage (if adopting)
+    init      refusals → ledger replay → adoption gate (positions only; no order adoption)
     run       while not stopping:  halt check → scan → classify → slots → engine.cycle() → sleep
     shutdown  cancel-all → handback (ALWAYS) → zeroed cash feed
 
@@ -23,7 +23,9 @@ Three properties this file exists to hold, each of which a naive loop loses:
 import time
 
 from . import config as C, cutover, engine, guards as G, ledger as LG
-from . import money as M, ratchet as RT, ratelimit as RL, runtime as R, scan
+from . import ratchet as RT, ratelimit as RL, runtime as R, scan   # `money` left with the
+                                                                  # shed path: its only use
+                                                                  # here was l_shed_median_h
 
 
 class Runner(object):
@@ -60,22 +62,12 @@ class Runner(object):
 
         self.recover(now)
 
-        if adopt_obj is not None and venues and C.CUTOVER_TRIAGE_ENABLED:
-            # Venue readings supplied up front: triage NOW and feed the verdicts to the shed
-            # path (charter A: "maker-shed orders for cutover-triage verdicts").  With no
-            # readings the positions sit in `m.pending_triage` and are judged per position
-            # as the classify sweep produces a slot for them — never blind.
-            verdicts = self.m.triage(now, venues)
-            for v in verdicts:
-                if v.get("exit_path") == cutover.MAKER_SHED:
-                    self.m.triage_shed.add(v["ticker"])
-            triaged = {v["ticker"] for v in verdicts}
-            self.m.pending_triage = [p for p in self.m.pending_triage
-                                     if p["ticker"] not in triaged]
-            R.log("cutover_triage_summary",
-                  keep=sum(1 for v in verdicts if v["decision"] == cutover.KEEP),
-                  shed=sum(1 for v in verdicts if v["exit_path"] == cutover.MAKER_SHED),
-                  cross=sum(1 for v in verdicts if v["decision"] == cutover.TAKER_CROSS))
+        # ── THE TRIAGE→SHED WIRING IS GONE (owner decision, 2026-07-30). ────────────────
+        # This block ran `Maker.triage` at init and fed every MAKER_SHED verdict into
+        # `m.triage_shed`, which the requoter then turned into cap-exempt closing orders at
+        # the opposing best.  `cutover.triage` survives as a MEASUREMENT (see
+        # `Maker.triage`'s docstring) but nothing here consumes a verdict, because the bot
+        # does not sell.  Adopted positions ride to settlement like every other position.
         # ── STAGE 5 (2026-07-30): REINSTATE IS GONE. ──────────────────────────────────
         # It replayed the last snapshot of OUR OWN RESTING BOOK through the safety checks
         # and re-placed it — the most direct possible violation of the concept: the book
@@ -459,8 +451,11 @@ class Runner(object):
                 yes_mids[tk] = rec["yes_mid"]
 
         seg = self.m.presence_log.read_segment(now)
-        l_shed = {k: M.l_shed_median_h(v)
-                  for k, v in self.m.shed_completed_h.items()}
+        # L_SHED IS PERMANENTLY UNMEASURED, and that is the truth rather than a gap: it is
+        # the median hours a completed SHED took, and this program completes none.  Passing
+        # nothing makes `money.l_eff_h` take its `l_shed_h is None ⇒ ∞` branch, so `l_eff`
+        # is the real horizon — time to close plus the settle lag — which is exactly how
+        # long the capital is now committed for.
         # Tickers whose PROGRAM the scanner now refuses (window too long, denied family) are
         # retired: the requoter recalls any order resting on them so the capital returns to a
         # venue that is still eligible.
@@ -480,7 +475,7 @@ class Runner(object):
                 self.m.ticker_program[_tk] = _prog.get("program_id")
         self.slots = scan.build_slots(programs, self.classifier, now,
                                       presence_rows=seg, frozen=self.m.frozen,
-                                      l_shed=l_shed, p6=self.classifier.p6_ok,
+                                      p6=self.classifier.p6_ok,
                                       accrued=self.m.accrued,
                                       own_orders=self.own_orders(),
                                       held=self.held_tickers())

@@ -314,7 +314,23 @@ class TestTheReplacementExemption(EngineCase):
 # NEW-2 — THE HALTED BOOK MUST STILL SEE ITS OWN FILLS.
 # =============================================================================================
 class TestFillsPollWhileHalted(NewRoundCase):
-    def _halted_with_a_resting_shed(self):
+    """NEW-2 survives the 2026-07-30 law change, with a different order under the microscope.
+
+    LAW CHANGE (owner decision: "it's either running and placing orders, or it's not
+    running").  The helper below used to be `_halted_with_a_resting_shed`, and it MANUFACTURED
+    its subject by letting the halted closing pass post one — `assertEqual(len(shed), 1, "the
+    halted closing pass never posted a shed")`.  A halted bot places nothing now, so there is
+    no shed to observe.
+
+    NEW-2'S FINDING IS UNCHANGED AND STILL LOAD-BEARING: a halted process must keep reading
+    its own fills.  The order at risk is now an ENTRY quote placed BEFORE the halt whose
+    cancel the wire refused (a 503 — B10's UNKNOWN state, which is precisely the case where
+    the order is still live and can still fill).  If a halted iteration stopped polling fills,
+    that order would fill on the wire and sit in our books as presence forever — the same
+    defect NEW-2 named, reached through the door that still exists.
+    """
+
+    def _halted_with_a_stuck_entry_order(self):
         ex = ProgExchange(program_body(tickers=(TK,)), {TK: bk("0.40", "1200", "0.58", "1200")},
                           positions=[{"ticker": TK, "position": 20}])
         r = self.runner(ex)
@@ -325,7 +341,14 @@ class TestFillsPollWhileHalted(NewRoundCase):
             exchange_positions={(TK, "yes"): 20.0}, marks={(TK, "yes"): 0.41},
             nestor_state=NESTOR)
         self.assertTrue(ok, refusals)
-        r.iteration(NOW + 1)
+        # An ENTRY quote of ours rests on the wire before the halt.
+        okp, why, _ = r.m.place(TK, "ask", 0.58, 20, int(NOW + 8 * 3600), NOW + 1,
+                                available_cash_usd=100_000.0)
+        self.assertTrue(okp, why)
+        oid = [o for o in ex.resting][0]
+        # The cancel-all the halt performs cannot remove it: the wire 503s (B10 UNKNOWN —
+        # the order may still be live, and here it is).
+        ex.cancel_status = 503
         r.m.position_cost[TK] = 1000.0                        # crush the mark: day stop trips
         out = r.iteration(NOW + 2)
         self.assertTrue(out.get("day_stop"))
@@ -334,27 +357,34 @@ class TestFillsPollWhileHalted(NewRoundCase):
         for _ in range(4):
             r.iteration(t)
             t += 30.0
-        shed = [oid for oid, b in ex.resting.items() if b["side"] == "ask"]
-        self.assertEqual(len(shed), 1, "the halted closing pass never posted a shed")
-        return r, ex, shed[0], t
+        self.assertIn(oid, ex.resting, "the fixture lost its stuck order")
+        self.assertEqual([b for b in ex.placed if float(b.get("count", 0)) and
+                          b is not ex.placed[0]], [],
+                         "the halted bot placed something")
+        return r, ex, oid, t
 
     def test_a_fill_during_the_halt_reaches_our_books(self):
         """THE ADVERSARIAL TEST.  Pre-fix: 600 s of halted iterations and the position and the
         dead order both still sit in our books."""
-        r, ex, oid, t = self._halted_with_a_resting_shed()
+        r, ex, oid, t = self._halted_with_a_stuck_entry_order()
         ex.take(oid, 20, now=t)
         for _ in range(20):
             r.iteration(t)
             t += 30.0
+        # The 20-lot ask fills against the 20 YES we hold: NET goes flat.  (Whether the
+        # books record that as a closed YES leg or an opened NO leg is `book_fill_row`'s
+        # business — see `TestAFillThatNetsIsStillBookedAsClosing`; either way the NET must
+        # move, and pre-NEW-2 it did not move at all.)
         self.assertLess(abs(r.m.net_position(TK)), 1.0,
-                        "the halted shed FILLED on the wire and our books never learned")
+                        "the stuck order FILLED on the wire and our books never learned")
         live = [o for o in r.m.orders.values() if o.get("remaining", 0) > 0]
         self.assertEqual(live, [], "a dead order is still counted as our presence")
 
     def test_the_halted_fills_poll_cannot_crash_the_loop(self):
-        """SF-3's exception-safety, extended over the new call: a raising fills read must not
-        take the loop down, and must not cost the closing pass its turn."""
-        r, ex, oid, t = self._halted_with_a_resting_shed()
+        """Exception-safety: a raising fills read must not take the loop down.  (It used to
+        say "and must not cost the closing pass its turn" — there is no closing pass; the
+        duty it must not cost is the cash-feed heartbeat, which lives in the sibling try.)"""
+        r, ex, oid, t = self._halted_with_a_stuck_entry_order()
 
         def boom(*_a, **_kw):
             raise RuntimeError("fills exploded")
@@ -368,7 +398,7 @@ class TestFillsPollWhileHalted(NewRoundCase):
     def test_the_halted_poll_keeps_the_cheap_cadence(self):
         """The halted branch runs at the idle cadence; the fills poll must not turn it into a
         1 Hz read of the fills index."""
-        r, ex, oid, t = self._halted_with_a_resting_shed()
+        r, ex, oid, t = self._halted_with_a_stuck_entry_order()
         calls = []
         real = r.m.ex.fills
         r.m.ex.fills = lambda *a, **kw: (calls.append(1), real(*a, **kw))[1]

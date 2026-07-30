@@ -95,35 +95,32 @@ class TestNoChangeSuppression(LipTestCase):
         self.assertEqual(len(got), 5)
 
 
-class TestShedGeometry(LipTestCase):
-    def test_shed_side_is_the_opposing_slot(self):
-        """v1 §5.4 / D4: a YES ask IS a NO bid — the shed is the opposing slot's quote."""
-        self.assertEqual(Q.shed_side("yes"), "ask")
-        self.assertEqual(Q.shed_side("no"), "bid")
+class TestTheShedGeometryIsGone(LipTestCase):
+    """LAW CHANGE (owner decision, 2026-07-30): "it's either running and placing orders, or
+    it's not running."  THE BOT NEVER SELLS.
 
-    def test_held_leg(self):
-        self.assertEqual(Q.held_leg_of(5), "yes")
-        self.assertEqual(Q.held_leg_of(-5), "no")
+    This class replaces `TestShedGeometry`, which asserted the arithmetic of leaving a
+    position: `shed_side` (a held YES sells through the ask slot), `held_leg_of`,
+    `shed_price` (join the OPPOSING best, refuse a crossed book) and `shed_qty` (clamp at
+    |net| so a shed cannot flip).  Every one of those functions is deleted, and the test is
+    now that they are ABSENT — because their existence is what let `engine` re-derive an exit
+    price.  A helper nobody calls today is a helper somebody calls next quarter.
 
-    def test_shed_price_joins_and_never_crosses(self):
-        self.assertEqual(Q.shed_price("yes", 0.40, 0.42), 0.42)   # join the ask queue
-        self.assertEqual(Q.shed_price("no", 0.40, 0.42), 0.40)    # join the bid queue
+    What is NOT gone, and is asserted below so the two can never be confused again: ask-side
+    QUOTING.  An ask posts NO-side collateral as an OPENING maker quote and earns the NO half
+    of the pool.  `would_cross` still guards it on both sides."""
 
-    def test_a_crossed_or_locked_book_refuses_to_price(self):
-        """Joining a crossed book would in fact TAKE — the G6-off guarantee would be broken
-        by arithmetic, not by intent."""
-        self.assertIsNone(Q.shed_price("yes", 0.42, 0.42))
-        self.assertIsNone(Q.shed_price("yes", 0.43, 0.42))
-        self.assertIsNone(Q.shed_price("yes", None, 0.42))
-        self.assertIsNone(Q.shed_price("yes", 0.40, None))
+    def test_no_exit_geometry_survives_in_the_quote_module(self):
+        for gone in ("shed_side", "shed_price", "shed_qty", "held_leg_of"):
+            self.assertFalse(hasattr(Q, gone),
+                             "quote.%s survived: the exit geometry is back" % gone)
 
-    def test_shed_qty_clamps_at_net_and_never_flips(self):
-        """C8: a 40-lot shed against 20 held is a fresh opposite position wearing a shed's
-        name."""
-        self.assertEqual(Q.shed_qty(20.0, target=40.0), 20)
-        self.assertEqual(Q.shed_qty(-20.0, target=40.0), 20)
-        self.assertEqual(Q.shed_qty(20.0, target=5.0), 5)
-        self.assertEqual(Q.shed_qty(0.6), 0)                      # dust cannot trade
+    def test_ask_side_quoting_is_untouched(self):
+        """The ask is the NO half of the pool, not a sale.  `would_cross` protects it exactly
+        as it protects the bid: an ask at or below the yes-bid would take."""
+        self.assertTrue(Q.would_cross("ask", 0.40, 0.40, 0.42))   # would take the 0.40 bid
+        self.assertFalse(Q.would_cross("ask", 0.42, 0.40, 0.42))  # rests at its own best
+        self.assertFalse(Q.would_cross("ask", 0.41, 0.40, 0.42))  # inside the spread, rests
 
 
 class TestWholeSecond(LipTestCase):
