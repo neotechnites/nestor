@@ -377,6 +377,48 @@ class CashState(object):
         self._release(ticker, float(paid_usd))
         return True
 
+    def settlement_zero(self, ticker):
+        """The settlements record whose paid amount is EXPLICITLY ZERO — a LOST position.
+
+        NOT the same door as `settlement_row(t, 0.0)`, and the split is the safety: a zero
+        that arrives by PARSING (a row whose revenue field is missing, defaulted to 0)
+        must never release a winner's basis before its cash lands, so `settlement_row`
+        refuses ≤ 0.  The caller of THIS method states that the exchange's own row carries
+        the zero — and a zero credit needs no cash confirmation, because there is no cash
+        to wait for: the money is gone, and the only honest bookkeeping is to say so NOW.
+
+        T-C2 holds by arithmetic, not by timing: the basis leaves the consumed sum
+        (+basis to `delta_dollars`) and the SAME basis lands in `realized_pnl` as loss
+        (−basis), so the published number does not move.  Deferring the release would not
+        be conservative, it would be a phantom `settled_awaiting_payout` claim that pages
+        `settlement_cash_unconfirmed` about cash that is never coming."""
+        if ticker not in self.pending:
+            return False
+        self._release(ticker, 0.0)
+        return True
+
+    def restore_pending(self, ticker, basis_usd, expected_credit_usd, resolved_ts):
+        """Restart replay's half of `resolve()`: rebuild a settled-awaiting-payout claim
+        from its `settlement` ledger row.  The basis comes from the ROW, never from
+        inventory — replay has already zeroed the position (cutover.V4Positions), so
+        calling `resolve()` here would book a basis of $0 and let `delta_dollars` rise by
+        the real basis with no cash confirmed, the one forbidden direction.  No balance
+        baseline is restored: a baseline pair must come from one instant observed by THIS
+        process (`observe_balance`'s rule), and missing evidence never releases."""
+        p = PendingSettlement(ticker, float(basis_usd), float(expected_credit_usd),
+                              float(resolved_ts))
+        existing = self.pending.get(ticker)
+        if existing is not None:
+            # Same MERGE rule as resolve(): replace would drop the first claim's basis
+            # out of delta_dollars.
+            existing.basis_usd += p.basis_usd
+            existing.expected_credit_usd += p.expected_credit_usd
+            existing.resolved_ts = min(existing.resolved_ts, p.resolved_ts)
+        else:
+            self.pending[ticker] = p
+        self.settled_payout_expected += float(expected_credit_usd)
+        return p
+
     def _release(self, ticker, paid_usd=None):
         p = self.pending.pop(ticker, None)
         if p is None:
