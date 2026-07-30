@@ -15,7 +15,10 @@ from .. import alloc, config as C
 from .base import LipTestCase
 
 
-def slot(ticker="KXLAW-26JUL30-T1", side="bid", rho=1.25, S=180.0, p=0.10, phi=0.0,
+# rho recalibrated 1.25 -> 5/6 when the owner set the target to the forfeit floor exactly
+# (CREDIT_TARGET_MARGIN 1.0, 2026-07-30 night): the fixtures pin W = $5.00, and W depends on
+# s = target/((rho/2)*24) — the same s = 0.10 that 1.25 gave at $1.50 needs rho = 5/6 at $1.00.
+def slot(ticker="KXLAW-26JUL30-T1", side="bid", rho=5.0 / 6.0, S=180.0, p=0.10, phi=0.0,
          hours_left=24.0, accrued=0.0, target_size=1000, cum_size=2000.0, **kw):
     """A candidate whose side already qualifies on rival depth (cum >= target), unless a
     test says otherwise.  Defaults reproduce owner example 1 when phi = 2.5/24."""
@@ -71,7 +74,8 @@ class TestTheOwnersRulingOnSizing(LipTestCase):
         screen compares the UNROUNDED W x T (= $10.00 exactly) against the allocation —
         stated choice, per the ruling: a skip caused by rounding one contract up would
         refuse the owner's own example-2 market.  MUST FUND, at order 42c."""
-        s = slot(rho=0.625, S=83.3333333333, p=0.02, phi=1.0)     # T = 24
+        # rho 0.625 -> 5/12: the $10 boundary case recalibrated for the $1.00 target
+        s = slot(rho=5.0/12.0, S=83.3333333333, p=0.02, phi=1.0)   # T = 24
         n = alloc.law_need(s)
         self.assertEqual(n.q_rest, 21)
         self.assertAlmostEqual(n.rest_usd, 0.42, places=9)
@@ -85,7 +89,7 @@ class TestTheOwnersRulingOnSizing(LipTestCase):
         """(d) = the owner's example 3, now measurement-gated (G3): "we can earn a dollar in
         24 hours with only one dollar, we will put all 10."  phi here is a measured FACT of
         zero, so the oversize stands."""
-        s = slot(rho=1.25, S=90.0, p=0.10, phi=0.0)               # phi_source defaults
+        s = slot(rho=5.0/6.0, S=90.0, p=0.10, phi=0.0)            # phi_source defaults
         n = alloc.law_need(s)                                     # "measured": a given fact
         self.assertAlmostEqual(n.total_usd, 1.0, places=9)
         a, spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
@@ -169,7 +173,7 @@ class TestRankingAndAccrual(LipTestCase):
         """Law §1: accrued banked there subtracts.  Same market, $1.00 already accrued ⇒
         need $0.50 ⇒ q_rest shrinks.  Mutation: drop the subtraction and the two are equal."""
         bare = alloc.law_need(slot())
-        banked = alloc.law_need(slot(accrued=1.0))
+        banked = alloc.law_need(slot(accrued=0.5))
         self.assertLess(banked.q_rest, bare.q_rest)
         self.assertAlmostEqual(banked.need_usd, 0.5, places=9)
 

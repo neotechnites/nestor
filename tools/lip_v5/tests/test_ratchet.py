@@ -26,9 +26,10 @@ class TestFloorQ(LipTestCase):
 
     def test_a_venue_whose_whole_pool_is_below_the_floor_is_None(self):
         """No q clears it — funding it is the PayPal error in miniature.  (Side pool
-        A = ρ/2 × window must sit below ENTRY_FLOOR = $1.50: 0.2 × 6 = $1.20.)"""
-        self.assertIsNone(RT.floor_q_contracts(rho=0.4, S=50, window_h=6.0))
-        self.assertIsNone(RT.floor_q_usd(0.4, 50, 0.30, 6.0))
+        A = ρ/2 × window must sit below ENTRY_FLOOR = $1.00 since the owner set the
+        target to the forfeit floor exactly: 0.1 × 6 = $0.60.)"""
+        self.assertIsNone(RT.floor_q_contracts(rho=0.2, S=50, window_h=6.0))
+        self.assertIsNone(RT.floor_q_usd(0.2, 50, 0.30, 6.0))
 
     def test_sole_qualifier_needs_only_the_qualification_size(self):
         self.assertEqual(RT.floor_q_contracts(6.25, 0.0, 16.0), 1)

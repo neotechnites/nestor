@@ -261,7 +261,7 @@ HORIZON_EXEMPT_RUNG = 2                      # spec §1.2 "unless ratchet rung �
 # the lot clears $1.50 and the cliff pass demands $2.00, so every correctly-sized rung reads
 # sub-cliff and is dropped.  One number, and the sizing rule's is the derived one (margin 1.5
 # = half a floor of headroom, note 52 D7).  `test_config` asserts the identity.
-ENTRY_FLOOR_USD = 1.50                       # == CREDIT_TARGET_USD x CREDIT_TARGET_MARGIN.
+ENTRY_FLOOR_USD = 1.00                       # == CREDIT_TARGET_USD x CREDIT_TARGET_MARGIN.
                                              # UNDERIVED §9.5 (recalibrate to
                                              # $1.00/q05(actual/projected) after 5 periods)
 # SECOND CHARTER AMENDMENT (Ryan) — the forfeit CLIFF.  Payout is $0 below $1.00, so accrual
@@ -1221,7 +1221,13 @@ CREDIT_TARGET_USD = 1.00
 # marginal credit it displaces".  Recalibrate to $1.00/q05(actual/projected) once a per-market
 # accrual reading exists — it does not today: credits are labelled by EVENT, and the bot's own
 # accrual model measured 2.27x off the receipt.
-CREDIT_TARGET_MARGIN = 1.5
+# OWNER DECISION (Ryan, 2026-07-30 night): margin 1.5 -> 1.0.  The buffer priced estimate
+# error; on the overnight board it priced 282 of 355 markets out of a $10 seat and left
+# capital idle — "i want that capital out instead of not."  The target is now the forfeit
+# floor exactly; the cliff-edge risk the buffer covered is accepted and MEASURED (the
+# estimates feed shows every rung's accrual against $1.00 live, so a systematic
+# just-under-the-cliff pattern will be visible on the tape, not silent).
+CREDIT_TARGET_MARGIN = 1.0
 MAX_TOTAL_COLLATERAL_USD = 300.0             # R168 ladder rung.  G5 owns changes to this: one
                                              # constant, one commit, funded by the PREVIOUS
                                              # window's OBSERVED print, never the model.
