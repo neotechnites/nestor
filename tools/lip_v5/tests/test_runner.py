@@ -103,6 +103,72 @@ class TestClassifyStage(LipTestCase):
         c.sweep(ex, b, progs, NOW)
         return c, ex
 
+    def _cache_cls(self):
+        """A classifier whose cache lives in the tmpdir — DATA_DIR is patched BEFORE
+        construction, because the constructor reads the cache path it derives there.  (Until
+        today this function wrote through a bare open() and the suite was quietly persisting
+        fixture closes into the live data dir; the write now goes through atomic_write_json,
+        so base.py's write-root guard covers it and a mispointed test fails loudly.)"""
+        import unittest.mock as mock
+        p = mock.patch.object(C, "DATA_DIR", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+        return scan.Classifier()
+
+    def _cached(self):
+        import json as _json
+        try:
+            with open(self.path("v5_close_cache.json")) as fh:
+                return _json.load(fh).get("close_ts") or {}
+        except IOError:
+            return None
+
+    def test_the_close_cache_flushes_on_AGE_not_only_on_a_count(self):
+        """A COUNTER THAT RESETS ON RESTART IS NOT A FLUSH POLICY.  `_close_dirty` starts at
+        zero in every process, so at today's restart cadence a run rarely reaches 25 NEW
+        closes before it is replaced — the counter kept being thrown away one short of a
+        write and the next process booted on a stale cache that both the D4 settlement gate
+        and the slot builder read."""
+        c = self._cache_cls()
+        c.close_ts["A"] = NOW + 3600
+        c._persist_closes(now=NOW)                 # first close of the process: written at once
+        self.assertEqual(sorted(self._cached()), ["A"])
+        c.close_ts["B"] = NOW + 3600
+        c._persist_closes(now=NOW + 1)             # 1 of 25, and the clock has barely moved
+        self.assertEqual(sorted(self._cached()), ["A"])
+        c.close_ts["C"] = NOW + 3600
+        c._persist_closes(now=NOW + C.BOOK_SNAPSHOT_S + 1)      # aged out: flushed
+        self.assertEqual(sorted(self._cached()), ["A", "B", "C"])
+
+    def test_the_age_bound_is_DERIVED_from_the_snapshot_cadence(self):
+        """No new arbitrary constant: BOOK_SNAPSHOT_S is the interval at which this program
+        already decided restart-critical state must be on disk, and a cache of world-facts is
+        the same class of state."""
+        import inspect
+        self.assertIn("max_age_s=C.BOOK_SNAPSHOT_S",
+                      inspect.getsource(scan.Classifier._persist_closes))
+
+    def test_the_first_full_sweep_flushes_what_it_learned(self):
+        """The sweep that learns the most closes is the first one, and it is the likeliest to
+        be the one a restart interrupts."""
+        from .. import ratelimit as RL
+        ex = ScanExchange()
+        c = self._cache_cls()
+        c.sweep(ex, RL.Bucket(NOW), scan.parse_programs(ex._programs), NOW)
+        self.assertTrue(self._cached(), "the first sweep left nothing on disk")
+        self.assertIn("KXAAAGASD-26JUL29-T4.12", self._cached())
+
+    def test_a_sweep_that_ran_OUT_OF_BUDGET_is_not_the_first_full_sweep(self):
+        """It is 'the first FULL sweep': a pass that broke early has not finished learning,
+        so it does not consume the one free flush."""
+        from .. import ratelimit as RL
+        ex = ScanExchange()
+        c = self._cache_cls()
+        b = RL.Bucket(NOW)
+        b.tokens, b.b = 0.0, 0.0
+        c.sweep(ex, b, scan.parse_programs(ex._programs), NOW)
+        self.assertFalse(c._first_sweep_flushed)
+
     def test_it_learns_pinned_qualifies_S_and_p(self):
         c, _ = self._cls()
         rec = c.table["KXAAAGASD-26JUL29-T4.12"]

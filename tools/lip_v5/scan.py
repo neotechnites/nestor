@@ -174,6 +174,10 @@ class Classifier:
         self.close_missing = set()           # tickers whose market object carried no close
         self._close_cache_path = os.path.join(C.DATA_DIR, "v5_close_cache.json")
         self._close_dirty = 0
+        # 0.0 ⇒ the first close a process learns is written IMMEDIATELY and the age clock
+        # starts from there, so a run that dies early still leaves its evidence on disk.
+        self._close_flush_ts = 0.0
+        self._first_sweep_flushed = False
         try:
             with open(self._close_cache_path) as f:
                 obj = json.load(f)
@@ -186,19 +190,49 @@ class Classifier:
         self.p6 = {}                         # ticker -> bool (True = someone trades here)
         self.p6_ts = {}                      # ticker -> last check ts
 
-    def _persist_closes(self, every=25):
-        """Write-behind: one atomic dump per `every` new closes — cheap against the read
-        it saves (each entry is one REST call a restart never re-spends)."""
-        self._close_dirty += 1
-        if self._close_dirty < int(every):
+    def _persist_closes(self, count=1, every=25, now=None, max_age_s=C.BOOK_SNAPSHOT_S,
+                        force=False):
+        """Write-behind: an atomic dump every `every` new closes OR every `max_age_s`,
+        whichever comes first — cheap against the reads it saves (each entry is one REST
+        call a restart never re-spends).
+
+        ── A COUNTER THAT RESETS ON RESTART IS NOT A FLUSH POLICY (2026-07-30). ────────────
+        The rule was purely "every 25 new closes", and `_close_dirty` starts at zero in each
+        process.  At today's restart cadence a run rarely learns 25 NEW closes before it is
+        replaced, so the counter kept being thrown away one short of a write and the cache on
+        disk stayed old — which means a fresh process boots believing stale closes, and both
+        the D4 settlement gate and the slot-builder read that cache.  The cost of the missing
+        write is paid by the NEXT process, which is exactly the shape of defect a
+        restart-frequency change makes worse without touching the code that contains it.
+        THE AGE BOUND IS DERIVED, not chosen: `BOOK_SNAPSHOT_S` is the interval at which this
+        program already decided restart-critical state must be on disk.  The close cache is
+        the same class of state — facts about the WORLD that survive us — so it inherits the
+        same cadence rather than inventing a second opinion about how much work a restart may
+        destroy.
+        `force` flushes whatever is dirty at the end of the first full sweep: the sweep that
+        learns the most closes is the first one, and it is also the one most likely to be
+        interrupted by the next restart.
+        """
+        self._close_dirty += int(count)
+        if self._close_dirty <= 0:
+            return                            # nothing new to write
+        now = R._now() if now is None else float(now)
+        aged = (now - self._close_flush_ts) >= float(max_age_s)
+        if not force and not aged and self._close_dirty < int(every):
             return
         self._close_dirty = 0
+        self._close_flush_ts = float(now)
         try:
-            tmp = self._close_cache_path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump({"close_ts": self.close_ts,
-                           "missing": sorted(self.close_missing)}, f)
-            os.replace(tmp, self._close_cache_path)
+            # THROUGH `atomic_write_json`, NOT A BARE open() — because this is the ONE writer
+            # in the package that was bypassing `runtime.set_write_roots`, and the suite has
+            # been writing this cache into the LIVE data dir as a result (found while raising
+            # the flush rate: the real v5_close_cache.json held a fixture ticker at a 1970
+            # close).  A test that can poison the live close cache can make the live bot
+            # refuse a real market forever.  The write-root guard raises here now, and this
+            # except keeps it an optimization rather than a halt — both ends preserved.
+            R.atomic_write_json(self._close_cache_path,
+                                {"close_ts": self.close_ts,
+                                 "missing": sorted(self.close_missing)}, fsync=False)
         except Exception:
             pass                             # cache is an optimization, never a halt
 
@@ -346,7 +380,7 @@ class Classifier:
                   note="falling back to program end_ts; carry may be UNDERSTATED")
         else:
             self.close_ts[ticker] = ts
-        self._persist_closes()
+        self._persist_closes(now=now)
 
     def learn_p6(self, ex, bucket, ticker, now,
                  lookback_days=C.P6_LOOKBACK_DAYS, recheck_s=C.P6_RECHECK_S):
@@ -390,6 +424,7 @@ class Classifier:
         rows = sorted(self.candidates(programs, now),
                       key=lambda r: (r[1] not in self.close_ts,
                                      float(r[2].get("end_ts") or 0)))
+        complete = True
         for rho, ticker, program in rows:
             self.learn_close(ex, bucket, ticker, now)
             self.learn_p6(ex, bucket, ticker, now)
@@ -399,6 +434,7 @@ class Classifier:
             if body is None:
                 ok, _ = bucket.admit("classify_sweep", now)
                 if not ok:
+                    complete = False
                     break                     # out of budget: the rest waits for the next pass
                 status, body = ex.book(ticker)
                 if status == 429:
@@ -407,6 +443,12 @@ class Classifier:
                     continue
             self.classify_one(ticker, body, program, now)
             n += 1
+        # THE FIRST FULL SWEEP LEARNS THE MOST CLOSES AND IS THE LIKELIEST TO BE THE ONE A
+        # RESTART INTERRUPTS.  Flush what it gathered, once, without waiting for a count or a
+        # clock; every later sweep is covered by the two rules above.
+        if complete and not self._first_sweep_flushed:
+            self._first_sweep_flushed = True
+            self._persist_closes(count=0, now=now, force=True)
         return n
 
 
