@@ -347,6 +347,13 @@ class Runner(object):
                                                   {o["ticker"] for o in self.m.orders.values()}
                                                   or set())
                                   if t not in live_tk}
+        # THE 1.155 INCIDENT, root closed: ticker→program must not depend on the slot
+        # table (the owner-picker's accrued lookup read it, so an unclassified held rung's
+        # credit scored $0 and its sibling won the basis tiebreak — the same trap one level
+        # deeper).  The programs FEED already carries every ticker's program, request-free.
+        for _prog in programs:
+            for _tk in _prog.get("tickers") or ():
+                self.m.ticker_program[_tk] = _prog.get("program_id")
         self.slots = scan.build_slots(programs, self.classifier, now,
                                       presence_rows=seg, frozen=self.m.frozen,
                                       l_shed=l_shed, p6=self.classifier.p6_ok,
