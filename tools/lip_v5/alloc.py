@@ -1097,6 +1097,16 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
             if proj >= floor_usd:
                 continue
             A = max([s.accrued for s in ps] or [0.0])
+            # OWNER DISPLACEMENT AT THE GATE: a program whose cluster is owned by a
+            # DIFFERENT rung with strictly more banked accrual is neither rescued nor
+            # re-litigated here — its capital already belongs to the owner (the 3-lot
+            # top-up that re-entered 1.153 through this path, 2026-07-30).
+            _ck1 = _cluster_key(ps[0])
+            _own1 = (owner_seed or {}).get(_ck1)
+            _displaced = _own1 is not None and                 all(_own1 != s.key and
+                    not (_own1[1] is None and _own1[0] == s.ticker) for s in ps) and                 float((owner_accrued or {}).get(_ck1, 0.0)) > A + 1e-9
+            if _displaced:
+                continue
             if A <= 0.0:
                 if any(s.key in funded_keys for s in ps):
                     continue                                 # D12: funded ⇒ never re-litigated
@@ -1149,6 +1159,11 @@ def allocate_with_forfeit_gate(slots, budget_usd, r_star, caps=None,
         A = max([s.accrued for s in ps] or [0.0])
         if A <= 0.0:
             continue
+        _ck2 = _cluster_key(ps[0])
+        _own2 = (owner_seed or {}).get(_ck2)
+        if _own2 is not None and                 all(_own2 != s.key and
+                    not (_own2[1] is None and _own2[0] == s.ticker) for s in ps) and                 float((owner_accrued or {}).get(_ck2, 0.0)) > A + 1e-9:
+            continue                          # displaced: the owner's pot outranks this one
         res, best = _cliff_decision(ps, alloc, r_star, caps, venue_caps, held,
                                     budget_usd - spent, pv_spend,
                                     cluster_cap_usd, pc_spend)

@@ -446,3 +446,18 @@ class TestOwnerRanksByAccruedDollars(LipTestCase):
                                  owner_seed={"KXEUR": ("KXEUR-1-T1155", None)},
                                  owner_accrued={"KXEUR": 0.26})
         self.assertEqual(a[sib.key], 0)
+
+
+class TestDisplacementCoversTheRescue(LipTestCase):
+    """The 3-lot leak: displacement withheld the resting seed but the RESCUE path topped the
+    displaced rung back up through the forfeit gate.  Same rule, same seniority, both doors."""
+
+    def test_a_displaced_program_is_not_rescued(self):
+        sib = _slot("KXEUR-1-T1153", accrued=0.01, S=3000.0, rho=0.60, p=0.10,
+                    program_id="P153")
+        a, _, _, dropped = alloc.allocate_with_forfeit_gate(
+            [sib], 300.0, RSTAR, cluster_cap_usd=10.0,
+            owner_seed={"KXEUR": ("KXEUR-1-T1155", "bid")},
+            owner_accrued={"KXEUR": 0.26})
+        self.assertEqual(a[sib.key], 0, "the displaced rung was rescued back in")
+        self.assertNotIn("P153", dropped)
