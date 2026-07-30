@@ -12,6 +12,12 @@ from .base import LipTestCase
 
 
 def order(ticker="KXAAAGASD-26JUL29-B4.120", side="yes", n=10, basis=0.50, closing=False):
+    """LAW CHANGE (owner decision, 2026-07-30: "it's either running and placing orders, or
+    it's not running").  `closing=` is kept as a parameter ON PURPOSE and it is INERT: it puts
+    the old `fully_closing` key on the order dict, and `place_allowed` no longer reads it.
+    That is what the exemption tests below now assert — a caller can still SAY it is closing
+    and every rail refuses it anyway, which is the property that was missing when a
+    98-contract $93 buy at 95c declared itself exempt and ten rails believed it."""
     return {"ticker": ticker, "side": side, "n": n, "basis": basis, "fully_closing": closing}
 
 
@@ -45,15 +51,17 @@ class TestB2DayStop(LipTestCase):
         pnl = G.mark_to_market_pnl({"T": {"yes": 0.0, "no": 10.0}}, {"T": 4.0}, {"T": 0.50})
         self.assertAlmostEqual(pnl, 1.0, places=9)
 
-    def test_THE_FULLY_CLOSING_EXEMPTION(self):
-        """A halted book must still be able to LEAVE.  Refusing a closing order would trap us
-        in the position that tripped the stop."""
+    def test_THERE_IS_NO_FULLY_CLOSING_EXEMPTION(self):
+        """LAW CHANGE (2026-07-30).  This was `test_THE_FULLY_CLOSING_EXEMPTION`: "A halted
+        book must still be able to LEAVE.  Refusing a closing order would trap us in the
+        position that tripped the stop."  Sound while the bot could sell; void now that it
+        cannot.  Nothing the day stop admits would get us out of a position, so the stop is
+        absolute and the flag is ignored."""
         ctx = G.PlaceContext(day_stopped=True)
-        ok, reason, _ = G.place_allowed(ctx, order())
-        self.assertFalse(ok)
-        self.assertEqual(reason, "day_stop")
-        ok, _, _ = G.place_allowed(ctx, order(closing=True))
-        self.assertTrue(ok)
+        for o in (order(), order(closing=True)):
+            ok, reason, _ = G.place_allowed(ctx, o)
+            self.assertFalse(ok)
+            self.assertEqual(reason, "day_stop")
 
 
 class TestB5HaltStateMachine(LipTestCase):
@@ -105,11 +113,17 @@ class TestB5HaltStateMachine(LipTestCase):
         EXISTS and cannot be read fails closed."""
         self.assertFalse(G.HaltState(self.path("nothing_here.json")).load().halted)
 
-    def test_a_halted_book_can_still_close(self):
+    def test_a_halted_book_places_NOTHING_including_a_self_declared_close(self):
+        """LAW CHANGE (2026-07-30).  Was `test_a_halted_book_can_still_close`.  A halt means
+        our books are not trustworthy; an order sized from those books to "close" is the one
+        order that must NOT be admitted, and on 2026-07-30 it was the order that went out —
+        98 contracts, $93, at 95c, against a phantom short."""
         h = self._halt().halt("day_stop", now=1.0)
         ctx = G.PlaceContext(halt_state=h)
-        ok, _, _ = G.place_allowed(ctx, order(closing=True))
-        self.assertTrue(ok)
+        for o in (order(), order(closing=True)):
+            ok, reason, _ = G.place_allowed(ctx, o)
+            self.assertFalse(ok)
+            self.assertEqual(reason, "halted")
 
 
 class TestB3Drawdown(LipTestCase):
@@ -365,11 +379,13 @@ class TestB11CapitalFloor(LipTestCase):
         self.assertFalse(ok)
         self.assertEqual(reason, "capital_floor")
 
-    def test_a_closing_order_is_exempt(self):
-        """Leaving must never require capital we do not have."""
+    def test_a_self_declared_closing_order_is_NOT_exempt(self):
+        """LAW CHANGE (2026-07-30).  Was `test_a_closing_order_is_exempt`: "Leaving must never
+        require capital we do not have."  There is no leaving.  The floor is absolute."""
         ctx = G.PlaceContext(available_cash_usd=0.0)
-        ok, _, _ = G.place_allowed(ctx, order(closing=True))
-        self.assertTrue(ok)
+        ok, reason, _ = G.place_allowed(ctx, order(closing=True))
+        self.assertFalse(ok)
+        self.assertEqual(reason, "capital_floor")
 
 
 class TestB12ClockSkew(LipTestCase):
@@ -378,13 +394,15 @@ class TestB12ClockSkew(LipTestCase):
         self.assertTrue(G.clock_skew_alarming(G.clock_skew_s(1000.0, 1040.0)))
         self.assertTrue(G.clock_skew_alarming(G.clock_skew_s(1040.0, 1000.0)))
 
-    def test_it_blocks_opening_orders_but_not_closing_ones(self):
+    def test_it_blocks_EVERY_order_closing_or_not(self):
+        """LAW CHANGE (2026-07-30).  Was `test_it_blocks_opening_orders_but_not_closing_ones`.
+        A skewed clock makes `expiration_ts` unreliable for every order alike; the exemption
+        only ever existed to let an exit through, and there are no exits."""
         ctx = G.PlaceContext(skew_ok=False)
-        ok, reason, _ = G.place_allowed(ctx, order())
-        self.assertFalse(ok)
-        self.assertEqual(reason, "clock_skew")
-        ok, _, _ = G.place_allowed(ctx, order(closing=True))
-        self.assertTrue(ok)
+        for o in (order(), order(closing=True)):
+            ok, reason, _ = G.place_allowed(ctx, o)
+            self.assertFalse(ok)
+            self.assertEqual(reason, "clock_skew")
 
 
 class TestB13CrossBotExclusion(LipTestCase):
@@ -523,12 +541,17 @@ class TestB15TheCeilingBindsAtPlacement(LipTestCase):
         ok, reason, _ = G.place_allowed(ctx, order(ticker="C-1", n=100, basis=0.50))
         self.assertTrue(ok, reason)
 
-    def test_a_FULLY_CLOSING_order_is_exempt_so_a_book_at_its_ceiling_can_LEAVE(self):
+    def test_a_book_at_its_ceiling_STOPS_and_waits_for_settlement(self):
+        """LAW CHANGE (2026-07-30).  Was
+        `test_a_FULLY_CLOSING_order_is_exempt_so_a_book_at_its_ceiling_can_LEAVE`.  Settlement
+        is now the only thing that releases dollars (D4 bounds it at 7 days), so a book at its
+        ceiling stops placing rather than spending its way out."""
         ctx = G.PlaceContext(
             ceiling_usd=10.0,
             positions=[{"ticker": "A-1", "side": "yes", "n": 1000, "basis": 0.50}])
         ok, reason, _ = G.place_allowed(ctx, order(ticker="A-1", n=100, basis=0.50, closing=True))
-        self.assertTrue(ok, reason)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "ceiling")
 
     def test_no_ceiling_configured_is_a_no_op_not_a_refusal(self):
         ctx = G.PlaceContext(positions=[{"ticker": "A-1", "side": "yes", "n": 1e6, "basis": 0.99}])
@@ -565,11 +588,15 @@ class TestB16ThePerMarketAcquisitionCap(LipTestCase):
         self.assertFalse(ok)
         self.assertEqual(reason, "market_cap")
 
-    def test_a_FULLY_CLOSING_order_is_exempt(self):
+    def test_a_self_declared_closing_order_is_NOT_exempt(self):
+        """LAW CHANGE (2026-07-30).  Was `test_a_FULLY_CLOSING_order_is_exempt`.  This cap is
+        the PRIMARY instrument now — with no exit, NET exposure equals GROSS and refusing to
+        acquire is the only control there is — so it cannot carry a bypass."""
         ctx = G.PlaceContext(market_cap_usd=1.0,
                              positions=[{"ticker": "MINE-1", "side": "yes", "n": 1000, "basis": 0.50}])
         ok, reason, _ = G.place_allowed(ctx, order(ticker="MINE-1", n=100, basis=0.50, closing=True))
-        self.assertTrue(ok, reason)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "market_cap")
 
     def test_the_cap_derives_from_the_ceiling_and_REPLACED_v1s_inherited_bound(self):
         """WAS `..._is_strictly_inside_v1s_inherited_bound`, asserting

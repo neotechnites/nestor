@@ -145,12 +145,23 @@ def day_stop_breached(pnl_usd, projected_day_reward_usd, **kw):
     return -float(pnl_usd) >= day_stop_usd(projected_day_reward_usd, **kw) - 1e-12
 
 
-def day_stop_exempt(order_is_fully_closing):
-    """**THE FULLY-CLOSING EXEMPTION.**  A halted book must still be able to LEAVE.  An order
-    that only reduces inventory cannot increase exposure — its worst case is that we end up
-    flat — so refusing it would trap us in the position that tripped the stop, which is the
-    opposite of what a stop is for.  Every other order is refused."""
-    return bool(order_is_fully_closing)
+# ── `day_stop_exempt` IS GONE, AND WITH IT EVERY EXEMPTION IN THIS FILE. ─────────────────────
+# It read: "THE FULLY-CLOSING EXEMPTION.  A halted book must still be able to LEAVE.  An order
+# that only reduces inventory cannot increase exposure — its worst case is that we end up flat
+# — so refusing it would trap us in the position that tripped the stop."
+#
+# THE ARGUMENT WAS VALID AND ITS PREMISE IS NOW FALSE.  It licensed exactly one order class —
+# orders that reduce inventory — and as of 2026-07-30 this program places none (owner
+# decision: "it's either running and placing orders, or it's not running").  A stop can no
+# longer trap us in a position, because nothing it could admit would get us out of one.
+#
+# WHAT IT COST WHILE THE PREMISE HELD.  The flag was set by the CALLER, from the caller's own
+# books, and ten rails downstream believed it: halt, day stop, clock skew, frozen market,
+# capital floor, refill cap, cluster cap, portfolio variance, per-market leg cap, collateral
+# ceiling.  On 2026-07-30 a books-integrity halt armed the closing pass, which read the
+# condemned books, sized a 98-contract $93 buy at 95c against a position that did not exist,
+# and flagged it exempt.  Every rail stood aside for it.  There is now no argument
+# `place_allowed` accepts that can switch a rail off.
 
 
 # =============================================================================================
@@ -613,7 +624,9 @@ class PlaceContext(object):
 def place_allowed(ctx, order):
     """The rails, in dependency order.  Returns (ok, reason, detail).
 
-    `order`: {ticker, side, n, basis, fully_closing}
+    `order`: {ticker, side, n, basis}.  There is NO `fully_closing` key and no exemption of
+    any kind: every rail below applies to every order (see the `day_stop_exempt` obituary
+    above).  A caller cannot buy its way past a rail by describing its own intent.
 
     ORDER MATTERS and is derived: the halt is first because a halted book needs no further
     reasoning; the day stop is next because it is the only other condition that shuts
@@ -621,23 +634,21 @@ def place_allowed(ctx, order):
     are about size and therefore only meaningful on a market we were allowed to quote.
     """
     ticker = order["ticker"]
-    fully_closing = bool(order.get("fully_closing"))
 
-    # B5 — halt is place()'s FIRST check.  The fully-closing exemption lets a halted book LEAVE.
+    # B5 — halt is place()'s FIRST check, and it is now ABSOLUTE.
     if ctx.halt_state is not None and ctx.halt_state.halted:
-        if not day_stop_exempt(fully_closing):
-            return False, "halted", {"reason": ctx.halt_state.reason}
+        return False, "halted", {"reason": ctx.halt_state.reason}
 
-    # B2 — day stop, same exemption for the same reason.
-    if ctx.day_stopped and not day_stop_exempt(fully_closing):
+    # B2 — day stop, absolute for the same reason.
+    if ctx.day_stopped:
         return False, "day_stop", {}
 
     # B12 — a skewed clock makes `expiration_ts` and our signatures unreliable.
-    if not ctx.skew_ok and not fully_closing:
+    if not ctx.skew_ok:
         return False, "clock_skew", {}
 
     # Frozen (assume_filled / adoption exclusion / orphan) — quoting AND recycling.
-    if ticker in ctx.frozen and not fully_closing:
+    if ticker in ctx.frozen:
         return False, "frozen", {}
 
     # B13 — cross-bot exclusion, orders AND positions.
@@ -649,7 +660,7 @@ def place_allowed(ctx, order):
         return False, "series_denied", {}
 
     # B11 — capital floor: never spend the shared account's last dollars.
-    if not fully_closing and ctx.available_cash_usd is not None \
+    if ctx.available_cash_usd is not None \
             and not capital_floor_ok(ctx.available_cash_usd):
         return False, "capital_floor", {"available": ctx.available_cash_usd}
 
@@ -657,13 +668,13 @@ def place_allowed(ctx, order):
     # The tracker is keyed on the ORDER axis ("bid"/"ask" — what `book_fill` notes); the
     # order dict speaks the leg axis ("yes"/"no").  Convert, or the guard silently never
     # fires (found by the replenish fixture: 4-turnover churn sailed through).
-    if not fully_closing and ctx.refill is not None and ctx.n_cap_fn is not None:
+    if ctx.refill is not None and ctx.n_cap_fn is not None:
         order_side = "bid" if order["side"] == "yes" else "ask"
         if ctx.refill.exhausted(ticker, order_side, order["basis"], ctx.n_cap_fn):
             return False, "refill_cap", {}
 
     # B1 — the cluster cap, on OPEN + RESTING basis, before the ceiling.
-    if not fully_closing and ctx.cluster_cap_usd is not None:
+    if ctx.cluster_cap_usd is not None:
         existing = list(ctx.positions) + list(ctx.resting_basis)
         ok, reason, detail = CL.cluster_admits(existing, order, ctx.cluster_cap_usd)
         if not ok:
@@ -671,7 +682,8 @@ def place_allowed(ctx, order):
 
     # -----------------------------------------------------------------------------------------
     # B16 — THE PER-MARKET ACQUISITION CAP.  (2026-07-29)
-    # WHY IT EXISTS: we do not exit.  Measured on the full operation's tape, 149 of 6,149
+    # WHY IT EXISTS: we do not exit — as of 2026-07-30 a LAW rather than an observation, which
+    # promotes this cap from backstop to primary instrument.  Measured on the full tape, 149 of 6,149
     # acquired contracts were ever closed (2.4%), across SEVEN closing orders in the whole
     # history, all of them takers.  With no exit, NET exposure equals GROSS, so the only
     # instrument that bounds directional risk in a market is refusing to acquire more of it.
@@ -694,10 +706,13 @@ def place_allowed(ctx, order):
     # weights denominated in the CEILING, every added dollar raises Σwᵢ² and therefore raises V:
     # there is no such thing as a diluting ORDER, only a diluting SETTLEMENT or shed.  A condition
     # that can never be false is not a safeguard, it is a comment that reads like one.
-    # SO CAN THE BOOK GET STUCK ABOVE TOLERANCE?  No: `fully_closing` is exempt above, so the shed
-    # path always runs, and a position that settles leaves the book on its own.  The rail stops us
-    # ADDING to a concentrated book, which is the whole ask.
-    if not fully_closing and ctx.portfolio_var_max is not None:
+    # SO CAN THE BOOK GET STUCK ABOVE TOLERANCE?  Yes — and as of 2026-07-30 that is the DESIGNED
+    # state rather than a hole.  The old answer was "no, because `fully_closing` is exempt above so
+    # the shed path always runs"; the shed path is deleted, so this rail's safety argument had to be
+    # re-derived rather than inherited.  The honest one is the SETTLEMENT CLOCK: the only thing that
+    # lowers V is a position settling, and the D4 gate bounds that at 7 days.  The rail's job is
+    # unchanged — stop us ADDING to a concentrated book — and it now does it with no escape clause.
+    if ctx.portfolio_var_max is not None:
         _den = ctx.ceiling_usd
         v_now, _ = portfolio_variance(ctx.positions, ctx.resting_basis,
                                       denominator_usd=_den)
@@ -734,7 +749,7 @@ def place_allowed(ctx, order):
     # on BOTH sides — which is a box, whose worst case is still one side's collateral, and whose
     # >$1.00-sum failure mode is `joint_sub_dollar` above and one-rung-per-side upstream, not this
     # cap.  Total dollars remain bound by the cluster cap and by B15's ceiling.
-    if not fully_closing and ctx.market_cap_usd is not None:
+    if ctx.market_cap_usd is not None:
         leg = order.get("side")
         held = sum(float(p.get("n", 0)) * float(p.get("basis", 0.0))
                    for p in list(ctx.positions) + list(ctx.resting_basis)
@@ -758,9 +773,9 @@ def place_allowed(ctx, order):
     # MIRROR (ceiling too tight ↔ too loose): too tight starves the book and is visible as
     # `ceiling` refusals while `idle_capital` alerts — the exact failure we measured on
     # 2026-07-28 when $5.84 of $300 deployed.  Too loose is unbounded exposure on a shared
-    # account, which is what this closes.  The fully-closing exemption is mandatory: a book at
-    # its ceiling must always be able to LEAVE.
-    if not fully_closing and ctx.ceiling_usd is not None:
+    # account, which is what this closes.  THERE IS NO EXEMPTION: a book at its ceiling stops
+    # placing and waits for settlement to release the dollars, which is the only release there is.
+    if ctx.ceiling_usd is not None:
         committed = sum(float(p.get("n", 0)) * float(p.get("basis", 0.0))
                         for p in list(ctx.positions) + list(ctx.resting_basis))
         add = float(order.get("n", 0)) * float(order.get("basis", 0.0))

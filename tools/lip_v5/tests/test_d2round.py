@@ -229,10 +229,15 @@ class TestTheTrackedPortfolioVariance(LipTestCase):
         self.assertEqual(reason, "portfolio_var")
         # THERE IS NO DILUTING ORDER.  Ceiling-denominated weights rise with every added dollar,
         # so a second cluster raises V too — which is why the guard has no "only if it worsens V"
-        # clause: that condition could never be false.  What must still work is LEAVING:
+        # clause: that condition could never be false.
+        # LAW CHANGE (2026-07-30): the lines that used to follow asserted "a book above
+        # tolerance must always be able to LEAVE" and admitted a `fully_closing` order.  There
+        # is no leaving.  A book above tolerance STOPS ADDING and waits for settlement (D4: ≤7
+        # days), and the flag no longer buys anything:
         ok2, reason2, _ = G.place_allowed(ctx, {"ticker": "AAA-1", "side": "no", "n": 100,
                                                 "basis": 0.06, "fully_closing": True})
-        self.assertTrue(ok2, "a book above tolerance must always be able to LEAVE: %s" % reason2)
+        self.assertFalse(ok2, "a self-declared closing order got past the variance rail")
+        self.assertEqual(reason2, "portfolio_var")
 
 
 # =============================================================================================
@@ -270,11 +275,13 @@ class TestB15B16FireThroughTheRealPlaceContext(EngineCase):
                                                   "fully_closing": False})
         self.assertFalse(ok)
         self.assertEqual(reason, "ceiling", detail)
-        # a book at its ceiling must always be able to LEAVE
+        # LAW CHANGE (2026-07-30): was "a book at its ceiling must always be able to LEAVE".
+        # It stops instead, through the REAL place_context — the plumbing this class owns.
         ok2, reason2, _ = G.place_allowed(ctx, {"ticker": "EEE-1", "side": "yes",
                                                 "n": 18, "basis": 0.50,
                                                 "fully_closing": True})
-        self.assertTrue(ok2, reason2)
+        self.assertFalse(ok2)
+        self.assertEqual(reason2, "ceiling")
 
     def test_the_MARKET_CAP_refuses_through_engine_place_context(self):
         m = self._armed(300.0)

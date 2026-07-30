@@ -326,9 +326,22 @@ class Maker(object):
             portfolio_var_max=C.PORTFOLIO_VAR_MAX)
 
     def place(self, ticker, side, price, count, expiration_ts, now,
-              fully_closing=False, available_cash_usd=None, lane="place",
-              replacing_order_id=None):
+              available_cash_usd=None, lane="place", replacing_order_id=None):
         """The ONLY way an order reaches the exchange.  Returns (ok, reason, resp).
+
+        **THERE IS NO `fully_closing` ARGUMENT AND THEREFORE NOTHING IS CAP-EXEMPT.**
+        (Owner decision, 2026-07-30.)  It used to travel from here into `place_allowed` and
+        switch OFF, for that one order: the halt, the day stop, the clock-skew rail, the
+        frozen-market refusal, the capital floor, the refill cap, the cluster cap, the
+        portfolio-variance rail, the per-market leg cap and the collateral ceiling — every
+        rail this program has.  The justification was sound while the bot could sell ("a book
+        at its ceiling must always be able to LEAVE"), and it is void now that it cannot: an
+        exemption exists to admit an order class that no longer exists.
+
+        WHAT IT COST WHILE IT DID EXIST.  2026-07-30: a books-integrity halt armed the closing
+        pass, which sized a 98-contract $93 buy at 95c from the condemned books and marked it
+        `fully_closing=True`.  Ten rails read that flag and stood aside.  A rail that any
+        caller can switch off is not a rail; it is a suggestion with a bypass.
 
         Order of operations is load-bearing:
           1. the RAILS (`guards.place_allowed`) — refuse before anything is spent or written
@@ -345,8 +358,7 @@ class Maker(object):
         # cap and was refused every cycle, forever.  Plan and rail must measure in the same
         # currency as the money.
         order = {"ticker": ticker, "side": "yes" if side == "bid" else "no",
-                 "n": float(count), "basis": R.unit_collateral(side, price),
-                 "fully_closing": fully_closing}
+                 "n": float(count), "basis": R.unit_collateral(side, price)}
         ctx = self.place_context(available_cash_usd,
                                  replacing_order_id=replacing_order_id)
         ok, reason, detail = G.place_allowed(ctx, order)
@@ -375,7 +387,7 @@ class Maker(object):
                         and (o["ticker"], o["side"]) == bkey
                         for o in self.orders.values())
         hist = [t for t in self.place_hist.get(bkey, []) if now - t < C.PLACE_BURST_WINDOW_S]
-        if blind and len(hist) >= C.PLACE_BURST_MAX and not fully_closing:
+        if blind and len(hist) >= C.PLACE_BURST_MAX:
             self.place_hist[bkey] = hist
             R.log("place_burst", ticker=ticker, side=side, n=len(hist),
                   window_s=C.PLACE_BURST_WINDOW_S)
@@ -405,7 +417,9 @@ class Maker(object):
         self.ledger.write("place_req", ticker=ticker, side=side, price=price,
                           size=count, coid=coid, seq=self.coid_seq)
         # §5.3 — write (and fsync) the feed with this collateral ALREADY INCLUDED, then POST.
-        self.publisher.publish_before_wire(coid, 0.0 if fully_closing else collateral, now)
+        # Every order posts collateral now — a closing order was the only kind that did
+        # not, because it was covered by the position it reduced, and there are none.
+        self.publisher.publish_before_wire(coid, collateral, now)
 
         status, resp = self.ex.place(body)
         self.note_http(status, now)                           # SF-2
@@ -442,19 +456,17 @@ class Maker(object):
 
         o = o_resp
         oid = str(o["order_id"])
-        self.cash.confirm_order(coid, 0.0 if fully_closing else collateral)
+        self.cash.confirm_order(coid, collateral)
         self.orders[oid] = {"order_id": oid, "coid": coid, "ticker": ticker, "side": side,
                             "price": float(price), "size": float(count),
                             "remaining": float(o.get("remaining_count", count)),
-                            "fully_closing": fully_closing,
                             "expiration_ts": int(expiration_ts),
                             "placed_ts": now}
         self.ledger.write("place_resp", ticker=ticker, side=side, coid=coid, order_id=oid,
                           price=price, size=count,
                           remaining_count=o.get("remaining_count"),
                           fill_count=o.get("fill_count", 0), seq=self.coid_seq,
-                          expiration_ts=int(expiration_ts),
-                          fully_closing=fully_closing)
+                          expiration_ts=int(expiration_ts))
         self.publisher.publish(now)
         return True, "ok", resp
 
@@ -476,7 +488,8 @@ class Maker(object):
             if learned:
                 self.book_fill(o["ticker"], o["side"], learned, o["price"], now,
                                fill_id="cancel:%s" % oid, order_id=oid,
-                               closing=bool(o.get("fully_closing")))
+                               closing=self.fill_nets_against_inventory(
+                                   o["ticker"], o["side"], learned))
             # SF-4: `.get`, never `[...]` — an order rebuilt from replay or the recovery
             # sweep may carry no coid, and shutdown's cancel-all must survive that.
             self.cash.release_order(o.get("coid"))
@@ -501,6 +514,32 @@ class Maker(object):
     # =========================================================================================
     # FILLS
     # =========================================================================================
+    def fill_nets_against_inventory(self, ticker, side, count):
+        """**BOOKKEEPING OF CLOSING FILLS SURVIVES THE DEATH OF CLOSING ORDERS.**
+
+        The bot no longer places an order whose purpose is to reduce a position — but THE
+        EXCHANGE NETS AUTOMATICALLY, so an ordinary OPENING quote can still execute against
+        inventory we hold: quote an ask on a market where we are long YES and the fill
+        retires YES rather than opening NO.  That is a fact about the venue, not an intention
+        of ours, and the books must state it correctly or `position_cost`, the day stop's
+        mark-to-market and the cash feed's realized P&L all drift.
+
+        This is the derivation the deleted `fully_closing` FLAG used to short-circuit: the
+        order declared its own intent and the fill inherited it.  With no such intent to
+        declare, the answer comes from the only honest source — WHAT WE HOLD.  It is exactly
+        the rule `book_fill_row` already applied to fills it could not attribute to an order
+        (v4's `apply_fill` netting), now applied to every fill, which is also why the two
+        paths can no longer disagree.
+
+        An execution on `side` reduces the OPPOSITE leg from the one it would open: an ask
+        opens NO and closes YES.  MIRROR (calling an open a close ↔ calling a close an open):
+        the `>=` is strict about covering the WHOLE count, so a partially-covered fill books
+        as an OPEN — understating what we retired, which understates inventory rather than
+        inventing a short, and that is the same direction `guards.FillDedupe` chooses."""
+        leg = "yes" if side == "ask" else "no"
+        held = float((self.positions.get(ticker) or {}).get(leg, 0.0))
+        return held >= float(count) - 1e-9
+
     def book_fill(self, ticker, side, count, price, now, fill_id=None, closing=False,
                   proceeds=None, order_id=None, fee_usd=0.0, closed_leg=None):
         """The single entry point for a fill into state, so B8's dedupe cannot be bypassed.
@@ -540,7 +579,7 @@ class Maker(object):
             self.position_cost[ticker] = max(
                 0.0, self.position_cost.get(ticker, 0.0) - n_closed * basis)
             value = float(price) if leg == "yes" else (1.0 - float(price))
-            self.cash.fill(ticker, coid or "shed", count, value, side_sign=-1.0,
+            self.cash.fill(ticker, coid or "closing", count, value, side_sign=-1.0,
                            proceeds_per_contract=proceeds)
         else:
             prev = pos[leg] * self.entry_basis.get((ticker, leg), 0.0)
@@ -588,9 +627,11 @@ class Maker(object):
 
         OPEN vs CLOSE is OUR book's fact, not the row's: the fills axis (yes, sell) is an
         ask-shaped execution that CLOSES a held YES leg or OPENS a NO leg — the row cannot
-        tell them apart.  Attribution order: the ORDER the row names (its side and
-        `fully_closing` are authoritative), else the position (enough held ⇒ closing —
-        v4's apply_fill netting, the crash-gap case)."""
+        tell them apart.  The ORDER the row names still supplies our SIDE (the wire's own
+        `book_side` and the legacy (side, action) derivation are the fallbacks).  It no longer
+        supplies the OPEN/CLOSE answer: the `fully_closing` flag it used to carry is deleted
+        with the closing orders, so BOTH branches now ask `fill_nets_against_inventory` —
+        v4's apply_fill netting, which was already the crash-gap branch's rule."""
         # ── THE 2026-07-30 WIRE SHAPE, from a CAPTURED live payload (contact doctrine,
         # note 45: fields are the wire's to declare).  `captured_fills_20260730.json`:
         #   count_fp: "1.03"            — FRACTIONAL contracts, dollar-string.  The old
@@ -626,19 +667,16 @@ class Maker(object):
             else None
         bs = row.get("book_side")
         if o is not None:
-            side, closing = o["side"], bool(o.get("fully_closing"))
+            side = o["side"]
+        elif bs in ("bid", "ask"):
+            side = bs
         else:
-            if bs in ("bid", "ask"):
-                ask_like = (bs == "ask")
-            else:
-                # legacy derivation: (yes, sell) and (no, buy) are the same ask-shaped act
-                leg_, sign_ = cutover.normalize_fill(row.get("side"),
-                                                     row.get("action", "buy"))
-                ask_like = (leg_ == "bid" and sign_ < 0) or (leg_ == "ask" and sign_ > 0)
+            # legacy derivation: (yes, sell) and (no, buy) are the same ask-shaped act
+            leg_, sign_ = cutover.normalize_fill(row.get("side"),
+                                                 row.get("action", "buy"))
+            ask_like = (leg_ == "bid" and sign_ < 0) or (leg_ == "ask" and sign_ > 0)
             side = "ask" if ask_like else "bid"
-            pos = self.positions.get(ticker) or {}
-            held = pos.get("yes", 0.0) if ask_like else pos.get("no", 0.0)
-            closing = held >= count - 1e-9
+        closing = self.fill_nets_against_inventory(ticker, side, count)
         # Fee: the wire's own `fee_cost` when present (the truth, maker or taker); the
         # is_taker formula only as a legacy fallback.
         fc = row.get("fee_cost")
@@ -761,7 +799,8 @@ class Maker(object):
             return
         self.book_fill(o["ticker"], o["side"], o.get("remaining", 0.0), o["price"], now,
                        fill_id="assume404:%s" % oid, order_id=oid,
-                       closing=bool(o.get("fully_closing")))
+                       closing=self.fill_nets_against_inventory(
+                           o["ticker"], o["side"], o.get("remaining", 0.0)))
         self.orders.pop(str(oid), None)
         self.frozen.add(o["ticker"])
         self.ledger.write("assume_filled", ticker=o["ticker"], order_id=oid, why=why)

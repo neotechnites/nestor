@@ -813,5 +813,117 @@ class TestTheSoleQualifierNeedsNoPermission(EngineCase):
         self.assertIsNotNone(alloc.cliff_clearing_q(s))
 
 
+class TestNothingIsCapExempt(EngineCase):
+    """LAW CHANGE (owner decision, 2026-07-30: "it's either running and placing orders, or
+    it's not running").  `Maker.place` used to take `fully_closing=`, and that argument turned
+    OFF ten rails for the order carrying it — including the halt itself.  On 2026-07-30 a
+    books-integrity halt armed the closing pass, which sized a 98-contract $93 buy at 95c from
+    the condemned books, flagged it exempt, and every rail stood aside.
+
+    These tests assert the exemption cannot be reached: not through the signature, not through
+    a stray kwarg, and not through the order dict `place_context` builds."""
+
+    def test_place_has_no_fully_closing_parameter(self):
+        import inspect
+        params = inspect.signature(E.Maker.place).parameters
+        self.assertNotIn("fully_closing", params)
+        m = self.maker()
+        with self.assertRaises(TypeError):
+            m.place("T", "bid", 0.5, 1, NOW + 60, NOW, fully_closing=True)
+
+    def test_a_halted_maker_refuses_every_placement(self):
+        m = self.maker()
+        m.halt.halt("books_integrity", NOW)
+        ok, reason, _ = m.place("KXAAAGASD-26JUL29-T4.12", "ask", 0.95, 98, NOW + 3600, NOW,
+                                available_cash_usd=100_000.0)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "halted")
+        self.assertEqual(m.ex.placed, [], "a halted maker reached the wire")
+
+    def test_the_rail_input_carries_no_exemption_key(self):
+        """Structural: what `place()` hands `place_allowed` is {ticker, side, n, basis}.  A
+        rail cannot be switched off by a key that is never sent."""
+        m = self.maker()
+        seen = {}
+        real = G.place_allowed
+
+        def spy(ctx, order):
+            seen.update(order)
+            return real(ctx, order)
+
+        E.G.place_allowed = spy
+        self.addCleanup(lambda: setattr(E.G, "place_allowed", real))
+        m.place("KXAAAGASD-26JUL29-T4.12", "bid", 0.50, 1, NOW + 3600, NOW,
+                available_cash_usd=100_000.0)
+        self.assertEqual(sorted(seen), ["basis", "n", "side", "ticker"])
+
+
+class TestAFillThatNetsIsStillBookedAsClosing(EngineCase):
+    """**THE BOOKKEEPING OF CLOSING FILLS SURVIVES THE DEATH OF CLOSING ORDERS.**
+
+    The bot never places an order to reduce a position (2026-07-30), but THE EXCHANGE NETS
+    AUTOMATICALLY: an ordinary OPENING ask on a market where we are long YES executes against
+    the YES we hold.  Booking that as an opened NO leg would inflate `position_cost`, feed the
+    day stop a phantom loss and leave the cash feed's realized P&L unstated.
+
+    The old code answered this from the ORDER's `fully_closing` flag — which is deleted — so
+    the answer now comes from WHAT WE HOLD (`fill_nets_against_inventory`), which is the rule
+    the unattributable-fill branch already used.  Same rule, both branches, no disagreement."""
+
+    TK = "KXAAAGASD-26JUL29-T4.12"
+
+    def _long_yes(self, n=20, basis=0.40):
+        m = self.maker()
+        m.positions[self.TK] = {"yes": float(n), "no": 0.0}
+        m.entry_basis[(self.TK, "yes")] = basis
+        m.position_cost[self.TK] = n * basis
+        m.cash.inventory[self.TK] = {"n": float(n), "basis": basis}
+        return m
+
+    def test_an_ask_fill_against_held_YES_retires_the_YES_leg(self):
+        m = self._long_yes()
+        m.book_fill_row({"trade_id": "f1", "ticker": self.TK, "book_side": "ask",
+                         "count_fp": "20.00", "yes_price_dollars": "0.4200"}, NOW)
+        self.assertAlmostEqual(m.positions[self.TK]["yes"], 0.0, places=9)
+        self.assertAlmostEqual(m.positions[self.TK]["no"], 0.0, places=9,
+                               msg="the netting fill opened a phantom NO leg")
+        self.assertAlmostEqual(m.position_cost[self.TK], 0.0, places=9)
+
+    def test_it_is_written_to_the_tape_as_closing_so_replay_agrees(self):
+        """Replay reads `closing`/`closed_leg` off `fill_obs` (the 2026-07-30 -$78 Skubal
+        short: without them every closing sell replayed as an OPENING short, both legs stacked
+        and inventory_basis hit $315 of a $300 ceiling)."""
+        m = self._long_yes()
+        m.book_fill_row({"trade_id": "f1", "ticker": self.TK, "book_side": "ask",
+                         "count_fp": "20.00", "yes_price_dollars": "0.4200"}, NOW)
+        rows = [r for r in m.ledger.read() if (r.get("k") or r.get("kind")) == "fill_obs"]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["closing"])
+        self.assertEqual(rows[0]["closed_leg"], "yes")
+
+    def test_the_SAME_fill_with_no_inventory_opens_instead(self):
+        """The mirror.  `closing` is a fact about our book, not a label on the row — flat, the
+        identical ask row opens a NO leg."""
+        m = self.maker()
+        m.book_fill_row({"trade_id": "f1", "ticker": self.TK, "book_side": "ask",
+                         "count_fp": "20.00", "yes_price_dollars": "0.4200"}, NOW)
+        self.assertAlmostEqual(m.positions[self.TK]["no"], 20.0, places=9)
+        self.assertAlmostEqual(m.positions[self.TK]["yes"], 0.0, places=9)
+
+    def test_a_fill_ATTRIBUTED_TO_OUR_ORDER_uses_the_same_rule(self):
+        """The branch that used to trust the order's flag.  An order we placed as an ordinary
+        opening ask, filling against inventory, must book identically to the unattributed
+        case — one rule, so the two paths cannot drift apart."""
+        m = self._long_yes()
+        ok, why, _ = m.place(self.TK, "ask", 0.42, 20, int(NOW + 3600), NOW,
+                             available_cash_usd=100_000.0)
+        self.assertTrue(ok, why)
+        oid = sorted(m.orders)[0]
+        m.book_fill_row({"trade_id": "f2", "ticker": self.TK, "order_id": oid,
+                         "count_fp": "20.00", "yes_price_dollars": "0.4200"}, NOW + 1)
+        self.assertAlmostEqual(m.positions[self.TK]["yes"], 0.0, places=9)
+        self.assertAlmostEqual(m.positions[self.TK]["no"], 0.0, places=9)
+
+
 if __name__ == "__main__":
     unittest.main()
