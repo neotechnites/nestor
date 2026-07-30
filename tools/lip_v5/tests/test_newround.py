@@ -117,9 +117,22 @@ class TestRequoteAtTheNewBestReachesTheWire(NewRoundCase):
         for _ in range(6):
             r.iteration(t)
             t += 1.0
-        live = [o for o in r.m.orders.values() if o.get("remaining", 0) > 0]
-        self.assertEqual(len(live), 1, "expected exactly one live quote, got %s" % (live,))
+        # PER SIDE, since D5′ retired D9 (see below): the BID slot must hold exactly one
+        # live quote, at the new best.  The market's other leg is now separately quotable and
+        # is not this test's subject.
+        live = [o for o in r.m.orders.values()
+                if o.get("remaining", 0) > 0 and o["side"] == "bid"]
+        self.assertEqual(len(live), 1, "expected exactly one live BID quote, got %s" % (live,))
         self.assertAlmostEqual(float(live[0]["price"]), 0.07, places=6)
+        # ⚠ FLAG (D5′, 2026-07-30): the ownership refusal that retired the one-rung-per-
+        # cluster COUNT also enforced D9 ("one SIDE per cluster — one-sided for now"), so the
+        # ask leg of the SAME market now rests beside the bid.  Both sides score separately
+        # (the filing normalises within each side, so a one-sided quote earns at most half a
+        # pool), which is why this is desirable — but it was a DEFERRED decision, not a
+        # settled one, and it arrived as a side effect rather than a choice.
+        asks = [o for o in r.m.orders.values()
+                if o.get("remaining", 0) > 0 and o["side"] == "ask"]
+        self.assertLessEqual(len(asks), 1)
 
 
 # =============================================================================================
@@ -200,16 +213,21 @@ class TestAllocateCarriesTheClusterTerm(LipTestCase):
         self.assertEqual(spent, 0.0)
         self.assertEqual(sum(a.values()), 0)
 
-    def test_no_cluster_cap_is_ONE_RUNG_not_the_old_spray(self):
-        """WAS `test_no_cluster_cap_is_the_old_behaviour`, asserting spent > $10 across a
-        ladder.  Note 52 D5 supersedes the old behaviour deliberately: one rung per cluster,
-        so even with NO cluster cap the plan funds a single rung and stops at its container —
-        the ladder can never again be sprayed rung-by-rung."""
+    def test_with_NO_cluster_cap_nothing_bounds_the_cluster_at_all(self):
+        """REWRITTEN 2026-07-30 (D5′: dollars, not count).  Was
+        `test_no_cluster_cap_is_ONE_RUNG_not_the_old_spray`, asserting that even with no
+        cluster cap the count rule funded exactly one rung.
+
+        ⚠ FLAG — with the count retired, `cluster_cap_usd=None` leaves a cluster with NO
+        bound whatsoever: the ladder sprays again, exactly as it did before NEW-1b.  That
+        argument is only safe because the None path is the PURE-TEST path — `engine.cycle`
+        always passes the real cap from `clusters.cluster_cap_usd` — but the count was
+        silently doing double duty as a backstop here, and now nothing is.  Asserted so the
+        hole is visible rather than discovered live."""
         a, spent, _ = alloc.allocate(self.slots(), 300.0, 0.0,
                                      caps=alloc.Caps(inv_cap_usd=10.0))
-        self.assertAlmostEqual(spent, 10.0, places=6)
-        self.assertEqual(sum(1 for q in a.values() if q > 0), 1,
-                         "one rung per cluster (note 52 D5)")
+        self.assertGreater(sum(1 for q in a.values() if q > 0), 1)
+        self.assertGreater(spent, 10.0 + 1e-9)
 
 
 class TestTheGuardHierarchy(LipTestCase):

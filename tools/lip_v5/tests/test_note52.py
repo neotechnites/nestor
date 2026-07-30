@@ -93,24 +93,50 @@ class TestD4SettlementGate(LipTestCase):
 
 
 class TestD5OneRungPerCluster(LipTestCase):
-    def test_a_second_rung_in_the_same_cluster_is_refused(self):
+    """── D5′, 2026-07-30 (Ryan: "why shouldn\'t we make that not a requirement"). ──────────
+    THE CLUSTER BOUND IS DOLLARS, NOT A RUNG COUNT.  These tests encoded the count; they now
+    encode the dollars, deliberately.
+
+    D5\'s argument was that a second rung spends the first rung\'s refill reserve — true, and
+    the reserve is what `cluster_cap_usd` already enforces, on the same dollars, in the plan
+    AND at the rail.  The count added nothing to the worst case (one $10 rung and four $2.50
+    rungs lose the same $10 if the settle source goes against us) and cost the book a great
+    deal: MEASURED, `cluster_owned` refused 270 candidates per cycle and ALL 76 pass-2
+    candidates while ~$234 sat idle.  The correlation evidence is what makes the dollar bound
+    sufficient — treasury tenors\' daily settle directions agreed 9/9 across pairs over 13
+    settled days, so a cluster really is ONE BET, and bounding the bet in dollars is the
+    honest control."""
+
+    def test_several_rungs_of_one_cluster_are_fundable_up_to_its_DOLLARS(self):
         ss = [_slot("KXG-1-T1"), _slot("KXG-1-T2")]      # same series ⇒ one cluster
         a, spent, _ = alloc.allocate(ss, 300.0, RSTAR, cluster_cap_usd=10.0)
-        self.assertEqual(sum(1 for q in a.values() if q > 0), 1)
+        self.assertEqual(sum(1 for q in a.values() if q > 0), 2)
+        self.assertLessEqual(spent, 10.0 + 1e-9)         # the bound that survived
 
-    def test_two_clusters_get_one_rung_each(self):
+    def test_the_cluster_DOLLAR_cap_is_what_stops_the_third_rung(self):
+        """Four rungs, one cluster, a cap that fits two lots: the cap binds, not a count."""
+        ss = [_slot("KXG-1-T%d" % i) for i in range(1, 5)]
+        lot = C.SLOT_LOT_CAP_USD
+        a, spent, _ = alloc.allocate(ss, 300.0, RSTAR, cluster_cap_usd=2 * lot)
+        self.assertLessEqual(spent, 2 * lot + 1e-9)
+        self.assertGreater(sum(1 for q in a.values() if q > 0), 1)
+
+    def test_two_clusters_get_their_own_dollars_each(self):
         ss = [_slot("KXG-1-T1"), _slot("KXH-1-T1")]
         a, spent, _ = alloc.allocate(ss, 300.0, RSTAR, cluster_cap_usd=10.0)
         self.assertEqual(sum(1 for q in a.values() if q > 0), 2)
 
-    def test_money_already_in_a_cluster_owns_it(self):
-        """held/resting money makes its key the owner: the plan may grow THAT rung and no
-        other in the cluster."""
+    def test_money_already_in_a_cluster_no_longer_EXCLUDES_its_siblings(self):
+        """WAS `test_money_already_in_a_cluster_owns_it` ("the plan may grow THAT rung and no
+        other").  Ownership without ACCRUAL is now just bookkeeping: the sibling is fundable
+        out of whatever dollars the cluster has left.  Accrual seniority is a separate rule
+        and still bites — see TestOwnerDisplacement."""
         ss = [_slot("KXG-1-T1"), _slot("KXG-1-T2")]
-        a, _, _ = alloc.allocate(ss, 300.0, RSTAR, cluster_cap_usd=10.0,
-                                 resting={ss[1].key: 5.0})
-        self.assertEqual(a[ss[0].key], 0, "the un-owned rung must not be funded")
+        a, spent, _ = alloc.allocate(ss, 300.0, RSTAR, cluster_cap_usd=10.0,
+                                     resting={ss[1].key: 5.0})
+        self.assertGreater(a[ss[0].key], 0, "the sibling is bounded by dollars, not banned")
         self.assertGreater(a[ss[1].key], 0)
+        self.assertLessEqual(spent + 5.0 * ss[1].p, 10.0 + 1e-9)
 
     def test_a_zeroed_rung_frees_its_cluster(self):
         """A rung the cliff pass drops (cannot clear) hands the cluster to the next
@@ -369,12 +395,21 @@ class TestClusterOwnershipSeed(LipTestCase):
     cycle (post-restart classification gap) and slot-derived ownership let the sibling take
     the cluster's seat.  Ownership now seeds from the REAL book via `owner_seed`."""
 
-    def test_a_held_but_slotless_rung_still_owns_its_cluster(self):
+    def test_a_held_but_slotless_rung_keeps_its_cluster_only_via_ACCRUAL(self):
+        """REWRITTEN 2026-07-30 (D5′).  Ownership alone no longer excludes a sibling — the
+        cluster\'s DOLLARS do the bounding — so the 1.155 incident\'s protection now rests
+        entirely on the accrual rank: with a pot, the sibling is recalled; without one, it is
+        funded out of the cluster\'s remaining room.
+        ⚠ FLAG: in the live engine the slotless holder\'s dollars ARE inside `cluster_seed`,
+        so the cap sees them.  This pure-test path passes no seed, so the sibling gets the
+        whole $10 — the same shape as the incident, minus the accrual that made it costly."""
         sibling = _slot("KXEUR-1-T1153")
-        a, _, _ = alloc.allocate([sibling], 300.0, RSTAR, cluster_cap_usd=10.0,
-                                 owner_seed={"KXEUR": ("KXEUR-1-T1155", "bid")})
-        self.assertEqual(a[sibling.key], 0,
-                         "the sibling took a cluster whose rung is merely unclassified")
+        common = dict(cluster_cap_usd=10.0, owner_seed={"KXEUR": ("KXEUR-1-T1155", "bid")})
+        a_no_pot, _, _ = alloc.allocate([sibling], 300.0, RSTAR, **common)
+        self.assertGreater(a_no_pot[sibling.key], 0)
+        a_pot, _, _ = alloc.allocate([sibling], 300.0, RSTAR,
+                                     owner_accrued={"KXEUR": 0.26}, **common)
+        self.assertEqual(a_pot[sibling.key], 0, "accrual seniority must still recall it")
 
     def test_the_owner_rung_itself_still_funds(self):
         owner = _slot("KXEUR-1-T1155")
@@ -382,16 +417,26 @@ class TestClusterOwnershipSeed(LipTestCase):
                                  owner_seed={"KXEUR": owner.key})
         self.assertGreater(a[owner.key], 0)
 
-    def test_one_side_per_cluster_still_holds_under_ticker_seeding(self):
-        """D9: the owner key carries a SIDE — the same ticker's other leg is refused."""
+    def test_D9_IS_RETIRED_the_other_leg_is_now_quotable(self):
+        """⚠ FLAG — A DEFERRED DECISION ARRIVED AS A SIDE EFFECT.  D9 ("one SIDE per cluster
+        — one-sided for now") was enforced by the SAME owner check that enforced the rung
+        count, so retiring the count retired D9 with it.  Both legs of one market now rest
+        together, bounded by the cluster\'s dollars.
+
+        The economics favour it — the filing normalises scores WITHIN EACH SIDE, so a
+        one-sided quote can earn at most half a pool and a two-sided one addresses both — and
+        the legs cannot cross (a YES bid at p and a NO bid at p′ are a YES ask at 1−p′; they
+        cross only if p + p′ > 1, which is a box trade in OUR favour).  But it was deferred
+        on purpose, and it should be RATIFIED rather than inherited."""
         bid = _slot("KXEUR-1-T1155")
         ask = alloc.Slot("KXEUR-1-T1155", "ask", rho=6.25, S=100.0, p=0.12,
                          phi=0.001, d=0.0, l_eff=8.0, hours_left=16.0, window_h=16.0,
                          venue="KXEUR")
-        a, _, _ = alloc.allocate([bid, ask], 300.0, RSTAR, cluster_cap_usd=10.0,
-                                 owner_seed={"KXEUR": bid.key})
+        a, spent, _ = alloc.allocate([bid, ask], 300.0, RSTAR, cluster_cap_usd=10.0,
+                                     owner_seed={"KXEUR": bid.key})
         self.assertGreater(a[bid.key], 0)
-        self.assertEqual(a[ask.key], 0)
+        self.assertGreater(a[ask.key], 0)
+        self.assertLessEqual(spent, 10.0 + 1e-9)         # still one cluster, still $10
 
 
 class TestOwnerDisplacement(LipTestCase):

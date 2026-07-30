@@ -684,6 +684,18 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
             v += w * w * (1.0 - p_bar) / p_bar
         return v
 
+    # D5′ (2026-07-30) — WITHHOLDING A SEED IS NOT ENOUGH ONCE THE COUNT REFUSAL IS GONE.
+    # Owner displacement works by NOT seeding the displaced rung, on the assumption that
+    # something downstream then declines to fund it — and that something used to be D5's
+    # one-rung-per-cluster refusal.  With the count retired (see the water-fill), the very
+    # next pass would re-fund from zero the rung we had just recalled: the cancel and the
+    # re-place in one cycle, which is the cancel/replace oscillation the seeding rule exists
+    # to prevent, wearing displacement's clothes.  So the recall is now stated ONCE, here,
+    # and honored everywhere: `recalled` is the accrual-ranked refusal, and it is the ONLY
+    # part of the old ownership gate that survives.  It is not a count — a cluster may hold
+    # any number of rungs — it is "this rung's own settle source has a strictly richer pot
+    # elsewhere, so its capital belongs there this period".
+    recalled = set()
     elig = []
     for s in slots:
         # ── OWNER DISPLACEMENT (Ryan, 2026-07-30: "1.153 has earned one cent, 1.155 has
@@ -710,6 +722,7 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
                 float(_own_acc.get(_ck0, 0.0)) > float(getattr(s, "accrued", 0.0) or 0.0) + 1e-9:
             alloc[s.key] = int(q_alloc.get(s.key, 0))     # displaced: no resting seed ⇒
                                                           # the requoter recalls the order
+            recalled.add(s.key)                           # …and nothing re-funds it today
         else:
             alloc[s.key] = max(int(q_alloc.get(s.key, 0)),
                                int(float((resting or {}).get(s.key, 0.0))))
@@ -802,15 +815,38 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
                         per_cluster.get(_cluster_key(s), 0.0) + s.p > float(cluster_cap_usd) + 1e-9:
                     _why["cluster_cap"] = _why.get("cluster_cap", 0) + 1
                     continue
-                # D5 — ONE RUNG PER CLUSTER: a settle source's reserve belongs to one
-                # TICKER (see the ownership note above the loop).
-                _ck = _cluster_key(s)
-                _owner = cluster_owner.get(_ck)
-                # a side-wildcard owner (side None) claims the TICKER, either side
-                if _owner is not None and _owner != s.key and \
-                        not (_owner[1] is None and _owner[0] == s.ticker):
-                    _why["cluster_owned"] = _why.get("cluster_owned", 0) + 1
+                # D5′ (Ryan, 2026-07-30: "why shouldn't we make that not a requirement") —
+                # THE CLUSTER BOUND IS DOLLARS, NOT A RUNG COUNT.  The count refusal that
+                # stood here is GONE; the line above it is the whole rule now.
+                #
+                # WHY THE COUNT WAS NEVER THE RISK STATEMENT.  D5's argument was that a second
+                # rung in a cluster spends the first rung's refill reserve.  True — and the
+                # thing that stops it is the reserve itself, which `cluster_cap_usd` already
+                # enforces on the same dollars, per cluster, in the plan AND at the rail.  The
+                # count added nothing to the worst case (one $10 rung and four $2.50 rungs lose
+                # the same $10 if the settle source goes against us) and subtracted a great
+                # deal of earning: MEASURED 2026-07-30, `cluster_owned` refused 270 candidates
+                # per cycle and ALL 76 pass-2 candidates, with ~$234 of the budget idle.
+                # The correlation evidence is what makes the dollar bound sufficient: the
+                # treasury tenors' daily settle directions agreed 9/9 across pairs over 13
+                # settled days, i.e. a cluster really is one bet — so bounding the BET in
+                # dollars is the honest control, and rationing it into one rung is a control on
+                # the wrong variable.  General, not treasury-only: the same arithmetic holds
+                # for any cluster, because the worst case is the cap either way.
+                # WHAT REMAINS OF D5: `cluster_owner` is still tracked, because OWNER
+                # DISPLACEMENT (the accrual-ranked seed withholding above) still needs to know
+                # which rung the cluster's accrued credit belongs to.  Only the REFUSAL is
+                # retired, never the bookkeeping.
+                # MIRROR (many small rungs ↔ one big one): many small rungs inside the same
+                # dollar cap diversify MARKET risk within the settle source and cost more
+                # refills; one big rung concentrates it and refills cheaply.  The cliff pass
+                # already prefers fewer/bigger where the budget cannot fund both, so the plan
+                # keeps that preference without needing a hard count.
+                # What DID survive is the accrual-ranked recall — see `recalled` above.
+                if s.key in recalled:
+                    _why["owner_recalled"] = _why.get("owner_recalled", 0) + 1
                     continue
+                _ck = _cluster_key(s)
                 # D11 — the plan-side variance test, charged at the CLUSTER RESERVE: a funded
                 # rung's cluster can grow to (1+refills) lots through the requoter's re-posts
                 # without ever passing this loop again, so the conservative charge is what the
@@ -1018,11 +1054,15 @@ def allocate(slots, budget_usd, r_star, caps=None, floor_rate=C.ADMIT_FLOOR_RATE
             return False, "already_funded"
         dq = q_target - q_now
         cost = dq * sl.p
+        if sl.key in recalled:
+            return False, "owner_recalled"                # accrual seniority, not a count
         ck = _cluster_key(sl)
-        owner = cluster_owner.get(ck)
-        if owner is not None and owner != sl.key and \
-                not (owner[1] is None and owner[0] == sl.ticker):
-            return False, "cluster_owned"                     # D5
+        # D5′ 2026-07-30 — the one-rung-per-cluster refusal is RETIRED here too, and this is
+        # where it bit hardest: MEASURED, `pass2_refused` reported cluster_owned as the
+        # blocking term for ALL 76 candidates while ~$234 sat idle, i.e. the sweep built to
+        # spend idle capital was refusing every single rung on a COUNT while the DOLLAR cap
+        # below had room.  The cluster cap is the bound; the count was a second, cruder copy
+        # of it that could only ever be more restrictive.
         if q_target * sl.p > float(lot_cap_usd) + 1e-9:
             return False, "lot_cap"
         if per_market.get(sl.ticker, 0.0) + cost > market_cap_usd(sl, budget_usd, caps) + 1e-9:

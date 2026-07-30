@@ -689,12 +689,23 @@ class TestPass2IdleCapitalSweep(LipTestCase):
         self.assertEqual(rows[-1]["candidates"], 1)
         self.assertEqual(rows[-1]["reasons"], {"lot_cap": 1})
 
-    def test_ONE_RUNG_PER_CLUSTER_still_holds_in_pass_2(self):
-        """D5: KXFAT-1 and KXFAT-2 are one settle source, so one of them gets the reserve."""
+    def test_the_cluster_DOLLARS_bound_pass_2_not_a_rung_COUNT(self):
+        """REWRITTEN 2026-07-30 — was `test_ONE_RUNG_PER_CLUSTER_still_holds_in_pass_2`.
+        D5′: a settle source is bounded by its DOLLARS.  Two $8 lots do not fit a $10
+        reserve, so exactly one lands — for the dollar reason, provably, since raising the
+        reserve to $20 lands both.  MEASURED motive: `pass2_refused` reported cluster_owned
+        as the blocking term for ALL 76 candidates while ~$234 sat idle."""
         a, spent, _ = self._run([self.fat("KXFAT-1"), self.fat("KXFAT-2")], 300.0)
-        funded = {k: q for k, q in a.items() if q > 0}
-        self.assertEqual(len(funded), 1, funded)
+        self.assertEqual(sum(1 for q in a.values() if q > 0), 1)
         self.assertAlmostEqual(spent, 8.00, places=9)
+
+    def test_raising_the_cluster_DOLLARS_lands_both_rungs_of_one_cluster(self):
+        a, spent, _ = self._run([self.fat("KXFAT-1"), self.fat("KXFAT-2")], 300.0,
+                                cluster_cap_usd=20.0)
+        self.assertEqual(sum(1 for q in a.values() if q > 0), 2)
+        self.assertAlmostEqual(spent, 16.00, places=9)
+        rows = self.logs_of("pass2_funded")
+        self.assertEqual(rows[0]["rungs"], 2)
 
     def test_the_plan_side_VARIANCE_test_still_refuses_in_pass_2(self):
         """D11 is unchanged by pass 2 because it was ALREADY charging the cluster reserve —
