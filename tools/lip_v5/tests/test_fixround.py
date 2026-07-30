@@ -66,9 +66,12 @@ class TestFakeFidelity(LipTestCase):
                             "price": "0.0200", "client_order_id": "v5-x-1"})
         oid = resp["order_id"]          # FLAT: the real wire shape
         row = ex.take(oid, 10, now=NOW)
-        self.assertEqual(row["side"], "yes")
-        self.assertEqual(row["action"], "buy")
-        self.assertEqual(row["yes_price"], 2)              # CENTS, the real unit
+        # the 2026-07-30 wire dialect (captured_fills_20260730.json): fractional
+        # dollar-string count_fp, *_price_dollars, book_side, fee_cost
+        self.assertEqual(row["book_side"], "bid")
+        self.assertEqual(row["count_fp"], "10.00")
+        self.assertEqual(row["yes_price_dollars"], "0.0200")
+        self.assertEqual(row["fee_cost"], "0.000000")
         self.assertTrue(row["trade_id"])
         self.assertNotIn(oid, ex.resting)                  # gone: only fills can teach it
         self.assertEqual(ex.positions()[1]["market_positions"][0]["position"], 10.0)

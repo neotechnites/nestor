@@ -247,18 +247,30 @@ class FakeExchange(object):
         body["count"] = float(body.get("count", 0)) - n
         if body["count"] <= 1e-9:
             self.resting.pop(order_id, None)
-        yes_price_c = int(round(float(body.get("price", 0)) * 100))
-        # The real payload speaks the YES axis with a direction: a filled bid reads
-        # (yes, buy), a filled ask (yes, sell) — v4's prod-proven normalize consumes exactly
-        # this pair (its B3 note: "a fills row carrying side='yes'...").
-        action = "buy" if body.get("side") == "bid" else "sell"
+        # THE 2026-07-30 WIRE SHAPE, verbatim from captured_fills_20260730.json (a real
+        # maker fill on KXUST10AD): fractional dollar-string `count_fp`, `*_price_dollars`,
+        # `book_side`, `fee_cost`.  The old fixture spoke `count`/`yes_price` cents — and the
+        # parser that consumed them read every REAL fill as ZERO contracts (found live,
+        # first fill of the note-52 deploy).  The fake emits ONLY the wire's dialect so a
+        # parser regression to the old fields fails the suite instead of the account.
+        yes_p = float(body.get("price", 0))
+        our_side = body.get("side")                       # "bid"/"ask", our order's side
         row = {"trade_id": trade_id or ("t-%d" % (len(self.fills_rows) + 1)),
-               "order_id": order_id, "ticker": body.get("ticker"),
-               "side": "yes", "action": action, "count": n,
-               "yes_price": yes_price_c, "no_price": 100 - yes_price_c,
-               "is_taker": False, "created_time": now}
+               "fill_id": trade_id or ("t-%d" % (len(self.fills_rows) + 1)),
+               "order_id": order_id,
+               "ticker": body.get("ticker"), "market_ticker": body.get("ticker"),
+               "book_side": our_side,
+               "side": "yes" if our_side == "bid" else "no",
+               "outcome_side": "yes" if our_side == "bid" else "no",
+               "action": "buy" if our_side == "bid" else "sell",
+               "count_fp": "%.2f" % n,
+               "yes_price_dollars": "%.4f" % yes_p,
+               "no_price_dollars": "%.4f" % (1.0 - yes_p),
+               "fee_cost": "0.000000",
+               "is_taker": False, "created_time": now,
+               "ts": int(now or 0), "subaccount_number": 0}
         self.fills_rows.append(row)
-        sign = 1 if action == "buy" else -1
+        sign = 1 if our_side == "bid" else -1
         tk = body.get("ticker")
         for p in self._positions:
             if p.get("ticker") == tk:

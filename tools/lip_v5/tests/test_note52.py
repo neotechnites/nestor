@@ -230,3 +230,69 @@ class TestD12PeriodLock(LipTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRealWireFills(LipTestCase):
+    """The 2026-07-30 wire dialect, tested against the CAPTURED payload verbatim
+    (captured_fills_20260730.json, a real maker fill on the note-52 deploy's first order).
+    The old parser read `count` (gone) and booked every real fill as ZERO contracts —
+    inventory invisible to the caps, the shed, the variance rail AND the cash feed, which
+    under-declared and halted nestor's divergence breaker."""
+
+    ROW = {"action": "sell", "book_side": "ask", "count_fp": "2.97",
+           "created_time": "2026-07-30T04:39:40.458649Z", "fee_cost": "0.000000",
+           "fill_id": "9a499d1c-c837-67c7-7c55-67fe7c848451",
+           "is_taker": False, "market_ticker": "KXUST10AD-26JUL30-T4.73",
+           "no_price_dollars": "0.8700",
+           "order_id": "849c8d28-6072-4fdd-8985-affa0f5ca7a1",
+           "outcome_side": "no", "side": "no", "subaccount_number": 0,
+           "ticker": "KXUST10AD-26JUL30-T4.73",
+           "trade_id": "9a499d1c-c837-67c7-7c55-67fe7c848451",
+           "ts": 1785386380, "yes_price_dollars": "0.1300"}
+
+    def _maker(self):
+        from .test_engine import EngineCase
+        class T(EngineCase):
+            def runTest(self):
+                pass
+        t = T()
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        return t.maker()
+
+    def test_the_captured_row_books_fractional_contracts_at_the_dollar_price(self):
+        m = self._maker()
+        self.assertTrue(m.book_fill_row(dict(self.ROW), NOW))
+        pos = m.positions["KXUST10AD-26JUL30-T4.73"]
+        self.assertAlmostEqual(pos["no"], 2.97, places=6)   # ask-shaped: acquires NO
+        self.assertAlmostEqual(m.position_cost["KXUST10AD-26JUL30-T4.73"],
+                               2.97 * 0.87, places=6)       # collateral at 1−0.13
+        self.assertAlmostEqual(m.cash.fees_paid, 0.0, places=9)
+
+    def test_a_charged_fee_is_booked_from_fee_cost(self):
+        m = self._maker()
+        row = dict(self.ROW, fee_cost="0.160000", trade_id="fee-1", fill_id="fee-1")
+        self.assertTrue(m.book_fill_row(row, NOW))
+        self.assertAlmostEqual(m.cash.fees_paid, 0.16, places=9)
+
+    def test_a_zero_count_row_is_a_non_event_and_does_not_consume_its_id(self):
+        """The heal path depends on this: the ids the broken parser saw at count 0 must
+        stay bookable when the same fills are re-read with true counts."""
+        m = self._maker()
+        z = dict(self.ROW, count_fp="0.00")
+        self.assertFalse(m.book_fill_row(z, NOW))
+        self.assertTrue(m.book_fill_row(dict(self.ROW), NOW),
+                        "the true reading of the same fill_id must still book")
+
+    def test_dedupe_still_holds_on_the_true_row(self):
+        m = self._maker()
+        self.assertTrue(m.book_fill_row(dict(self.ROW), NOW))
+        self.assertFalse(m.book_fill_row(dict(self.ROW), NOW))
+
+    def test_book_side_attributes_an_orderless_row(self):
+        """Crash-gap case: no order in our books; `book_side` names our side directly."""
+        m = self._maker()
+        row = dict(self.ROW, order_id="unknown-1", trade_id="bs-1", fill_id="bs-1")
+        self.assertTrue(m.book_fill_row(row, NOW))
+        self.assertAlmostEqual(
+            m.positions["KXUST10AD-26JUL30-T4.73"]["no"], 2.97, places=6)

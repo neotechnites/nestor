@@ -535,7 +535,7 @@ class Maker(object):
         self.rollback.note_fill(ticker, leg, now)
         self.ledger.write("fill_obs", ticker=ticker, side=side, count=count,
                           price_c=int(round(price * 100)), fill_id=fill_id,
-                          order_id=order_id)
+                          order_id=order_id, fee_usd=round(float(fee_usd), 6))
         return True
 
     def pay_fee(self, usd):
@@ -563,34 +563,68 @@ class Maker(object):
         tell them apart.  Attribution order: the ORDER the row names (its side and
         `fully_closing` are authoritative), else the position (enough held ⇒ closing —
         v4's apply_fill netting, the crash-gap case)."""
-        leg, sign = cutover.normalize_fill(row.get("side"), row.get("action", "buy"))
-        count = float(row.get("count", 0))
+        # ── THE 2026-07-30 WIRE SHAPE, from a CAPTURED live payload (contact doctrine,
+        # note 45: fields are the wire's to declare).  `captured_fills_20260730.json`:
+        #   count_fp: "1.03"            — FRACTIONAL contracts, dollar-string.  The old
+        #                                 `count` int is GONE; parsing it read every fill as
+        #                                 ZERO, so inventory was invisible to the caps, the
+        #                                 shed and the variance rail (found live, first fill
+        #                                 of the note-52 deploy).
+        #   yes_price_dollars: "0.1300" — replaces `yes_price` cents.
+        #   book_side: "bid"/"ask"      — OUR side of the book, directly.
+        #   fee_cost: "0.000000"        — the ACTUAL charged fee.  Measured on our first two
+        #                                 maker fills: $0.00 — the UI's per-ticket fee column
+        #                                 is a projection, not a charge.  When the wire says
+        #                                 we paid, we book it; per-venue fee evidence is how
+        #                                 "maker is free" stops being a generalization.
+        # Old field names remain as fallbacks so v4-era ledger replays still parse.
+        cfp = row.get("count_fp")
+        count = float(cfp) if cfp is not None else float(row.get("count", 0))
+        if count <= 0:
+            # A zero-count row is a NON-EVENT and must not consume its fill_id: the old
+            # parser read count_fp rows as 0, and booking them would have marked the ids
+            # seen — blocking the TRUE booking of the same fills forever.
+            return False
+        ypd = row.get("yes_price_dollars")
         yp = row.get("yes_price")
-        price = (float(yp) / 100.0) if yp is not None else float(row.get("price", 0))
-        # One YES-axis fact: was this execution bid-shaped (acquires YES) or ask-shaped
-        # (acquires NO / sheds YES)?  (yes, sell) and (no, buy) are the same ask-shaped act.
-        ask_like = (leg == "bid" and sign < 0) or (leg == "ask" and sign > 0)
-        ticker = row.get("ticker")
+        if ypd is not None:
+            price = float(ypd)
+        elif yp is not None:
+            price = float(yp) / 100.0
+        else:
+            price = float(row.get("price", 0))
+        ticker = row.get("ticker") or row.get("market_ticker")
         o = self.orders.get(str(row.get("order_id"))) if row.get("order_id") is not None \
             else None
+        bs = row.get("book_side")
         if o is not None:
             side, closing = o["side"], bool(o.get("fully_closing"))
         else:
+            if bs in ("bid", "ask"):
+                ask_like = (bs == "ask")
+            else:
+                # legacy derivation: (yes, sell) and (no, buy) are the same ask-shaped act
+                leg_, sign_ = cutover.normalize_fill(row.get("side"),
+                                                     row.get("action", "buy"))
+                ask_like = (leg_ == "bid" and sign_ < 0) or (leg_ == "ask" and sign_ > 0)
             side = "ask" if ask_like else "bid"
             pos = self.positions.get(ticker) or {}
             held = pos.get("yes", 0.0) if ask_like else pos.get("no", 0.0)
             closing = held >= count - 1e-9
-        # Fee-bearing event (charter B): a maker fill is free; `is_taker` means we crossed
-        # (should be unreachable under STP, but if the exchange says we paid, we book it —
-        # a fee we refuse to book is a silent divergence in the cash feed).
-        fee = cutover.taker_fee_usd(count, price) if row.get("is_taker") else 0.0
+        # Fee: the wire's own `fee_cost` when present (the truth, maker or taker); the
+        # is_taker formula only as a legacy fallback.
+        fc = row.get("fee_cost")
+        if fc is not None:
+            fee = float(fc)
+        else:
+            fee = cutover.taker_fee_usd(count, price) if row.get("is_taker") else 0.0
         # v4 NEW-3: the fallback key carries order_id, price, time AND the enumeration
         # index — a keyless 5+5 split at one price must not collide (colliding keys DROP
         # the second fill: the naked-short direction).
         fid = row.get("trade_id") or row.get("fill_id") or row.get("id")
         fallback = "syn-%s|%s|%s|%s|%s|%s|%s" % (
             row.get("order_id"), ticker, row.get("side"), count,
-            yp if yp is not None else row.get("price"), row.get("created_time"),
+            price, row.get("created_time"),
             "?" if idx is None else int(idx))
         return self.book_fill(ticker, side, count, price, now,
                               fill_id=fid if fid else fallback, closing=closing,
