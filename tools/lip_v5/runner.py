@@ -329,7 +329,12 @@ class Runner(object):
 
         # (2) scan → classify → slots.  Each is cadence-gated and rate-laned inside.
         programs = self.scanner.scan(self.m.ex, self.m.bucket, now)
-        self.classifier.sweep(self.m.ex, self.m.bucket, programs, now, books=books)
+        # `accrued` (per-program banked dollars, SF-4c, polled one line above) ranks the
+        # read set: a market carrying accrual is among the cheapest finishes on the board
+        # and must always make classify's cut (Ryan, 2026-07-30: gas 4.095 held $0.63 and
+        # never got a book read while its $1.00-need sibling took the cluster seat).
+        self.classifier.sweep(self.m.ex, self.m.bucket, programs, now, books=books,
+                              accrued=self.m.accrued)
 
         # (2b) BLOCKER-3: the book_poll lane — held/ordered markets ALWAYS, best-ranked
         # rest up to breadth, refreshing the classification so the requoter's price

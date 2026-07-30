@@ -242,7 +242,7 @@ class Classifier:
         t = self.last.get(ticker)
         return t is None or (float(now) - t) >= self.refresh_s
 
-    def candidates(self, programs, now):
+    def candidates(self, programs, now, accrued=None):
         """Top-N markets by ρ, with EVERY request-free exclusion applied first.
 
         Denied series were already excluded here.  The window ones were not, and that was the
@@ -279,6 +279,18 @@ class Classifier:
             # `test_venue_floor_uses_the_rescue_target_not_the_entry_floor` catches it).  The
             # two exclusions above are accrual-INDEPENDENT and unambiguous, and they are the
             # ones that were costing the whole budget.
+            # ── ACCRUAL RANKS THE READ SET (Ryan, 2026-07-30 night). ──────────────────────
+            # The old comment above says "accrual is unknown until build_slots" — TRUE when
+            # written, FALSE since SF-4c: the estimates feed carries per-PROGRAM accrued
+            # dollars request-free, keyed to exactly these program objects.  Measured live
+            # within an hour of the law going on: gas 4.095 held $0.63 banked (need $0.37,
+            # the cheapest finish in its cluster) and NEVER GOT A BOOK READ, because this
+            # ranking saw two identical rhos and broke the tie by feed order toward 4.100
+            # (need $1.00).  A market carrying banked accrual is by definition among the
+            # cheapest finishes on the board; it must always make the read set.
+            acc = float((accrued or {}).get(prog.get("program_id")) or 0.0)
+            _tgt, _h = alloc.law_target_usd(hours_left)
+            need_ref = max(0.0, _tgt - acc)
             for tk in prog["tickers"]:
                 if C.series_denied(tk):
                     continue
@@ -291,7 +303,7 @@ class Classifier:
                 if known_close is not None and \
                         (float(known_close) - float(now)) / 3600.0 > C.SETTLE_HORIZON_H:
                     continue
-                rows.append((prog["rho"], tk, prog))
+                rows.append((prog["rho"], tk, prog, need_ref))
         # RANK BY CLUSTER DIVERSITY, NOT BY RAW POOL.  Sorting on rho alone loads the whole
         # classify budget onto the biggest cluster: measured live, the top of the board is
         # treasury rungs, all five tenors are ONE cluster sharing ONE $75 cap, and the sweep
@@ -308,12 +320,16 @@ class Classifier:
         # pass and the caps still decide sizing, and a cluster with nothing worth funding
         # simply gets none.  It spreads DISCOVERY, which is free.
         by_cluster = {}
-        for rho, tk, prog in rows:
-            by_cluster.setdefault(CL.cluster_of(tk), []).append((rho, tk, prog))
+        for rho, tk, prog, need_ref in rows:
+            by_cluster.setdefault(CL.cluster_of(tk), []).append((rho, tk, prog, need_ref))
+        # WITHIN a cluster: cheapest remaining need first (banked accrual makes a market the
+        # cheapest finish; rho breaks ties exactly as before when nothing is banked).
         for lst in by_cluster.values():
-            lst.sort(key=lambda r: (-r[0], str(r[1])))
-        # clusters themselves ordered by their best market, so the strongest lead the rounds
-        order = sorted(by_cluster, key=lambda c: (-by_cluster[c][0][0], c))
+            lst.sort(key=lambda r: (r[3], -r[0], str(r[1])))
+        # clusters themselves ordered by their best market — best now means cheapest-need
+        # first, strongest pool second — so the cheapest finishes lead the rounds
+        order = sorted(by_cluster,
+                       key=lambda c: (by_cluster[c][0][3], -by_cluster[c][0][0], c))
         out, depth = [], 0
         while len(out) < self.max_markets:
             took = False
@@ -412,7 +428,7 @@ class Classifier:
     def p6_ok(self, ticker):
         return self.p6.get(ticker, True)      # unknown admits; see learn_p6's mirror
 
-    def sweep(self, ex, bucket, programs, now, books=None):
+    def sweep(self, ex, bucket, programs, now, books=None, accrued=None):
         """One pass.  Returns the number of markets (re)classified."""
         books = books or {}
         n = 0
@@ -423,11 +439,11 @@ class Classifier:
         # classify first — the quoting set — then unknowns in soonest-ending order, because a
         # program that ends tomorrow is the best prior that its market settles tomorrow (the
         # dailies), and a 5-month program can wait its turn to be refused.
-        rows = sorted(self.candidates(programs, now),
+        rows = sorted(self.candidates(programs, now, accrued=accrued),
                       key=lambda r: (r[1] not in self.close_ts,
                                      float(r[2].get("end_ts") or 0)))
         complete = True
-        for rho, ticker, program in rows:
+        for rho, ticker, program, _need_ref in rows:
             self.learn_close(ex, bucket, ticker, now)
             self.learn_p6(ex, bucket, ticker, now)
             if not self.due(ticker, now):

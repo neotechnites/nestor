@@ -1045,7 +1045,7 @@ class TestClassifyDiscoversBreadth(LipTestCase):
     def test_every_cluster_is_reached_before_one_is_exhausted(self):
         progs, now = self._programs()
         c = scan.Classifier(max_markets=5)
-        picked = [tk for _, tk, _ in c.candidates(progs, now)]
+        picked = [tk for _, tk, _, _ in c.candidates(progs, now)]
         clusters = {t.split("-")[0] for t in picked}
         self.assertIn("KXAAAGASD", clusters, "a distinct cluster must be discovered early")
         self.assertIn("KXTRUEV", clusters, "and so must the third")
@@ -1054,6 +1054,38 @@ class TestClassifyDiscoversBreadth(LipTestCase):
     def test_the_strongest_cluster_still_leads(self):
         progs, now = self._programs()
         c = scan.Classifier(max_markets=5)
-        picked = [tk for _, tk, _ in c.candidates(progs, now)]
+        picked = [tk for _, tk, _, _ in c.candidates(progs, now)]
         self.assertTrue(picked[0].startswith("KXUST10AD"),
                         "within the rounds, the richest cluster still goes first")
+
+    def test_ACCRUAL_ranks_the_read_set(self):
+        """Ryan, 2026-07-30 night: gas 4.095 held $0.63 banked (need $0.37, the cheapest
+        finish in its cluster) and NEVER GOT A BOOK READ — this ranking saw two identical
+        rhos and broke the tie by feed order toward the $1.00-need sibling.  The estimates
+        feed (SF-4c) knows per-program accrual request-free; a market carrying banked
+        credit must always make the read set, first in its cluster."""
+        now = 1785268000.0
+        mk = lambda pid, tk: {"program_id": pid, "series": tk.split("-")[0],
+                              "tickers": [tk], "period_reward": 1000000,
+                              "start_ts": now - 3600, "end_ts": now + 36000,
+                              "window_h": 11.0, "rho": 5.0, "target_size": 1000.0,
+                              "paid_out": False}
+        # identical rho, identical window, same cluster: only accrual separates them —
+        # and the plain-ticker tie-break would put 4.095 SECOND ("4.100" < "4.095" is
+        # False: lexicographic order favors 4.095... so pin the tie-break the hard way:
+        # give the accrued market the LOSING ticker string).
+        progs = [mk("pa", "KXAAAGASD-26JUL31-4.095"), mk("pb", "KXAAAGASD-26JUL31-4.100")]
+        c = scan.Classifier(max_markets=2)
+        # without accrual: lexicographic tie-break, 4.095 first (control)
+        plain = [tk for _, tk, _, _ in c.candidates(progs, now)]
+        self.assertEqual(plain[0], "KXAAAGASD-26JUL31-4.095")
+        # with $0.63 banked on 4.100 (the lexicographic LOSER), it must lead the cluster
+        ranked = [tk for _, tk, _, _ in c.candidates(progs, now, accrued={"pb": 0.63})]
+        self.assertEqual(ranked[0], "KXAAAGASD-26JUL31-4.100",
+                         "banked accrual must beat the tie-break: it is the cheapest finish")
+        # and a cluster with banked accrual leads OTHER equal clusters in the rounds
+        progs2 = progs + [mk("pc", "KXTRUEV-26JUL30-T1")]
+        lead = [tk for _, tk, _, _ in scan.Classifier(max_markets=3).candidates(
+            progs2, now, accrued={"pc": 0.63})][0]
+        self.assertEqual(lead, "KXTRUEV-26JUL30-T1",
+                         "the cheapest-need cluster leads the read rounds")
