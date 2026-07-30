@@ -1373,6 +1373,12 @@ SETTLEMENT_CASH_TIMEOUT_S = 6 * 3600.0       # spec §5.2a — ≈9× the 41-min
                                              # is the halt-nestor direction and is forbidden;
                                              # late only makes v5 look poorer than it is, so
                                              # the timeout pages instead of releasing.
+# THE SETTLED WORD, verbatim from the exchange's market-status vocabulary.  A market past
+# trading walks closed → determined (outcome fixed, payout pending) → settled/finalized
+# (paid).  Settlement handling keys on membership here and NEVER on a clock or a close_time:
+# a market we merely believe has resolved is exactly the naked-exposure case (see
+# engine.place_context's derivation, measured live on the 26JUL28 treasury rungs).
+MARKET_SETTLED_STATUSES = ("determined", "settled", "finalized")
 CASH_MODE_SHARED = "shared"                  # spec §5.2
 CASH_MODE_SUBACCOUNT = "subaccount"          # spec §5.5
 # MIRROR (v5 stops PUBLISHING the feed ↔ nestor stops CONSUMING it): v5 reads nestor's

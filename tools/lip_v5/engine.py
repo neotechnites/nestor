@@ -122,10 +122,16 @@ class Maker(object):
         self.readings_line = 0               # SF-4: v5_readings.jsonl lines consumed
         self._readings_stat = None           # (mtime, size) — skip unchanged files
         self.close_cache = {}                # ticker -> close_ts (halted closing pass)
-        self.resolved = set()
-        self.retired_tickers = set()         # windows the scanner refuses (too long, closed)                # tickers whose market is determined/settled:
-                                             # outcome fixed, no variance left, so they hold
-                                             # no CLUSTER risk — only pending cash
+        self.resolved = set()                # tickers whose market is determined/settled/
+                                             # finalized: outcome fixed, no variance left, so
+                                             # they hold no CLUSTER risk and never enter the
+                                             # divergence path.  Fed ONLY by the exchange's
+                                             # own word (settlements rows, market status);
+                                             # rebuilt on restart from `settlement` ledger
+                                             # rows, and doubling as the dedupe against the
+                                             # settlements endpoint, which returns the FULL
+                                             # tape every poll.
+        self.retired_tickers = set()         # windows the scanner refuses (too long, closed)
 
     # =========================================================================================
     # STARTUP
@@ -1204,23 +1210,83 @@ class Maker(object):
             # count_fp; found from Ryan's portfolio screenshot.
             _pfp = row.get("position_fp")
             exch[row.get("ticker")] = float(_pfp) if _pfp is not None                 else float(row.get("position", 0))
+        # ── SETTLEMENTS BEFORE THE TRUE-UP.  A settled ticker's positions row (if listed
+        # at all) reads 0 — exactly the shape of a full true-down — and judging it there
+        # first would zero the books SILENTLY: `cash.inventory` gets n=0, `inventory_basis`
+        # drops with NO realized P&L booked, and `delta_dollars` rises by the basis before
+        # any cash is confirmed — publishing above the truth, the one forbidden direction
+        # (T-C2), on every losing settlement.  The settlements read is the exchange's own
+        # settlement record and it carries the PAID amount, so it outranks the positions
+        # delta it explains; process it first and the divergence loop below never sees a
+        # settled ticker as a divergence.
+        ss, srows = self.ex.settlements()
+        self.note_http(ss, now)                               # SF-2
+        if ss == 200:
+            for row in (srows.get("settlements") or []):
+                tk = row.get("ticker")
+                if not tk:
+                    continue
+                # `revenue` is CENTS on the wire.  A row MISSING the field entirely is a
+                # settlement signal with no cash statement: it resolves (the market IS
+                # settled) but confirms nothing — settle_ticker's paid=None path.
+                rev = row.get("revenue")
+                self.settle_ticker(tk, None if rev is None else float(rev) / 100.0, now,
+                                   src="settlements_row")
         # ── THE TRUE-UP (Ryan, 2026-07-30: "probe every minute and true up the ledger").
         # The exchange's read of our positions is the truth; the only question is which
         # DIRECTION the divergence runs.  DOWN (they show less than we book) is the safe
-        # direction — a hand cancel, a hand sale, a settlement — and is ADOPTED silently:
-        # freezing on it is what made hand intervention "just fucking halt and explode".
+        # direction — a hand cancel, a hand sale — and is ADOPTED silently: freezing on it
+        # is what made hand intervention "just fucking halt and explode".
         # UP (they show more than we book) is an unexplained acquisition — the dangerous
         # direction — and still freezes and pages.  ONLY tickers the response explicitly
         # lists are judged: truing-down on ABSENCE would zero real inventory on any partial
         # or paged response (and did exactly that to replay-held books in the fixtures).
-        # Fully-settled tickers leave via the settlements path below instead.
+        # Settled tickers leave via the settlement path above/below, never through here.
         for t in exch:
+            if t in self.resolved:
+                # A DETERMINED MARKET IS NOT A DIVERGENCE.  Its exit is the settlement
+                # path: freezing it pages a human about the exchange doing its job, and
+                # truing it down leaves basis behind (see the ordering note above).
+                continue
             n = exch.get(t, 0.0)
             ours = self.positions.get(t, {})
             our_net = ours.get("yes", 0.0) - ours.get("no", 0.0)
             if abs(our_net - n) <= 0.5:
                 continue
             if abs(n) < abs(our_net) and (n == 0 or (n > 0) == (our_net > 0)):
+                if n == 0:
+                    # A POSITION GONE TO ZERO WITH NO OBSERVED CLOSING FILL IS EITHER A
+                    # HAND SALE OR A SETTLEMENT, and the exchange can say which: ask the
+                    # market's own status (never a clock — a market we merely believe has
+                    # resolved is the naked-exposure case).  Settled ⇒ the settlement
+                    # path: basis moves to settled_awaiting_payout (budget frees, the
+                    # published cash stays consumed — T-C2), the books close coherently,
+                    # and the cash release waits for the settlements row, the one exact
+                    # release path in shared mode.  The fills-poll case cannot land here:
+                    # reconcile runs after poll_fills_due, so an observed closing fill has
+                    # already trued the books and there is no divergence to judge.
+                    settled, result = self.market_settled(t, now)
+                    if settled:
+                        inv = self.cash.inventory.get(t) or {}
+                        n_held = abs(float(inv.get("n", 0.0)))
+                        # The held LEG is the book's fact (`our_net` sign) — the cash
+                        # feed's `inventory[n]` is a contract COUNT booked positive for
+                        # both legs by book_fill/adopt, so its sign says nothing here.
+                        held_leg = "yes" if our_net > 0 else "no"
+                        if result in ("yes", "no"):
+                            # The exchange named the outcome: a matching leg pays $1.00 a
+                            # contract, the other $0.00 — exact, not estimated.
+                            exp = n_held * (1.0 if result == held_leg else 0.0)
+                        else:
+                            # No result field: n × $1.00, the inventory_settle_max
+                            # convention — the LARGEST credit that could land.  Over-
+                            # stating widens the positive band only and makes the
+                            # balance-path release HARDER, both the safe side.
+                            exp = n_held * 1.00
+                        self.settle_ticker(t, None, now,
+                                           src="position_zero_determined",
+                                           expected_usd=exp)
+                        continue
                 leg = "yes" if our_net > 0 else "no"
                 new_leg = abs(n) if (n > 0) == (our_net > 0) or n == 0 else 0.0
                 pos = self.positions.setdefault(t, {"yes": 0.0, "no": 0.0})
@@ -1264,16 +1330,116 @@ class Maker(object):
         self.note_http(sb, now)                               # SF-2
         if sb == 200:
             self.cash.observe_balance(float(bal.get("balance", 0)) / 100.0, now)
-        ss, srows = self.ex.settlements()
-        self.note_http(ss, now)                               # SF-2
-        if ss == 200:
-            for row in (srows.get("settlements") or []):
-                self.cash.settlement_row(row.get("ticker"), float(row.get("revenue", 0)) / 100.0)
-                # The exchange has SETTLED it: outcome fixed, cash pending.  It leaves the
-                # cluster's risk budget (see place_context) but stays in the cash feed.
-                self.resolved.add(row.get("ticker"))
         return exch
 
+    # =========================================================================================
+    # SETTLEMENT RELEASE — the exit every position that is not shed takes.  Daily treasuries
+    # settle EVERY AFTERNOON; without this the basis stayed in `inventory_basis` forever,
+    # the budget (`ceiling − inventory_basis − resting`) starved on capital Kalshi had
+    # already paid back, and `cashfeed.resolve()` had zero call sites.
+    # =========================================================================================
+    def market_settled(self, ticker, now):
+        """One market read: (settled, result).  `settled` is TRUE only for the exchange's
+        own settled word (config.MARKET_SETTLED_STATUSES) — an error, a 404 or any other
+        status is (False, None), because settlement inferred from anything but the
+        exchange's statement is the naked-exposure case.  Costs one public read on the
+        verify lane's admit that reconcile already holds, only ever asked for the rare
+        held-position-went-to-zero transition."""
+        status, body = self.ex.market(ticker)
+        self.note_http(status, now)                           # SF-2
+        if status != 200:
+            return False, None
+        mkt = (body or {}).get("market") or body or {}
+        st = str(mkt.get("status") or "").lower()
+        result = str(mkt.get("result") or "").lower()
+        return (st in C.MARKET_SETTLED_STATUSES), (result if result in ("yes", "no")
+                                                   else None)
+
+    def settle_ticker(self, ticker, paid_usd, now, src, expected_usd=None):
+        """The ONE settlement entry point, from either signal the exchange gives us — a
+        `/portfolio/settlements` row (paid amount known, possibly an explicit zero) or a
+        determined market whose position row went to zero (paid unknown ⇒ `paid_usd=None`).
+        Idempotent against the settlements endpoint returning the FULL tape every poll:
+        with no inventory and no pending claim the call is a no-op beyond `resolved`.
+
+        Two steps, and each may fire without the other:
+
+          RESOLVE (inventory held): the basis leaves `cash.inventory` for
+          `settled_awaiting_payout` — the BUDGET frees NOW (allocation reads
+          `ceiling − inventory_basis`) while `delta_dollars` still counts the basis as
+          consumed (T-C2: the published number moves only on cash confirmation).  The
+          engine books close coherently in the same step (positions/entry_basis/
+          position_cost), the cluster stops charging it (`resolved`), and a `settlement`
+          ledger row (released=False) makes replay rebuild exactly this state.
+
+          RELEASE (pending claim + a cash statement): a paid amount > 0 is §5.2a's exact
+          confirmation (`settlement_row`); an explicit zero is a LOST position with
+          nothing to wait for (`settlement_zero`).  Realized P&L = payout − basis lands in
+          `cash.realized_pnl` — the drawdown guard's equity term, so a winning settlement
+          RAISES equity and can never read as a loss — and the released `settlement` row
+          (released=True) carries it for replay.  `paid_usd=None` releases nothing: no
+          cash statement, no release, the 6 h `settlement_cash_unconfirmed` page bounds
+          the wait.
+        """
+        inv = self.cash.inventory.get(ticker)
+        held = inv is not None and abs(float(inv.get("n", 0.0))) > 1e-9
+        changed = False
+        if held:
+            n_held = abs(float(inv.get("n", 0.0)))
+            expected = float(expected_usd) if expected_usd is not None else \
+                (float(paid_usd) if paid_usd is not None else n_held * 1.00)
+            basis = self.cash.resolve(ticker, expected, now)
+            self._close_settled_position(ticker)
+            self.ledger.write("settlement", ticker=ticker, n=n_held,
+                              basis_usd=round(basis, 6),
+                              expected_usd=round(expected, 6), released=False, src=src)
+            R.log("settlement_resolved", ticker=ticker, n=n_held,
+                  basis_usd=round(basis, 6), expected_usd=round(expected, 6), src=src)
+            changed = True
+        p = self.cash.pending.get(ticker)
+        if p is not None and paid_usd is not None:
+            paid = float(paid_usd)
+            basis_p = p.basis_usd
+            released = self.cash.settlement_row(ticker, paid) if paid > 0 \
+                else self.cash.settlement_zero(ticker)
+            if released:
+                realized = paid - basis_p
+                self.ledger.write("settlement", ticker=ticker, paid_usd=round(paid, 6),
+                                  realized_usd=round(realized, 6), released=True, src=src)
+                R.log("settlement_released", ticker=ticker, paid_usd=round(paid, 6),
+                      realized_usd=round(realized, 6), src=src)
+                changed = True
+        if changed:
+            self.resolved.add(ticker)
+            self.publisher.publish(now)
+        else:
+            # History (the tape replays every poll) or someone else's settlement in the
+            # shared account: remember the settled word — it keeps the divergence loop and
+            # this dedupe honest — but write and publish nothing.
+            self.resolved.add(ticker)
+        return changed
+
+    def _close_settled_position(self, ticker):
+        """The engine-book half of RESOLVE, kept in one place so positions, entry_basis
+        and position_cost can never part ways: the day stop reads
+        `mark_to_market_pnl(positions, position_cost, …)`, and removing one without the
+        other reads a settled winner as `value 0 − cost basis` — a phantom loss the size
+        of the position, i.e. a day stop tripped by the exchange paying us."""
+        self.positions.pop(ticker, None)
+        self.entry_basis.pop((ticker, "yes"), None)
+        self.entry_basis.pop((ticker, "no"), None)
+        self.position_cost.pop(ticker, None)
+        # SETTLEMENT IS NOT A SHED COMPLETION.  update_shed_targets records hours-to-flat
+        # into L_shed when a shedding ticker reaches flat; a settlement reaching flat is
+        # the exchange's clock, not liquidity evidence, and a sample from it would teach
+        # the carry model that illiquid books exit quickly.  Drop the shed state quietly.
+        self.shed_since.pop(ticker, None)
+        self.shed_held.pop(ticker, None)
+        self.triage_shed.discard(ticker)
+        for key in [k for k in self.shed_target if k[0] == ticker]:
+            self.shed_target.pop(key, None)
+        self.pending_triage = [pt for pt in self.pending_triage
+                               if pt.get("ticker") != ticker]
     def venue_retired(self, ticker):
         """True when a ticker is one the strategy has decided against — denied family, or a
         program whose window the scanner now refuses.  Distinct from "not in this cycle's
