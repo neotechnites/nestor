@@ -450,10 +450,15 @@ def allocate_law(slots, budget_usd, market_spent=None, alloc_cap_usd=None,
             examples.append(ex)
 
     for s in slots:
+        # Structural skips are COUNTED, not silent (2026-07-30 adjudication: the empty-side
+        # slot was priced by scan, handed here with legal_price_exists=False, and vanished
+        # with an empty reasons dict — a silent refusal wearing a type check).
         if s.pinned or s.denied or not s.legal_price_exists:
-            continue                              # structurally unquotable: no arithmetic
+            why["unquotable"] = why.get("unquotable", 0) + 1
+            continue
         if s.hours_left <= 0 or s.hours_to_start > C.PREPOSITION_LEAD_H:
-            continue                              # window over / not yet open: rho is not live
+            why["window"] = why.get("window", 0) + 1
+            continue
         n = law_need(s)
         if n.reason in (DONE, UNREACHABLE):
             skip(n, n.reason)

@@ -850,6 +850,66 @@ class TestTheEmptyBookForkIsResolvedByTheLaw(__import__('unittest').TestCase):
                         "the refusal must carry the walk arithmetic: %s" % ex)
 
 
+class TestTheEmptySideIsLegalAndRefusedInTheNeed(__import__('unittest').TestCase):
+    """G2, grafted 2026-07-30 from the allocator-law branch after adjudication.  build_slots
+    priced the empty side at the band floor but handed the Slot legal_price_exists=False
+    (the classifier reads legality off a best that does not exist), and allocate_law then
+    skipped it SILENTLY — alloc 0, empty reasons.  Now the side is LEGAL and the refusal
+    comes out of the need arithmetic with its numbers, or the walk funds when small."""
+
+    def _empty(self, target_size):
+        import time
+        from lip_v5 import scan
+        now = time.time()
+        prog = {"program_id": "p1", "series": "KXEMPTY", "tickers": ["KXEMPTY-26JUL29-T1"],
+                "period_reward": 1000000, "start_ts": now - 3600, "end_ts": now + 36000,
+                "window_h": 11.0, "rho": 9.0, "target_size": float(target_size),
+                "paid_out": False}
+        rec = {"ticker": "KXEMPTY-26JUL29-T1", "program_id": "p1", "series": "KXEMPTY",
+               "pinned": False, "target_size": float(target_size), "yes_mid": None,
+               "ts": now, "close_ts": now + 20 * 3600.0,
+               "sides": {"bid": {"S": 0.0, "qualifies": False, "cum_size": 0.0,
+                                 "p": None, "legal": False},
+                         "ask": {"S": 0.0, "qualifies": False, "cum_size": 0.0,
+                                 "p": None, "legal": False}}}
+
+        class C0(object):
+            table = {"KXEMPTY-26JUL29-T1": rec}
+        return scan.build_slots([prog], C0(), now, p6=lambda t: True)
+
+    def test_the_priced_empty_side_is_LEGAL(self):
+        slots = self._empty(1000)
+        self.assertEqual(len(slots), 2)
+        for s in slots:
+            self.assertTrue(s.legal_price_exists,
+                            "a module cannot price a side and refuse its own price")
+
+    def test_a_1000_walk_is_refused_UNAFFORDABLE_with_its_numbers_never_silently(self):
+        from lip_v5 import alloc, runtime as R
+        logs = []
+        R.set_log_sink(logs.append)
+        try:
+            a, spent, rep = alloc.allocate_law(self._empty(1000), 300.0)
+        finally:
+            R.set_log_sink(None)
+        self.assertEqual(spent, 0.0)
+        self.assertEqual(rep["reasons"].get("unaffordable"), 2)     # both sides, counted
+        self.assertNotIn("unquotable", rep["reasons"],
+                         "the silent structural skip must not be what refused it")
+        ex = [l for l in logs if l.get("t") == "law_example"]
+        self.assertTrue(any(e.get("qualify_q") == 1000 for e in ex),
+                        "the skip must carry the qualifying-walk arithmetic: %s" % ex)
+
+    def test_a_small_walk_funds_through_the_law(self):
+        from lip_v5 import alloc
+        slots = self._empty(100)                  # 101 x 6c = $6.06 <= $10
+        a, spent, rep = alloc.allocate_law(slots, 300.0)
+        funded = [(k, q) for k, q in a.items() if q > 0]
+        self.assertEqual(len(funded), 1, "one order per cluster, and it must exist")
+        self.assertGreaterEqual(funded[0][1], 101, "the walk plus the earning contract")
+        self.assertGreater(spent, 0.0)
+
+
 class TestNoDuplicateOrderLoop(__import__('unittest').TestCase):
     """THE 130-ORDER LOOP, 2026-07-28 live.  The prod wire returns the placed order's fields
     FLAT (`{order_id, remaining_count: "61.00", ...}`); the engine read only the nested

@@ -802,8 +802,22 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                 if rec["pinned"]:
                     continue
                 p = C.ENTRY_BAND_LO_C / 100.0
+                # AND THE SIDE IS LEGAL — grafted 2026-07-30 from the allocator-law branch
+                # after adjudication.  The comment above has always asserted it ("a legal
+                # price always exists on an empty side; pinned markets are excluded above")
+                # while `sd["legal"]` stayed False, because the classifier reads legality
+                # off a best price that does not exist — so the slot was built, priced at
+                # the band floor, and then SILENTLY skipped by the allocator's
+                # `legal_price_exists` test: a module pricing a thing and refusing its own
+                # price, one layer down, with nothing in the log.  Legal here means the
+                # empty side is refused where every other candidate is refused — IN THE
+                # NEED, with its qualifying-walk arithmetic (law §7a: 1,000 x 6c = $60
+                # against a $10 allocation), or funded when the walk is genuinely small.
+                legal = True
             elif not sd["legal"]:
                 continue
+            else:
+                legal = True
             key = (ticker, side)
             # ── THE ENTRY PRICE BAND (config.ENTRY_BAND_LO_C..HI_C, 2026-07-29 night) ───────
             # FREE-RIDING IS RIGHT ABOUT WHO PAYS FOR QUALIFICATION AND SILENT ABOUT WHERE, and
@@ -912,7 +926,7 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                     land_grab = 0
             slots.append(alloc.Slot(
                 ticker, side, rho=prog["rho"], S=S_riv, p=p, venue=rec["series"],
-                pinned=rec["pinned"], legal_price_exists=sd["legal"],
+                pinned=rec["pinned"], legal_price_exists=legal,
                 phi=phi, d=d, l_eff=l_eff, t_hat=t_hat,
                 program_id=prog["program_id"], window_h=prog["window_h"],
                 hours_left=hours_left, hours_to_start=hours_to_start,
