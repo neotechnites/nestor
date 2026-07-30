@@ -699,3 +699,91 @@ class TestPass2IdleCapitalSweep(LipTestCase):
         a, spent, _ = self._run([hopeless], 300.0)
         self.assertEqual(a[("KXDEAD-1", "bid")], 0)
         self.assertAlmostEqual(spent, 0.0, places=9)
+
+
+class TestDisplacementAtCapacity(LipTestCase):
+    """CALCULABLE DISPLACEMENT (Ryan: "which makes more total is calculable").  At capacity the
+    question is not "may we?" but "which rung makes more?", and both sides are the same
+    product in the same units — expected credit over the horizon we are judged on, with the
+    incumbent charged for the banked pot its cancellation forfeits."""
+
+    R_STAR = 0.0625
+
+    def lean(self, i):
+        return alloc.Slot("KXL%d-1" % i, "bid", rho=1.0, S=140.0, p=0.25, hours_left=24.0,
+                          venue="KXL%d" % i, window_h=24.0)
+
+    def old(self, hours_left=1.0, accrued=0.02):
+        """A DECAYED incumbent: 20 contracts resting, an hour of window left, pennies banked.
+        E_keep = 0.02 + (20/160)×0.5×1 = $0.0825."""
+        return alloc.Slot("KXOLD-1", "bid", rho=1.0, S=140.0, p=0.25, hours_left=hours_left,
+                          venue="KXOLD", window_h=24.0, accrued=accrued)
+
+    def fat(self):
+        """The fresh candidate: big pool, whole window.  q_min = 32 ⇒ E_new = $1.50."""
+        return alloc.Slot("KXFAT-1", "bid", rho=1.0, S=224.0, p=0.25, hours_left=24.0,
+                          venue="KXFAT", window_h=24.0)
+
+    def _run(self, extra, budget=100.0, **kw):
+        """19 lean rungs at $5 each = $95 of a $100 budget: the fat rung's $8 lot cannot be
+        funded without recalling something."""
+        slots = [self.lean(i) for i in range(19)] + list(extra)
+        kw.setdefault("caps", alloc.Caps(inv_cap_usd=5.0))
+        kw.setdefault("cluster_cap_usd", 10.0)
+        kw.setdefault("ceiling_usd", 300.0)
+        return alloc.allocate(slots, budget, self.R_STAR, **kw)
+
+    KOLD, KFAT = ("KXOLD-1", "bid"), ("KXFAT-1", "bid")
+
+    def test_the_fat_candidate_displaces_the_penny_earner_and_shows_its_work(self):
+        a, spent, _ = self._run([self.old(), self.fat()],
+                                resting={self.KOLD: 20.0})
+        self.assertEqual(a[self.KFAT], 32)
+        self.assertEqual(a[self.KOLD], 0)             # zeroed ⇒ the requoter recalls it
+        self.assertLessEqual(spent, 100.0 + 1e-9)
+        rows = self.logs_of("rung_displaced")
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual((r["took"], r["dropped"]), ("KXFAT-1", "KXOLD-1"))
+        self.assertAlmostEqual(r["e_new_usd"], 1.50, places=6)
+        self.assertAlmostEqual(r["e_keep_usd"], 0.0825, places=6)
+        self.assertAlmostEqual(r["accrued_at_risk_usd"], 0.02, places=6)
+        self.assertGreater(r["e_new_usd"], r["e_keep_usd"])
+
+    def test_a_BANKED_pot_defends_the_same_incumbent_against_the_same_candidate(self):
+        """The hysteresis is the accrued term, not a constant: $2.00 banked makes E_keep
+        larger than anything a fresh rung can promise, and nothing moves."""
+        a, _, _ = self._run([self.old(accrued=2.00), self.fat()],
+                            resting={self.KOLD: 20.0})
+        self.assertEqual(a[self.KOLD], 20)
+        self.assertEqual(a[self.KFAT], 0)
+        self.assertEqual(self.logs_of("rung_displaced"), [])
+
+    def test_a_POSITION_is_never_a_displacement_target(self):
+        """Held inventory RIDES (2026-07-30).  Only a resting order can be recalled, so
+        planning against inventory would "free" dollars no cancel can free."""
+        a, _, _ = self._run([self.old(), self.fat()],
+                            resting={self.KOLD: 20.0}, held={self.KOLD: 20.0})
+        self.assertEqual(a[self.KOLD], 20)
+        self.assertEqual(a[self.KFAT], 0)
+        self.assertEqual(self.logs_of("rung_displaced"), [])
+
+    def test_below_capacity_nothing_is_ever_displaced(self):
+        """Pass 2 spends idle dollars; displacement only speaks when there are none."""
+        a, _, _ = self._run([self.old(), self.fat()], budget=300.0,
+                            resting={self.KOLD: 20.0})
+        self.assertEqual(a[self.KFAT], 32)
+        self.assertEqual(a[self.KOLD], 20)            # untouched
+        self.assertEqual(self.logs_of("rung_displaced"), [])
+
+    def test_NO_CHURN_the_swap_does_not_swap_back(self):
+        """Feed the result back as the book: the displaced rung, now with a full window
+        again, cannot displace the rung that took its place — both are sized to the same
+        floor, so E_new never STRICTLY exceeds E_keep and ties keep the incumbent."""
+        a, spent, _ = self._run([self.old(hours_left=24.0), self.fat()],
+                                resting={self.KFAT: 32.0})
+        self.assertEqual(a[self.KFAT], 32)            # the incumbent keeps its seat
+        self.assertEqual(self.logs_of("rung_displaced"), [])
+        self.assertLessEqual(spent, 100.0 + 1e-9)
+        # (the recalled rung may be re-funded from dollars that are genuinely IDLE — that is
+        # pass 2 doing its job, and it costs the incumbent nothing)
