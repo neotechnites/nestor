@@ -584,7 +584,10 @@ CYCLE_OVERRUN_WARN_S = 0.100
 HALTED_IDLE_S = 30.0
 BOOK_POLL_HZ = 1.0                           # spec §3.4 step 4 from
 BOOK_POLL_HZ_DEGRADED = 0.5                  # spec §3.4 step 4 to
-RECON_POSITIONS_S = 600.0                    # spec §3.4 step 5 from
+RECON_POSITIONS_S = 120.0                    # 2026-07-30 (Ryan): the recon is the
+                                             # TRUE-UP now — 2 min bounds how long a hand
+                                             # cancel/sell or a settlement stays unseen.
+                                             # One request per pass; was 600.
 RECON_POSITIONS_S_DEGRADED = 1800.0          # spec §3.4 step 5 to (never dropped)
 
 # =============================================================================================
@@ -1387,7 +1390,12 @@ ADOPT_BASIS_MARK_MULT = 2.0                  # the cash feed all wrong in the sa
 # Runs ONCE at adoption: every adopted position is re-judged against (★) and the ones that
 # fail are exited.  v4's orders are already gone (its SIGTERM cancel-all is the proven path),
 # so triage decides only about POSITIONS.
-CUTOVER_TRIAGE_ENABLED = True                # the decision + maker-shed path
+# ── OFF (Ryan, 2026-07-30 morning).  After the truth-resync adoption, triage began
+# shedding freshly-adopted positions at the opposing best — 26 Skubal YES offered at 3c
+# against a 16c basis.  Our own measurements refuted paying to exit (instant-flatten −$123
+# vs riding; +2c leg −$40.30), and the whole book settles ≤7 days by the D4 gate, so the
+# ride is short by construction.  Positions RIDE; kills and the day stop are the only exits.
+CUTOVER_TRIAGE_ENABLED = False               # the decision + maker-shed path
 TAKER_FEE_RATE = 0.07                        # v1 §5.1 F = ceil(0.07·n·p·(1−p)) up to the cent
 TAKER_EXIT_MAX_SLIPPAGE_C = 3                # v1 — a MARKETABLE LIMIT, never a market order:
                                              # §8.8 aborts on "a fill at a price we did not

@@ -219,6 +219,12 @@ class TestAdoptionGate(LipTestCase):
 
 
 class TestTriage(LipTestCase):
+    def setUp(self):
+        super().setUp()
+        import unittest.mock as mock
+        p = mock.patch.object(C, "CUTOVER_TRIAGE_ENABLED", True)
+        p.start(); self.addCleanup(p.stop)
+
     """CUTOVER TRIAGE — v5 re-judges every adopted position against its OWN net-rate equation
     and actively leaves the ones that fail.  Adoption without triage would inherit v4's book
     wholesale, INCLUDING precisely the venues (★) exists to refuse."""

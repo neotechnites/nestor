@@ -618,6 +618,12 @@ class TestShadowReadout(EngineCase):
 
 
 class TestAdoptionAndTriage(EngineCase):
+    def setUp(self):
+        super().setUp()
+        import unittest.mock as mock
+        p = mock.patch.object(C, "CUTOVER_TRIAGE_ENABLED", True)
+        p.start(); self.addCleanup(p.stop)
+
     ADOPT = {"positions": [{"ticker": "KXUST10AD-1", "side": "yes", "net": 20.0,
                             "basis": 0.50}]}
 

@@ -60,7 +60,7 @@ class Runner(object):
 
         self.recover(now)
 
-        if adopt_obj is not None and venues:
+        if adopt_obj is not None and venues and C.CUTOVER_TRIAGE_ENABLED:
             # Venue readings supplied up front: triage NOW and feed the verdicts to the shed
             # path (charter A: "maker-shed orders for cutover-triage verdicts").  With no
             # readings the positions sit in `m.pending_triage` and are judged per position

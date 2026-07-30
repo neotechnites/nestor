@@ -313,6 +313,10 @@ class TestRunnerInit(RunnerCase):
         self.assertNotIn("T", r.m.frozen)                     # agrees, so no freeze
 
     def test_triage_runs_at_init_when_adopting(self):
+        import unittest.mock as mock
+        p = mock.patch.object(C, "CUTOVER_TRIAGE_ENABLED", True)
+        p.start()
+        self.addCleanup(p.stop)
         r = self.runner()
         adopt = {"positions": [{"ticker": "KXUST10AD-1", "side": "yes", "net": 20.0,
                                 "basis": 0.50}]}

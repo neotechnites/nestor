@@ -1109,10 +1109,37 @@ class Maker(object):
             # count_fp; found from Ryan's portfolio screenshot.
             _pfp = row.get("position_fp")
             exch[row.get("ticker")] = float(_pfp) if _pfp is not None                 else float(row.get("position", 0))
-        for t, n in exch.items():
+        # ── THE TRUE-UP (Ryan, 2026-07-30: "probe every minute and true up the ledger").
+        # The exchange's read of our positions is the truth; the only question is which
+        # DIRECTION the divergence runs.  DOWN (they show less than we book) is the safe
+        # direction — a hand cancel, a hand sale, a settlement — and is ADOPTED silently:
+        # freezing on it is what made hand intervention "just fucking halt and explode".
+        # UP (they show more than we book) is an unexplained acquisition — the dangerous
+        # direction — and still freezes and pages.  ONLY tickers the response explicitly
+        # lists are judged: truing-down on ABSENCE would zero real inventory on any partial
+        # or paged response (and did exactly that to replay-held books in the fixtures).
+        # Fully-settled tickers leave via the settlements path below instead.
+        for t in exch:
+            n = exch.get(t, 0.0)
             ours = self.positions.get(t, {})
             our_net = ours.get("yes", 0.0) - ours.get("no", 0.0)
-            if abs(our_net - n) > 0.5:
+            if abs(our_net - n) <= 0.5:
+                continue
+            if abs(n) < abs(our_net) and (n == 0 or (n > 0) == (our_net > 0)):
+                leg = "yes" if our_net > 0 else "no"
+                new_leg = abs(n) if (n > 0) == (our_net > 0) or n == 0 else 0.0
+                pos = self.positions.setdefault(t, {"yes": 0.0, "no": 0.0})
+                basis = self.entry_basis.get((t, leg), 0.0)
+                removed = pos.get(leg, 0.0) - new_leg
+                pos[leg] = new_leg
+                self.position_cost[t] = max(
+                    0.0, self.position_cost.get(t, 0.0) - removed * basis)
+                self.cash.inventory[t] = {"n": (new_leg if leg == "yes" else -new_leg),
+                                          "basis": basis}
+                self.ledger.write("position_divergence", ticker=t, ours=our_net,
+                                  exchange=n, action="trued_down")
+                R.log("position_trued_down", ticker=t, ours=our_net, exchange=n)
+            else:
                 R.log("position_divergence", ticker=t, ours=our_net, exchange=n)
                 R.ntfy("assume_filled", "lip_v5 position divergence %s" % t)
                 self.frozen.add(t)
@@ -1415,6 +1442,12 @@ class Maker(object):
         return float(p.get("yes", 0.0)) - float(p.get("no", 0.0))
 
     def run_pending_triage(self, now, slots, r_star):
+        if not C.CUTOVER_TRIAGE_ENABLED:
+            if self.pending_triage:
+                R.log_once("triage_disabled", pending=len(self.pending_triage),
+                           note="positions ride to settlement (Ryan 2026-07-30)")
+                self.pending_triage = []
+            return
         """Adopted positions are triaged as soon as a venue reading exists — the slot table
         IS the reading (rho, S, p, phi, d, close/program end all live there).  Triage at
         adoption time would run with NO readings and sentence the whole book to shed on

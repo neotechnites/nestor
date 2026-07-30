@@ -416,10 +416,13 @@ def triage_position(pos, venue, now, r_star, floor_rate=C.FLOOR_RATE_PER_H,
 
 
 def triage(adopted, venues, now, r_star, floor_rate=C.FLOOR_RATE_PER_H,
-           taker_enabled=C.TAKER_EXIT_ENABLED, enabled=C.CUTOVER_TRIAGE_ENABLED):
+           taker_enabled=C.TAKER_EXIT_ENABLED, enabled=None):
     """Run the triage over the whole adopted book, ONCE, at adoption.  Returns the verdict
     list; every entry is written to the ledger as a `cutover_triage` row so the cutover is
     auditable after the fact.  `venues` maps ticker → the venue dict of `triage_position`."""
+    if enabled is None:
+        enabled = C.CUTOVER_TRIAGE_ENABLED    # resolved at CALL time: an import-time
+                                              # default froze the flag and made it untunable
     if not enabled:
         return []
     out = []

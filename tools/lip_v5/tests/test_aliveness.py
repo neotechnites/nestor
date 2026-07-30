@@ -308,6 +308,12 @@ class TestLandGrabAppears(EngineCase):
 
 
 class TestShedAppears(EngineCase):
+    def setUp(self):
+        super().setUp()
+        import unittest.mock as mock
+        p = mock.patch.object(C, "CUTOVER_TRIAGE_ENABLED", True)
+        p.start(); self.addCleanup(p.stop)
+
     """A failing adopted position → a maker-shed order appears, fully closing, never
     crossing, and its completion feeds l_shed."""
 
