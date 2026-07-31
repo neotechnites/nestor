@@ -308,6 +308,8 @@ class TestRescueUnverifiedVenue(FixRoundCase):
         r.m.accrued["prog-1"] = 0.87                      # the stranded accrual
         return r, ex
 
+    @unittest.skipUnless(C.MARGINAL_QUEUE_ARMED,
+                         "the fixture runs at v6's $600 regime; v5 has its own $300 seat")
     def test_stranded_accrual_is_rescued_by_ARITHMETIC_not_machinery(self):
         """REWRITTEN under the owner's law §1 (2026-07-30).  WAS a lot-container refusal of
         a ~$16 top-up.  The rescue machinery is DELETED: accrued subtracts from the need

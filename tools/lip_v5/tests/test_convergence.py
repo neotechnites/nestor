@@ -270,6 +270,8 @@ class TestPlanGrowthReachesTheWire(ConvergenceCase):
         r.classifier.close_ts[TK_A] = NOW + 16 * 3600
         return r, ex, m
 
+    @unittest.skipUnless(C.MARGINAL_QUEUE_ARMED,
+                         "v6 growth driver: the rail is A = C/N only under the armed core")
     def test_the_deposit_grows_the_rail_and_trigger_f_carries_it_to_the_wire(self):
         r, ex, m = self._one_sided_runner(300.0)
         ok, refusals = r.init(NOW, nestor_state=NESTOR)
@@ -295,6 +297,7 @@ class TestPlanGrowthReachesTheWire(ConvergenceCase):
                            "the grown plan never reached the wire: %s -> %s"
                            % (before, after))
 
+    @unittest.skipUnless(C.MARGINAL_QUEUE_ARMED, "v6 dials")
     def test_N_is_capital_independent(self):
         """note 54 step 1: "N is capital-independent" — C cancels out of the ruin formula, so
         the rail scales LINEARLY and the diversification count does not move."""
