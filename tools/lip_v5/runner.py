@@ -463,12 +463,17 @@ class Runner(object):
         if not tickers:
             return {"polled": 0, "due": 0}
         # The degrade ladder sheds the WORST-ranked breadth first; "net" here is the LAW's
-        # ordering inverted into a higher-is-better score (cheapest need → largest score),
-        # so what the ladder sheds is exactly what the allocator would fund last.
+        # ordering inverted into a higher-is-better score (cheapest EFFECTIVE need → largest
+        # score), so what the ladder sheds is exactly what the allocator would fund last.
+        # EFFECTIVE, not capital (reviewer send-back, 2026-07-30 night): on `total_usd` this
+        # ladder kept a 3c rung's breadth and shed a 15c rung's under rate pressure, i.e. it
+        # shed the rungs the allocator actually funds and defended the ones it refuses.
+        # `alloc.law_shed_score` is that inversion, defined beside `alloc.law_sort_key` —
+        # the single expression of the law's order — so it cannot drift from it.
         net_by = {}
         for s in self.slots:
             n = alloc.law_need(s)
-            score = -n.total_usd if n.reason == "" else float("-inf")
+            score = alloc.law_shed_score(n)
             net_by[s.ticker] = max(net_by.get(s.ticker, float("-inf")), score)
         markets = [{"ticker": t,
                     "net": float("inf") if t in always else net_by.get(t, 0.0),

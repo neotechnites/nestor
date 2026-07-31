@@ -14,6 +14,7 @@ that `place()` still reads.
 
 import math
 
+from . import bleed as B
 from . import clusters as CL
 from . import config as C
 from . import money as M
@@ -278,6 +279,73 @@ def t0_qualification_size(cum_size, target_size, min_floor_q=0):
 # exactly but posted $4 where example 1 said "we will put in 5 dollars".  No single formula
 # reproduces both examples; the owner resolved the fork BY RULE (order = W), and the old
 # example-1 arithmetic is set aside with this note as the record.
+#
+# ── THE FILL-BLEED TERM (2026-07-30 night, after the law shipped) ────────────────────────────
+# THE INCIDENT.  The law above ranks by CAPITAL NEEDED and by nothing else.  The allocator it
+# replaced carried an EV hurdle — its (*) test charged `phi x loss-per-fill` against the rung's
+# accrual — and that term did not survive the translation: `max(1, T)` charges turnovers as
+# CAPITAL CONSUMPTION (the same dollars re-committed) but never as LOSS (the dollars that do
+# not come back).  Cheap contracts minimise capital per unit of score, so a ranking that sees
+# only capital walks the book to the cheapest, most toxic end of the axis, and it did:
+#
+#   measured live 2026-07-30 — resting book average price 8.2c (two 300-lot walls at 3c, a rung
+#   at 1c) against a held-position average of 12.3c and a design average of ~15c.
+#
+#   "how the fuck did that happen. turn off v5. fix it"   — the owner, 2026-07-30
+#
+# THE DERIVATION.  A rung of W dollars of collateral, expected to turn over T = phi x h times
+# inside the horizon, does two things to the capital stack, not one:
+#
+#   (a) it COMMITS  W x max(1, T)   — dollars that must be present, and come back on settlement.
+#       This is the existing `total_usd`; it is what the $10/market rail measures, and it is
+#       correctly a capital number.
+#   (b) it DESTROYS W x T x g(p)    — each expected turnover converts W of collateral into
+#       inventory whose expected settlement value is (1 - g) x W.  `bleed.g_for_price` measures
+#       g off n = 8,240 settled markets.  These dollars are NOT recycled: they cannot fund the
+#       next rung, this rung, or any rung, ever.
+#
+# So the true price of reaching the target through this rung is
+#
+#       effective_need = W x max(1, T)  +  W x T x g(p)
+#                        \___________/     \_________/
+#                         recycled           gone
+#
+# and THAT is the ranking number (law §1's "capital needed", read honestly — capital needed is
+# capital committed plus capital consumed).  The property this buys, which is the whole point:
+# at EQUAL capital-need, a 3c rung (g = 0.667) ranks far behind a 15c rung (g = 0.340) and
+# hopelessly behind a 40c rung (g = 0.105); at 1c/2c (g = 0.95/1.00) the term nearly doubles
+# the rung's price.  The band's 6c entry floor was the only guard before tonight and it is a
+# guard on ONE RUNG'S PRICE — it cannot correct a RANKING.  No average-price rule is added
+# anywhere: the book's average price re-emerging at 12-15c is a CONSEQUENCE of the ordering,
+# and if the tape changes, the ordering changes with it.
+#
+# THE VIABILITY SCREEN.  Ranking alone still funds a bad rung when nothing better competes for
+# the dollar, and some rungs are negative-EV at ANY rank.  The pool pays at most `target` over
+# the horizon; the fills cost `W x T x g`.  If
+#
+#       target <= W x T x g            (expected bleed >= expected credit)
+#
+# the rung loses money on the fills it needs in order to earn the credit — it is not a cheap
+# rung, it is a rung that should never be funded at any price.  Skipped as `bleed_exceeds_credit`
+# with both numbers logged.  Note the screen uses `target` (the full credit the rung is funded
+# to earn), not `need`: it is the more permissive of the two readings and the one the brief
+# states, so a market that has already banked most of its target is not refused for a bleed its
+# remaining sliver would not incur.
+#
+# WHY T AND NOT max(1, T).  `max(1, T)` is a floor on CAPITAL — the dollars have to be there for
+# the lot to rest even if it never fills.  Bleed is charged per expected FILL, so it carries the
+# bare T and vanishes as phi does.  This is the term's self-limiting property and it is exactly
+# what makes the OVERSIZE path (law_order_q rule 3, which only fires at T <= 1) safe: a
+# measured-low-phi rung has T ~ 0, its bleed is ~0 at ANY size, and it stays cheap to oversize.
+# But an oversized order rests the FULL ENVELOPE, not W, so its bleed is env x T x g, not
+# W x T x g — the viability screen is therefore re-run in `allocate_law` against the ACTUAL
+# order size after `law_order_q` returns.  (Charging the envelope's bleed at the W-level screen
+# instead would refuse rungs that will never be oversized.)
+#
+# MIRROR (charging bleed too MUCH ↔ too little): too much refuses a rung that would have paid —
+# bounded, the next-best gets the dollar and the `law_reasons` count of `bleed_exceeds_credit`
+# is the instrument that says so; too little is tonight — a book of 3c walls, unbounded in
+# dollars until a human reads the book.
 # =============================================================================================
 LAW_HORIZON_H = 24.0                          # "in the next 24 hours" — the law's own horizon
 
@@ -307,6 +375,7 @@ def law_target_usd(hours_left, floor_24h=None, cliff=None, horizon_h=LAW_HORIZON
 DONE, UNREACHABLE, UNAFFORDABLE, CLUSTER_TAKEN, BUDGET_EXHAUSTED, EXHAUSTED, FUND = (
     "done", "unreachable", "unaffordable", "cluster_taken", "budget_exhausted",
     "allocation_exhausted", "funded")
+BLEED = "bleed_exceeds_credit"                # the fill-bleed viability screen (header)
 
 
 class Need(object):
@@ -314,11 +383,11 @@ class Need(object):
 
     __slots__ = ("slot", "cluster", "target_usd", "need_usd", "h", "q_rest", "rest_usd",
                  "turnovers", "qualify_q", "qualify_usd", "unit_usd", "total_usd",
-                 "phi_source", "reason")
+                 "phi_source", "reason", "g", "bleed_usd", "effective_usd", "w_usd")
 
     def __init__(self, slot, cluster, target_usd, need_usd, h, q_rest=0, rest_usd=0.0,
                  turnovers=0.0, qualify_q=0, qualify_usd=0.0, unit_usd=0.0, total_usd=0.0,
-                 reason=""):
+                 reason="", g=0.0, bleed_usd=0.0, effective_usd=0.0, w_usd=0.0):
         self.slot = slot
         self.cluster = cluster
         self.target_usd = target_usd
@@ -330,8 +399,17 @@ class Need(object):
         self.qualify_q = int(qualify_q)
         self.qualify_usd = qualify_usd
         self.unit_usd = unit_usd                  # collateral $/contract at the ORDER's price
-        self.total_usd = total_usd                # THE RANKING NUMBER (law §1) — computed
-                                                  # from the UNROUNDED resting need (ruling)
+        self.total_usd = total_usd                # CAPITAL COMMITTED — W x max(1, T), what the
+                                                  # $10 rail measures and the affordability
+                                                  # screen tests.  Unrounded W (ruling).
+        self.w_usd = w_usd                        # W, the UNROUNDED resting need in dollars —
+                                                  # what total_usd and bleed_usd are both
+                                                  # built from (the ruling on rounding)
+        self.g = g                                # bleed.g_for_price(unit_usd) — EV loss per
+                                                  # dollar filled at this rung's price
+        self.bleed_usd = bleed_usd                # W x T x g — capital DESTROYED, never recycled
+        self.effective_usd = effective_usd        # THE RANKING NUMBER (law §1, read honestly):
+                                                  # total_usd + bleed_usd.  See the header.
         self.phi_source = getattr(slot, "phi_source", "measured")   # where the PRIOR came
                                                   # from: "bucket" | "global" | "seed"
         self.reason = reason
@@ -405,13 +483,19 @@ class Need(object):
         return (float(C.RULE_OF_THREE) / e) * max(0.0, float(self.h)) <= 1.0
 
     def numbers(self):
-        """The log payload: no refusal without its arithmetic."""
+        """The log payload: no refusal without its arithmetic, and NO SILENT TERMS — `g` and
+        `bleed_usd` ride on every law_funded / law_example line, because a term that moves the
+        ranking and cannot be read off the log is the next incident."""
         return {"ticker": self.slot.ticker, "side": self.slot.side, "cluster": self.cluster,
                 "target_usd": round(self.target_usd, 4), "need_usd": round(self.need_usd, 4),
                 "h": round(self.h, 2), "q_rest": self.q_rest,
                 "rest_usd": round(self.rest_usd, 4), "turnovers": round(self.turnovers, 3),
                 "qualify_q": self.qualify_q, "qualify_usd": round(self.qualify_usd, 4),
                 "total_usd": round(self.total_usd, 4), "phi_source": self.phi_source,
+                # THE FILL BLEED, on every line (2026-07-30 night): the term that decides
+                # cheap-vs-expensive must be readable off the log or it is the next incident.
+                "g": round(self.g, 4), "bleed_usd": round(self.bleed_usd, 4),
+                "effective_usd": round(self.effective_usd, 4),
                 # THE POSTERIOR'S COMPOSITION, not just its value (owner, 2026-07-30 night):
                 # a size chosen off phi must show whether phi came from this rung's own tape
                 # or from its neighborhood, or the tape cannot audit tonight's incident.
@@ -478,9 +562,9 @@ def law_need(slot):
         q_rest = qual_gap + 1
         rest = q_rest * unit
         total = rest * max(1.0, T)
-        return Need(slot, ck, target, need, h, q_rest=q_rest, rest_usd=rest, turnovers=T,
-                    qualify_q=qual_gap, qualify_usd=qual_gap * unit, unit_usd=unit,
-                    total_usd=total)
+        return _priced(slot, ck, target, need, h, q_rest=q_rest, rest_usd=rest, turnovers=T,
+                       qualify_q=qual_gap, qualify_usd=qual_gap * unit, unit_usd=unit,
+                       total_usd=total, w_usd=rest)
     # THE AFFORDABILITY NUMBER USES THE UNROUNDED NEED (owner's ruling, 2026-07-30): the
     # order posts whole contracts (q_rest = ceil), but a skip caused by rounding ONE
     # CONTRACT up would refuse the owner's own example-2 market (q_raw = 20.83 -> 21
@@ -502,14 +586,85 @@ def law_need(slot):
         rest = q_rest * unit                      # cost is inside `rest` from here on
         q_raw = max(q_raw, float(qual_gap))
     total = q_raw * unit * max(1.0, T)
-    return Need(slot, ck, target, need, h, q_rest=q_rest, rest_usd=rest, turnovers=T,
-                qualify_q=qual_gap, qualify_usd=qual_usd, unit_usd=unit, total_usd=total)
+    return _priced(slot, ck, target, need, h, q_rest=q_rest, rest_usd=rest, turnovers=T,
+                   qualify_q=qual_gap, qualify_usd=qual_usd, unit_usd=unit, total_usd=total,
+                   w_usd=q_raw * unit)
+
+
+def _priced(slot, ck, target, need, h, w_usd, **kw):
+    """Attach the FILL-BLEED terms to a Need and apply the viability screen (see the header's
+    "THE FILL-BLEED TERM" derivation — this is that arithmetic, in one place, for both of
+    law_need's returns).
+
+        g              = bleed.g_for_price(unit_usd)  — unit_usd is ALREADY side-corrected
+                         (`R.unit_collateral`), so a NO rung against a 97c YES is charged the
+                         3c bleed it actually is.
+        bleed_usd      = W x T x g                    — capital destroyed (bare T, not max(1,T))
+        effective_usd  = W x max(1, T) + W x T x g    — THE RANKING NUMBER: committed + gone
+
+    W is the UNROUNDED resting need, the same quantity `total_usd` is built from (the owner's
+    2026-07-30 ruling on rounding): the bleed must not flip a decision on one contract either.
+    On the SELF-QUALIFYING path there is nothing to unround — the walk is `qual_gap + 1` whole
+    contracts by construction — so `w_usd` is that walk's cost exactly, and the two readings
+    coincide.
+
+    VIABILITY: `target <= bleed_usd` ⇒ the rung's expected fills cost more than the pool can
+    pay it, at any rank and any price.  Refused with reason BLEED and both numbers logged.
+    """
+    unit = kw.get("unit_usd", 0.0)
+    T = kw.get("turnovers", 0.0)
+    total = kw.get("total_usd", 0.0)
+    g = B.g_for_price(unit)
+    bl = B.bleed_usd(w_usd, T, unit)
+    n = Need(slot, ck, target, need, h, g=g, bleed_usd=bl, effective_usd=total + bl,
+             w_usd=w_usd, **kw)
+    if bl >= float(target) - 1e-12:
+        n.reason = BLEED
+    return n
+
+
+def law_sort_key(need):
+    """THE ONE ORDERING.  Every consumer that claims to rank "by the law" sorts on THIS —
+    `law_rank` here, `scan.law_poll_key` (the 1 Hz poll clamp), the runner's degrade-ladder
+    shed score (through `law_shed_score` below) and `engine.shadow_readout`'s venue_rank.
+
+    ── WHY IT IS A FUNCTION AND NOT A FIELD READ (reviewer send-back, 2026-07-30 night) ──
+    The fill-bleed term went into `law_rank` and the other three consumers were left reading
+    `total_usd`, each under a docstring promising "the ONE formula".  The divergence is the
+    incident itself, surviving in the plumbing: two viable equal-capital rungs at 3c and 15c
+    with T = 0.5 — the allocator funds 15c first, the poll clamp polled 3c first, so the
+    cheap-first preference still decided which book we watched and which breadth we shed
+    under rate pressure.  Ranking is now ONE callable and a consumer that wants the law's
+    order has exactly one thing to call; there is no second expression of it to go stale.
+
+      (reason != "", effective_usd, ticker, side)
+
+    `reason != ""` sorts refusals last (the poll clamp and the read-out see skipped
+    candidates; `law_rank` only ever gets live ones, for which the term is constant and
+    therefore free).  `effective_usd` is capital committed PLUS capital destroyed — the
+    header's derivation.  (ticker, side) makes a restart reproduce the same order from the
+    same world (law §10)."""
+    return (need.reason != "", need.effective_usd, need.slot.ticker, need.slot.side)
+
+
+def law_shed_score(need):
+    """`law_sort_key` inverted into a HIGHER-IS-BETTER scalar for the runner's degrade ladder,
+    which sheds the worst-ranked breadth first.  Refusals score -inf (shed first); everything
+    else scores minus its effective need, so what the ladder sheds is exactly what the
+    allocator would fund last.  Defined HERE, beside the key it inverts, so the ladder cannot
+    drift from the ranking the way it did on `total_usd` (reviewer send-back, 2026-07-30
+    night: the ladder was defending 3c rungs and shedding 15c ones under rate pressure —
+    precisely inverted)."""
+    if need.reason != "":
+        return float("-inf")
+    return -law_sort_key(need)[1]
 
 
 def law_rank(needs):
-    """Cheapest-need first (law §1), ties broken by (ticker, side) so a restart with the
-    same world produces the same ranking — no discovery-order dependence (law §10)."""
-    return sorted(needs, key=lambda n: (n.total_usd, n.slot.ticker, n.slot.side))
+    """Cheapest EFFECTIVE need first (law §1 + the fill-bleed term) — `law_sort_key`, which
+    every other consumer of the law's ordering also calls.  Ranking on `total_usd` alone is
+    the 2026-07-30 incident; see the header derivation."""
+    return sorted(needs, key=law_sort_key)
 
 
 def law_order_q(need, env_usd):
@@ -601,6 +756,8 @@ def allocate_law(slots, budget_usd, market_spent=None, alloc_cap_usd=None,
     budget = max(0.0, min(float(budget_usd), total_cap))
     alloc = {s.key: 0 for s in slots}
     needs, why, examples = [], {}, []
+    prerank_drops = 0                             # law_need refusals (done/unreachable/bleed):
+                                                  # candidates that never reached the ranking
 
     def skip(n, reason):
         why[reason] = why.get(reason, 0) + 1
@@ -620,8 +777,12 @@ def allocate_law(slots, budget_usd, market_spent=None, alloc_cap_usd=None,
             why["window"] = why.get("window", 0) + 1
             continue
         n = law_need(s)
-        if n.reason in (DONE, UNREACHABLE):
+        if n.reason in (DONE, UNREACHABLE, BLEED):
+            # BLEED: expected fill loss over the horizon >= the credit the pool would pay.
+            # A rung that loses more on the fills than it earns is never funded at any price
+            # or any rank — it is not competing with the other candidates, it is negative.
             skip(n, n.reason)
+            prerank_drops += 1
             continue
         needs.append(n)
 
@@ -656,15 +817,46 @@ def allocate_law(slots, budget_usd, market_spent=None, alloc_cap_usd=None,
         if q < 1:
             skip(n, UNAFFORDABLE)
             continue
+        # THE OVERSIZE PATH'S BLEED IS CHARGED AT THE ORDER'S SIZE, NOT AT W (header, "WHY T
+        # AND NOT max(1, T)").  `law_order_q` may return the FULL ENVELOPE — rule 3's oversize
+        # on measured-low phi — and an order that rests env dollars bleeds env x T x g, not
+        # W x T x g.  Re-run the viability screen against what is actually being posted.  It
+        # self-limits exactly where it should: oversize only fires at T <= 1 and a
+        # measured-low-phi rung has T ~ 0, so its bleed is ~0 at any size and it stays cheap
+        # to oversize; a rung with real fill hazard cannot buy its way past this by being big.
+        #
+        # THE ONE-CONTRACT RULING APPLIES HERE TOO (reviewer send-back, 2026-07-30 night).
+        # The order is whole contracts, so `q x unit` carries whatever ceil() added; screening
+        # the raw product would let a decision flip on ONE CONTRACT OF ROUNDING, which is the
+        # exact thing the owner's ruling forbids of the affordability screen.  So the screened
+        # size is `max(W, order_usd - one contract)`:
+        #   * when the order is W rounded up (q = q_rest, no oversize), W dominates and this
+        #     reproduces the unrounded W-level screen EXACTLY — the rung is not re-tried
+        #     against a stricter number than the one that already cleared it, so no rung is
+        #     ever refused for a contract of rounding;
+        #   * when `law_order_q` oversized (q >> q_rest, up to the whole envelope), one
+        #     contract is immaterial against the multiple and the screen bites at the size
+        #     actually posted, which is the point of re-screening at all.
+        # It is deliberately NOT a tolerance constant: it is the same one-contract quantity
+        # the ruling is about, read off the rung's own unit price.
+        order_usd = q * n.unit_usd
+        screened_usd = max(n.w_usd, order_usd - n.unit_usd)
+        order_bleed = B.bleed_usd(screened_usd, n.turnovers, n.unit_usd)
+        if order_bleed >= n.target_usd - 1e-12:
+            n.bleed_usd = order_bleed             # log the number that refused it, not W's
+            n.effective_usd = n.total_usd + order_bleed
+            skip(n, BLEED)
+            continue
         alloc[s.key] = q
         charge = min(q * n.unit_usd * max(1.0, n.turnovers), env)
         spent += charge
         funded_clusters[n.cluster] = s.key
-        R.log("law_funded", q=q, order_usd=round(q * n.unit_usd, 4),
+        R.log("law_funded", q=q, order_usd=round(order_usd, 4),
+              order_bleed_usd=round(order_bleed, 4),
+              screened_usd=round(screened_usd, 4),
               env_usd=round(env, 4), charge_usd=round(charge, 4), **n.numbers())
     if why:
-        R.log("law_reasons", candidates=len(needs) + sum(
-            v for k, v in why.items() if k in (DONE, UNREACHABLE)),
+        R.log("law_reasons", candidates=len(needs) + prerank_drops,
             funded=len(funded_clusters), spent=round(spent, 2),
             budget=round(budget, 2), **{k: v for k, v in sorted(why.items())})
         for ex in examples:

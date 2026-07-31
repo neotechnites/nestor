@@ -614,6 +614,38 @@ class TestShadowReadout(EngineCase):
         self.assertFalse(out["venue_rank"][1]["affordable"])
         self.assertTrue(self.logs_of("venue_rank"))
 
+    def test_venue_rank_orders_by_the_EFFECTIVE_need(self):
+        """REVIEWER SEND-BACK, 2026-07-30 night.  `venue_rank` is the board a human reads
+        before arming, and it ranked on `total_usd` after the fill-bleed term went into
+        `law_rank` — so it showed a cheap-first board while the allocator funded
+        expensive-first.  The reviewer's fixture: two VIABLE rungs of equal capital need,
+        3c and 15c at T = 0.5, with the 3c one named so the stale key's (ticker, side)
+        tie-break puts it on top.  The read-out must lead with the 15c rung, which is the one
+        the allocator funds first.
+
+        MUTATION: sort these rows on `r["total_usd"]` again and the first assertion fails.
+        The full argument, and the guard that catches a reverted consumer even when the two
+        orderings tie, are in test_law.TestThereIsGenuinelyOneFormula."""
+        m = self.maker(shadow=True)
+        # This harness's slot has rho = 6.25 over a 16 h window, so s = 1.00/50 = 0.02 and
+        # q_raw = S/49; S is chosen to put W where we want it.  The 3c rung gets the CHEAPER
+        # capital ($2.40 against $2.50) so the stale key prefers it unconditionally — not by
+        # a float tie-break (see test_law.TestThereIsGenuinelyOneFormula for the argument).
+        mk = lambda t, p, w: slot(t, S=49.0 * (w / p), p=p, phi=0.5 / 24.0, cum_size=2000.0)
+        out = m.shadow_readout(NOW, slots=[mk("KXA-3C", 0.03, 2.40),
+                                           mk("KXB-15C", 0.15, 2.50)])
+        rows = out["venue_rank"]
+        self.assertEqual([r["ticker"] for r in rows], ["KXB-15C", "KXA-3C"])
+        # the 15c rung leads DESPITE needing more capital — the bleed term, and nothing else
+        self.assertGreater(rows[0]["total_usd"], rows[1]["total_usd"])
+        self.assertLess(rows[0]["effective_usd"], rows[1]["effective_usd"])
+        # `affordable` deliberately stays the $10 RAIL's question (capital committed), and a
+        # bleeding rung never reaches it — it carries a reason and sorts to the bottom.
+        self.assertTrue(rows[0]["affordable"] and rows[1]["affordable"])
+        self.assertEqual([r["reason"] for r in rows], ["", ""])
+        logged = [l["ticker"] for l in self.logs_of("venue_rank")]
+        self.assertEqual(logged, ["KXB-15C", "KXA-3C"])
+
     def test_shadow_publishes_a_ZEROED_feed_not_a_live_one(self):
         m = self.maker(shadow=True)
         m.cash.confirm_order("o", 50.0)
@@ -816,7 +848,11 @@ class TestTheSoleQualifierNeedsNoPermission(EngineCase):
         s = slot("KXAAAGASD-1", S=0.0, venue="KXAAAGASD")
         self.assertEqual(alloc.our_share(1, s.S), 1.0)
         n = alloc.law_need(s)
-        self.assertIn(n.reason, ("", "unaffordable"))
+        # `bleed_exceeds_credit` joins the accepted set 2026-07-30 night: a self-qualifying
+        # walk at the 6c band floor is a large W, and the fill-bleed viability screen may
+        # refuse it on EV.  Either way the point of this test stands — law_need priced the
+        # slot, walk and all, with no venue state consulted.
+        self.assertIn(n.reason, ("", "unaffordable", alloc.BLEED))
         self.assertGreater(n.total_usd, 0.0)
 
 

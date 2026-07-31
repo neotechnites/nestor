@@ -40,13 +40,22 @@ class TestTheOwnersRulingOnSizing(LipTestCase):
          which two quiet contract-hours were enough to satisfy).  Tested in
          TestOversizeRequiresAMeasurement below.
 
-    Fixtures pin the ruling's own four cases (a)-(d)."""
+    Fixtures pin the ruling's own four cases (a)-(d).
+
+    FIXTURE PRICES MOVED TO 62.5c, 2026-07-30 night: these cases test the AFFORDABILITY
+    screen (W x max(1, T) vs the $10 allocation) and nothing else.  The fill-bleed viability
+    screen added the same night (alloc's "THE FILL-BLEED TERM" header) refuses the original
+    10c/25c fixtures on EV before affordability is ever reached — correctly, that is the
+    incident being fixed — which would have made these tests assert the wrong screen's
+    reason.  62.5c sits in the g = 0 band, so the bleed term is exactly zero here and the
+    arithmetic under test is unchanged: W, T and the $10 boundary are identical.  The bleed
+    screen has its own tests in TestTheFillBleedTerm."""
 
     def test_a_W5_at_T2_5_is_SKIPPED_unaffordable_with_the_numbers(self):
         """(a) need $5 resting, T = 2.5: total $12.50 > $10 ⇒ SKIP.  NOTE: this INVERTS the
         owner's old example 1 ("we will put in 5 dollars") — the ruling wins, explicitly:
         turnovers are an affordability screen, and $5 x 2.5 does not fit the allocation."""
-        s = slot(p=0.25, phi=2.5 / 24.0)          # q_rest = 20 @ 25c ⇒ W = $5; T = 2.5
+        s = slot(S=72.0, p=0.625, phi=2.5 / 24.0)  # q_rest = 8 @ 62.5c ⇒ W = $5; T = 2.5
         n = alloc.law_need(s)
         self.assertAlmostEqual(n.rest_usd, 5.0, places=9)
         self.assertAlmostEqual(n.turnovers, 2.5, places=9)
@@ -63,29 +72,66 @@ class TestTheOwnersRulingOnSizing(LipTestCase):
     def test_b_W5_at_T2_funds_at_order_exactly_5(self):
         """(b) the same market at T = 2.0: total $10.00 fits, and the ORDER IS W — five
         dollars exactly, never oversized (T > 1) and never shrunk (rule 1)."""
-        s = slot(p=0.25, phi=2.0 / 24.0)
+        s = slot(S=72.0, p=0.625, phi=2.0 / 24.0)
         n = alloc.law_need(s)
         self.assertAlmostEqual(n.total_usd, 10.0, places=9)
         a, spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
-        self.assertEqual(a[s.key], 20)
+        self.assertEqual(a[s.key], 8)
         self.assertAlmostEqual(a[s.key] * s.p, 5.0, places=9)
 
-    def test_c_the_example_2_boundary_funds_the_42c_order(self):
-        """(c) the owner's example-2 world with integer rounding: q_raw = 20.83 at 2c rounds
-        to a 21-contract, 42c order whose ROUNDED consumption is $10.08.  The affordability
-        screen compares the UNROUNDED W x T (= $10.00 exactly) against the allocation —
-        stated choice, per the ruling: a skip caused by rounding one contract up would
-        refuse the owner's own example-2 market.  MUST FUND, at order 42c."""
-        # rho 0.625 -> 5/12: the $10 boundary case recalibrated for the $1.00 target
+    def test_c_the_unrounded_screen_funds_the_boundary_order(self):
+        """(c) INTEGER ROUNDING AT THE $10 BOUNDARY.  q_raw = 6.4 at 62.5c rounds to a
+        7-contract, $4.375 order whose ROUNDED consumption is 7 x 62.5c x 2.5 = $10.9375.
+        The affordability screen compares the UNROUNDED W x T (= $10.00 exactly) against the
+        allocation — stated choice, per the ruling: a skip caused by rounding one contract up
+        would refuse a market the owner's own example 2 says to fund.  MUST FUND, at order 7.
+
+        RE-PRICED 2026-07-30 night, and the ORIGINAL FIXTURE IS NOW test_c2 BELOW.  This case
+        used to be run at the owner's example-2 world literally — 2c, T = 24 — and that world
+        is exactly the 2c wall the fill-bleed term exists to refuse (g(2c) = 1.0000: every
+        dollar filled there is lost).  The ROUNDING property is what this test is for, so it
+        is preserved at a price where the bleed is zero; the example-2 world's new verdict is
+        pinned separately, because a refusal that used to be a funding is a fact about the
+        law, not a lost test."""
+        s = slot(S=57.6, p=0.625, phi=2.5 / 24.0)                 # q_raw = 6.4, T = 2.5
+        n = alloc.law_need(s)
+        self.assertEqual(n.q_rest, 7)
+        self.assertAlmostEqual(n.rest_usd, 4.375, places=9)
+        self.assertAlmostEqual(n.total_usd, 10.0, places=6)       # unrounded, exactly
+        self.assertAlmostEqual(7 * s.p * n.turnovers, 10.9375, places=6)   # rounded: over
+        a, _spent, rep = alloc.allocate_law([s], budget_usd=300.0)
+        self.assertEqual(a[s.key], 7)
+        self.assertEqual(rep["reasons"], {})
+
+    def test_c2_the_example_2_world_is_now_REFUSED_for_bleed(self):
+        """(c2) THE ORIGINAL (c), kept verbatim as a fixture and re-adjudicated.  The owner's
+        example-2 world is a 2c rung expected to turn over 24 times inside the horizon.  Its
+        capital arithmetic is unchanged and still lands exactly on the $10 boundary — the
+        ruling's unrounded screen still passes it.  It is refused anyway, and for the reason
+        the whole 2026-07-30-night fix exists:
+
+            g(2c) = 1.0000 (n = 1,368 side-observations; realised 0.00%)
+            bleed = W x T x g = $0.41667 x 24 x 1.0000 = $10.00
+                    (W is the UNROUNDED resting need, the same quantity total_usd is built
+                     from — the ruling's rounding tolerance applies to the bleed too, so the
+                     bleed cannot flip a decision on one contract either)
+            credit the pool would pay over the horizon = $1.00
+
+        $10.00 of expected permanent loss to earn $1.00.  This is the 2c/3c wall, and it is
+        never funded at any price or any rank."""
         s = slot(rho=5.0/12.0, S=83.3333333333, p=0.02, phi=1.0)   # T = 24
         n = alloc.law_need(s)
         self.assertEqual(n.q_rest, 21)
         self.assertAlmostEqual(n.rest_usd, 0.42, places=9)
-        self.assertAlmostEqual(n.total_usd, 10.0, places=6)       # unrounded, exactly
-        a, _spent, rep = alloc.allocate_law([s], budget_usd=300.0)
-        self.assertEqual(a[s.key], 21)
-        self.assertAlmostEqual(a[s.key] * s.p, 0.42, places=9)
-        self.assertEqual(rep["reasons"], {})
+        self.assertAlmostEqual(n.total_usd, 10.0, places=6)        # capital: still affordable
+        self.assertAlmostEqual(n.g, 1.0, places=9)
+        self.assertAlmostEqual(n.bleed_usd, 10.0, places=6)
+        self.assertAlmostEqual(n.effective_usd, 20.0, places=6)    # committed + destroyed
+        self.assertEqual(n.reason, alloc.BLEED)
+        a, spent, rep = alloc.allocate_law([s], budget_usd=300.0)
+        self.assertEqual(a[s.key], 0)
+        self.assertEqual(spent, 0.0)
+        self.assertEqual(rep["reasons"].get(alloc.BLEED), 1)
 
     def test_d_measured_low_phi_small_need_puts_all_ten(self):
         """(d) = the owner's example 3: "we can earn a dollar in 24 hours with only one
@@ -103,7 +149,7 @@ class TestTheOwnersRulingOnSizing(LipTestCase):
         """"if it doesn't fit in there, we can't afford it" — the ruling KEEPS this screen
         verbatim (three silent-refusal incidents on 2026-07-30 are why the numbers ride
         every skip)."""
-        s = slot(phi=6.0 / 24.0)                  # W = $2, T = 6: total = $12
+        s = slot(S=28.8, p=0.625, phi=6.0 / 24.0)  # W = $2, T = 6: total = $12
         n = alloc.law_need(s)
         self.assertAlmostEqual(n.total_usd, 12.0, places=9)
         a, spent, rep = alloc.allocate_law([s], budget_usd=300.0)
@@ -128,9 +174,17 @@ class TestOversizeRequiresAMeasurement(LipTestCase):
     oversize asks the only question that survives: IS THIS RUNG'S OWN HISTORY WHAT MADE THE
     NUMBER LOW — own exposure > k (`Need.history_dominates`)?"""
 
+    # PRICE MOVED 10c -> 62.5c, 2026-07-30 night (the fill-bleed term).  These cases are
+    # about the OVERSIZE GATE — how much of the $10 a rung's evidence entitles it to — and
+    # nothing else.  The fill-bleed viability screen added the same night (alloc's "THE
+    # FILL-BLEED TERM" header) refuses a 10c rung at these turnover rates on EV before the
+    # sizing question is ever reached, which would leave these tests asserting a different
+    # screen's verdict.  62.5c sits in the g = 0 band, so the bleed is exactly zero here and
+    # W, T, the $5 lot container and the $10 envelope are all unchanged.  The bleed screen's
+    # own cases live in TestTheFillBleedTerm.
     def _big_need(self, **kw):
-        # q_raw = 60 @ 10c ⇒ W = $6 > the $5 lot container
-        kw.setdefault("rho", 1.25); kw.setdefault("S", 540.0); kw.setdefault("p", 0.10)
+        # q_raw = 9.6 @ 62.5c ⇒ W = $6 > the $5 lot container (q_rest = 10, rest = $6.25)
+        kw.setdefault("rho", 1.25); kw.setdefault("S", 134.4); kw.setdefault("p", 0.625)
         return slot(**kw)
 
     def test_THE_INCIDENT_two_quiet_hours_may_not_unlock_the_envelope(self):
@@ -150,12 +204,15 @@ class TestOversizeRequiresAMeasurement(LipTestCase):
         phi = scan.phi_posterior(0, expo, prior, k)
         self.assertAlmostEqual(phi, 0.2990, places=4)
         self.assertGreater(phi, 0.99 * prior, "the posterior must stay AT the prior")
-        # The incident's rung, affordable so the SIZING is what is on trial: W = $1.00 at
-        # 10c (q_rest = 10), T = 7.2 turnovers ⇒ total $7.18, inside the $10 allocation.
-        s = slot(rho=5.0 / 6.0, S=90.0, p=0.10, phi=phi, phi_source="bucket",
+        # The incident's rung, affordable so the SIZING is what is on trial: W = $1.25 at
+        # 62.5c (q_rest = 2), T = 7.18 turnovers ⇒ total $8.98, inside the $10 allocation.
+        # (Priced at 62.5c for the reason given on `_big_need` above: g = 0 there, so this
+        # test asks the oversize gate its question and only its question.)
+        s = slot(rho=5.0 / 6.0, S=18.0, p=0.625, phi=phi, phi_source="bucket",
                  phi_prior=prior, phi_k=k, phi_exposure_h=expo)
         n = alloc.law_need(s)
-        self.assertEqual(n.q_rest, 10)
+        self.assertEqual(n.q_rest, 2)
+        self.assertAlmostEqual(n.bleed_usd, 0.0, places=9)
         self.assertFalse(n.history_dominates)
         # and the second clause refuses independently: 3/2 x 24h = 36 turnovers cannot be
         # ruled out on two contract-hours (see `Need.evidence_bounds_a_turnover`)
@@ -163,12 +220,12 @@ class TestOversizeRequiresAMeasurement(LipTestCase):
         self.assertLessEqual(n.total_usd, 10.0)
         a, spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
         self.assertEqual(a[s.key], n.q_rest, "the order must size to the NEED, not the $10")
-        self.assertAlmostEqual(a[s.key] * s.p, 1.0, places=6)
+        self.assertAlmostEqual(a[s.key] * s.p, 1.25, places=6)
         self.assertLessEqual(a[s.key] * s.p, C.SLOT_LOT_CAP_USD + 1e-9,
                              "THE INCIDENT: 2 quiet hours put the full envelope down")
-        # The requote reserve IS what is held back: the rung rests $1.00 of the $10 it is
-        # allowed, so the flow that ate the oversized seats can only reach a tenth of it.
-        self.assertGreaterEqual(C.ALLOC_PER_MARKET_USD - a[s.key] * s.p, 9.0)
+        # The requote reserve IS what is held back: the rung rests $1.25 of the $10 it is
+        # allowed, so the flow that ate the oversized seats can only reach an eighth of it.
+        self.assertGreaterEqual(C.ALLOC_PER_MARKET_USD - a[s.key] * s.p, 8.75)
         self.assertAlmostEqual(spent, n.total_usd, places=6)   # the CHARGE is W x T (law §1)
 
     def test_a_LONG_quiet_rung_still_earns_the_envelope(self):
@@ -397,3 +454,328 @@ class TestTheRequoteBudget(LipTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheFillBleedTerm(LipTestCase):
+    """THE 2026-07-30-NIGHT INCIDENT, as tests.
+
+    The law ranked by CAPITAL NEEDED and by nothing else, so the cheapest contract always won
+    the queue, and the book walked to the toxic end of the price axis:
+
+        resting book average price 8.2c — two 300-lot walls at 3c and a rung at 1c — against
+        a held-position average of 12.3c and a design average of ~15c.
+
+        "how the fuck did that happen. turn off v5. fix it"   — the owner, 2026-07-30
+
+    The derivation is in `alloc.py`'s "THE FILL-BLEED TERM" header; g comes from
+    `bleed.G_TABLE` (n = 8,240 settled markets), pinned in `test_bleed`.
+
+    MUTATION CONTRACT.  Delete the bleed term from `law_rank`/`_priced` and
+    `test_the_3c_walls_and_the_1c_rung_are_refused` funds all three rungs and fails on the
+    first assertion; `test_at_equal_capital_need_the_15c_rung_wins` fails on the ordering.
+    Corrupt g's derivation and `test_bleed.test_pinned_bucket_values` fails first.
+
+    NOTE — NO AVERAGE-PRICE RULE EXISTS ANYWHERE.  Nothing in the allocator looks at the
+    book's mean price.  `test_the_book_reprices_itself_as_a_consequence` asserts the 12-15c
+    shape as an OUTPUT of the ranking, which is the only way it is allowed to be true.
+    """
+
+    # T = phi x h; h = 24 here, so phi = T/24.  T = 1.1 is "a moderate phi": the lot is
+    # expected to turn over just past once inside the horizon — above the oversize gate's
+    # T <= 1 so the order is W exactly, and low enough that the CAPITAL screen (W x max(1,T)
+    # <= $10) passes for every rung below.  Every refusal in these tests is therefore the
+    # BLEED screen and nothing else, which is what makes them mutation-decisive.
+    T = 1.1
+    PHI = 1.1 / 24.0
+
+    def _rung(self, ticker, p, w_usd, **kw):
+        """A rung at price `p` whose share-math need is exactly `w_usd` of resting collateral.
+        s = target/((rho/2)h) = 1.00/10 = 0.10 at the default rho, so q_raw = S/9."""
+        q_raw = w_usd / p
+        kw.setdefault("phi", self.PHI)
+        return slot(ticker, S=9.0 * q_raw, p=p, **kw)
+
+    def test_the_3c_walls_and_the_1c_rung_are_refused(self):
+        """TONIGHT'S BOOK, AT TONIGHT'S PARAMETERS.  A 300-lot wall at 3c is $9.00 of resting
+        collateral; the 1c rung, same lot shape, is $3.00.
+
+        Both were FUNDABLE under the old law and that is the bug: their capital arithmetic
+        ($9.90 and $3.30 committed at T = 1.1) sits inside the $10 allocation, and the 1c rung
+        was the CHEAPEST thing in the queue, so it ranked first.  Both are now refused on EV:
+
+            3c wall: bleed = $9.00 x 1.1 x 0.6669 = $6.60  against $1.00 of credit
+            1c rung: bleed = $3.00 x 1.1 x 0.9484 = $3.13  against $1.00 of credit
+        """
+        wall = self._rung("KXWALL-3C", 0.03, 9.00)
+        rung = self._rung("KXRUNG-1C", 0.01, 3.00)
+        nw, nr = alloc.law_need(wall), alloc.law_need(rung)
+        # (i) the capital screen does NOT refuse them — this is what made the incident possible
+        self.assertAlmostEqual(nw.total_usd, 9.90, places=6)
+        self.assertAlmostEqual(nr.total_usd, 3.30, places=6)
+        self.assertLess(nw.total_usd, C.ALLOC_PER_MARKET_USD)
+        self.assertLess(nr.total_usd, C.ALLOC_PER_MARKET_USD)
+        # (ii) the bleed screen does
+        self.assertAlmostEqual(nw.g, 0.6669, places=4)
+        self.assertAlmostEqual(nr.g, 0.9484, places=4)
+        self.assertAlmostEqual(nw.bleed_usd, 9.00 * 1.1 * 0.6669, places=6)
+        self.assertAlmostEqual(nr.bleed_usd, 3.00 * 1.1 * 0.9484, places=6)
+        self.assertGreater(nw.bleed_usd, nw.target_usd)
+        self.assertGreater(nr.bleed_usd, nr.target_usd)
+        self.assertEqual(nw.reason, alloc.BLEED)
+        self.assertEqual(nr.reason, alloc.BLEED)
+        a, spent, rep = alloc.allocate_law([wall, rung], budget_usd=300.0)
+        self.assertEqual(a[wall.key], 0)
+        self.assertEqual(a[rung.key], 0)
+        self.assertEqual(spent, 0.0)
+        self.assertEqual(rep["reasons"].get(alloc.BLEED), 2)
+        # (iii) no silent terms: the refusal cites g and the dollars
+        ex = self.logs_of("law_example")
+        self.assertTrue(ex, "a bleed refusal with no numbers is the defect, not the policy")
+        for e in ex:
+            self.assertIn("g", e)
+            self.assertIn("bleed_usd", e)
+            self.assertIn("effective_usd", e)
+            self.assertEqual(e["reason"], alloc.BLEED)
+
+    def test_at_equal_capital_need_the_15c_rung_wins(self):
+        """THE RANKING PROPERTY, isolated.  Three rungs at 1c, 3c and 15c, each needing the
+        SAME $2.50 of resting collateral and the same T — identical capital need ($2.75), so
+        under the old law they were a three-way tie broken by ticker and all three funded.
+
+        With the bleed charged, the capital need is the same but the TRUE need is not:
+
+            1c : 2.75 + 2.50 x 1.1 x 0.9484 = $5.36   refused (bleed $2.61 > $1.00 credit)
+            3c : 2.75 + 2.50 x 1.1 x 0.6669 = $4.58   refused (bleed $1.83 > $1.00 credit)
+            15c: 2.75 + 2.50 x 1.1 x 0.3508 = $3.71   FUNDED  (bleed $0.96 < $1.00 credit)
+
+        Mutation: drop `bleed_usd` from `effective_usd` and the ordering assertion fails on a
+        tie; drop the viability screen and all three fund."""
+        one = self._rung("KXA-1C", 0.01, 2.50)
+        three = self._rung("KXB-3C", 0.03, 2.50)
+        fifteen = self._rung("KXC-15C", 0.15, 2.50)
+        needs = [alloc.law_need(x) for x in (one, three, fifteen)]
+        for n in needs:                                    # identical CAPITAL need
+            self.assertAlmostEqual(n.total_usd, 2.75, places=6)
+        ranked = alloc.law_rank(needs)
+        self.assertEqual([n.slot.ticker for n in ranked], ["KXC-15C", "KXB-3C", "KXA-1C"])
+        self.assertAlmostEqual(ranked[0].effective_usd, 2.75 + 2.50 * 1.1 * 0.3508, places=6)
+        a, spent, rep = alloc.allocate_law([one, three, fifteen], budget_usd=300.0)
+        self.assertEqual(a[one.key], 0)
+        self.assertEqual(a[three.key], 0)
+        self.assertGreater(a[fifteen.key], 0)
+        self.assertAlmostEqual(a[fifteen.key] * 0.15, 2.55, places=6)   # W, ceil to 17 lots
+        self.assertEqual(rep["reasons"].get(alloc.BLEED), 2)
+        f = self.logs_of("law_funded")
+        self.assertEqual(len(f), 1)
+        self.assertAlmostEqual(f[0]["g"], 0.3508, places=4)
+        self.assertAlmostEqual(f[0]["bleed_usd"], 2.50 * 1.1 * 0.3508, places=4)
+        self.assertIn("order_bleed_usd", f[0])
+
+    def test_the_book_reprices_itself_as_a_consequence(self):
+        """THE OWNER'S ACCEPTANCE SHAPE, and the reason it may not be a rule.  Offer the
+        allocator the whole cheap axis at once — 1c through 40c, one cluster each, every one
+        of them affordable and every one of them needing the same capital.  Nothing here reads
+        an average price; the allocator simply refuses the rungs whose fills lose more than
+        the pool pays and ranks the rest by true cost.  The book's average price is whatever
+        falls out of that, and what falls out is >= 12c."""
+        rungs = [self._rung("KX%02dC" % c, c / 100.0, 2.50) for c in
+                 (1, 2, 3, 4, 6, 9, 12, 15, 20, 30, 40)]
+        a, _spent, _rep = alloc.allocate_law(rungs, budget_usd=300.0)
+        funded = [(s, a[s.key]) for s in rungs if a[s.key] > 0]
+        self.assertTrue(funded)
+        for s, _q in funded:
+            self.assertGreaterEqual(s.p, 0.12, "a sub-12c rung funded: %s" % s.ticker)
+        usd = sum(q * s.p for s, q in funded)
+        avg_c = 100.0 * usd / sum(q for _s, q in funded)
+        self.assertGreaterEqual(avg_c, 12.0)
+
+    def test_low_phi_stays_cheap_to_oversize(self):
+        """THE TERM SELF-LIMITS WHERE FILLS ARE RARE (header, "WHY T AND NOT max(1, T)").  A
+        MEASURED phi of zero means T = 0, so the bleed is zero at ANY size — the oversize path
+        (law_order_q rule 3) still puts the whole $10 on the rung, exactly as owner example 3
+        requires.  Charging the bleed with max(1, T) instead of T would refuse this rung for a
+        loss it will never take."""
+        s = self._rung("KXQUIET", 0.03, 1.00, phi=0.0)        # measured phi = 0 ⇒ T = 0
+        n = alloc.law_need(s)
+        self.assertAlmostEqual(n.turnovers, 0.0, places=12)
+        self.assertAlmostEqual(n.g, 0.6669, places=4)         # g is still the 3c value...
+        self.assertAlmostEqual(n.bleed_usd, 0.0, places=12)   # ...and the charge is still zero
+        self.assertAlmostEqual(n.effective_usd, n.total_usd, places=12)
+        a, spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
+        self.assertEqual(a[s.key], 333)                       # $9.99 — the whole envelope
+        self.assertAlmostEqual(spent, 9.99, places=6)
+
+    def test_the_oversize_order_is_charged_at_the_ENVELOPE_not_at_W(self):
+        """THE OVERSIZE PATH MULTIPLIES EXPOSURE, so it must be screened at the size actually
+        posted.  This rung needs only $1.00 of resting collateral at 3c and would pass the
+        W-level screen ($1.00 x 1.0 x 0.6669 = $0.67 < $1.00 of credit).  But its T is exactly
+        1.0, which arms law_order_q's oversize, and the order that would rest is the FULL $10
+        envelope — 333 contracts whose expected bleed is $6.66.  Refused.
+
+        Mutation: screen the order at W instead of at `q x unit` and this test funds a $10
+        wall at 3c — the incident, re-entering through the oversize door."""
+        s = self._rung("KXOVER-3C", 0.03, 1.00, phi=1.0 / 24.0)      # T = 1.0 exactly
+        n = alloc.law_need(s)
+        self.assertAlmostEqual(n.turnovers, 1.0, places=9)
+        self.assertAlmostEqual(n.bleed_usd, 1.00 * 1.0 * 0.6669, places=6)
+        self.assertEqual(n.reason, "")                        # W-level screen PASSES
+        self.assertEqual(alloc.law_order_q(n, 10.0), 333)     # ...and the order is the $10
+        a, spent, rep = alloc.allocate_law([s], budget_usd=300.0)
+        self.assertEqual(a[s.key], 0)
+        self.assertEqual(spent, 0.0)
+        self.assertEqual(rep["reasons"].get(alloc.BLEED), 1)
+        ex = [e for e in self.logs_of("law_example") if e["reason"] == alloc.BLEED]
+        self.assertAlmostEqual(ex[0]["bleed_usd"], (333 - 1) * 0.03 * 1.0 * 0.6669, places=4)
+
+    def test_a_no_rung_is_charged_its_own_side_of_the_book(self):
+        """`unit_usd` is already side-corrected, so an ASK rung resting at 97c-YES collateral
+        is charged the 97c bucket's g (zero), not the 3c bucket's.  The mirror case — a NO
+        position that IS cheap — is the 3c wall above.  Getting this backwards would charge
+        the expensive half of the book for the cheap half's toxicity."""
+        s = self._rung("KXRICH", 0.97, 2.50, side="ask")
+        n = alloc.law_need(s)
+        self.assertAlmostEqual(n.unit_usd, 0.97, places=9)
+        self.assertAlmostEqual(n.g, 0.0, places=6)
+        self.assertAlmostEqual(n.bleed_usd, 0.0, places=9)
+        self.assertAlmostEqual(n.effective_usd, n.total_usd, places=9)
+
+
+class TestThereIsGenuinelyOneFormula(LipTestCase):
+    """REVIEWER SEND-BACK, 2026-07-30 night.  The fill-bleed term went into `law_rank` and
+    THREE other consumers were left ranking on `total_usd`, each under a docstring promising
+    "the ONE formula":
+
+        scan.law_poll_key       — the 1 Hz book-poll clamp: which markets we watch at all
+        runner's degrade ladder — which breadth gets SHED first under rate pressure
+        engine.shadow_readout   — the venue_rank board a human reads before arming
+
+    That is the incident surviving in the plumbing.  On the reviewer's own fixture — two
+    VIABLE rungs of equal capital need, 3c and 15c at T = 0.5 — the allocator funds 15c first
+    while the poll clamp polled 3c first: we would have funded the expensive rung and spent
+    our poll budget, and our shed order, defending the cheap one.
+
+    The ranking is now ONE callable, `alloc.law_sort_key`, and its one inversion
+    `alloc.law_shed_score`.  Nothing re-spells it.
+
+    MUTATION: revert any single consumer to `total_usd` and
+    `test_the_poll_clamp_orders_exactly_as_the_allocator_funds` (scan),
+    `test_the_degrade_ladder_sheds_what_the_allocator_funds_last` (runner) or
+    `TestShadowReadout.test_venue_rank_orders_by_the_EFFECTIVE_need` in test_engine.py
+    (engine) fails; `test_no_consumer_re_spells_the_key` fails for any of the three even when
+    the reverted ordering happens to tie.
+    """
+
+    # THE REVIEWER'S FIXTURE: two rungs of comparable capital need at 3c and 15c, T = 0.5
+    # (<= 1, so max(1, T) = 1 and capital need IS W), both VIABLE — 3c bleeds $0.80 and 15c
+    # $0.44 against $1.00 of credit, so neither is refused and this is a pure ordering
+    # question, not a screening one.
+    #
+    # THE 3c RUNG IS GIVEN THE CHEAPER CAPITAL ($2.40 against $2.50) ON PURPOSE.  The
+    # reviewer's fixture was equal-capital and relied on the (ticker, side) tie-break to
+    # expose the stale ordering — which works, but makes the whole mutation check hang on
+    # two floats comparing exactly equal (they are `750/49 x 0.03` and `150/49 x 0.15`: equal
+    # in algebra, not necessarily in IEEE 754).  A 10c capital gap makes the stale key prefer
+    # the 3c rung UNCONDITIONALLY and for the honest reason — it really is the cheaper
+    # capital — so the test states the incident rather than a rounding coincidence.
+    T = 0.5
+    W_3C, W_15C = 2.40, 2.50
+
+    def _pair(self):
+        return (slot("KXA-3C", S=9.0 * (self.W_3C / 0.03), p=0.03, phi=self.T / 24.0),
+                slot("KXB-15C", S=9.0 * (self.W_15C / 0.15), p=0.15, phi=self.T / 24.0))
+
+    def test_the_fixture_is_an_ordering_question_not_a_screening_one(self):
+        """Both rungs are live candidates, and the CHEAPER capital is the 3c one — so the
+        allocator preferring 15c is the bleed term overriding capital, which is the whole
+        fix."""
+        three, fifteen = self._pair()
+        n3, n15 = alloc.law_need(three), alloc.law_need(fifteen)
+        for n in (n3, n15):
+            self.assertEqual(n.reason, "")                       # neither is refused
+        self.assertAlmostEqual(n3.total_usd, 2.40, places=6)     # the CHEAPER capital...
+        self.assertAlmostEqual(n15.total_usd, 2.50, places=6)
+        self.assertLess(n3.total_usd, n15.total_usd)
+        self.assertAlmostEqual(n3.bleed_usd, 2.40 * 0.5 * 0.6669, places=6)
+        self.assertAlmostEqual(n15.bleed_usd, 2.50 * 0.5 * 0.3508, places=6)
+        self.assertGreater(n3.effective_usd, n15.effective_usd)  # ...and the DEARER rung
+        # THE STALE KEY, spelled out, so the divergence is on the record: on capital alone
+        # these tie and the tie-break puts the 3c rung first.
+        stale = sorted([n3, n15], key=lambda n: (n.reason != "", n.total_usd,
+                                                 n.slot.ticker, n.slot.side))
+        self.assertEqual([n.slot.ticker for n in stale], ["KXA-3C", "KXB-15C"])
+        self.assertEqual([n.slot.ticker for n in alloc.law_rank([n3, n15])],
+                         ["KXB-15C", "KXA-3C"])
+
+    def test_the_poll_clamp_orders_exactly_as_the_allocator_funds(self):
+        """`scan.law_poll_key` and the funding order are the SAME order.  Asserted against
+        the allocator's actual `law_funded` sequence, not against a re-derivation of it — the
+        envelope is trimmed to $2.60 so the oversize path does not change the subject."""
+        three, fifteen = self._pair()
+        polled = [s.ticker for s in sorted([three, fifteen], key=scan.law_poll_key)]
+        self.assertEqual(polled, ["KXB-15C", "KXA-3C"])
+        a, _spent, _rep = alloc.allocate_law([three, fifteen], budget_usd=300.0,
+                                             alloc_cap_usd=2.60)
+        self.assertGreater(a[three.key], 0)
+        self.assertGreater(a[fifteen.key], 0)
+        funded_order = [f["ticker"] for f in self.logs_of("law_funded")]
+        self.assertEqual(funded_order, ["KXB-15C", "KXA-3C"])
+        self.assertEqual(polled, funded_order,
+                         "the poll clamp must watch the book the allocator funds")
+
+    def test_the_degrade_ladder_sheds_what_the_allocator_funds_last(self):
+        """`alloc.law_shed_score` is `law_sort_key` inverted, so the ladder's shed order is
+        the funding order reversed.  On `total_usd` this ladder defended the 3c rung and shed
+        the 15c one — exactly inverted."""
+        three, fifteen = self._pair()
+        scored = sorted([(alloc.law_shed_score(alloc.law_need(s)), s.ticker)
+                         for s in (three, fifteen)])
+        self.assertEqual([t for _sc, t in scored], ["KXA-3C", "KXB-15C"])   # shed 3c first
+        self.assertGreater(alloc.law_shed_score(alloc.law_need(fifteen)),
+                           alloc.law_shed_score(alloc.law_need(three)))
+        # a refused rung is shed before any live one, whatever its capital
+        dead = slot("KXC-2C", S=9.0 * (2.50 / 0.02), p=0.02, phi=1.0)
+        self.assertEqual(alloc.law_need(dead).reason, alloc.BLEED)
+        self.assertEqual(alloc.law_shed_score(alloc.law_need(dead)), float("-inf"))
+
+    @staticmethod
+    def _code_only(fn):
+        """A function's EXECUTABLE source, with docstrings and comments removed.
+
+        The three consumer sites all NAME `alloc.law_sort_key` in their prose — that is the
+        point of the prose — so a raw substring search over `inspect.getsource` would pass on
+        a consumer whose BODY had been reverted underneath its own comment, which is exactly
+        the failure mode this test exists to catch.  Round-tripping through `ast` drops
+        comments (they are not in the tree) and the docstring node explicitly, so what is
+        left is what actually runs."""
+        import ast
+        import inspect
+        import textwrap
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        body = tree.body[0].body
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(getattr(body[0], "value", None), ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            body = body[1:]                        # the docstring
+        return "\n".join(ast.unparse(node) for node in body)
+
+    def test_no_consumer_re_spells_the_key(self):
+        """THE STRUCTURAL GUARD, and the reason this class exists.  A consumer that re-spells
+        the ordering is one that can go stale silently — that is the entire send-back.  Every
+        site that claims the law's order must CALL `alloc.law_sort_key` (or its inversion
+        `law_shed_score`), so reverting one to `total_usd` fails here even in a world where
+        the two orderings happen to tie and the functional tests above stay green."""
+        from .. import engine as E, runner as RUN
+        for label, fn in (("scan.law_poll_key", scan.law_poll_key),
+                          ("runner.book_poll_pass", RUN.Runner.book_poll_pass),
+                          ("engine.shadow_readout", E.Maker.shadow_readout)):
+            body = self._code_only(fn)
+            self.assertTrue("law_sort_key" in body or "law_shed_score" in body,
+                            "%s does not call the law's one ordering key" % label)
+            # `total_usd` may still be READ in code (the $10 rail's own question is capital),
+            # but it may never be a sort key, a rank score, or a tuple handed to a sort.
+            for line in body.splitlines():
+                if "total_usd" in line:
+                    self.assertNotIn("sort", line, "%s sorts on total_usd" % label)
+                    self.assertNotIn("score", line, "%s scores on total_usd" % label)
+                    self.assertNotIn("append", line,
+                                     "%s builds its sort key from total_usd" % label)

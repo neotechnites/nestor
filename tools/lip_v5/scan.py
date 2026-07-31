@@ -1203,12 +1203,17 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
 
 
 def law_poll_key(slot):
-    """The LAW's own ordering for a slot, cheapest capital-need first (law §1), with
-    done/unreachable candidates last and deterministic (ticker, side) ties — so the poll
-    clamp, the shadow read-out and the allocator all rank by the ONE formula, and a restart
-    reproduces the same order from the same world (law §10)."""
-    n = alloc.law_need(slot)
-    return (n.reason != "", n.total_usd, slot.ticker, slot.side)
+    """The LAW's own ordering for a slot — literally `alloc.law_sort_key`, so the poll clamp,
+    the shadow read-out, the degrade ladder and the allocator rank by the ONE formula and a
+    restart reproduces the same order from the same world (law §10).
+
+    DO NOT RE-EXPRESS THE KEY HERE (reviewer send-back, 2026-07-30 night).  This function used
+    to spell out `(reason != "", total_usd, ticker, side)` under that same "ONE formula"
+    promise, and when the fill-bleed term went into `law_rank` this copy silently stayed on
+    capital alone: on two viable equal-capital rungs at 3c and 15c the allocator funded 15c
+    and the clamp polled 3c — the cheap-first preference that caused the incident, still
+    choosing which book we watch.  Delegate; never restate."""
+    return alloc.law_sort_key(alloc.law_need(slot))
 
 
 def rank_for_poll(slots, limit=None):

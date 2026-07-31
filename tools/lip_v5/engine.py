@@ -2142,12 +2142,20 @@ class Maker(object):
             row = n.numbers()
             row["venue"] = s.venue
             row["reason"] = n.reason
+            # `affordable` stays on total_usd: it answers the $10 RAIL's question (capital
+            # committed), which is a different question from the ranking's.  A rung refused
+            # for bleed carries reason == "bleed_exceeds_credit" and is excluded here by the
+            # `reason == ""` clause, so the read-out never calls a bleeding rung affordable.
             row["affordable"] = (n.reason == "" and
                                  n.total_usd <= C.ALLOC_PER_MARKET_USD + 1e-9)
-            rows.append(row)
-        # Cheapest need first — the LAW's own ranking (skips sort last, by name).
-        rows.sort(key=lambda r: (r["reason"] != "", r["total_usd"] or 0.0,
-                                 r["ticker"], r["side"]))
+            rows.append((alloc.law_sort_key(n), row))
+        # Cheapest EFFECTIVE need first — `alloc.law_sort_key`, the LAW's one ordering (skips
+        # sort last, by name).  Sorted on the key OBJECT, not on a re-spelling of it over the
+        # row dict: the re-spelling is what went stale on `total_usd` when the fill-bleed term
+        # landed (reviewer send-back, 2026-07-30 night), so venue_rank showed the operator a
+        # cheap-first board while the allocator funded expensive-first.
+        rows.sort(key=lambda kr: kr[0])
+        rows = [r for _k, r in rows]
         for r in rows:
             R.log("venue_rank", **r)
         seg = self.presence_log.read_segment(now)
