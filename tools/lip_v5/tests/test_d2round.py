@@ -463,6 +463,108 @@ class TestPhiShrinkage(LipTestCase):
         self.assertAlmostEqual(bid.phi_prior, C.PHI_SEED_CHEAP, places=9)
         self.assertNotAlmostEqual(bid.phi_prior, 0.05, places=6)
 
+    # ── THE QUIET-NEIGHBORHOOD INCIDENT (blocking review finding, 2026-07-30 night). ──────
+    # The first cut shrank each rung toward its bucket average and stopped there.  When the
+    # WHOLE BOARD is quiet — the incident's own precondition — that average is exactly 0.0,
+    # `phi_prior_strength` cannot fit a scale, `phi_k(0.0)` is 0, and `history_dominates` =
+    # (exposure > 0) is TRUE on any tape at all: $9.96 of a $10 envelope on 2.5 quiet
+    # contract-hours, reproduced end to end in review.  The prior is now itself shrunk toward
+    # the seed by the pool's COLLECTIVE exposure (`scan.phi_prior_shrunk`).
+    QUIET_TICKERS = ("KXBAND-26JUL29-T4.12", "KXBAND-26JUL29-T4.20")
+
+    def _quiet_board(self, exposure_h):
+        """Two markets in ONE price bucket (12c), four sides, every one of them quiet for
+        `exposure_h` contract-hours with zero fills — so every measured phi on the board is
+        0.0 and the raw bucket average is an authoritative zero."""
+        class TwoTable(object):
+            def __init__(self, tks):
+                self.table = {}
+                for tk in tks:
+                    self.table[tk] = {
+                        "ticker": tk, "program_id": "p1", "series": "KXBAND",
+                        "pinned": False, "target_size": 1000.0, "yes_mid": 0.135,
+                        "ts": NOW, "close_ts": NOW + 16 * 3600,
+                        "sides": {"bid": {"S": 500.0, "qualifies": True, "cum_size": 1200.0,
+                                          "p": 0.12, "legal": True},
+                                  "ask": {"S": 500.0, "qualifies": True, "cum_size": 1200.0,
+                                          "p": 0.88, "legal": True}}}
+        rows = [{"ticker": tk, "side": sd, "fills_ct": 0,
+                 "rest_contract_s": exposure_h * 3600.0, "rest_dollar_s": 0.0,
+                 "prox_dollar_s": 0.0, "inv_dollar_s": 0.0, "at_best_s": 0.0,
+                 "fill_notional": 0.0}
+                for tk in self.QUIET_TICKERS for sd in ("bid", "ask")]
+        return (scan.build_slots([prog(tickers=self.QUIET_TICKERS)],
+                                 TwoTable(self.QUIET_TICKERS), NOW, presence_rows=rows),
+                rows)
+
+    def test_THE_QUIET_NEIGHBORHOOD_incident_a_zero_prior_confers_no_authority(self):
+        """2.5 quiet contract-hours on a board where EVERYTHING is quiet — 54 seconds of rest
+        for a 166-lot rung — must not open the envelope.
+
+        The pool's collective evidence is ~7.5 contract-hours (leave-one-out of ~10), and a
+        Rule-of-Three bound on that is ~0.4/h: nowhere near a measured zero.  So the prior is
+        pulled to the seed, k stays large, our own 2.5 hours are a rounding error, and the
+        order tranches at the lot container with the requote reserve held.
+        MUTATION: delete the `phi_prior_shrunk` step (prior = the raw pool average) and this
+        fails on the envelope — $9.96 of $10 on 2.5 quiet contract-hours."""
+        slots, _rows = self._quiet_board(2.5)
+        bid = [s for s in slots if s.side == "bid"][0]
+        self.assertEqual(bid.phi_source, "bucket")
+        self.assertAlmostEqual(bid.phi_exposure_h, 2.5, places=9)
+        # (a) the prior is no longer an authoritative zero: the pool's 7.5 collective quiet
+        # contract-hours are shrunk toward the seed, so BOTH the prior and k stay positive.
+        self.assertGreater(bid.phi_prior, 0.0, "a zero prior is an unearned certainty")
+        self.assertGreater(bid.phi, 0.0)
+        self.assertGreater(bid.phi_k, 0.0)
+        n = alloc.law_need(bid)
+        # (b) and the gate does not depend on that: 2.5 contract-hours cannot rule out a
+        # turnover at the Rule-of-Three bound (3/2.5 x 16h = 19 >> 1), so the envelope is
+        # refused whatever the prior does.  THIS is the clause review's repro needed —
+        # `seed_phi` returns 0.001 at every price, so the seed alone lends only ~1.9
+        # contract-hours of authority and `history_dominates` is satisfiable at 2.5.
+        self.assertFalse(n.evidence_bounds_a_turnover,
+                         "2.5 contract-hours cannot rule out a turnover")
+        a, _spent, _rep = alloc.allocate_law(slots, budget_usd=300.0)
+        for s in slots:
+            self.assertLessEqual(a[s.key] * s.p, C.SLOT_LOT_CAP_USD + 1e-9,
+                                 "THE QUIET-BOARD INCIDENT: the envelope opened on %s" % s.p)
+        funded = self.logs_of("law_funded")
+        self.assertTrue(funded)
+        self.assertIs(funded[0]["turnover_bounded"], False,
+                      "the refusing clause must be visible on the line")
+
+    def test_a_genuinely_long_quiet_board_still_earns_the_envelope(self):
+        """The other end, so the fix is not the R3 deadlock in new clothes: 25,000 collective
+        contract-hours of quiet IS a measurement.  The seed's pull vanishes as 1/E_pool, the
+        prior collapses, k collapses with it, every rung's own history dominates, and the
+        envelope is earned — exactly the convergence the R3 bound used to prevent."""
+        slots, _rows = self._quiet_board(25_000.0)
+        bid = [s for s in slots if s.side == "bid"][0]
+        self.assertLess(bid.phi_prior, 1e-3, "a long-quiet board must converge to low phi")
+        self.assertLess(bid.phi, 1e-3)
+        n = alloc.law_need(bid)
+        self.assertTrue(n.history_dominates)
+        self.assertTrue(n.evidence_bounds_a_turnover)
+        self.assertLessEqual(n.turnovers, 1.0)
+        a, _spent, _rep = alloc.allocate_law([bid], budget_usd=300.0)
+        # 83 contracts x 12c = $9.96: the envelope, to the last whole contract it can hold
+        self.assertGreater(a[bid.key] * bid.p, C.SLOT_LOT_CAP_USD)
+        self.assertAlmostEqual(a[bid.key] * bid.p, 10.0, delta=bid.p)
+
+    def test_the_prior_is_itself_shrunk_by_the_pools_exposure(self):
+        seed = C.PHI_SEED_MID
+        k_seed = scan.phi_k(seed)
+        self.assertAlmostEqual(scan.phi_prior_shrunk(0.0, 0.0, seed), seed, places=12)
+        self.assertAlmostEqual(scan.phi_prior_shrunk(0.0, 7.5, seed),
+                               (k_seed * seed) / (7.5 + k_seed), places=12)
+        # monotone: the more collective exposure behind a zero, the closer the prior to zero
+        prev = seed
+        for e in (1.0, 10.0, 100.0, 10_000.0):
+            v = scan.phi_prior_shrunk(0.0, e, seed)
+            self.assertLess(v, prev)
+            prev = v
+        self.assertLess(prev, seed / 50.0)      # the seed's pull vanishes as 1/E_pool
+
     def test_the_composition_is_logged_no_silent_estimator(self):
         R.reset_log_once()
         scan.build_slots([prog()], Table(), NOW)

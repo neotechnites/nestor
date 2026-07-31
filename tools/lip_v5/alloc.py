@@ -362,6 +362,48 @@ class Need(object):
             return True
         return float(e) > float(getattr(self.slot, "phi_k", 0.0) or 0.0)
 
+    @property
+    def evidence_bounds_a_turnover(self):
+        """Can this rung's OWN evidence RULE OUT a turnover inside the horizon?
+
+        THE SECOND CLAUSE OF THE OVERSIZE GATE (blocking review finding, 2026-07-30 night).
+        `history_dominates` asks whose number the low phi is; it does NOT ask whether that
+        number is precise enough to bet ten dollars on, and review found the gap: when the
+        whole neighborhood is quiet the prior goes to ~0, k goes with it, and "own exposure >
+        k" is satisfied by a couple of contract-hours — the incident again, one door over.
+        Shrinking the prior toward the seed (`scan.phi_prior_shrunk`) narrows that door but
+        cannot shut it, because `money.seed_phi` deliberately returns PHI_SEED_CHEAP = 0.001
+        for every price (the price step was refuted 2026-07-29 as an admission router), so
+        the seed itself only lends ~1.9 contract-hours of authority.  A gate that depends on
+        the prior being well-behaved is a gate that fails whenever the prior does.
+
+        So the second clause reads the EVIDENCE directly, with the closed form this codebase
+        already owns.  Zero fills over exposure E bounds the rate at RULE_OF_THREE / E at 95%
+        (`money.phi_estimate`).  The oversize is justified by exactly one claim — "this lot
+        will not turn over inside the horizon" — so require the BOUND to support it:
+
+            (RULE_OF_THREE / own_exposure) x h <= 1   ⇒   own_exposure >= 3h
+
+        At the standard 24h horizon that is 72 contract-hours of our own tape before the full
+        envelope may rest: tonight's 2 contract-hours are refused by a factor of 36, and so is
+        the quiet-board variant, at ANY prior, which is the point — this clause cannot be
+        subverted by a pathological prior because it never reads one.
+        THIS IS NOT THE R3 DEADLOCK RETURNING.  That deadlock (litigated in
+        `scan.measured_phi` and `money.seed_phi`) was 3/E used as the ESTIMATE, inside the
+        cost and admission path, where it made quiet books rank unaffordable and un-fund
+        themselves.  Here 3/E never touches phi, never enters `law_need`, and never refuses a
+        market: it can only pull an order back from the whole envelope to W — from $10 to the
+        need itself — on a rung that is funded either way.  Bounded in dollars, bounded in
+        time, and it clears itself with exposure.
+        `None` exposure = the caller asserted phi as a fact (see `Slot.__init__`)."""
+        e = getattr(self.slot, "phi_exposure_h", None)
+        if e is None:
+            return True
+        e = float(e)
+        if e <= 0.0:
+            return False
+        return (float(C.RULE_OF_THREE) / e) * max(0.0, float(self.h)) <= 1.0
+
     def numbers(self):
         """The log payload: no refusal without its arithmetic."""
         return {"ticker": self.slot.ticker, "side": self.slot.side, "cluster": self.cluster,
@@ -378,7 +420,10 @@ class Need(object):
                 "phi_k": round(float(getattr(self.slot, "phi_k", 0.0) or 0.0), 4),
                 "own_exposure_h": (None if getattr(self.slot, "phi_exposure_h", None) is None
                                    else round(float(self.slot.phi_exposure_h), 4)),
+                # BOTH clauses of the oversize gate, because a size chosen (or refused) off
+                # one of them must be auditable from the line alone.
                 "history_dominates": self.history_dominates,
+                "turnover_bounded": self.evidence_bounds_a_turnover,
                 "accrued": round(self.slot.accrued, 4)}
 
 
@@ -483,9 +528,12 @@ def law_order_q(need, env_usd):
          HISTORY'S (rewritten 2026-07-30 night; supersedes G3's `phi_source` test).
          Example 3 is conditioned on a FACT — "somehow this market is awesome and [its phi
          is very low]" — and under shrinkage a low posterior is a fact about THIS rung only
-         once its own exposure outweighs the prior, i.e. `Need.history_dominates`
-         (own exposure > k).  Then T <= 1 means the lot is not expected to turn over inside
-         the horizon and the whole envelope may rest.
+         when BOTH of these hold: its own exposure outweighs the prior's strength
+         (`Need.history_dominates`, own exposure > k) AND its own exposure is enough to rule
+         out a turnover at the Rule-of-Three bound (`Need.evidence_bounds_a_turnover`,
+         own exposure >= 3h — the clause review added after the first cut's zero-prior hole).
+         Then T <= 1 means the lot is not expected to turn over inside the horizon and the
+         whole envelope may rest.
          Below that exposure the low number is mostly the neighborhood's, borrowed — we do
          not know THIS rung is quiet, we know we have not looked long enough — so the order
          tranches at the LOT CONTAINER (SLOT_LOT_CAP_USD, the per-source reserve halved so
@@ -501,7 +549,10 @@ def law_order_q(need, env_usd):
     Both ends are the same $10."""
     if need.unit_usd <= 0:
         return 0
-    dominant = need.history_dominates
+    # BOTH clauses, and they catch different failures: `history_dominates` says the low phi
+    # is OURS rather than the neighborhood's; `evidence_bounds_a_turnover` says it is precise
+    # enough to bet the envelope on, and holds even when the prior is degenerate.
+    dominant = need.history_dominates and need.evidence_bounds_a_turnover
     if need.qualify_q > 0:
         # THE WALK IS ALL-OR-NOTHING (the filing's step function): a sub-walk order scores
         # ZERO, so the seed tranche may not undercut it (it would buy a worthless sub-walk),

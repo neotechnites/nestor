@@ -157,6 +157,9 @@ class TestOversizeRequiresAMeasurement(LipTestCase):
         n = alloc.law_need(s)
         self.assertEqual(n.q_rest, 10)
         self.assertFalse(n.history_dominates)
+        # and the second clause refuses independently: 3/2 x 24h = 36 turnovers cannot be
+        # ruled out on two contract-hours (see `Need.evidence_bounds_a_turnover`)
+        self.assertFalse(n.evidence_bounds_a_turnover)
         self.assertLessEqual(n.total_usd, 10.0)
         a, spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
         self.assertEqual(a[s.key], n.q_rest, "the order must size to the NEED, not the $10")

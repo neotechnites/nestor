@@ -612,7 +612,16 @@ def phi_seed_band_var():
     ceiling on phi_ub at zero exposure").  That band IS a prior dispersion statement, and the
     maximum-entropy variance of a rate known only to lie in a band is the uniform's,
     (hi − lo)² / 12.  No new constant: the number is read off two that already exist, and it
-    moves with them if they are ever recalibrated."""
+    moves with them if they are ever recalibrated.
+
+    ON USING PHI_SEED_MID AT ALL, since `money.seed_phi` REFUSED it (2026-07-29): what was
+    refuted there is the price STEP — seed_phi returns PHI_SEED_CHEAP at every price now,
+    because an 80x jump at a 5c cutoff was acting as a global admission router and selecting
+    precisely the cohort measured at −100%.  That argument is about the seed as a LEVEL on one
+    venue.  Here neither seed is a level: only the DISTANCE between them is read, as a
+    statement of how uncertain this program is about an unmeasured fill rate, and nothing
+    routes on it.  If PHI_SEED_MID is ever deleted outright this function must be re-derived
+    rather than silently defaulted — flagged, not assumed."""
     lo, hi = sorted((float(C.PHI_SEED_CHEAP), float(C.PHI_SEED_MID)))
     return ((hi - lo) ** 2) / 12.0
 
@@ -657,12 +666,52 @@ def phi_k(prior, dispersion_k=None):
     return p / v
 
 
+def phi_prior_shrunk(pool_rate, pool_exposure_h, seed):
+    """THE PRIOR IS ITSELF A POSTERIOR — the neighborhood average shrunk toward the seed by
+    the pool's COLLECTIVE exposure.  (Blocking review finding, 2026-07-30 night.)
+
+    THE HOLE THIS CLOSES.  When the whole board is quiet — which is the incident's own
+    precondition, "a quiet afternoon put SEVERAL rungs at phi = 0" — every measured phi in
+    the bucket is 0.0, so the raw average is an authoritative 0.0, `phi_prior_strength`
+    cannot fit a scale (mu = 0), `phi_k(0.0)` is 0, and `history_dominates` = (exposure > 0)
+    is TRUE on any tape at all.  phi = 0, T = 0, and the full envelope opens on 54 seconds of
+    rest: the incident, arriving through the prior's door instead of the tape's.  Reproduced
+    end to end in review — $9.96 of a $10 envelope on 2.5 quiet contract-hours.
+    The defect is that a MEASURED zero is being read as a KNOWN zero regardless of how thin
+    the evidence behind it is.  Four rungs quiet for 2.5 contract-hours each is ~10
+    contract-hours of collective evidence; the Rule-of-Three bound on that is ~0.3/h, nowhere
+    near zero.  So the pool's average gets exactly the treatment a rung's own tape gets, with
+    the pool's own exposure as its weight and the seed as ITS prior:
+
+        prior = (avg x E_pool + k_seed x seed) / (E_pool + k_seed),  k_seed = phi_k(seed)
+
+    ONE FORMULA AT TWO LEVELS, and it collapses the old three-rung chain into a continuum:
+    an EMPTY pool (E_pool = 0) returns the seed exactly — which is what the old "seed" rung
+    was — a thin pool returns something between, and a pool with enormous collective exposure
+    returns its own average, seed pull vanishing as 1/E_pool.
+    THE OTHER END IS NOT RE-ARMED (R3): a genuinely long-quiet board converges to a genuinely
+    low prior — 100,000 collective contract-hours of quiet gives prior = 1.2e-4, k = 0.24, and
+    every rung's own tape dominates immediately and earns the envelope.  The seed floor is a
+    thin-EVIDENCE guard, never a standing floor; it is the same argument the entry band's
+    floor won on ("floor the UNMEASURED, and let (★) judge the measured"), applied to the
+    pool rather than to one rung.
+    A CONSEQUENCE WORTH STATING: since the seeds are strictly positive, the prior now is too,
+    so `phi_k` can no longer return 0 through a zero prior and the `exposure > 0` degenerate
+    gate is structurally unreachable — not merely untested."""
+    e = max(0.0, float(pool_exposure_h))
+    sd = max(0.0, float(seed))
+    return phi_posterior(max(0.0, float(pool_rate)) * e, e, sd, phi_k(sd))
+
+
 def phi_posterior(fills_ct, exposure_h, prior, k):
     """phi_hat = (fills + k x prior) / (exposure_h + k) — the shrunk fill rate (see above).
 
     Total ignorance (no exposure) returns the prior exactly; k = 0 with no exposure has no
-    information at all and returns the prior rather than dividing by zero."""
-    n = max(0, int(fills_ct))
+    information at all and returns the prior rather than dividing by zero.
+    `fills_ct` is a count from the tape at the rung level, but FLOAT-TOLERANT because
+    `phi_prior_shrunk` runs the identical update one level up, where the "count" is a pool's
+    rate x its collective exposure and need not land on an integer."""
+    n = max(0.0, float(fills_ct))
     e = max(0.0, float(exposure_h))
     kk = max(0.0, float(k))
     denom = e + kk
@@ -821,7 +870,10 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
     # thin board is decisive again — exactly tonight's failure wearing a posterior's clothes.
     # The owner's sentence is "take our GLOBAL AVERAGE and use THE RUNG'S HISTORY to adjust
     # it": two different bodies of evidence, and a rung's own hours may not be both.
-    _phi_buckets, _phi_global, _phi_samples, _phi_by_key = {}, [0.0, 0], [], {}
+    # Each pool carries [Σ m_i, n, Σ E_i]: the average AND the COLLECTIVE EXPOSURE behind it,
+    # because `phi_prior_shrunk` weighs the pool's own evidence against the seed — an average
+    # of zeros drawn from ten collective contract-hours is not a measured zero.
+    _phi_buckets, _phi_global, _phi_samples, _phi_by_key = {}, [0.0, 0, 0.0], [], {}
     for _tk, _rec in sorted(classifier.table.items()):
         for _sd_side in ("bid", "ask"):
             _p = _rec["sides"][_sd_side]["p"]
@@ -836,24 +888,30 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             _m = measured_phi(_f, _e)
             if _m is None:
                 continue
-            _b = _phi_buckets.setdefault(phi_bucket(_p), [0.0, 0])
+            _b = _phi_buckets.setdefault(phi_bucket(_p), [0.0, 0, 0.0])
             _b[0] += _m
             _b[1] += 1
+            _b[2] += _e
             _phi_global[0] += _m
             _phi_global[1] += 1
+            _phi_global[2] += _e
             _phi_samples.append((_m, _e))
-            _phi_by_key[_key] = (phi_bucket(_p), _m)
+            _phi_by_key[_key] = (phi_bucket(_p), _m, _e)
     # k, ONCE PER PASS, from the board's own dispersion (empirical Bayes — see `phi_k`).
     # None here is not a defect: it is "the board cannot yet say how much markets differ",
-    # and every slot then derives its own k from its own prior (RULE_OF_THREE / prior).
+    # and every slot then takes k from the SAME formula (k = mu/v) run against the program's
+    # own stated dispersion, the seed band — never RULE_OF_THREE/prior, which `phi_k`'s
+    # docstring rejects with the arithmetic.
     _k_disp = phi_prior_strength(_phi_samples)
     R.log_once("phi_shrinkage_k",
                k_dispersion=None if _k_disp is None else round(_k_disp, 4),
                n_measured=_phi_global[1],
+               pool_exposure_h=round(_phi_global[2], 4),
                phi_mean=(round(_phi_global[0] / _phi_global[1], 6)
                          if _phi_global[1] else None),
-               note="phi_hat = (fills + k*prior)/(exposure_h + k); k from cross-market "
-                    "dispersion, else RULE_OF_THREE/prior (owner 2026-07-30 night)")
+               note="phi_hat = (fills + k*prior)/(exposure_h + k); k = mu/v, v from "
+                    "cross-market dispersion else the seed band; the prior is itself "
+                    "shrunk to the seed by the pool's exposure (owner 2026-07-30 night)")
 
     for ticker, rec in sorted(classifier.table.items()):
         prog = by_prog.get(rec["program_id"])
@@ -1070,27 +1128,33 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             # filling anyone at the busy rate) — phi only, never a refusal.
             quiet = (p6 is not None and not p6(ticker))
             # Leave-one-out: this key's own sample (if it has one) comes OUT of both pools
-            # before they are averaged — see the pre-pass note.
-            _own_b, _own_m = _phi_by_key.get(key, (None, 0.0))
+            # before they are averaged — see the pre-pass note.  Its exposure leaves with it,
+            # or a rung would lend its own hours to the pool that judges it.
+            _own_b, _own_m, _own_e = _phi_by_key.get(key, (None, 0.0, 0.0))
             _bk = phi_bucket(p)
             _b = _phi_buckets.get(_bk)
-            _b_sum, _b_n = (_b[0], _b[1]) if _b else (0.0, 0)
+            _b_sum, _b_n, _b_e = (_b[0], _b[1], _b[2]) if _b else (0.0, 0, 0.0)
             if _own_b == _bk:
-                _b_sum, _b_n = _b_sum - _own_m, _b_n - 1
-            _g_sum, _g_n = _phi_global[0], _phi_global[1]
+                _b_sum, _b_n, _b_e = _b_sum - _own_m, _b_n - 1, _b_e - _own_e
+            _g_sum, _g_n, _g_e = _phi_global[0], _phi_global[1], _phi_global[2]
             if _own_b is not None:
-                _g_sum, _g_n = _g_sum - _own_m, _g_n - 1
+                _g_sum, _g_n, _g_e = _g_sum - _own_m, _g_n - 1, _g_e - _own_e
+            # The SEED is no longer the last rung of a chain — it is the prior OF THE PRIOR,
+            # and it is always consulted (`phi_prior_shrunk`).  An empty pool returns it
+            # unchanged, which is exactly what the old "seed" rung did; a thin pool is pulled
+            # toward it; a pool with real collective exposure overwhelms it.  This is the
+            # blocking review finding of 2026-07-30 night: an all-quiet neighborhood used to
+            # hand out an authoritative prior of 0.0, k = 0, and therefore the full envelope
+            # on any tape at all — the incident through the prior's door.
+            _seed = M.phi_estimate(0, 0.0,
+                                   p=(C.PHI_CHEAP_PRICE_CUT / 2.0) if quiet else p)
             if _b_n > 0:
-                phi_prior, phi_source = max(0.0, _b_sum) / _b_n, "bucket"
+                _pool_rate, _pool_e, phi_source = max(0.0, _b_sum) / _b_n, _b_e, "bucket"
             elif _g_n > 0:
-                phi_prior, phi_source = max(0.0, _g_sum) / _g_n, "global"
+                _pool_rate, _pool_e, phi_source = max(0.0, _g_sum) / _g_n, _g_e, "global"
             else:
-                # No measurement anywhere on the board: the prior is the seed, and it is the
-                # SEED PROPER (zero own-evidence), because own fills/exposure enter through
-                # the posterior below and must not be counted twice.
-                phi_prior = M.phi_estimate(0, 0.0,
-                                           p=(C.PHI_CHEAP_PRICE_CUT / 2.0) if quiet else p)
-                phi_source = "seed"
+                _pool_rate, _pool_e, phi_source = 0.0, 0.0, "seed"
+            phi_prior = phi_prior_shrunk(_pool_rate, _pool_e, _seed)
             k = phi_k(phi_prior, _k_disp)
             phi = phi_posterior(fills, rest_ch, phi_prior, k)
             d = M.d_estimate(t.get("drift_samples"), p)

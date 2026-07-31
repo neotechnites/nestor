@@ -200,9 +200,16 @@ class TestPlanGrowthReachesTheWire(ConvergenceCase):
     the measurement arrived, not of the world."""
 
     def test_the_seed_to_measured_growth_is_carried_by_trigger_f(self):
+        # REWRITTEN 2026-07-30 night for the shrinkage estimator.  The growth is the same
+        # 83 -> 166 pair, but it is no longer bought with 2 contract-hours of quiet (that is
+        # the incident, and `alloc.Need.evidence_bounds_a_turnover` now refuses it): the rung
+        # must rest long enough that the Rule-of-Three bound can rule out a turnover inside
+        # the 16 h horizon, own exposure >= 3h = 48 contract-hours, which at 83 contracts
+        # resting is ~35 minutes of wall clock.  The RUN is longer; the assertion is the same
+        # one, and it is still trigger (f) that carries the growth to the wire.
         # reward tuned so W = ~$5.40 at 6c: the seed tranche posts $5.00 = 83 contracts,
-        # and the measured-zero oversize posts the $10 envelope = 166 — the rival branch's
-        # exact measured pair, reproduced from the world instead of asserted.
+        # and the oversize posts the $10 envelope = 166 — the rival branch's exact measured
+        # pair, reproduced from the world instead of asserted.
         ex = ConvergenceExchange(program_body(tickers=(TK_A,), reward=287_000),
                                  {TK_A: cheap_book()})
         ex.market_closes[TK_A] = NOW + 16 * 3600
@@ -215,10 +222,16 @@ class TestPlanGrowthReachesTheWire(ConvergenceCase):
         early = self.fingerprint(ex)
         self.assertEqual(early.get((TK_A, "bid")), 83.0,
                          "the seed tranche must rest first: %s" % early)
-        # ...the book does not move; only the TAPE does (2 contract-hours of quiet resting
-        # measures phi = 0), and the plan doubles.  83 is EXACTLY half of 166, so the
-        # refill trigger's strict inequality stays silent — (f) is what reaches the wire.
-        t = self.settle(r, t, n=60, step=5.0)             # to ~360 s: decisively measured
+        # ...the book does not move; only the TAPE does, and the plan doubles.  83 is
+        # EXACTLY half of 166, so the refill trigger's strict inequality stays silent —
+        # (f) is what reaches the wire.
+        # ...and only once the rung's OWN tape can bound its turnover (>= 3h = 48 contract-
+        # hours, ~35 min of wall clock at 83 contracts resting) does the envelope open.  Two
+        # contract-hours no longer can — that is the incident.  The run is at TRUE 1 Hz
+        # because the meter accrues `remaining` once per TICK: stepping simulated time faster
+        # than the sampler under-counts exposure by exactly the step, and this test is now
+        # about how much exposure exists.
+        t = self.settle(r, t, n=2_200, step=1.0)          # to ~2,260 s ≈ 52 contract-hours
         grown = self.fingerprint(ex)
         self.assertEqual(grown.get((TK_A, "bid")), 166.0,
                          "the measured plan never reached the wire: %s" % grown)
