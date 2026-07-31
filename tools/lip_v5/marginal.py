@@ -88,6 +88,18 @@ convergence spine — both are functions of WORLD STATE ONLY:
       the toll on live orders would have made the book a function of its own history, which is
       the disease `test_convergence` exists to detect.
 
+── WHY NO SEPARATE CUMULATIVE-BLEED CAP IS NEEDED (adjudicator's optional graft, evaluated) ─
+The queue only ever takes an increment whose MARGINAL net is positive, and the entry block is
+admitted only when its own net is positive.  So `net(q) = paid(q) - bleed(q)` starts positive
+and is non-decreasing along every path the queue walks, which means
+
+        bleed(q)  <  paid(q)          at every size the queue can reach
+
+— cumulative expected bleed is bounded below the credit actually earned, by construction, with
+no cap, no counter and no new constant.  That is the property a separate cumulative-bleed cap
+would enforce, so it is not added; `test_the_cumulative_bleed_can_never_exceed_the_credit`
+pins it instead, and a mutation that lets a negative-marginal increment through fails it.
+
 ── WHAT IS *NOT* HERE ──────────────────────────────────────────────────────────────────────
 No timer, no cooldown, no hysteresis constant, no minimum-improvement threshold, no DONE
 flag, no rotation rule.  Stay-vs-move is the comparison of two rates with one of them holding
@@ -118,9 +130,10 @@ def transit_h():
 # defect, not a policy (three separate incidents on 2026-07-30 were silent refusals).
 ENTERED, DEEPENED = "entered", "deepened"
 NO_POOL, UNREACHABLE_CLIFF, NEGATIVE_ENTRY, CANT_AFFORD_ENTRY, CLUSTER_TAKEN, RAIL_FULL, \
-    BUDGET_EXHAUSTED, UNQUOTABLE, WINDOW = (
+    BUDGET_EXHAUSTED, UNQUOTABLE, WINDOW, UNMEASURED_DEPTH = (
         "no_pool", "cliff_unreachable", "entry_net_negative", "cant_afford_entry",
-        "cluster_taken", "cluster_rail_full", "budget_exhausted", "unquotable", "window")
+        "cluster_taken", "cluster_rail_full", "budget_exhausted", "unquotable", "window",
+        "deepen_unmeasured")
 
 
 class Curve(object):
@@ -240,6 +253,61 @@ class Curve(object):
             return 0.0
         return self.net(self.q_entry) / cap
 
+    @property
+    def may_deepen(self):
+        """MAY THIS RUNG TAKE MORE THAN ITS ENTRY BLOCK?  — the two evidence clauses v5's
+        oversize gate already implements, ported onto the queue's DEPTH arm.
+
+        ── G2, THE ADJUDICATOR'S BLOCKING FINDING (2026-07-31) ──────────────────────────────
+        The queue's deepening arm consulted the marginal RATE and nothing else, and a rate is
+        computed from phi — so a rung whose phi is LOW BECAUSE WE HAVE NOT LOOKED reads
+        identically to one whose phi is low because we looked for a day.  Measured in this
+        worktree: a 15c rung with phi = 0.002 on HALF A CONTRACT-HOUR of its own tape (prior
+        0.002, k = 0.4 — the neighbourhood's word, not the rung's) was deepened from its $1.20
+        entry to 133 contracts = $19.95, the whole rail, on thirty minutes of tape, while the
+        MEASURED rung beside it correctly stopped at $2.85.  If that rung's true phi is a
+        normal 15c rung's ~0.1, the seat bleeds ~$14/day.
+
+        THIS IS THE QUIET-AFTERNOON INCIDENT, ONE DOOR OVER.  2026-07-30: "measured 0" on a
+        quiet afternoon unlocked the full $10 envelope and the evening flow ate it (42 fills,
+        ~$76 of inventory in 8 h).  The fix Ryan gave then was the shrinkage estimator plus a
+        two-clause gate, and note 55 states it twice:
+            "Oversize past W toward full A only on MEASURED-low phi" (§2)
+            "Oversize gate becomes posterior-low AND history-dominates" (PHI SHRINKAGE)
+        v6 replaced the seat with a queue and the gate did not come with it.  It does now, and
+        it is the SAME two clauses, with the same derivations, that
+        `alloc.Need.history_dominates` and `alloc.Need.evidence_bounds_a_turnover` carry:
+
+          (1) own exposure > phi_k        — "more than half of this number is our own history"
+                                            (k is exactly the crossover weight)
+          (2) own exposure >= 3 x h       — zero fills bound the rate at RULE_OF_THREE /
+                                            exposure, so this is the bound RULING OUT a
+                                            turnover inside the horizon at 95%.  It holds even
+                                            when the prior is degenerate, which clause (1)
+                                            cannot promise.
+
+        SCOPE, DELIBERATELY NARROW: this gates DEPTH, never PRESENCE.  The ENTRY BLOCK —
+        including a qualifying wall — is always allowed, because entering is how a rung's tape
+        gets written in the first place and a gate that refused entry would be self-sealing.
+        The quiet ladder-wide class is therefore unaffected: note 55's amendment 2 relaxes the
+        MARKET COUNT, not depth, and a quiet family's walls are entry blocks by construction.
+        MIRROR (gate too tight ↔ too loose): too tight leaves a genuinely quiet rung at its
+        entry block while its own tape accumulates — bounded, self-clearing, and the dollars go
+        to the next-best rung instead of idling.  Too loose is the incident, whose bound is the
+        whole rail on a rung we have not measured.
+        `None` exposure = the caller asserted phi as a fact (`Slot.__init__`'s idiom).
+        """
+        e = getattr(self.slot, "phi_exposure_h", None)
+        if e is None:
+            return True
+        e = float(e)
+        if e <= 0.0:
+            return False
+        k = max(0.0, float(getattr(self.slot, "phi_k", 0.0) or 0.0))
+        if e <= k:
+            return False
+        return (float(C.RULE_OF_THREE) / e) * max(0.0, self.h) <= 1.0
+
     def marginal_rate(self, q):
         """dNET/dCAPITAL at resting size q (q >= q_entry).  Closed form, module header."""
         if self.p <= 0.0:
@@ -265,6 +333,10 @@ class Curve(object):
                 "S": round(self.S, 3), "rho": round(self.rho, 5),
                 "h": round(self.h, 3), "h_eff": round(self.h_eff, 3),
                 "present": self.present, "accrued": round(self.accrued, 4),
+                "may_deepen": self.may_deepen,
+                "own_exposure_h": (None if getattr(self.slot, "phi_exposure_h", None) is None
+                                   else round(float(self.slot.phi_exposure_h), 4)),
+                "phi_k": round(float(getattr(self.slot, "phi_k", 0.0) or 0.0), 4),
                 "cliff_usd": round(self.cliff, 4),
                 "T": round(self.T, 4), "g": round(self.g, 4),
                 "phi": round(self.phi, 6),
@@ -411,7 +483,12 @@ def allocate_marginal(slots, budget_usd, market_spent=None, cluster_spent=None,
         if probe is not None:
             r = min(r, probe.room_usd(cv, spent_by_lane))
             exempt = probe.rail_exempt(cv)
-        if per_market_cap_usd is not None and not exempt:
+        # G3 (adjudicator, 2026-07-31): the PER-MARKET cap binds on a probe order too.  The
+        # exemption is from the CLUSTER rail and from nothing else, which is what probe.py's
+        # header claims and what note 55's own shape requires — "walls across tenors at 1-2c
+        # sides ~$10-20 each" is SPREAD across a family, each leg inside a seat, not one leg
+        # holding the lane.  Only the cluster line below reads `exempt`.
+        if per_market_cap_usd is not None:
             r = min(r, float(per_market_cap_usd)
                     - float(market_spent.get(cv.slot.ticker, 0.0))
                     - by_market.get(cv.slot.ticker, 0.0))
@@ -458,6 +535,18 @@ def allocate_marginal(slots, budget_usd, market_spent=None, cluster_spent=None,
             q_new = cv.q_entry
             q_old = 0
         else:
+            if not cv.may_deepen:
+                # G2, AND THIS IS THE ONE PLACE IT IS ENFORCED.  The rung's own tape cannot
+                # yet tell earned-low phi from thin-low, so it keeps its entry block and the
+                # dollar goes to the next-best rung.  Counted and exampled like every other
+                # refusal — this one moves real money.
+                # WHY THE GATE LIVES AT THE POP AND NOT AT THE PUSH: a gate at the push is
+                # unreachable code at the pop and vice-versa, and unreachable code is a clause
+                # no mutation can kill — the battery proved exactly that (a gate at both
+                # points left the pop-side test un-killable).  ONE enforcement point, on the
+                # path every deepening dollar actually takes.
+                skip(cv, UNMEASURED_DEPTH)
+                continue
             q_old = alloc[(tk, side)]
             q_max_by_room = q_old + int((avail) / (cv.p * max(1.0, cv.T)) + 1e-9)
             if q_max_by_room <= q_old:
@@ -485,6 +574,9 @@ def allocate_marginal(slots, budget_usd, market_spent=None, cluster_spent=None,
               rate=round(rate, 6), lam=round(lam, 6), **cv.numbers(q_new))
         nxt = cv.marginal_rate(q_new)
         if nxt > 0.0:
+            # Pushed unconditionally; `may_deepen` decides at the POP (see above), so the gate
+            # is on one reachable path and the refusal is counted exactly once — a rung that
+            # is refused is never re-pushed.
             heapq.heappush(heap, (-nxt, tk, side, "deepen"))
 
     funded = {}

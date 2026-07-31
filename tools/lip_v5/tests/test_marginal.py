@@ -320,3 +320,152 @@ class TestSmoothedCompetition(LipTestCase):
         self.assertGreater(a_smooth[s.key], 0,
                            "S is an input to the entry cost; the smoothed value must be the "
                            "one the queue uses")
+
+
+class TestTheDeepenEvidenceGate(LipTestCase):
+    """G2 (adjudicator, 2026-07-31) — note 55 §2 "Oversize past W toward full A only on
+    MEASURED-low phi" and the PHI SHRINKAGE section's "posterior-low AND history-dominates",
+    ported onto the queue's DEPTH arm.
+
+    THE MEASURED FAILURE this pins, reproduced by the adjudicator on this branch: a 15c rung
+    with phi = 0.002 on HALF a contract-hour of its own tape was deepened from its $1.20 entry
+    block to the whole rail, while the same-priced rung with real tape correctly stopped.  The
+    queue could not tell earned-low phi from thin-low.
+    """
+
+    def measured(self, ticker, exposure, k=0.4, prior=0.002, **kw):
+        """A rung whose posterior is 0.002 — the only difference between the two fixtures is
+        HOW MUCH OF THAT NUMBER IS OURS."""
+        return alloc.Slot(ticker, "bid", rho=2.0, S=200.0, p=0.15, phi=0.002,
+                          phi_prior=prior, phi_k=k, phi_exposure_h=exposure,
+                          hours_left=24.0, target_size=1000, cum_size=2000.0, **kw)
+
+    def test_clause_2_the_rule_of_three_turnover_bound(self):
+        """own exposure >= 3h: zero fills bound the rate at RULE_OF_THREE/exposure, so this is
+        the bound that RULES OUT a turnover inside the horizon at 95%.  The adjudicator's
+        fixture (0.5 contract-hours) is refused by a factor of 144."""
+        thin = MQ.Curve(self.measured("KXTHIN-26JUL31-T1", exposure=0.5))
+        self.assertFalse(thin.may_deepen)
+        rich = MQ.Curve(self.measured("KXRICH-26JUL31-T1", exposure=3.0 * 24.0))
+        self.assertTrue(rich.may_deepen)
+        edge = MQ.Curve(self.measured("KXEDGE-26JUL31-T1", exposure=3.0 * 24.0 - 0.01))
+        self.assertFalse(edge.may_deepen,
+                         "the bound is own exposure >= 3h; one contract-hour short is short")
+
+    def test_clause_1_history_must_DOMINATE_the_borrowed_prior(self):
+        """own exposure > phi_k.  k is exactly the crossover at which our own tape and the
+        prior carry equal weight, so this is "more than half of this number is ours".  It
+        catches what clause 2 cannot: a rung with plenty of hours against a prior that is
+        stronger still."""
+        borrowed = MQ.Curve(self.measured("KXBORROW-26JUL31-T1", exposure=100.0, k=200.0))
+        self.assertGreaterEqual(borrowed.slot.phi_exposure_h, 3.0 * 24.0)  # clause 2 passes
+        self.assertFalse(borrowed.may_deepen, "clause 1 must still refuse it")
+        ours = MQ.Curve(self.measured("KXOURS-26JUL31-T1", exposure=100.0, k=50.0))
+        self.assertTrue(ours.may_deepen)
+
+    def test_a_THIN_rung_keeps_its_entry_block_and_the_rail_goes_elsewhere(self):
+        thin = self.measured("KXTHIN-26JUL31-T1", exposure=0.5)
+        a, spent, rep = MQ.allocate_marginal([thin], budget_usd=600.0,
+                                             per_market_cap_usd=20.0, cluster_cap_usd=20.0)
+        cv = MQ.Curve(thin)
+        self.assertEqual(a[thin.key], cv.q_entry)
+        self.assertAlmostEqual(spent, cv.capital(cv.q_entry), places=6)
+        self.assertLess(spent, 20.0 * 0.5,
+                        "thin tape took most of the rail: $%.2f" % spent)
+        self.assertEqual(rep["reasons"].get(MQ.UNMEASURED_DEPTH), 1,
+                         "the declined depth must be COUNTED: %s" % rep["reasons"])
+
+    def test_a_MEASURED_rung_deepens_to_the_rail(self):
+        rich = self.measured("KXRICH-26JUL31-T1", exposure=3.0 * 24.0)
+        a, spent, _rep = MQ.allocate_marginal([rich], budget_usd=600.0,
+                                              per_market_cap_usd=20.0, cluster_cap_usd=20.0)
+        self.assertGreater(a[rich.key], MQ.Curve(rich).q_entry)
+        self.assertAlmostEqual(spent, 20.0, delta=0.15)
+
+    def test_side_by_side_on_ONE_board_the_gate_is_the_only_difference(self):
+        """Same price, same pool, same posterior phi — only the tape differs."""
+        thin = self.measured("KXTHIN-26JUL31-T1", exposure=0.5)
+        rich = self.measured("KXRICH-26JUL31-T1", exposure=3.0 * 24.0)
+        a, _s, rep = MQ.allocate_marginal([thin, rich], budget_usd=600.0,
+                                          per_market_cap_usd=20.0, cluster_cap_usd=20.0)
+        thin_usd = MQ.Curve(thin).capital(a[thin.key])
+        rich_usd = MQ.Curve(rich).capital(a[rich.key])
+        self.assertGreater(rich_usd, thin_usd * 3.0,
+                           "the measured rung must out-deploy the unmeasured one: "
+                           "$%.2f vs $%.2f" % (rich_usd, thin_usd))
+        self.assertGreaterEqual(rep["reasons"].get(MQ.UNMEASURED_DEPTH, 0), 1,
+                                "the refusal must be COUNTED: %s" % rep["reasons"])
+
+    def test_the_gate_bounds_DEPTH_and_never_PRESENCE(self):
+        """Entry blocks — including a qualifying WALL — are always allowed: entering is how a
+        rung's tape gets written, so a gate on entry would be self-sealing.  This is also why
+        the quiet ladder-wide class is unaffected (amendment 2 relaxes market COUNT, not
+        depth, and a quiet family's walls are entry blocks)."""
+        wall = alloc.Slot("KXUST-26JUL31-T1", "bid", rho=0.6, S=0.0, p=0.01, phi=0.0125,
+                          phi_prior=0.3, phi_k=10.0, phi_exposure_h=0.5,
+                          hours_left=24.0, target_size=1000, cum_size=0.0,
+                          land_grab_price_c=C.V6_PRICE_FLOOR_C)
+        self.assertFalse(MQ.Curve(wall).may_deepen)
+        a, spent, _rep = MQ.allocate_marginal([wall], budget_usd=600.0,
+                                              per_market_cap_usd=20.0, cluster_cap_usd=20.0)
+        self.assertEqual(a[wall.key], 1001, "the wall must still be funded in full")
+        self.assertAlmostEqual(spent, 10.01, places=2)
+
+    def test_an_ASSERTED_phi_is_still_treated_as_a_fact(self):
+        """`phi_exposure_h is None` is the hand-built-Slot idiom for "this phi is given"; it
+        must not become a refusal, or every fixture in the suite changes meaning."""
+        s = alloc.Slot("KXGIVEN-26JUL31-T1", "bid", rho=2.0, S=200.0, p=0.15, phi=0.002,
+                       hours_left=24.0, target_size=1000, cum_size=2000.0)
+        self.assertTrue(MQ.Curve(s).may_deepen)
+
+    def test_the_gate_is_on_the_log_line(self):
+        thin = self.measured("KXTHIN-26JUL31-T1", exposure=0.5)
+        MQ.allocate_marginal([thin], budget_usd=600.0, per_market_cap_usd=20.0)
+        rec = self.logs_of("mq_entered")
+        self.assertTrue(rec)
+        self.assertIn("may_deepen", rec[0])
+        self.assertFalse(rec[0]["may_deepen"])
+        self.assertEqual(rec[0]["own_exposure_h"], 0.5)
+
+
+class TestTheCumulativeBleedIsBoundedByConstruction(LipTestCase):
+    """The adjudicator's OPTIONAL graft (a cumulative deepen-bleed cap), evaluated: it falls
+    out of the queue's own invariant and needs no machinery.  Every increment the queue takes
+    has positive marginal net and the entry block has positive net, so `net(q)` is positive
+    and non-decreasing along the path — i.e. bleed < paid at every reachable size."""
+
+    def rung(self, ticker, p=0.15, phi=0.01, exposure=200.0, rho=2.0, S=200.0):
+        return alloc.Slot(ticker, "bid", rho=rho, S=S, p=p, phi=phi, phi_prior=phi,
+                          phi_k=1.0, phi_exposure_h=exposure, hours_left=24.0,
+                          target_size=1000, cum_size=2000.0)
+
+    def test_the_cumulative_bleed_can_never_exceed_the_credit(self):
+        board = [self.rung("KXC%02d-26JUL31-T1" % i, p=0.02 + 0.03 * i, phi=0.002 + 0.004 * i)
+                 for i in range(8)]
+        a, _s, _r = MQ.allocate_marginal(board, budget_usd=600.0, per_market_cap_usd=20.0,
+                                         cluster_cap_usd=20.0)
+        funded = 0
+        for s in board:
+            q = a[s.key]
+            if q <= 0:
+                continue
+            funded += 1
+            cv = MQ.Curve(s)
+            self.assertLess(cv.bleed(q), cv.paid(q),
+                            "%s: bleed $%.4f vs paid $%.4f at q=%d"
+                            % (s.ticker, cv.bleed(q), cv.paid(q), q))
+            self.assertGreater(cv.net(q), 0.0)
+        self.assertGreaterEqual(funded, 3, "the fixture funded almost nothing")
+
+    def test_net_is_NON_DECREASING_along_the_path_the_queue_walks(self):
+        s = self.rung("KXPATH-26JUL31-T1", p=0.10, phi=0.01)
+        a, _sp, _r = MQ.allocate_marginal([s], budget_usd=600.0, per_market_cap_usd=20.0)
+        cv = MQ.Curve(s)
+        q_final = a[s.key]
+        self.assertGreater(q_final, cv.q_entry)
+        prev = cv.net(cv.q_entry)
+        for q in range(cv.q_entry, q_final + 1):
+            self.assertGreaterEqual(cv.net(q) + 1e-12, prev,
+                                    "net fell at q=%d — a negative-marginal increment was "
+                                    "taken" % q)
+            prev = cv.net(q)

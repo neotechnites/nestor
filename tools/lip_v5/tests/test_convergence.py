@@ -272,30 +272,64 @@ class TestPlanGrowthReachesTheWire(ConvergenceCase):
 
     @unittest.skipUnless(C.MARGINAL_QUEUE_ARMED,
                          "v6 growth driver: the rail is A = C/N only under the armed core")
-    def test_the_deposit_grows_the_rail_and_trigger_f_carries_it_to_the_wire(self):
+    def test_the_entry_block_rests_first_and_thin_tape_may_NOT_deepen_it(self):
+        """G2 AT THE WIRE.  The queue enters at the cliff block in ONE placement — no v5
+        staircase — and it may NOT deepen past it while the rung's own tape is thin.  Revert
+        `Curve.may_deepen` and this rung goes straight to the rail on its first second of
+        life, which is the quiet-afternoon incident through the deepening door."""
+        r, ex, m = self._one_sided_runner(300.0)
+        ok, refusals = r.init(NOW, nestor_state=NESTOR)
+        self.assertTrue(ok, refusals)
+        self.settle(r, NOW, n=60)
+        early = self.fingerprint(ex)
+        self.assertEqual(early.get((TK_A, "bid")), 96.0,
+                         "the ENTRY BLOCK is what rests first: %s" % early)
+        self.assertLess(early[(TK_A, "bid")] * 0.06, m.cluster_rail_usd(),
+                        "thin tape took the whole rail")
+
+    @unittest.skipUnless(C.MARGINAL_QUEUE_ARMED,
+                         "v6 growth driver: the rail is A = C/N only under the armed core")
+    def test_earned_depth_then_a_DEPOSIT_both_reach_the_wire_via_trigger_f(self):
+        """G1's spine half, in v6's two growth drivers — and both are world facts, not
+        memories of ours.
+
+        (1) EARNED DEPTH.  The rung's own exposure crosses `may_deepen`'s two clauses
+            (own exposure > k AND >= 3 x h = 48 contract-hours, ~30 min of wall clock at 96
+            contracts resting) and the queue deepens it toward the rail.  Nothing about the
+            board moved; only the TAPE did.
+        (2) THE DEPOSIT.  C doubles; the rail A = C/N doubles with it because N is
+            capital-INDEPENDENT, and the plan grows again.  "v6 goes live the moment the
+            deposit lands" — this is that event, at the wire.
+
+        Only trigger (f) TARGET_MOVED carries a pure size increase, so this is also its test.
+        """
         r, ex, m = self._one_sided_runner(300.0)
         ok, refusals = r.init(NOW, nestor_state=NESTOR)
         self.assertTrue(ok, refusals)
         t = self.settle(r, NOW, n=60)
-        before = self.fingerprint(ex)
+        entry = self.fingerprint(ex)[(TK_A, "bid")]
+        # (1) the rung earns its own depth — TRUE 1 Hz, because the meter accrues `remaining`
+        # once per TICK and this test is about how much exposure exists.
+        t = self.settle(r, t, n=2_200, step=1.0)
+        earned = self.fingerprint(ex)[(TK_A, "bid")]
         rail_before = m.cluster_rail_usd()
-        self.assertGreater(before.get((TK_A, "bid"), 0), 0,
-                           "nothing rested at all: %s" % before)
-        self.assertAlmostEqual(before[(TK_A, "bid")] * 0.06, rail_before, delta=0.06,
-                               msg="v6 rests the whole rail in ONE placement, no staircase: "
-                                   "%s at rail %s" % (before, rail_before))
-        # THE DEPOSIT.  C doubles; nothing about the board changes.
+        self.assertGreater(earned, entry,
+                           "earned depth never reached the wire: %s -> %s" % (entry, earned))
+        self.assertAlmostEqual(earned * 0.06, rail_before, delta=0.06,
+                               msg="deepening should now run to the rail: %s at $%s"
+                                   % (earned, rail_before))
+        # (2) THE DEPOSIT.  Nothing about the board changes.
         m.ceiling_usd = 600.0
         m.cash.ceiling_usd = 600.0
         t = self.settle(r, t, n=int(C.MIN_RESTING_LIFE_S) + 30, step=1.0)
-        after = self.fingerprint(ex)
+        after = self.fingerprint(ex)[(TK_A, "bid")]
         rail_after = m.cluster_rail_usd()
-        self.assertGreater(rail_after, rail_before,
-                           "the rail is A = C/N and N is capital-INDEPENDENT: doubling C "
-                           "must double the rail (%s -> %s)" % (rail_before, rail_after))
-        self.assertGreater(after.get((TK_A, "bid"), 0), before[(TK_A, "bid")],
+        self.assertAlmostEqual(rail_after, 2.0 * rail_before, places=6,
+                               msg="N is capital-independent, so the rail must double: "
+                                   "%s -> %s" % (rail_before, rail_after))
+        self.assertGreater(after, earned,
                            "the grown plan never reached the wire: %s -> %s"
-                           % (before, after))
+                           % (earned, after))
 
     @unittest.skipUnless(C.MARGINAL_QUEUE_ARMED, "v6 dials")
     def test_N_is_capital_independent(self):

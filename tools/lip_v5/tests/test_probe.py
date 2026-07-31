@@ -205,3 +205,81 @@ class TestTheVerdictInstrumentation(LipTestCase):
         src = inspect.getsource(PR)
         self.assertNotIn("halt", src)
         self.assertNotIn("day_stopped", src)
+
+
+class TestTheExemptionIsTheCLUSTERRAILONLY(LipTestCase):
+    """G3 (adjudicator, 2026-07-31).  probe.py's header claims the probe is "exempt from the
+    CLUSTER RAIL and from nothing else", and `room()` was also skipping the PER-MARKET seat —
+    a header that outran its code.  The note's own shape is a SPREAD: "treasury qualification
+    walls across tenors at 1-2c sides ~$10-20 each", each leg inside a seat.  Binding the seat
+    is also what makes the $120 mean eight walls instead of one leg holding the lane."""
+
+    def _one_family(self, n=8, p=0.01):
+        return [slot("KXUST-26JUL31-T%d" % i, rho=3.0, S=0.0, p=p, cum_size=0.0)
+                for i in range(n)]
+
+    def test_a_probe_leg_may_not_exceed_the_PER_MARKET_seat(self):
+        pr = PR.Probe(600.0)
+        board = self._one_family()
+        a, _s, _r = MQ.allocate_marginal(board, budget_usd=600.0, per_market_cap_usd=20.0,
+                                         cluster_cap_usd=20.0,
+                                         multi_market_clusters=pr.clusters(board), probe=pr)
+        for s in board:
+            self.assertLessEqual(MQ.Curve(s).capital(a[s.key]), 20.0 + 1e-6,
+                                 "%s took more than a seat" % s.ticker)
+
+    def test_the_probe_still_exceeds_the_CLUSTER_rail_across_the_family(self):
+        """The exemption that remains, and it must still bite: eight $10 walls is $80 in one
+        settle source, four times the $20 rail, which is the whole point of the probe."""
+        pr = PR.Probe(600.0)
+        board = self._one_family()
+        a, spent, _r = MQ.allocate_marginal(board, budget_usd=600.0, per_market_cap_usd=20.0,
+                                            cluster_cap_usd=20.0,
+                                            multi_market_clusters=pr.clusters(board), probe=pr)
+        self.assertGreater(spent, 20.0 * 3,
+                           "the cluster exemption stopped working: $%.2f" % spent)
+        self.assertLessEqual(spent, pr.cap_usd + 1e-6)
+        self.assertGreaterEqual(sum(1 for q in a.values() if q > 0), 4,
+                                "the probe must SPREAD across tenors, not concentrate")
+
+    def test_the_header_and_the_code_agree(self):
+        import inspect
+        src = inspect.getsource(MQ.allocate_marginal)
+        self.assertIn("if per_market_cap_usd is not None:", src,
+                      "the per-market seat must bind unconditionally")
+        self.assertIn("if cluster_cap_usd is not None and not exempt:", src,
+                      "the cluster rail is the one the probe is exempt from")
+
+
+class TestTheArmedProbeMustMatchTheLiveBoard(LipTestCase):
+    """G4 (adjudicator, 2026-07-31).  PROBE_FAMILIES are prefixes matched against someone
+    else's series symbols, and symbols get renamed.  An armed probe that matches nothing looks
+    exactly like a working night with a smaller book, and the deploy's whole first act is the
+    probe — so it PAGES."""
+
+    def test_the_codebases_own_gas_family_is_in_the_list(self):
+        self.assertTrue(PR.is_probe_family("KXAAAGASD-26JUL29-T4.12"),
+                        "the gas family this codebase actually sees on the wire must match")
+
+    def test_zero_matches_on_a_live_board_PAGES(self):
+        pr = PR.Probe(600.0)
+        board = [slot("KXNOTHING-26JUL31-T%d" % i, p=0.20) for i in range(5)]
+        self.assertEqual(pr.clusters(board), set())
+        self.assertTrue(any(a[0] == "probe_no_families" for a in self.alerts),
+                        "a probe that matched nothing must page: %s" % self.alerts)
+        rec = self.logs_of("probe_no_families")
+        self.assertTrue(rec and rec[0]["slots"] == 5, rec)
+
+    def test_an_EMPTY_board_does_not_page(self):
+        """No slots is "the scan has not run yet", not "the families are wrong"."""
+        pr = PR.Probe(600.0)
+        pr.clusters([])
+        self.assertFalse(any(a[0] == "probe_no_families" for a in self.alerts))
+
+    def test_a_matching_board_does_not_page(self):
+        pr = PR.Probe(600.0)
+        pr.clusters([slot("KXAAAGASD-26JUL29-T4.12", p=0.01)])
+        self.assertFalse(any(a[0] == "probe_no_families" for a in self.alerts))
+
+    def test_the_page_is_a_registered_alert(self):
+        self.assertIn("probe_no_families", C.ALERTS)

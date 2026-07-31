@@ -1545,7 +1545,7 @@ ALERTS = (
     "probe_oversized", "unit_mismatch", "ws_degraded",
     # V6: the money-lost stopper is replaced by the BUG ALARM (note 55's risk frame).  A
     # variance loss no longer pages; a loss the model calls impossible does.
-    "bug_alarm", "dials_dont_play", "probe_verdict",
+    "bug_alarm", "dials_dont_play", "probe_verdict", "probe_no_families",
 )
 
 
@@ -1620,8 +1620,15 @@ PROBE_WING_MAX_C = 4
 # gas (the measured top earners)", "both families run daily windows" ⇒ verdict within one
 # settle cycle).  Matched against `clusters.cluster_of`, so a family rename shows up as an
 # empty probe in the log rather than as a silent mis-fund.
-PROBE_FAMILIES = ("KXTREASURY", "KXUST", "KX10Y", "KX30Y", "KX2Y", "KX5Y", "KXNATGAS",
-                  "KXGAS", "KXNGAS")
+# G4 (adjudicator, 2026-07-31): these were GUESSED prefixes.  The gas family this codebase
+# actually sees on the wire — in its own fixtures and in the 2026-07-30 live log — is
+# KXAAAGASD, and a guessed list that matches nothing is a probe that silently funds zero on
+# deploy night.  So: the real symbol is first, the plausible aliases are kept (a family rename
+# must degrade to "no probe", never to "wrong probe"), and `probe.Probe.clusters` PAGES when an
+# armed probe matches no live slot.  DEPLOY CHECKLIST (README, v6 section): before arming,
+# diff this list against the live board's series symbols.
+PROBE_FAMILIES = ("KXAAAGASD", "KXNATGAS", "KXGAS", "KXNGAS",
+                  "KXTREASURY", "KXUST", "KX10Y", "KX30Y", "KX2Y", "KX5Y")
 
 # --- THE RUIN FORMULA'S p, ANCHORED (dials.py header carries the full argument) ---
 # p = P(a cluster is wiped in a day) is a PRODUCT of two factors and only the product is

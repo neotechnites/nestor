@@ -72,6 +72,14 @@ price:
     case's answer.  It is an instrument, not a mode; it returns "don't play", which is the
     honest content of reading B at these prices.
 
+  * THE RATIO CUTS BOTH WAYS, AND THE N FLOOR IS WHAT BOUNDS THAT (adjudicator, 2026-07-31).
+    A mix RICHER than the reference drives p BELOW the 0.09 base — 0.0617 at a 45c mix — and
+    without a floor the ruin formula would spend that discount on concentration (N = 13, a
+    $46 rail at C = 600).  `n_from_required` floors N at `N_TARGET_CLUSTERS`, so the discount
+    is BANKED rather than converted into a bigger seat: the anchoring is safe in both
+    directions, not only the cheap one, and the coupling stays one-directional exactly as
+    note 55's "N is a diversification FLOOR, not a target" says.
+
 FLAGGED FOR THE REVIEWER: this is the single place where I read the spec against itself.  The
 alternative — shipping reading B — is a bot that deploys zero dollars, which cannot be what
 "turn it on tomorrow" means.
@@ -124,6 +132,37 @@ def n_required(p, d=None, z=None):
     if p >= d:
         return float("inf")
     return (z * z) * p * (1.0 - p) / ((d - p) ** 2)
+
+
+def n_from_required(n_req):
+    """N = max(N_TARGET_CLUSTERS, ceil(n_required)) — THE RUIN GUARD IS ONE-DIRECTIONAL.
+
+    ── G1, THE ADJUDICATOR'S BLOCKING FINDING (2026-07-31) ──────────────────────────────────
+    The formula alone lets N FLOAT DOWN on a rich mix: measured in this worktree, a 45c funded
+    mix gives p = 0.062, n_required = 12.6, N = 13 and a rail of $46.15 at C = 600 — three
+    times the note's own seat, reached by the book having become expensive for a while.  That
+    is outside note 55's stated band in the direction that adds risk, and NOTHING in the notes
+    licenses it: note 55 says "run 30" and, explicitly, "N is a diversification FLOOR, not a
+    target", and every printed pair it quotes is C/30 ($10 at $300, ~$20 at $600, $66 at $2k).
+
+    So the coupling is kept but made ONE-DIRECTIONAL, which is what "floor" means:
+      * a CHEAP mix may push N above 30 and shrink the rail — that is the floor-cap coupling
+        Ryan decided ("floor↓ ⇒ funded-mix p↑ ⇒ N↑ ⇒ A↓") and it survives intact;
+      * a RICH mix may NOT push N below 30 and widen it.  Diversification is not something the
+        book earns back by holding expensive paper for an afternoon: the 30 is a statement
+        about how many independent settle sources we want to be alive across, and the ruin
+        formula is a check that 30 is ENOUGH, not a licence to hold fewer.
+
+    INTERACTION WITH THE ANCHORED p (module header, and the adjudicator asked for it in
+    writing): `p_from_mix` is a RATIO around the reference mix, so a mix richer than 19.7c
+    drives p BELOW the 0.09 base — 0.062 at 45c — and without this floor that discount would
+    be spent on concentration.  With the floor it is simply unspent: the rail stays C/30 and
+    the extra safety margin is banked rather than converted into a bigger seat.  The floor is
+    therefore what makes the anchoring safe in BOTH directions, not just the cheap one.
+    """
+    if n_req == float("inf"):
+        return 0
+    return max(int(C.N_TARGET_CLUSTERS), max(1, int(math.ceil(n_req))))
 
 
 def p_against(price_usd):
@@ -293,7 +332,7 @@ def derive(capital_usd, rows, iters=0):
                "lip_v6 ruin formula refuses to play: p=%.4f >= d=%.2f (rail $0)" % (p, C.RUIN_D))
         return Dials(capital_usd, p, pf, pa, n_req, 0, 0.0, False, iters, nclust,
                      mix_price=px)
-    n = max(1, int(math.ceil(n_req)))
+    n = n_from_required(n_req)
     return Dials(capital_usd, p, pf, pa, n_req, n, float(capital_usd) / n, True, iters,
                  nclust, mix_price=px)
 
@@ -308,6 +347,9 @@ def seed_dials(capital_usd):
     replaces it, and the log shows the move.
     """
     n = int(C.N_TARGET_CLUSTERS)
+    # ...which is also the FLOOR every derived answer respects (G1, `n_from_required`), so the
+    # seed is not a different kind of number from the derivations that follow it: it is the
+    # floor itself, before any mix has been measured.
     return Dials(capital_usd, 0.0, 0.0, 0.0, float(n), n, float(capital_usd) / n, True,
                  0, 0)
 

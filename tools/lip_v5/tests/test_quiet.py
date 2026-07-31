@@ -182,7 +182,7 @@ class TestTheWallEconomics(LipTestCase):
 
     def test_a_1000_contract_wall_at_1c_costs_ten_dollars_and_fits_the_rail(self):
         rail = D.derive(600.0, [("KXA", 20.0, C.RUIN_P_REF_PRICE, 0.0, 24.0)]).rail_usd
-        self.assertAlmostEqual(rail, 21.4285714, places=6)
+        self.assertAlmostEqual(rail, 20.0, places=6)
         w = quiet_slot("KXUST-26JUL31-T1", rho=0.6, S=0.0, p=0.01, target_size=1000,
                        cum_size=0.0, exposure=100.0)
         cv = MQ.Curve(w)

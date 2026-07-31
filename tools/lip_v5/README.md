@@ -387,3 +387,30 @@ orders appear, sheds appear, completions are measured.
   loop's shape; it is not a venue ranking. G2's real read-out needs `--shadow --live`.
 - **Note 43 §7's "the exit consumes room"** is modelled qualitatively (inventory blocks the
   slot) but is not a term in (★). See "Contradictions with note 43" below.
+
+## V6 DEPLOY CHECKLIST (note 55, "THE DEPLOY PLAN — RYAN'S 120/480")
+
+Run in order; every item is a thing that has already gone wrong once or that the
+adjudication round flagged.
+
+1. **Set C.** `config.MAX_TOTAL_COLLATERAL_USD` = the deposited capital ($600 recommended;
+   any C is supported).  Nothing else is a capital number: the rail is `A = C/N`, the probe is
+   `d x C`, both derived at boot and both on the `dials` / `probe_armed` log lines.
+2. **Diff `config.PROBE_FAMILIES` against the LIVE board's series symbols.**  The list is
+   prefixes matched against `clusters.cluster_of`, and prefixes on someone else's board get
+   renamed.  If an armed probe matches zero live slots the bot PAGES `probe_no_families` on
+   its first cycle with a slot table — but a page during the window is worse than a diff
+   before it.
+3. **Read the first `dials` line.**  `p`, `mix_price_c`, `n_required`, `n_clusters`,
+   `rail_usd`, `floor_c`, `p_fill_implied`.  `n_clusters` must be >= 30 (the floor);
+   `rail_usd` must be `C/n_clusters`.  If `feasible=false` the ruin formula is refusing to
+   play and the book will deploy nothing — that is a `dials_dont_play` page, not a silent day.
+4. **Read the first `smoothing_window` line.**  `source=deltas` means the competition
+   recorder's tape was reachable; `source=fallback` means the derived 60 s anti-alias window
+   is in use and the reason is on the line.  Fallback is legal; unnoticed fallback is not.
+5. **Read the first `bug_alarm_armed` line.**  `z` and `checks` must match
+   `LIP_PROGRAM_DAYS_REMAINING`; that constant moves if the program is extended.
+6. **Watch `probe_accrual` / `probe_verdict`.**  Verdict lands after 2 reward batches and
+   PAGES.  It gates nothing — scale-or-rework is Ryan's call.
+7. **Fallback.**  `config.MARGINAL_QUEUE_ARMED = False` restores v5 exactly; the suite is
+   green in both configurations and that is asserted, not assumed.

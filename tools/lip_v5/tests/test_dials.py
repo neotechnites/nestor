@@ -36,12 +36,41 @@ class TestTheRuinFormula(LipTestCase):
         self.assertAlmostEqual(d6.rail_usd, 2.0 * d3.rail_usd, places=9)
 
     def test_the_deploy_numbers_at_C_600(self):
-        """THE WORKED EXAMPLE.  Reference mix (19.7c) ⇒ p = 0.09 ⇒ N = 28 ⇒ A = $21.43."""
+        """THE WORKED EXAMPLE.  Reference mix (19.7c) ⇒ p = 0.09 ⇒ n_required = 27.07, which
+        the FLOOR (G1) rounds up to the note's own N = 30 ⇒ A = $20.00 — note 55's "run 30"
+        and "~$20 seats at $600", exactly."""
         d = D.derive(600.0, [("KXA", 20.0, C.RUIN_P_REF_PRICE, 0.0, 24.0)])
         self.assertAlmostEqual(d.p, C.RUIN_P_BASE, places=6)
-        self.assertEqual(d.n_clusters, 28)
-        self.assertAlmostEqual(d.rail_usd, 600.0 / 28.0, places=6)
-        self.assertAlmostEqual(d.rail_usd, 21.4285714, places=6)
+        self.assertAlmostEqual(d.n_required, 27.0743801652893, places=9)
+        self.assertEqual(d.n_clusters, C.N_TARGET_CLUSTERS)
+        self.assertAlmostEqual(d.rail_usd, 20.0, places=6)
+
+    def test_the_notes_THREE_PRINTED_PAIRS_reproduce(self):
+        """note 55 prints ($10 at $300), (~$20 at $600) and ($66 at $2k) — all C/30.  A build
+        whose rail does not reproduce them at the measured mix has drifted from the note."""
+        for cap, seat in ((300.0, 10.0), (600.0, 20.0), (2000.0, 66.67)):
+            d = D.derive(cap, [("KXA", 20.0, C.RUIN_P_REF_PRICE, 0.0, 24.0)])
+            self.assertAlmostEqual(d.rail_usd, seat, delta=0.01,
+                                   msg="C=%s wanted $%s got $%.2f" % (cap, seat, d.rail_usd))
+
+    def test_a_RICH_mix_may_NOT_widen_the_rail_below_the_floor(self):
+        """G1, THE BLOCKING FINDING.  Without the floor a 45c funded mix gives p = 0.0617,
+        n_required = 12.12, N = 13 and a rail of $46.15 — three times the note's seat, reached
+        by the book having been expensive for an afternoon.  "N is a diversification FLOOR,
+        not a target" (note 55), so the coupling is ONE-DIRECTIONAL."""
+        rich = D.derive(600.0, [("KXA", 20.0, 0.45, 0.0, 24.0)])
+        self.assertLess(rich.n_required, C.N_TARGET_CLUSTERS)
+        self.assertAlmostEqual(rich.n_required, 12.1189, places=3)
+        self.assertEqual(rich.n_clusters, C.N_TARGET_CLUSTERS)
+        self.assertAlmostEqual(rich.rail_usd, 20.0, places=6)
+
+    def test_the_floor_is_the_SEED_so_a_derivation_is_never_looser_than_no_derivation(self):
+        seed = D.seed_dials(600.0)
+        for px in (0.45, 0.90, 0.197, 0.05):
+            d = D.derive(600.0, [("KXA", 20.0, px, 0.0, 24.0)])
+            self.assertLessEqual(d.rail_usd, seed.rail_usd + 1e-9,
+                                 "a measured mix widened the rail past the unmeasured seed "
+                                 "at %sc" % (px * 100))
 
 
 class TestTheCalibrationDegrade(LipTestCase):
@@ -62,19 +91,23 @@ class TestTheFloorCapCoupling(LipTestCase):
     mix's p."  This is the whole coupling, in one assertion chain."""
 
     def test_a_cheaper_funded_mix_buys_a_SMALLER_rail(self):
+        """The coupling, in the direction it runs: cheaper mix ⇒ higher p ⇒ higher N ⇒ smaller
+        rail.  Upward from the floor only (G1) — the rich end is pinned by
+        `test_a_RICH_mix_may_NOT_widen_the_rail_below_the_floor`."""
         rich = D.derive(600.0, [("KXA", 20.0, 0.40, 0.0, 24.0)])
         mid = D.derive(600.0, [("KXA", 20.0, 0.197, 0.0, 24.0)])
         cheap = D.derive(600.0, [("KXA", 20.0, 0.05, 0.0, 24.0)])
+        cheapest = D.derive(600.0, [("KXA", 20.0, 0.01, 0.0, 24.0)])
         self.assertLess(rich.p, mid.p)
         self.assertLess(mid.p, cheap.p)
-        self.assertGreater(rich.n_clusters, 0)
-        self.assertLess(rich.n_clusters, mid.n_clusters)
-        self.assertLess(mid.n_clusters, cheap.n_clusters)
-        self.assertGreater(rich.rail_usd, mid.rail_usd)
-        self.assertGreater(mid.rail_usd, cheap.rail_usd)
+        self.assertLessEqual(mid.n_clusters, cheap.n_clusters)
+        self.assertLess(cheap.n_clusters, cheapest.n_clusters)
+        self.assertGreaterEqual(mid.rail_usd, cheap.rail_usd)
+        self.assertGreater(cheap.rail_usd, cheapest.rail_usd)
         # the deploy-relevant magnitudes, so a drift in the table shows up here
-        self.assertAlmostEqual(mid.rail_usd, 21.4285714, places=6)
+        self.assertAlmostEqual(mid.rail_usd, 20.0, places=6)
         self.assertAlmostEqual(cheap.rail_usd, 600.0 / 37.0, places=6)
+        self.assertAlmostEqual(cheapest.rail_usd, 600.0 / 40.0, places=6)
 
     def test_the_wipe_unit_is_the_CLUSTER_not_the_market(self):
         """Two markets of one cluster are ONE bet, so they pool into one p, not two."""

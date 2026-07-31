@@ -129,6 +129,16 @@ class Probe(object):
             R.log_once("probe_clusters_exempt", clusters=sorted(out),
                        note="the probe's families are multi-market by construction; the quiet "
                             "classifier cannot license them until the probe has built the tape")
+        elif slots:
+            # G4 (adjudicator, 2026-07-31): AN ARMED PROBE THAT MATCHES NOTHING IS SILENT
+            # FAILURE — the deploy's whole first act is the probe, and a stale prefix in
+            # PROBE_FAMILIES would look exactly like a working night with a smaller book.
+            # The families are symbols on someone else's board and they get renamed, so this
+            # PAGES rather than logs: an operator has to look before the window burns.
+            R.ntfy("probe_no_families",
+                   "lip_v6 PROBE ARMED BUT MATCHED ZERO of %d live slots — check "
+                   "config.PROBE_FAMILIES against the live board's series symbols" % len(slots))
+            R.log("probe_no_families", slots=len(slots), families=list(C.PROBE_FAMILIES))
         return out
 
     # ── the verdict ─────────────────────────────────────────────────────────────────────
