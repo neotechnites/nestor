@@ -118,6 +118,57 @@ class TestTheBookIsAPureFunctionOfTheWorld(ConvergenceCase):
             self.assertAlmostEqual(after[key], q, delta=max(1.0, 0.10 * q),
                                    msg="rung %s came back at a different size" % (key,))
 
+    def test_the_MARGINAL_QUEUE_extends_the_spine_EXACTLY_not_within_hysteresis(self):
+        """THE SPINE, EXTENDED TO V6 (note 55 item 4a's anti-churn).
+
+        A switch toll is a hysteresis, and a hysteresis is normally the death of convergence:
+        if "do I already rest here" were an input, the book after a cancel-all would differ
+        from the book before it, and the most that could be claimed is agreement WITHIN the
+        toll.  v6 claims more, and this test is the claim: the toll's two halves are
+
+          (a) stranded sub-cliff accrual — the estimates feed's own number, and
+          (b) transit presence loss, charged as `h_eff = h - transit_h` for a market we are
+              not PRESENT in, where presence is read from ACCRUED and not from our orders,
+
+        so BOTH are world facts that a cancel-all cannot touch.  The allocation is therefore
+        reproduced EXACTLY, not approximately.  Revert `Curve.present` to read a resting order
+        and this test fails on the exact symptom: the second derivation pays the toll the
+        first one did not.
+        """
+        from .. import marginal as MQ
+
+        def board(accrued):
+            return [
+                MQ.A.Slot("KXSPINE-26JUL31-T1", "bid", rho=2.0, S=200.0, p=0.20,
+                          hours_left=24.0, accrued=accrued, target_size=1000,
+                          cum_size=2000.0),
+                MQ.A.Slot("KXSPINE2-26JUL31-T1", "bid", rho=2.0, S=200.0, p=0.20,
+                          hours_left=24.0, accrued=0.0, target_size=1000, cum_size=2000.0),
+            ]
+        # steady state: one market holds $0.60 of conditional accrual and is PRESENT.
+        first, _s1, _r1 = MQ.allocate_marginal(board(0.60), budget_usd=60.0,
+                                               per_market_cap_usd=21.43,
+                                               cluster_cap_usd=21.43)
+        # cancel-all: every order of ours is gone.  The accrual is NOT — the exchange already
+        # credited it — so the identical inputs produce the identical book.
+        again, _s2, _r2 = MQ.allocate_marginal(board(0.60), budget_usd=60.0,
+                                               per_market_cap_usd=21.43,
+                                               cluster_cap_usd=21.43)
+        self.assertEqual(first, again)
+        self.assertTrue(any(q > 0 for q in first.values()), "the fixture funded nothing")
+
+    def test_the_queue_carries_NO_memory_of_its_own_previous_allocation(self):
+        """The mutation guard for the test above: `allocate_marginal` is a pure function, so
+        there is nowhere for a previous allocation to hide."""
+        import inspect
+        from .. import marginal as MQ
+        sig = inspect.signature(MQ.allocate_marginal)
+        for forbidden in ("previous", "last_alloc", "prior_alloc", "incumbent", "resting"):
+            self.assertNotIn(forbidden, sig.parameters, forbidden)
+        src = inspect.getsource(MQ.Curve.__init__)
+        self.assertNotIn("orders", src,
+                         "the toll must key on ACCRUED, never on our own resting orders")
+
     def test_no_replay_path_is_reachable_from_the_runner(self):
         """The mutation guard for the assertion above: if any replay path returns, the test
         above could pass for the wrong reason."""

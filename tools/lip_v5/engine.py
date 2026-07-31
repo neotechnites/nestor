@@ -24,7 +24,8 @@ import os
 import signal
 
 from . import alloc, cashfeed, clusters as CL, config as C, cutover
-from . import alarm as AL, dials as DI, marginal as MQ, quiet as QT, smooth as SM
+from . import alarm as AL, dials as DI, marginal as MQ, probe as PR
+from . import quiet as QT, smooth as SM
 from . import guards as G, ledger as LG, presence as P
 from . import quote as Q
 from . import ratchet as RT, ratelimit as RL, runtime as R, wsgate
@@ -55,7 +56,10 @@ class Maker(object):
         # both are properties of the BOARD and of config, never of our own past decisions.
         self.quiet_clusters = set()
         self.quiet_phi = {}
-        self.probe = None
+        # THE 120/480 BOOT MODE (note 55, THE DEPLOY PLAN).  `None` when disarmed, and with it
+        # None there is no probe code on any allocation path.
+        self.probe = PR.Probe(self.ceiling_usd) if (C.MARGINAL_QUEUE_ARMED
+                                                    and C.PROBE_ARMED) else None
         # THE BUG ALARM replaces the money-lost stopper (note 55's risk frame).  It accumulates
         # WORLD events — fills the wire reported, settlements the wire paid — never our own
         # decisions, so it is the same class of memory the convergence doctrine licenses.
@@ -304,6 +308,9 @@ class Maker(object):
         self.quiet_clusters, self.quiet_phi = QT.classify(slots, MQ.A.LAW_HORIZON_H)
         if self.probe is not None:
             self.quiet_clusters = self.quiet_clusters | self.probe.clusters(slots)
+            # THE VERDICT INSTRUMENTATION rides the same slot table the plan does, so it reads
+            # the estimates feed's accrual on every pass and cannot drift from what we funded.
+            self.probe.observe(slots)
 
         def _alloc(sl, budget, rail, **kw):
             return MQ.allocate_marginal(sl, min(budget_usd, budget), market_spent=market_spent,

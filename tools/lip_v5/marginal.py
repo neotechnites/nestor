@@ -399,15 +399,23 @@ def allocate_marginal(slots, budget_usd, market_spent=None, cluster_spent=None,
     entered = {}
 
     def room(cv):
-        """Dollars this (market, side) may still commit, over every rail at once."""
+        """Dollars this (market, side) may still commit, over every rail at once.
+
+        THE PROBE LANE IS EXEMPT FROM THE CLUSTER RAIL AND FROM NOTHING ELSE (probe.py's
+        header): its whole worst case is d x C by construction, which is the same guarantee
+        the rail exists to deliver, so stacking both would refuse the experiment while adding
+        no safety.  Every other bound — the budget, the lane cap, the per-strike cliff, the
+        bleed screen — still binds on a probe order."""
         r = budget - spent
+        exempt = False
         if probe is not None:
             r = min(r, probe.room_usd(cv, spent_by_lane))
-        if per_market_cap_usd is not None:
+            exempt = probe.rail_exempt(cv)
+        if per_market_cap_usd is not None and not exempt:
             r = min(r, float(per_market_cap_usd)
                     - float(market_spent.get(cv.slot.ticker, 0.0))
                     - by_market.get(cv.slot.ticker, 0.0))
-        if cluster_cap_usd is not None:
+        if cluster_cap_usd is not None and not exempt:
             r = min(r, float(cluster_cap_usd) - float(cluster_spent.get(cv.cluster, 0.0))
                     - by_cluster.get(cv.cluster, 0.0))
         return r
