@@ -1920,7 +1920,11 @@ class Maker(object):
 
         Fills are adverse-selected samples of our orders — cheap orders fill more — so the
         capital-weighted average PRICE of positions runs below that of resting orders.  The
-        skew is already PRICED when every rung carries its own price-bucket phi (law §6):
+        skew is already PRICED when every rung carries its own price-bucket phi — since
+        2026-07-30 night the SHRUNK one, `scan.phi_posterior`, read straight off the slot
+        table (`phi_by_key`), so the tripwire's prediction and the allocator's sizing are one
+        number built from one prior; a tripwire fed a different phi than the sizer would be
+        measuring its own disagreement instead of the book's (law §6):
         orders fill at rate phi_i x size_i, so the model's own predicted average position
         price is Σ(w_i·phi_i·p_i) / Σ(w_i·phi_i) over the resting book (w_i = collateral,
         p_i = per-contract basis), and the predicted gap is avg_order_price minus that.

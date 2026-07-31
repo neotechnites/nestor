@@ -363,14 +363,113 @@ class TestPhiIsActuallyMeasured(LipTestCase):
         self.assertAlmostEqual(P.rest_contract_hours(rows, (TK, "bid")), 1.0, places=9)
 
     def test_build_slots_carries_measured_fills_into_phi(self):
-        """With fills on the tape, phi must be the MEASURED rate, not the seed."""
+        """With fills on the tape, phi must track the MEASURED rate, not the seed.
+
+        REWRITTEN 2026-07-30 night (owner: "take our global average and use the rung's
+        history to adjust it until the history is very long").  phi is now the SHRUNK
+        estimate (fills + k x prior)/(exposure + k), so a LONG history no longer produces
+        n/E exactly — it produces n/E to within the prior's residual pull, and the pull must
+        be negligible here because 1,000 contract-hours is exactly what "very long" means.
+        The seed's own strength is the assertion under test: k = prior/v_seed = 1.92
+        contract-hours at the cheap seed, so 1,000 hours of fact carry 99.8% of the answer.
+        THIS IS THE TEST THAT KILLED `k = RULE_OF_THREE / prior` (see `scan.phi_k`): that
+        fallback gave the cheap seed k = 3,000 contract-hours and answered 0.0133 here — a
+        guess outvoting 1,000 measured hours 3:1, in the direction that oversizes hot rungs.
+        """
         rows = self.rows(50, 1000.0 * 3600.0)
         slots = scan.build_slots([prog()], Table(), NOW, presence_rows=rows)
         bid = [s for s in slots if s.side == "bid"][0]
-        self.assertAlmostEqual(bid.phi, 50.0 / 1000.0, places=9)
-        # and with NO evidence it falls back to the single seed
+        k = scan.phi_k(C.PHI_SEED_CHEAP)
+        self.assertAlmostEqual(bid.phi_k, k, places=9)
+        self.assertAlmostEqual(bid.phi_prior, C.PHI_SEED_CHEAP, places=9)
+        self.assertAlmostEqual(bid.phi_exposure_h, 1000.0, places=9)
+        self.assertAlmostEqual(bid.phi, (50.0 + k * C.PHI_SEED_CHEAP) / (1000.0 + k),
+                               places=12)
+        self.assertAlmostEqual(bid.phi, 50.0 / 1000.0, places=3)   # "very long" ⇒ the fact
+        # and with NO evidence phi IS the prior — the seed, unshrunk, at zero exposure
         clean = [s for s in scan.build_slots([prog()], Table(), NOW) if s.side == "bid"][0]
         self.assertAlmostEqual(clean.phi, C.PHI_SEED_CHEAP, places=9)
+        self.assertEqual(clean.phi_source, "seed")
+
+
+class TestPhiShrinkage(LipTestCase):
+    """THE ESTIMATOR ITSELF (owner, 2026-07-30 night): "we should take our global average and
+    use the rung's history to adjust it until the history is very long."
+
+    Every test here is mutation-checked against one clause:
+      * revert the posterior to the ladder ⇒ the incident test in test_law fails on the exact
+        symptom (the full $10 on two quiet contract-hours);
+      * replace k's derivation with ANY constant ⇒ `test_k_is_DERIVED_from_dispersion_not_a
+        _constant` fails, because k has to move when the board's dispersion moves;
+      * drop leave-one-out ⇒ `test_a_rung_is_never_its_own_prior` fails.
+    """
+
+    def test_the_posterior_is_the_credibility_formula_at_both_ends(self):
+        # zero exposure IS the prior; infinite exposure IS the tape; k is the midpoint
+        self.assertAlmostEqual(scan.phi_posterior(0, 0.0, 0.3, 577.0), 0.3, places=12)
+        self.assertAlmostEqual(scan.phi_posterior(0, 577.0, 0.3, 577.0), 0.15, places=12)
+        self.assertAlmostEqual(scan.phi_posterior(500, 1e7, 0.3, 577.0),
+                               (500.0 + 577.0 * 0.3) / (1e7 + 577.0), places=15)
+        self.assertAlmostEqual(scan.phi_posterior(500, 1e7, 0.3, 577.0), 5e-5, delta=2e-5)
+        # and it is monotone in the tape, never a step: no exposure can be "decisive"
+        prev = None
+        for e in (0.5, 2.0, 10.0, 100.0, 577.0, 5000.0):
+            v = scan.phi_posterior(0, e, 0.3, 577.0)
+            self.assertTrue(prev is None or v < prev)
+            prev = v
+
+    def test_k_is_DERIVED_from_dispersion_not_a_constant(self):
+        """k = mu/v (gamma-Poisson): a board whose markets differ WIDELY makes the prior
+        weak; a board whose markets agree makes it strong.  A constant k cannot do this, so
+        this test is the mutation guard on the derivation."""
+        tight = [(0.30, 40000.0), (0.32, 40000.0), (0.28, 40000.0), (0.31, 40000.0)]
+        wide = [(0.05, 40000.0), (0.60, 40000.0), (0.10, 40000.0), (0.55, 40000.0)]
+        k_tight = scan.phi_prior_strength(tight)
+        k_wide = scan.phi_prior_strength(wide)
+        self.assertTrue(k_tight and k_wide)
+        self.assertGreater(k_tight, 10.0 * k_wide,
+                           "k must move with the board's dispersion (k=%s vs %s)"
+                           % (k_tight, k_wide))
+        # the Poisson term is SUBTRACTED: the SAME spread measured over thinner exposure is
+        # more explicable as noise, so less of it is real dispersion and k is larger.
+        thin = [(m, 400.0) for m, _e in wide]
+        self.assertGreater(scan.phi_prior_strength(thin), k_wide)
+        # and a spread ENTIRELY explained by Poisson noise is not estimable -> None
+        self.assertIsNone(scan.phi_prior_strength([(0.30, 0.5), (0.31, 0.5)]))
+        self.assertIsNone(scan.phi_prior_strength([(0.30, 400.0)]))
+
+    def test_the_fallback_k_is_the_same_formula_on_the_seed_band(self):
+        v = ((C.PHI_SEED_MID - C.PHI_SEED_CHEAP) ** 2) / 12.0
+        self.assertAlmostEqual(scan.phi_seed_band_var(), v, places=15)
+        self.assertAlmostEqual(scan.phi_k(0.3), 0.3 / v, places=9)
+        self.assertAlmostEqual(scan.phi_k(0.3), 577.0, places=0)
+        # a measured dispersion always wins over the fallback
+        self.assertAlmostEqual(scan.phi_k(0.3, dispersion_k=25.0), 25.0, places=9)
+        # nothing to shrink toward ⇒ no strength
+        self.assertEqual(scan.phi_k(0.0), 0.0)
+
+    def test_a_rung_is_never_its_own_prior(self):
+        """LEAVE-ONE-OUT.  A bucket holding exactly one measured market would otherwise hand
+        that market its OWN tape as its prior — phi = n/E at any k, the ladder rebuilt inside
+        the posterior.  Here the bid is the only measured key on the board, so its prior must
+        fall through to the seed, NOT to its own 0.05."""
+        rows = [{"ticker": TK, "side": "bid", "fills_ct": 50,
+                 "rest_contract_s": 1000.0 * 3600.0, "rest_dollar_s": 0.0,
+                 "prox_dollar_s": 0.0, "inv_dollar_s": 0.0, "at_best_s": 0.0,
+                 "fill_notional": 0.0}]
+        bid = [s for s in scan.build_slots([prog()], Table(), NOW, presence_rows=rows)
+               if s.side == "bid"][0]
+        self.assertEqual(bid.phi_source, "seed")
+        self.assertAlmostEqual(bid.phi_prior, C.PHI_SEED_CHEAP, places=9)
+        self.assertNotAlmostEqual(bid.phi_prior, 0.05, places=6)
+
+    def test_the_composition_is_logged_no_silent_estimator(self):
+        R.reset_log_once()
+        scan.build_slots([prog()], Table(), NOW)
+        line = self.logs_of("phi_shrinkage_k")
+        self.assertTrue(line, "the estimator must announce its k")
+        self.assertIn("k_dispersion", line[0])
+        self.assertIn("n_measured", line[0])
 
 
 class TestTheFloorLiftsOnEvidence(LipTestCase):

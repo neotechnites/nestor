@@ -117,17 +117,28 @@ class Slot(object):
     # only — a slot cannot carry a refusal flag for a gate that no longer exists — and the
     # assume-filled freeze already acts through `frozen` at slot-build, not through the plan.
     __slots__ = ("ticker", "side", "venue", "rho", "S", "p", "pinned", "denied",
-                 "legal_price_exists", "phi", "phi_source", "d", "l_eff", "t_hat",
+                 "legal_price_exists", "phi", "phi_source", "phi_prior", "phi_k",
+                 "phi_exposure_h", "d", "l_eff", "t_hat",
                  "program_id", "window_h", "hours_left", "hours_to_start", "accrued",
                  "target_size", "cum_size", "land_grab_size", "land_grab_price_c",
                  "moneyness", "close_ts", "program_end_ts", "rung")
 
-    # `phi_source` — which rung of the law §6 chain produced `phi`: "measured" | "bucket" |
-    # "global" | "seed".  `scan.build_slots` ALWAYS stamps it; the default is "measured"
-    # because a directly-constructed slot's phi is given by its caller as a fact, which is
-    # exactly the condition the oversize gate tests (G3, grafted 2026-07-30).
+    # ── THE PHI POSTERIOR'S COMPOSITION RIDES THE SLOT (owner, 2026-07-30 night). ──────────
+    # `phi` is no longer a rung of a ladder; it is the shrunk estimate
+    #     phi = (fills + phi_k x phi_prior) / (phi_exposure_h + phi_k)
+    # computed in `scan.phi_posterior`.  The three inputs travel with it because the sizing
+    # law needs them, not merely the log: the oversize gate (law_order_q rule 3) is now
+    # "own exposure has outgrown the prior's strength", which is unanswerable from `phi`
+    # alone — a phi of 0.02 means opposite things at 0.5 exposure-hours and at 500.
+    # `phi_source` survives with a NARROWED meaning: where the PRIOR came from ("bucket" |
+    # "global" | "seed").  It no longer gates anything; it explains the prior in the log.
+    # DEFAULTS.  `phi_exposure_h=None` means "the caller is asserting this phi as a fact"
+    # (the same idiom the old `phi_source="measured"` default carried, and for the same
+    # reason: a hand-built Slot's phi is given, not inferred).  `scan.build_slots` ALWAYS
+    # stamps all three, so no production path relies on the default.
     def __init__(self, ticker, side, rho, S, p, venue=None, pinned=False, denied=False,
-                 legal_price_exists=True, phi=0.0, phi_source="measured", d=None,
+                 legal_price_exists=True, phi=0.0, phi_source="measured",
+                 phi_prior=None, phi_k=0.0, phi_exposure_h=None, d=None,
                  l_eff=C.SETTLE_LAG_H,
                  t_hat=1.0, program_id=None, window_h=16.0, hours_left=None,
                  hours_to_start=0.0, accrued=0.0, target_size=1000,
@@ -144,6 +155,10 @@ class Slot(object):
         self.legal_price_exists = legal_price_exists
         self.phi = float(phi)
         self.phi_source = str(phi_source)
+        self.phi_prior = float(phi) if phi_prior is None else float(phi_prior)
+        self.phi_k = max(0.0, float(phi_k or 0.0))
+        self.phi_exposure_h = (None if phi_exposure_h is None
+                               else max(0.0, float(phi_exposure_h)))
         self.d = M.d_estimate(None, p) if d is None else float(d)
         self.l_eff = float(l_eff)
         self.t_hat = float(t_hat)
@@ -317,9 +332,35 @@ class Need(object):
         self.unit_usd = unit_usd                  # collateral $/contract at the ORDER's price
         self.total_usd = total_usd                # THE RANKING NUMBER (law §1) — computed
                                                   # from the UNROUNDED resting need (ruling)
-        self.phi_source = getattr(slot, "phi_source", "measured")   # G3 (grafted): which
-                                                  # rung of the §6 chain produced phi
+        self.phi_source = getattr(slot, "phi_source", "measured")   # where the PRIOR came
+                                                  # from: "bucket" | "global" | "seed"
         self.reason = reason
+
+    @property
+    def history_dominates(self):
+        """Has this rung's OWN tape outgrown the prior's strength (own exposure > k)?
+
+        THE OVERSIZE GATE, rewritten 2026-07-30 night.  It used to ask whether `phi_source`
+        was a measurement — and under the ladder "measured" included ZERO FILLS OVER TWO
+        HOURS, so a quiet afternoon unlocked the full $10 envelope on several rungs and the
+        evening flow ate them (42 fills, ~$76 of inventory conversion in 8 hours).  Under
+        shrinkage that question is no longer answerable from a label, and it is no longer
+        the right question: the posterior only READS low when either the prior is low or
+        the tape is long, so the thing to test is which of those two it was.  k is exactly
+        the crossover — at exposure = k own tape and prior carry equal weight — so
+        `exposure > k` is "more than half of this number is our own history", and the full
+        envelope rests only on a rung whose quietness we have actually earned the right to
+        believe.  Two hours against a k of 10 exposure-hours is 17% weight: NOT dominant,
+        and the incident cannot recur by this path.
+        MIRROR (gate too tight ↔ too loose): too tight leaves a genuinely dead-quiet rung
+        tranching at the lot container, costing share on a safe seat — bounded, and it
+        self-clears as exposure accumulates past k; too loose is tonight's incident, which
+        is unbounded in inventory until the window closes.
+        `None` exposure = the caller asserted phi as a fact (see `Slot.__init__`)."""
+        e = getattr(self.slot, "phi_exposure_h", None)
+        if e is None:
+            return True
+        return float(e) > float(getattr(self.slot, "phi_k", 0.0) or 0.0)
 
     def numbers(self):
         """The log payload: no refusal without its arithmetic."""
@@ -329,6 +370,15 @@ class Need(object):
                 "rest_usd": round(self.rest_usd, 4), "turnovers": round(self.turnovers, 3),
                 "qualify_q": self.qualify_q, "qualify_usd": round(self.qualify_usd, 4),
                 "total_usd": round(self.total_usd, 4), "phi_source": self.phi_source,
+                # THE POSTERIOR'S COMPOSITION, not just its value (owner, 2026-07-30 night):
+                # a size chosen off phi must show whether phi came from this rung's own tape
+                # or from its neighborhood, or the tape cannot audit tonight's incident.
+                "phi": round(float(self.slot.phi), 6),
+                "phi_prior": round(float(getattr(self.slot, "phi_prior", self.slot.phi)), 6),
+                "phi_k": round(float(getattr(self.slot, "phi_k", 0.0) or 0.0), 4),
+                "own_exposure_h": (None if getattr(self.slot, "phi_exposure_h", None) is None
+                                   else round(float(self.slot.phi_exposure_h), 4)),
+                "history_dominates": self.history_dominates,
                 "accrued": round(self.slot.accrued, 4)}
 
 
@@ -429,22 +479,29 @@ def law_order_q(need, env_usd):
       2. Turnovers enter ONLY the affordability screen (law_need's total_usd, unrounded);
          the requote budget is the allocation minus consumed basis, and refills re-post at
          full W until the allocation is spent.
-      3. OVERSIZE beyond W toward the full envelope ONLY on MEASURED-low phi (G3, grafted
-         from the allocator-law branch): example 3 is conditioned on a FACT — "somehow this
-         market is awesome and [its phi is very low]" — not on the absence of one.
-         Measured (or bucket/global — a measurement borrowed from the neighborhood) with
-         T <= 1 means the lot is not expected to turn over inside the horizon, so the whole
-         envelope can rest safely.  When the chain bottomed out at the SEED we do not know
-         phi is low — we know we have never looked — so the order additionally tranches at
-         the LOT CONTAINER (SLOT_LOT_CAP_USD, the per-source reserve halved so at least one
-         re-post is guaranteed; an existing derivation, no new constant): a never-rested
-         market can never put its whole $10 one fill from done-for-the-day.
-    MIRROR (oversizing ↔ tranching): oversizing buys share on a rung the measurement says
-    is safe, bounded by the envelope; tranching keeps a re-post alive on a rung nobody has
-    measured, bounded below by one contract.  Both ends are the same $10."""
+      3. OVERSIZE beyond W toward the full envelope ONLY when the LOW PHI IS OUR OWN
+         HISTORY'S (rewritten 2026-07-30 night; supersedes G3's `phi_source` test).
+         Example 3 is conditioned on a FACT — "somehow this market is awesome and [its phi
+         is very low]" — and under shrinkage a low posterior is a fact about THIS rung only
+         once its own exposure outweighs the prior, i.e. `Need.history_dominates`
+         (own exposure > k).  Then T <= 1 means the lot is not expected to turn over inside
+         the horizon and the whole envelope may rest.
+         Below that exposure the low number is mostly the neighborhood's, borrowed — we do
+         not know THIS rung is quiet, we know we have not looked long enough — so the order
+         tranches at the LOT CONTAINER (SLOT_LOT_CAP_USD, the per-source reserve halved so
+         at least one re-post is guaranteed; an existing derivation, no new constant): a
+         thinly-observed market can never put its whole $10 one fill from done-for-the-day,
+         and it sizes to its actual need with the requote reserve held back.
+         THIS IS TONIGHT'S INCIDENT, NAILED SHUT: two quiet hours against a k of ~10
+         exposure-hours is 17% weight, the posterior stays at its ~0.3/h prior, and the
+         envelope stays closed.  A rung quiet for 40 hours against the same k still earns it.
+    MIRROR (oversizing ↔ tranching): oversizing buys share on a rung our own history says
+    is safe, bounded by the envelope; tranching keeps a re-post alive on a rung we have not
+    measured long enough to distinguish from its neighbors, bounded below by one contract.
+    Both ends are the same $10."""
     if need.unit_usd <= 0:
         return 0
-    measured = need.phi_source in ("measured", "bucket", "global")
+    dominant = need.history_dominates
     if need.qualify_q > 0:
         # THE WALK IS ALL-OR-NOTHING (the filing's step function): a sub-walk order scores
         # ZERO, so the seed tranche may not undercut it (it would buy a worthless sub-walk),
@@ -452,7 +509,7 @@ def law_order_q(need, env_usd):
         # (t0_qualification_size: "the minimum qualifying size is the maximum of the
         # objective").  The qualify order is q_rest, exactly.
         q = need.q_rest
-    elif not measured:
+    elif not dominant:
         lot_usd = min(need.rest_usd, float(C.SLOT_LOT_CAP_USD), float(env_usd))
         q = max(1, int(lot_usd / need.unit_usd + 1e-9))
     elif need.turnovers <= 1.0 + 1e-12:

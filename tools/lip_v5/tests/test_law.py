@@ -11,7 +11,7 @@ The reading of "dollar-hours" and of phi-as-turnovers is stated once, in the law
 
 import unittest
 
-from .. import alloc, config as C
+from .. import alloc, config as C, scan
 from .base import LipTestCase
 
 
@@ -35,8 +35,10 @@ class TestTheOwnersRulingOnSizing(LipTestCase):
          across turnovers.
       2. Turnovers enter ONLY the affordability screen: W x max(1, T) <= $10, else SKIP with
          the numbers logged.  The screen compares the UNROUNDED W.
-      3. Oversize beyond W only on MEASURED-low phi (tested in
-         TestOversizeRequiresAMeasurement below).
+      3. Oversize beyond W only when the low phi is OUR OWN HISTORY'S — own exposure > k,
+         the prior's strength (owner, 2026-07-30 night; supersedes G3's phi_source test,
+         which two quiet contract-hours were enough to satisfy).  Tested in
+         TestOversizeRequiresAMeasurement below.
 
     Fixtures pin the ruling's own four cases (a)-(d)."""
 
@@ -86,11 +88,12 @@ class TestTheOwnersRulingOnSizing(LipTestCase):
         self.assertEqual(rep["reasons"], {})
 
     def test_d_measured_low_phi_small_need_puts_all_ten(self):
-        """(d) = the owner's example 3, now measurement-gated (G3): "we can earn a dollar in
-        24 hours with only one dollar, we will put all 10."  phi here is a measured FACT of
-        zero, so the oversize stands."""
-        s = slot(rho=5.0/6.0, S=90.0, p=0.10, phi=0.0)            # phi_source defaults
-        n = alloc.law_need(s)                                     # "measured": a given fact
+        """(d) = the owner's example 3: "we can earn a dollar in 24 hours with only one
+        dollar, we will put all 10."  phi here is ASSERTED by the caller as a fact of zero
+        (`phi_exposure_h` unset — see `alloc.Slot`), so the oversize stands.  A phi that came
+        from a SHRUNK estimate has to earn it with exposure; see the incident test below."""
+        s = slot(rho=5.0/6.0, S=90.0, p=0.10, phi=0.0)      # exposure unset: a given fact
+        n = alloc.law_need(s)
         self.assertAlmostEqual(n.total_usd, 1.0, places=9)
         a, spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
         self.assertAlmostEqual(a[s.key] * s.p, 10.0, places=6)
@@ -111,39 +114,112 @@ class TestTheOwnersRulingOnSizing(LipTestCase):
 
 
 class TestOversizeRequiresAMeasurement(LipTestCase):
-    """G3, grafted 2026-07-30 from the allocator-law branch, confirmed by the owner's
-    ruling rule 3: example 3 is conditioned on a KNOWN low phi, not on ignorance."""
+    """REWRITTEN 2026-07-30 night, after the incident this class FAILED TO PREVENT.
+
+    G3 gated the oversize on `phi_source` — was phi "measured" (or borrowed from a measured
+    neighborhood) rather than the seed.  Under the old ladder "measured" INCLUDED zero fills
+    over DECISIVE_COMMITTED_H = 2 contract-hours, which for a 166-contract rung is 43
+    seconds.  A quiet afternoon put several rungs at phi = 0 on nothing, the full $10 rested
+    on each, and the evening flow ate them: 42 fills, ~$76 of inventory conversion in 8h.
+
+    The owner's fix (Ryan, verbatim intent): "we should take our global average and use the
+    rung's history to adjust it until the history is very long."  phi is now shrunk toward
+    its price-bucket prior with strength k (`scan.phi_posterior` / `scan.phi_k`), and the
+    oversize asks the only question that survives: IS THIS RUNG'S OWN HISTORY WHAT MADE THE
+    NUMBER LOW — own exposure > k (`Need.history_dominates`)?"""
 
     def _big_need(self, **kw):
         # q_raw = 60 @ 10c ⇒ W = $6 > the $5 lot container
         kw.setdefault("rho", 1.25); kw.setdefault("S", 540.0); kw.setdefault("p", 0.10)
         return slot(**kw)
 
-    def test_a_seed_phi_slot_never_orders_above_the_lot_container(self):
-        """Unmeasured ⇒ tranche at SLOT_LOT_CAP_USD (the per-source reserve halved so one
-        re-post is guaranteed — an existing derivation, no new constant): a never-rested
-        market can never be one fill from done-for-the-day."""
-        s = self._big_need(phi=0.001, phi_source="seed")
+    def test_THE_INCIDENT_two_quiet_hours_may_not_unlock_the_envelope(self):
+        """TONIGHT'S EXACT SHAPE, pinned (2026-07-30).  A rung whose price bucket measures
+        ~0.3 fills per contract-hour rests quietly for 2 contract-hours: zero fills.
+
+        Under the ladder that was a "measured" phi of 0.0 ⇒ oversize ⇒ the whole $10.
+        Under shrinkage k = 0.3 / v_seed = 577 contract-hours, so the two hours buy 0.35% of
+        the answer, the posterior stays at 0.2990 — the prior, essentially untouched — and
+        `history_dominates` is FALSE.  The order sizes to the rung's actual need, tranched
+        at the lot container so the requote reserve is held back.  MUTATION: restore the
+        ladder (phi = 0.0 with phi_source "measured") and this test fails on the incident's
+        exact symptom — $10 resting on 2 hours of quiet."""
+        prior, expo = 0.3, 2.0
+        k = scan.phi_k(prior)
+        self.assertAlmostEqual(k, 577.0, places=0)
+        phi = scan.phi_posterior(0, expo, prior, k)
+        self.assertAlmostEqual(phi, 0.2990, places=4)
+        self.assertGreater(phi, 0.99 * prior, "the posterior must stay AT the prior")
+        # The incident's rung, affordable so the SIZING is what is on trial: W = $1.00 at
+        # 10c (q_rest = 10), T = 7.2 turnovers ⇒ total $7.18, inside the $10 allocation.
+        s = slot(rho=5.0 / 6.0, S=90.0, p=0.10, phi=phi, phi_source="bucket",
+                 phi_prior=prior, phi_k=k, phi_exposure_h=expo)
+        n = alloc.law_need(s)
+        self.assertEqual(n.q_rest, 10)
+        self.assertFalse(n.history_dominates)
+        self.assertLessEqual(n.total_usd, 10.0)
+        a, spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
+        self.assertEqual(a[s.key], n.q_rest, "the order must size to the NEED, not the $10")
+        self.assertAlmostEqual(a[s.key] * s.p, 1.0, places=6)
+        self.assertLessEqual(a[s.key] * s.p, C.SLOT_LOT_CAP_USD + 1e-9,
+                             "THE INCIDENT: 2 quiet hours put the full envelope down")
+        # The requote reserve IS what is held back: the rung rests $1.00 of the $10 it is
+        # allowed, so the flow that ate the oversized seats can only reach a tenth of it.
+        self.assertGreaterEqual(C.ALLOC_PER_MARKET_USD - a[s.key] * s.p, 9.0)
+        self.assertAlmostEqual(spent, n.total_usd, places=6)   # the CHARGE is W x T (law §1)
+
+    def test_a_LONG_quiet_rung_still_earns_the_envelope(self):
+        """The other half, and the reason this is shrinkage and not a refusal: the SAME rung
+        after 5,000 contract-hours of quiet has a posterior of 0.032, its own history owns
+        90% of that number, and example 3 stands — "we can earn a dollar in 24 hours with
+        only one dollar, we will put all 10"."""
+        prior, expo = 0.3, 5000.0
+        k = scan.phi_k(prior)
+        phi = scan.phi_posterior(0, expo, prior, k)
+        s = self._big_need(phi=phi, phi_source="bucket", phi_prior=prior, phi_k=k,
+                           phi_exposure_h=expo)
+        n = alloc.law_need(s)
+        self.assertTrue(n.history_dominates)
+        self.assertLessEqual(n.turnovers, 1.0)
+        a, _spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
+        self.assertAlmostEqual(a[s.key] * s.p, 10.0, places=6)
+
+    def test_a_thinly_observed_slot_never_orders_above_the_lot_container(self):
+        """Prior-dominated ⇒ tranche at SLOT_LOT_CAP_USD (the per-source reserve halved so
+        one re-post is guaranteed — an existing derivation, no new constant): a rung we have
+        not watched longer than its prior is worth can never be one fill from done."""
+        s = self._big_need(phi=0.001, phi_source="seed", phi_prior=0.001,
+                           phi_k=10.0, phi_exposure_h=1.0)
         a, _spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
         self.assertGreater(a[s.key], 0)
         self.assertLessEqual(a[s.key] * s.p, C.SLOT_LOT_CAP_USD + 1e-9)
 
-    def test_a_measured_zero_phi_slot_still_oversizes_to_the_envelope(self):
-        s = self._big_need(phi=0.0, phi_source="measured")
-        a, _spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
-        self.assertAlmostEqual(a[s.key] * s.p, 10.0, places=6)
+    def test_the_gate_is_exposure_vs_k_not_the_priors_name(self):
+        """phi_source no longer gates anything — it explains the prior.  The SAME source
+        label sizes both ways, decided only by exposure against k."""
+        for src_ in ("bucket", "global", "seed"):
+            thin = self._big_need(phi=0.0, phi_source=src_, phi_prior=0.05, phi_k=100.0,
+                                  phi_exposure_h=99.0)
+            a, _s, _r = alloc.allocate_law([thin], budget_usd=300.0)
+            self.assertLessEqual(a[thin.key] * thin.p, C.SLOT_LOT_CAP_USD + 1e-9, msg=src_)
+            long_ = self._big_need(phi=0.0, phi_source=src_, phi_prior=0.05, phi_k=100.0,
+                                   phi_exposure_h=101.0)
+            a, _s, _r = alloc.allocate_law([long_], budget_usd=300.0)
+            self.assertAlmostEqual(a[long_.key] * long_.p, 10.0, places=6, msg=src_)
 
-    def test_bucket_and_global_phis_count_as_measurement(self):
-        for src_ in ("bucket", "global"):
-            s = self._big_need(phi=0.0, phi_source=src_)
-            a, _spent, _rep = alloc.allocate_law([s], budget_usd=300.0)
-            self.assertAlmostEqual(a[s.key] * s.p, 10.0, places=6, msg=src_)
-
-    def test_the_phi_source_rides_the_funded_log_line(self):
-        s = self._big_need(phi=0.001, phi_source="seed")
+    def test_the_posteriors_composition_rides_the_funded_log_line(self):
+        """No silent behavior: the tape must show WHY a size was chosen — the prior, its
+        strength, our own exposure and which of the two won."""
+        s = self._big_need(phi=0.02, phi_source="bucket", phi_prior=0.3, phi_k=577.0,
+                           phi_exposure_h=2.0)
         alloc.allocate_law([s], budget_usd=300.0)
-        funded = self.logs_of("law_funded")
-        self.assertTrue(funded and funded[0]["phi_source"] == "seed", funded)
+        f = self.logs_of("law_funded")
+        self.assertTrue(f, "no law_funded line")
+        self.assertEqual(f[0]["phi_source"], "bucket")
+        self.assertAlmostEqual(f[0]["phi_prior"], 0.3, places=6)
+        self.assertAlmostEqual(f[0]["phi_k"], 577.0, places=4)
+        self.assertAlmostEqual(f[0]["own_exposure_h"], 2.0, places=4)
+        self.assertIs(f[0]["history_dominates"], False)
 
     def test_a_self_qualifying_walk_posts_the_walk_exactly(self):
         """The walk is ALL-OR-NOTHING (the filing's step function): a sub-walk order scores

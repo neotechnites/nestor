@@ -494,7 +494,17 @@ def _mid(yes_bid_c, yes_ask_c):
 # STAGE 3 — the slot table.
 # =============================================================================================
 def measured_phi(fills_ct, rest_contract_hours):
-    """Law §6's "measured", from OUR OWN tape.  Returns None when unmeasured.
+    """One market's own-tape phi — now a SAMPLE FEEDING THE PRIOR, never the estimate itself.
+
+    DEMOTED 2026-07-30 night (owner: "we should take our global average and use the rung's
+    history to adjust it until the history is very long").  This function still decides which
+    (market, side) pairs are informative enough to enter the price-bucket / global averages
+    and the cross-market dispersion behind k — but NOTHING reads its return value as a rung's
+    phi any more.  The rung's phi is `phi_posterior`, and the DECISIVE_COMMITTED_H threshold
+    below therefore no longer decides any market's sizing; it only decides pool membership,
+    where a zero is a legitimate low sample among many rather than a verdict on one rung.
+    That is the whole content of tonight's fix: see the block above `phi_prior_strength`.
+    Returns None when unmeasured.
 
     fills > 0 with exposure is the estimate itself, n/E.  Zero fills over at least
     DECISIVE_COMMITTED_H of exposure is ALSO a measurement — of QUIETNESS — and it is
@@ -527,6 +537,138 @@ def phi_bucket(p):
     UNDERIVED as a width — recalibrate when the tape supports finer (the
     `fill_selection_tripwire` line is the instrument that will say so)."""
     return min(9, max(0, int(round(float(p) * 100)) // 10))
+
+
+# ── PHI IS SHRUNK TOWARD ITS NEIGHBORHOOD, NOT LADDERED (owner, 2026-07-30 night). ──────────
+# "we should take our global average and use the rung's history to adjust it until the history
+# is very long."  — Ryan, verbatim intent, after tonight's incident.
+#
+# THE INCIDENT.  The old chain was a HARD LADDER: own tape if "decisive" (zero fills over
+# DECISIVE_COMMITTED_H = 2 exposure-hours counted as a measured phi of 0.0), else the price-
+# bucket average, else the global average, else the seed.  A quiet afternoon put several rungs
+# on the top rung at phi = 0 on two hours of nothing, `alloc.law_order_q`'s oversize condition
+# ("measured-low phi ⇒ the whole envelope may rest") read that as a FACT, and the full $10 went
+# down on each.  The evening flow then ate the oversized seats: 42 fills, ~$76 of inventory
+# conversion in 8 hours.  Two hours of quiet is not a measurement of quietness; it is two hours.
+# THE OPPOSITE FAILURE IS ALSO ON RECORD and must not be re-armed: treating unknown phi as a
+# high upper bound (Rule-of-Three 3/E as the ESTIMATE) made quiet books rank unaffordable and
+# the book un-funded itself — the R3 deadlock, litigated in `measured_phi`'s docstring above.
+# The ladder was built to escape R3; shrinkage escapes BOTH, because a posterior cannot exceed
+# the range spanned by the prior and the tape.
+#
+# THE ESTIMATOR (gamma-Poisson conjugacy, the standard credibility form):
+#
+#     phi_hat = (fills + k x phi_prior) / (exposure_h + k)
+#
+# `phi_prior` is the price-bucket average of measured phis (global average when the bucket is
+# empty, the seed when the board has no measurement at all) — the EXISTING bucket machinery,
+# demoted from an estimate to a PRIOR.  `k` is the prior's strength in exposure-hours: the
+# exposure at which own tape and prior carry equal weight.  At exposure = 0 the posterior IS
+# the prior; at exposure = k it is the midpoint; as exposure → ∞ it is n/E.  Continuous, with
+# no rung, so no amount of arithmetic can make two quiet hours decisive.
+def phi_prior_strength(samples):
+    """k from the CROSS-MARKET DISPERSION of measured phis — empirical Bayes, not a constant.
+
+    `samples` is [(m_i, E_i)]: each market's measured phi and the exposure it was measured
+    over.  Model: n_i ~ Poisson(phi_i x E_i) with phi_i ~ Gamma(a, b) across markets, so the
+    prior mean is mu = a/b and its variance v = a/b², giving b = mu / v — and b is in units
+    of EXPOSURE (the conjugate update is (n + b·mu)/(E + b)).  So k = b = mu / v is literally
+    "the exposure at which own-tape evidence deserves equal weight to the prior", derived
+    from how much markets actually differ from one another.  Tight cross-market dispersion ⇒
+    the neighborhood already tells you your rate ⇒ large k ⇒ slow to believe your own tape.
+
+    THE SAMPLING TERM IS SUBTRACTED (moment matching, and it is not optional): the observed
+    spread of the m_i is Var(m) = v + mu x mean(1/E_i) — true dispersion PLUS Poisson noise
+    from finite exposure.  Using the raw spread would over-state v, under-state k, and hand
+    the incident back: thin, noisy tape would look like genuine market-to-market variety and
+    licence own-tape dominance early.  So v = Var(m) − mu x mean(1/E_i).
+
+    Returns None when the dispersion is NOT ESTIMABLE — fewer than two measured markets, or
+    v <= 0 (the observed spread is entirely explained by Poisson noise, i.e. the board looks
+    like one single rate and the data cannot say how strong the prior is).  The caller then
+    falls back to `phi_k`'s prior-derived form.  NEVER a constant."""
+    pairs = [(float(m), float(e)) for m, e in samples if float(e) > 0.0]
+    n = len(pairs)
+    if n < 2:
+        return None
+    mu = sum(m for m, _e in pairs) / n
+    if mu <= 0.0:
+        return None                                # a board of all-zero phis: no scale to fit
+    var_obs = sum((m - mu) ** 2 for m, _e in pairs) / (n - 1)
+    noise = mu * (sum(1.0 / e for _m, e in pairs) / n)
+    v = var_obs - noise
+    if v <= 0.0:
+        return None
+    return mu / v
+
+
+def phi_seed_band_var():
+    """The variance of phi implied by the program's OWN stated uncertainty, for use when the
+    board cannot yet measure the cross-market dispersion.
+
+    config declares exactly two seeds and they BRACKET everything this program believes
+    about a fill rate it has not measured: PHI_SEED_CHEAP = 0.001 below PHI_CHEAP_PRICE_CUT,
+    PHI_SEED_MID = 0.08 above it (v1 §2.2's price band; config §2.4 keeps them "ONLY as the
+    ceiling on phi_ub at zero exposure").  That band IS a prior dispersion statement, and the
+    maximum-entropy variance of a rate known only to lie in a band is the uniform's,
+    (hi − lo)² / 12.  No new constant: the number is read off two that already exist, and it
+    moves with them if they are ever recalibrated."""
+    lo, hi = sorted((float(C.PHI_SEED_CHEAP), float(C.PHI_SEED_MID)))
+    return ((hi - lo) ** 2) / 12.0
+
+
+def phi_k(prior, dispersion_k=None):
+    """The prior strength actually used, in exposure-hours.  ONE FORMULA, k = mu / v.
+
+    The measured path (`phi_prior_strength`) fits v from how much markets actually differ.
+    When the board cannot yet fit it, the SAME formula runs against the program's own stated
+    dispersion (`phi_seed_band_var`) — the fallback is a different SOURCE OF v, never a
+    different estimator and never a constant, so k always means the one thing: the exposure
+    at which own tape and prior carry equal weight.
+
+    WHY NOT THE OTHER OBVIOUS FALLBACK (rejected, 2026-07-30 night, with the arithmetic).
+    "The exposure carrying ~2-3 expected fills at the prior rate", k = RULE_OF_THREE / prior,
+    reads well and is WRONG at the low end, because it makes a small prior INFINITELY
+    authoritative: the cheap seed 0.001 would buy k = 3,000 exposure-hours, so a rung that
+    had actually observed 50 fills over 1,000 exposure-hours (a hot market, measured) would
+    still be quoted phi = 0.013 instead of 0.05 — the seed, a documented GUESS, outvoting
+    1,000 hours of fact 3:1.  Under-stating phi under-states turnovers, which under-reserves
+    the requote budget and OVERSIZES hot rungs: the incident's own failure direction.
+    k = mu/v does not have that end: a lower prior rate lends LESS pseudo-exposure, which is
+    what "we barely believe anything happens here" should mean.
+
+    UNITS.  Exposure is CONTRACT-hours (`presence.rest_contract_hours`), so k is too, and
+    that is why the old ladder was so easy to trip: DECISIVE_COMMITTED_H = 2 contract-hours
+    is 43 SECONDS for a 166-contract rung.  k is measured on the same axis and is typically
+    two to three orders of magnitude larger.
+    Worked, tonight's rung: a bucket prior of 0.3 fills per contract-hour with the seed-band
+    v = (0.08 − 0.001)²/12 = 5.20e-4 gives k = 0.3 / 5.20e-4 = 577 contract-hours.  Two quiet
+    hours buy 2/(2+577) = 0.35% weight and phi_hat = 0.2990 — the prior, essentially
+    untouched, which is the owner's sentence ("use the rung's history to adjust it until the
+    history is very long") made arithmetic.
+    A prior of zero lends nothing: k = 0, and the tape speaks for itself — there is nothing
+    to shrink toward."""
+    if dispersion_k is not None and float(dispersion_k) > 0.0:
+        return float(dispersion_k)
+    p = max(0.0, float(prior))
+    v = phi_seed_band_var()
+    if p <= 0.0 or v <= 0.0:
+        return 0.0
+    return p / v
+
+
+def phi_posterior(fills_ct, exposure_h, prior, k):
+    """phi_hat = (fills + k x prior) / (exposure_h + k) — the shrunk fill rate (see above).
+
+    Total ignorance (no exposure) returns the prior exactly; k = 0 with no exposure has no
+    information at all and returns the prior rather than dividing by zero."""
+    n = max(0, int(fills_ct))
+    e = max(0.0, float(exposure_h))
+    kk = max(0.0, float(k))
+    denom = e + kk
+    if denom <= 0.0:
+        return max(0.0, float(prior))
+    return (n + kk * max(0.0, float(prior))) / denom
 
 
 _P6_WARNED = False
@@ -663,13 +805,23 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
     slots = []
     by_prog = {p["program_id"]: p for p in programs}
 
-    # ── THE PHI-CHAIN PRE-PASS (law §6). ────────────────────────────────────────────────────
-    # Collect every MEASURED phi on the board with its price, so an unmeasured market can
-    # borrow the average of its price bucket (then the global average) instead of a seed.
+    # ── THE PHI-PRIOR PRE-PASS (law §6, rewritten 2026-07-30 night). ────────────────────────
+    # Collect every measured phi on the board with its price AND ITS EXPOSURE.  The averages
+    # are now the PRIOR each rung is shrunk toward (`phi_posterior`), not a rung it can climb
+    # onto; the exposures are what makes k measurable (`phi_prior_strength` must subtract the
+    # Poisson noise term mu x mean(1/E), so E travels with every sample).
     # Runs over the whole classify table — evidence is evidence whether or not the market
     # produces a slot this cycle — and over the same tape/presence rows the per-slot numbers
-    # below read, so the chain and the market can never disagree about the same key.
-    _phi_buckets, _phi_global = {}, [0.0, 0]
+    # below read, so the prior and the market can never disagree about the same key.
+    # LEAVE-ONE-OUT (and why it is not optional).  `_phi_by_key` remembers each key's OWN
+    # contribution so the per-slot pass can SUBTRACT it from its bucket and from the global
+    # average before shrinking toward them.  Without this the estimator quietly rebuilds the
+    # ladder through the prior's door: a bucket holding one measured market has that market's
+    # own tape as its prior, so phi_hat = own tape at ANY k, and a single quiet rung on a
+    # thin board is decisive again — exactly tonight's failure wearing a posterior's clothes.
+    # The owner's sentence is "take our GLOBAL AVERAGE and use THE RUNG'S HISTORY to adjust
+    # it": two different bodies of evidence, and a rung's own hours may not be both.
+    _phi_buckets, _phi_global, _phi_samples, _phi_by_key = {}, [0.0, 0], [], {}
     for _tk, _rec in sorted(classifier.table.items()):
         for _sd_side in ("bid", "ask"):
             _p = _rec["sides"][_sd_side]["p"]
@@ -689,6 +841,19 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             _b[1] += 1
             _phi_global[0] += _m
             _phi_global[1] += 1
+            _phi_samples.append((_m, _e))
+            _phi_by_key[_key] = (phi_bucket(_p), _m)
+    # k, ONCE PER PASS, from the board's own dispersion (empirical Bayes — see `phi_k`).
+    # None here is not a defect: it is "the board cannot yet say how much markets differ",
+    # and every slot then derives its own k from its own prior (RULE_OF_THREE / prior).
+    _k_disp = phi_prior_strength(_phi_samples)
+    R.log_once("phi_shrinkage_k",
+               k_dispersion=None if _k_disp is None else round(_k_disp, 4),
+               n_measured=_phi_global[1],
+               phi_mean=(round(_phi_global[0] / _phi_global[1], 6)
+                         if _phi_global[1] else None),
+               note="phi_hat = (fills + k*prior)/(exposure_h + k); k from cross-market "
+                    "dispersion, else RULE_OF_THREE/prior (owner 2026-07-30 night)")
 
     for ticker, rec in sorted(classifier.table.items()):
         prog = by_prog.get(rec["program_id"])
@@ -892,29 +1057,42 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             # band-floor price — which at $10/market practically ranks empty sides
             # unaffordable, with the numbers in the skip log instead of a silent refusal.
             #
-            # THE PHI CHAIN (law §6): per-market measured → price-bucket average of measured
-            # phis → global measured average → the seed.  The chain is resolved here because
-            # this is where every market's tape and price meet; the bucket/global tables are
-            # built in the pre-pass above from the SAME evidence.  P6's quietness still
-            # informs the seed (an untraded market cannot be filling anyone at the busy
-            # rate) — phi only, never a refusal.
+            # THE PHI ESTIMATE (law §6, REWRITTEN 2026-07-30 night — see the derivation block
+            # above `phi_prior_strength`).  The ladder is gone.  The bucket/global tables built
+            # in the pre-pass above are now the PRIOR, and this rung's own tape ADJUSTS it in
+            # proportion to how much tape there is:
+            #     phi_hat = (fills + k x prior) / (exposure + k)
+            # `phi_source` survives, re-pointed: it now names where the PRIOR came from
+            # ("bucket" | "global" | "seed"), never a claim that phi is a fact.  The three
+            # numbers that actually decide sizing — own exposure, k, prior — ride the Slot
+            # beside it so the tape shows WHY a size was chosen (`Need.numbers`).
+            # P6's quietness still informs the SEED prior only (an untraded market cannot be
+            # filling anyone at the busy rate) — phi only, never a refusal.
             quiet = (p6 is not None and not p6(ticker))
-            m_phi = measured_phi(fills, rest_ch)
-            # `phi_source` rides the Slot (G3, grafted 2026-07-30 from the allocator-law
-            # branch): the oversize decision needs to know whether phi is a FACT (measured
-            # here, or borrowed from a measured neighborhood) or the seed — i.e. whether we
-            # know phi is low or merely never looked.
-            if m_phi is not None:
-                phi, phi_source = m_phi, "measured"
-            elif _phi_buckets.get(phi_bucket(p)):
-                _b = _phi_buckets[phi_bucket(p)]
-                phi, phi_source = _b[0] / _b[1], "bucket"
-            elif _phi_global[1] > 0:
-                phi, phi_source = _phi_global[0] / _phi_global[1], "global"
+            # Leave-one-out: this key's own sample (if it has one) comes OUT of both pools
+            # before they are averaged — see the pre-pass note.
+            _own_b, _own_m = _phi_by_key.get(key, (None, 0.0))
+            _bk = phi_bucket(p)
+            _b = _phi_buckets.get(_bk)
+            _b_sum, _b_n = (_b[0], _b[1]) if _b else (0.0, 0)
+            if _own_b == _bk:
+                _b_sum, _b_n = _b_sum - _own_m, _b_n - 1
+            _g_sum, _g_n = _phi_global[0], _phi_global[1]
+            if _own_b is not None:
+                _g_sum, _g_n = _g_sum - _own_m, _g_n - 1
+            if _b_n > 0:
+                phi_prior, phi_source = max(0.0, _b_sum) / _b_n, "bucket"
+            elif _g_n > 0:
+                phi_prior, phi_source = max(0.0, _g_sum) / _g_n, "global"
             else:
-                phi = M.phi_estimate(fills, rest_ch,
-                                     p=(C.PHI_CHEAP_PRICE_CUT / 2.0) if quiet else p)
+                # No measurement anywhere on the board: the prior is the seed, and it is the
+                # SEED PROPER (zero own-evidence), because own fills/exposure enter through
+                # the posterior below and must not be counted twice.
+                phi_prior = M.phi_estimate(0, 0.0,
+                                           p=(C.PHI_CHEAP_PRICE_CUT / 2.0) if quiet else p)
                 phi_source = "seed"
+            k = phi_k(phi_prior, _k_disp)
+            phi = phi_posterior(fills, rest_ch, phi_prior, k)
             d = M.d_estimate(t.get("drift_samples"), p)
             l_eff = M.l_eff_h(close_ts, now,
                               (l_shed or {}).get(key), settled=False)
@@ -948,7 +1126,8 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             slots.append(alloc.Slot(
                 ticker, side, rho=prog["rho"], S=S_riv, p=p, venue=rec["series"],
                 pinned=rec["pinned"], legal_price_exists=legal,
-                phi=phi, phi_source=phi_source, d=d, l_eff=l_eff, t_hat=t_hat,
+                phi=phi, phi_source=phi_source, phi_prior=phi_prior, phi_k=k,
+                phi_exposure_h=rest_ch, d=d, l_eff=l_eff, t_hat=t_hat,
                 program_id=prog["program_id"], window_h=prog["window_h"],
                 hours_left=hours_left, hours_to_start=hours_to_start,
                 target_size=rec["target_size"], cum_size=sd["cum_size"],
