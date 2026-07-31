@@ -228,3 +228,23 @@ class SmoothedS(object):
     def get(self, key, default=0.0):
         v = self.state.get(key)
         return default if v is None else v[1]
+
+
+# THE BOOT DERIVATION, CACHED.  The window is a property of the recorder's tape, not of a
+# cycle, so it is derived ONCE per process and every consumer reads the same number — a
+# per-Maker derivation would re-read the tape on every construction and, worse, would let two
+# Makers in one process rank on two different windows.
+_BOOT_WINDOW = None
+
+
+def boot_window_s(dir_path=None):
+    global _BOOT_WINDOW
+    if _BOOT_WINDOW is None:
+        _BOOT_WINDOW = derive_window_s(dir_path=dir_path)
+    return _BOOT_WINDOW[0]
+
+
+def _reset_boot_window():
+    """Tests only — the cache is process-wide by design."""
+    global _BOOT_WINDOW
+    _BOOT_WINDOW = None

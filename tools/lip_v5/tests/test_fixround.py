@@ -132,9 +132,13 @@ class TestFillReplenishAtOneHz(FixRoundCase):
         deferral and asserts the whole sequence: deferral logged, then the mature recall
         empties the book."""
         r, ex, oid, n = self._filled_runner(verified=True)
-        # G3: the seed-phi order was tranched at the lot container, not the whole $10
+        # V6 (2026-07-31): the lot container is GONE with the seat.  The order is the
+        # marginal queue's own answer and it is bounded by the DERIVED CLUSTER RAIL (A = C/N),
+        # which is the only dollar bound the plan carries — the property that matters here is
+        # unchanged (one fill cannot exceed one settle source's allocation) and it is now the
+        # ruin formula, not a container constant, that says so.
         self.assertLessEqual(float(ex.placed[0]["count"]) * 0.06,
-                             C.SLOT_LOT_CAP_USD + 0.06)
+                             r.m.cluster_rail_usd() + 0.06)
         t = NOW + 2
         for _ in range(2 * int(C.FILLS_POLL_S) + 5):       # true 1 Hz
             t += 1.0
@@ -148,9 +152,16 @@ class TestFillReplenishAtOneHz(FixRoundCase):
         self.assertNotIn(oid, r.m.orders, "the filled order is still counted as resting")
         self.assertEqual(ex.resting, {},
                          "a measured-hot market must not be re-entered")
+        # V6: the measured-hot verdict now arrives as the queue's own screen — the rung's
+        # own tape makes T large, the bleed term makes its entry NET-negative
+        # (`entry_net_negative`) or the rail refuses it — and the reason is on the line
+        # either way.  The property is the invariant one: no silent refusal path.
+        _reasons = self.logs_of("mq_reasons") or self.logs_of("law_reasons")
         self.assertTrue(any(rec.get("unaffordable") or rec.get("allocation_exhausted")
-                            for rec in self.logs_of("law_reasons")),
-                        "the refusal must carry its reason — no silent paths")
+                            or rec.get("entry_net_negative") or rec.get("cant_afford_entry")
+                            or rec.get("cluster_rail_full") or rec.get("budget_exhausted")
+                            for rec in _reasons),
+                        "the refusal must carry its reason — no silent paths: %s" % _reasons)
         self.assertNotIn(TK, r.m.frozen)
 
     def test_the_fill_updates_collateral_so_the_feed_stays_true(self):
@@ -281,11 +292,18 @@ class Test404Disambiguation(EngineCase):
 # BLOCKER-2 — the cliff rescue fires for an UNVERIFIED venue (the launch regime).
 # =============================================================================================
 class TestRescueUnverifiedVenue(FixRoundCase):
-    def _runner(self, reward=25_000):
+    def _runner(self, reward=25_000, ceiling_usd=600.0):
+        # CEILING $600 (v6, note 55 amendment 3: "CAPITAL = $600 recommended").  v5's $300
+        # regime is explicitly outside v6's range — "v6 has nothing to buy below ~$600"
+        # (note 55 item 1) — and at $300 the derived rail (A = C/N = $8.33 at this board's
+        # 6c mix) is smaller than this fixture's $9.00 entry block, so the queue correctly
+        # buys nothing.  The rescue property under test is about the CLIFF, not about the
+        # rail, so the fixture is moved into the regime the rescue is meant to run in.
         ex = CountingExchange(
             program_body(series="KXCLIFF", tickers=(CLIFF_TK,), reward=reward),
             {CLIFF_TK: cheap_book()})
-        r = self.runner(ex)
+        m = self.maker(ex=ex, ceiling_usd=ceiling_usd)
+        r = RUN.Runner(m, sleep=lambda _s: None)
         r.init(NOW, nestor_state=NESTOR)
         r.m.accrued["prog-1"] = 0.87                      # the stranded accrual
         return r, ex
@@ -300,10 +318,16 @@ class TestRescueUnverifiedVenue(FixRoundCase):
         r.iteration(NOW + 1)
         self.assertEqual(self.logs_of("cliff_top_up"), [])      # the machinery is gone
         self.assertEqual(len(ex.placed), 1, "the accrued market funds like any other")
-        funded = self.logs_of("law_funded")
+        # V6: the arithmetic moved from `need = target - accrued` to the CLIFF LUMP — the
+        # $0.87 of conditional accrual means $0.13 of new credit buys a whole PAID dollar, so
+        # the entry's value is the full cliff against a fraction of the capital.  Same
+        # property (recovery is a consequence of the ranking), stated in the queue's terms.
+        funded = self.logs_of("mq_entered")
         self.assertTrue(funded and funded[0]["accrued"] > 0.8, funded)
-        self.assertLess(funded[0]["need_usd"], funded[0]["target_usd"],
-                        "accrued must SUBTRACT from the need (law §1)")
+        self.assertLess(funded[0]["credit_usd"], funded[0]["paid_usd"],
+                        "the accrued dollars must be what makes the entry cheap: new credit "
+                        "%s buys paid credit %s" % (funded[0]["credit_usd"],
+                                                    funded[0]["paid_usd"]))
 
     def test_dead_accrual_gets_no_cap_room(self):
         """The mirror: a cliff UNREACHABLE at the ρ/2 ceiling earns no exemption."""

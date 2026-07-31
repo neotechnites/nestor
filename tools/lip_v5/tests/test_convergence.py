@@ -191,57 +191,71 @@ class TestTheMultiMarketBookIsAPureFunctionOfTheWorld(ConvergenceCase):
 
 
 class TestPlanGrowthReachesTheWire(ConvergenceCase):
-    """G1's spine half (grafted 2026-07-30 from the allocator-law branch): the plan can
-    move while the book sits still — here, the phi chain crossing from SEED to MEASURED
-    flips the order from the lot-container tranche to the full allocation — and the refill
-    trigger is one-directional, silent at exactly this boundary: the tranche (83 contracts)
-    is precisely half the grown plan (166), and 83 < 0.5 x 166 is FALSE.  Only trigger (f)
-    TARGET_MOVED carries the growth to the wire; without it the wire is a function of WHEN
-    the measurement arrived, not of the world."""
+    """G1's spine half: the plan can move while the BOOK sits still, and the growth must
+    reach the wire — otherwise the wire is a function of WHEN a measurement arrived rather
+    than of the world.  Only trigger (f) TARGET_MOVED carries a pure size increase.
 
-    def test_the_seed_to_measured_growth_is_carried_by_trigger_f(self):
-        # REWRITTEN 2026-07-30 night for the shrinkage estimator.  The growth is the same
-        # 83 -> 166 pair, but it is no longer bought with 2 contract-hours of quiet (that is
-        # the incident, and `alloc.Need.evidence_bounds_a_turnover` now refuses it): the rung
-        # must rest long enough that the Rule-of-Three bound can rule out a turnover inside
-        # the 16 h horizon, own exposure >= 3h = 48 contract-hours, which at 83 contracts
-        # resting is ~35 minutes of wall clock.  The RUN is longer; the assertion is the same
-        # one, and it is still trigger (f) that carries the growth to the wire.
-        # reward tuned so W = ~$5.40 at 6c: the seed tranche posts $5.00 = 83 contracts,
-        # and the oversize posts the $10 envelope = 166 — the rival branch's exact measured
-        # pair, reproduced from the world instead of asserted.
-        # ONE-SIDED book (no NO-side depth): under the TWO-SIDED AMENDMENT (2026-07-31)
-        # a market whose both sides are viable SPLITS the seat, so the full-envelope 166
-        # would halve.  This spine tests plan-GROWTH reaching the wire, not seat-splitting;
-        # an empty NO side self-qual-refuses ($60 walk > $10 seat) and keeps the fixture's
-        # original one-sided geometry honest.
+    ── REWRITTEN FOR V6 (2026-07-31) ───────────────────────────────────────────────────────
+    The v5 version of this test used the phi chain crossing from SEED to MEASURED to flip
+    the order from the lot-container tranche (83 contracts) to the full $10 allocation (166).
+    BOTH of those objects are deleted by v6: there is no lot container and no seat, so there
+    is no staircase to climb — the marginal queue enters at the cliff block and deepens
+    continuously to wherever the next dollar stops being the best dollar, in ONE placement.
+
+    So the same spine property is tested against v6's own growth driver, which is the one
+    note 55 actually deploys on: A CAPITAL EVENT.  "v6 goes live the moment the deposit
+    lands" — the deposit raises C, the rail A = C/N grows with it, the plan grows, and the
+    growth has to reach the wire.  The book never moves; only C does.
+    """
+
+    def _one_sided_runner(self, ceiling_usd):
         one_sided = {"orderbook": {"orderbook_fp": {
             "yes_dollars": [["0.06", "1200"]], "no_dollars": []}}}
         ex = ConvergenceExchange(program_body(tickers=(TK_A,), reward=287_000),
                                  {TK_A: one_sided})
         ex.market_closes[TK_A] = NOW + 16 * 3600
-        m = self.maker(ex=ex)
+        m = self.maker(ex=ex, ceiling_usd=ceiling_usd)
         r = RUN.Runner(m, sleep=lambda _s: None)
         r.classifier.close_ts[TK_A] = NOW + 16 * 3600
+        return r, ex, m
+
+    def test_the_deposit_grows_the_rail_and_trigger_f_carries_it_to_the_wire(self):
+        r, ex, m = self._one_sided_runner(300.0)
         ok, refusals = r.init(NOW, nestor_state=NESTOR)
         self.assertTrue(ok, refusals)
-        t = self.settle(r, NOW, n=60)                     # 60 s: tape still under 2 c·h
-        early = self.fingerprint(ex)
-        self.assertEqual(early.get((TK_A, "bid")), 83.0,
-                         "the seed tranche must rest first: %s" % early)
-        # ...the book does not move; only the TAPE does, and the plan doubles.  83 is
-        # EXACTLY half of 166, so the refill trigger's strict inequality stays silent —
-        # (f) is what reaches the wire.
-        # ...and only once the rung's OWN tape can bound its turnover (>= 3h = 48 contract-
-        # hours, ~35 min of wall clock at 83 contracts resting) does the envelope open.  Two
-        # contract-hours no longer can — that is the incident.  The run is at TRUE 1 Hz
-        # because the meter accrues `remaining` once per TICK: stepping simulated time faster
-        # than the sampler under-counts exposure by exactly the step, and this test is now
-        # about how much exposure exists.
-        t = self.settle(r, t, n=2_200, step=1.0)          # to ~2,260 s ≈ 52 contract-hours
-        grown = self.fingerprint(ex)
-        self.assertEqual(grown.get((TK_A, "bid")), 166.0,
-                         "the measured plan never reached the wire: %s" % grown)
+        t = self.settle(r, NOW, n=60)
+        before = self.fingerprint(ex)
+        rail_before = m.cluster_rail_usd()
+        self.assertGreater(before.get((TK_A, "bid"), 0), 0,
+                           "nothing rested at all: %s" % before)
+        self.assertAlmostEqual(before[(TK_A, "bid")] * 0.06, rail_before, delta=0.06,
+                               msg="v6 rests the whole rail in ONE placement, no staircase: "
+                                   "%s at rail %s" % (before, rail_before))
+        # THE DEPOSIT.  C doubles; nothing about the board changes.
+        m.ceiling_usd = 600.0
+        m.cash.ceiling_usd = 600.0
+        t = self.settle(r, t, n=int(C.MIN_RESTING_LIFE_S) + 30, step=1.0)
+        after = self.fingerprint(ex)
+        rail_after = m.cluster_rail_usd()
+        self.assertGreater(rail_after, rail_before,
+                           "the rail is A = C/N and N is capital-INDEPENDENT: doubling C "
+                           "must double the rail (%s -> %s)" % (rail_before, rail_after))
+        self.assertGreater(after.get((TK_A, "bid"), 0), before[(TK_A, "bid")],
+                           "the grown plan never reached the wire: %s -> %s"
+                           % (before, after))
+
+    def test_N_is_capital_independent(self):
+        """note 54 step 1: "N is capital-independent" — C cancels out of the ruin formula, so
+        the rail scales LINEARLY and the diversification count does not move."""
+        r3, _ex3, m3 = self._one_sided_runner(300.0)
+        r6, _ex6, m6 = self._one_sided_runner(600.0)
+        for r in (r3, r6):
+            r.init(NOW, nestor_state=NESTOR)
+            self.settle(r, NOW, n=8)
+        self.assertEqual(m3.dials.n_clusters, m6.dials.n_clusters,
+                         "N moved with capital: %s vs %s" % (m3.dials.n_clusters,
+                                                             m6.dials.n_clusters))
+        self.assertAlmostEqual(m6.dials.rail_usd / m3.dials.rail_usd, 2.0, places=6)
 
 
 class TestTheRiskRailsSurviveConvergence(ConvergenceCase):

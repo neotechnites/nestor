@@ -24,6 +24,7 @@ import os
 import signal
 
 from . import alloc, cashfeed, clusters as CL, config as C, cutover
+from . import dials as DI, marginal as MQ, smooth as SM
 from . import guards as G, ledger as LG, presence as P
 from . import quote as Q
 from . import ratchet as RT, ratelimit as RL, runtime as R, wsgate
@@ -40,6 +41,20 @@ class Maker(object):
         self.shadow = bool(shadow)
         self.ceiling_usd = float(ceiling_usd)
         self.data_dir = data_dir or C.DATA_DIR
+
+        # ── V6: THE CAPITAL MACHINE (note 55).  Armed by `config.MARGINAL_QUEUE_ARMED`; with
+        # it False every line below is inert and this build is v5, which is what makes the
+        # frozen fallback binary real ("FORK, don't edit").
+        # `dials` are DERIVED FROM C at boot and re-derived every pass off the ACTUAL funded
+        # mix (the floor-cap coupling); the seed is v5's own N so the first cycle before any
+        # board data still has a legal rail.  `smoothed` is the competition estimate the queue
+        # ranks on — snapshot S is what churns (note 55 item 4b).
+        self.dials = DI.seed_dials(self.ceiling_usd)
+        self.smoothed = SM.SmoothedS(SM.boot_window_s())
+        # Filled by the quiet-family classifier (stage 3) and the 120/480 probe (stage 5);
+        # both are properties of the BOARD and of config, never of our own past decisions.
+        self.quiet_clusters = set()
+        self.probe = None
 
         self.ledger = LG.Ledger()
         self.presence_log = LG.PresenceLog()
@@ -238,6 +253,58 @@ class Maker(object):
     # =========================================================================================
     # THE ONE PATH TO THE WIRE
     # =========================================================================================
+    def cluster_rail_usd(self):
+        """THE CLUSTER RAIL, ONE NUMBER, READ BY BOTH THE PLAN AND THE RAILS.
+
+        v6: `A = C/N` off `dials` (note 54's capital-scaling procedure).  v5: the day-stop
+        derived reserve.  It must be ONE function because a plan that proposes what `place()`
+        refuses re-offers forever — the 2026-07-30 plan-vs-rail mismatch, which is a live
+        WATCH ITEM in note 55 and is structurally impossible if there is only one expression
+        of the rail."""
+        if C.MARGINAL_QUEUE_ARMED and self.dials is not None and self.dials.rail_usd > 0:
+            return self.dials.rail_usd
+        return CL.cluster_cap_usd(
+            G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd),
+            ceiling_usd=self.ceiling_usd)
+
+    def plan_marginal(self, now, slots, budget_usd, market_spent, cluster_spent):
+        """V6'S PLAN STEP — smoothed competition, dials from C, then the marginal queue.
+
+        Returns `(alloc, spent, report, rail_usd)`.  Three things happen here and each is
+        logged with its numbers:
+
+          1. SMOOTH.  Every slot's rival score is folded into `self.smoothed` at the derived
+             window and the queue ranks on the average, not on the snapshot (note 55 item 4b).
+             This is memory of the WORLD, which is legal under the convergence doctrine;
+             cancelling our own orders changes not one sample of it.
+          2. DERIVE THE DIALS.  `dials.derive_from_slots` runs the queue against a seed rail,
+             reads the ACTUAL funded mix's price, and re-solves N >= z^2 p(1-p)/(d-p)^2 until
+             N stops moving — the floor-cap coupling, computed rather than assumed.
+          3. ALLOCATE at the derived rail.
+
+        The rail is `self.cluster_rail_usd()` for BOTH the per-market and the per-cluster
+        bound: the knee (per-market, emergent) and the cap (per-cluster, law) are different
+        objects, and note 55 is explicit that a $66 rail naturally holds ~2 knee markets —
+        so the per-market bound must not be tighter than the rail or the second knee is
+        refused in exactly the double-fast clusters where the best dollars live.
+        """
+        s_smoothed = {}
+        for s in slots:
+            s_smoothed[s.key] = self.smoothed.observe(s.key, s.S, now)
+
+        def _alloc(sl, budget, rail, **kw):
+            return MQ.allocate_marginal(sl, min(budget_usd, budget), market_spent=market_spent,
+                                        cluster_spent=cluster_spent, cluster_cap_usd=rail,
+                                        per_market_cap_usd=rail, s_smoothed=s_smoothed,
+                                        multi_market_clusters=self.quiet_clusters,
+                                        probe=self.probe, **kw)
+
+        self.dials = DI.derive_from_slots(self.ceiling_usd, slots, _alloc)
+        R.log("dials", window_s=self.smoothed.window_s, **self.dials.numbers())
+        rail = self.cluster_rail_usd()
+        a, spent, rep = _alloc(slots, budget_usd, rail)
+        return a, spent, rep, rail
+
     def place_context(self, available_cash_usd=None, replacing_order_id=None):
         """`replacing_order_id` — **NEW-1: a MAKE-BEFORE-BREAK REPLACEMENT IS NOT AN
         ADDITION.**  MBB posts the new quote while the old one still rests, and the caps
@@ -310,8 +377,7 @@ class Maker(object):
             halt_state=self.halt, positions=open_pos, resting_basis=resting,
             nestor_orders=self.nestor_orders, nestor_positions=self.nestor_positions,
             available_cash_usd=available_cash_usd,
-            cluster_cap_usd=CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd),
-                                              ceiling_usd=self.ceiling_usd),
+            cluster_cap_usd=self.cluster_rail_usd(),
             frozen=self.frozen, refill=self.refill,
             n_cap_fn=lambda p: alloc.n_cap(p, caps),
             day_stopped=self.day_stopped, skew_ok=self.skew_ok,
@@ -940,7 +1006,11 @@ class Maker(object):
             # The per-ORDER bound IS the per-market allocation (law §3/§4: a single order
             # may carry the whole $10 — "we will put all 10").  B9's turnover cap and the
             # cluster rail still bound what fills may accumulate.
-            self.slot_cap_usd = C.ALLOC_PER_MARKET_USD
+            # v6: the per-ORDER bound is the CLUSTER RAIL — the knee is where money stops
+            # (note 55), the rail is only the ruin guard, so a single market may legitimately
+            # hold the whole rail when its marginal curve stays the best dollar on the board.
+            self.slot_cap_usd = (self.cluster_rail_usd() if C.MARGINAL_QUEUE_ARMED
+                                 else C.ALLOC_PER_MARKET_USD)
             self.phi_by_key = {s.key: s.phi for s in slots}
             for s in slots:
                 if s.program_id is not None:
@@ -967,22 +1037,32 @@ class Maker(object):
             # consume the ceiling (settlements release them back through reconcile — law
             # §8's capital events, arriving through the machinery that already exists).
             budget = alloc.reserve_budget(
-                self.ceiling_usd - self.cash.inventory_basis, C.ALLOC_PER_MARKET_USD)
-            # The SAME cluster cap the rails read, inside the plan — an allocator that
-            # plans what `place()` must refuse is not a plan.
-            cluster_cap = CL.cluster_cap_usd(
-                G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd),
-                ceiling_usd=self.ceiling_usd)
-            a, spent, rep = alloc.allocate_law(slots, budget,
-                                               market_spent=market_spent,
-                                               cluster_spent=cluster_spent,
-                                               cluster_cap_usd=cluster_cap)
+                self.ceiling_usd - self.cash.inventory_basis, self.cluster_rail_usd())
+            if C.MARGINAL_QUEUE_ARMED:
+                a, spent, rep, cluster_cap = self.plan_marginal(
+                    now, slots, budget, market_spent, cluster_spent)
+                out["allocate"] = {"spent": spent, "slots": len(slots),
+                                   "alloc_cap_usd": cluster_cap,
+                                   "cluster_cap_usd": cluster_cap,
+                                   "rail_usd": self.dials.rail_usd,
+                                   "n_clusters": self.dials.n_clusters,
+                                   "p": self.dials.p, "lam": rep.get("lam", 0.0),
+                                   "funded": len(rep["funded"]),
+                                   "reasons": rep["reasons"]}
+            else:
+                # The SAME cluster cap the rails read, inside the plan — an allocator that
+                # plans what `place()` must refuse is not a plan.
+                cluster_cap = self.cluster_rail_usd()
+                a, spent, rep = alloc.allocate_law(slots, budget,
+                                                   market_spent=market_spent,
+                                                   cluster_spent=cluster_spent,
+                                                   cluster_cap_usd=cluster_cap)
+                out["allocate"] = {"spent": spent, "slots": len(slots),
+                                   "alloc_cap_usd": C.ALLOC_PER_MARKET_USD,
+                                   "cluster_cap_usd": cluster_cap,
+                                   "funded": len(rep["funded"]),
+                                   "reasons": rep["reasons"]}
             self.last_alloc = dict(a)
-            out["allocate"] = {"spent": spent, "slots": len(slots),
-                               "alloc_cap_usd": C.ALLOC_PER_MARKET_USD,
-                               "cluster_cap_usd": cluster_cap,
-                               "funded": len(rep["funded"]),
-                               "reasons": rep["reasons"]}
             out["alloc"] = a
             out["requote"] = self.requote_pass(now, slots, a)
             out["accrued"] = self.integrate_accrual(now, slots, a)
@@ -1047,8 +1127,7 @@ class Maker(object):
             [{"ticker": t, "side": leg, "n": abs(p[leg]),
               "basis": self.entry_basis.get((t, leg), 0.0)}
              for t, p in self.positions.items() for leg in ("yes", "no") if abs(p[leg]) > 0],
-            CL.cluster_cap_usd(G.day_stop_usd(self.projected_day_reward, ceiling_usd=self.ceiling_usd),
-                               ceiling_usd=self.ceiling_usd))
+            self.cluster_rail_usd())
         out["bucket_hz"] = self.bucket.b
         out["halted"] = self.halt.halted
         out["rollback_clean"] = self.rollback.clean

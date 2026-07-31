@@ -1544,3 +1544,100 @@ ALERTS = (
     "rstar_no_converge", "coverage_low", "credits_ritual_due", "venue_out_of_reach",
     "probe_oversized", "unit_mismatch", "ws_degraded",
 )
+
+
+# =============================================================================================
+# V6 — THE CAPITAL MACHINE (note 55, spec'd with Ryan 2026-07-30/31).
+#
+# v5 is FROZEN as the working $300 earner and the fallback binary (note 55 item 2: "FORK,
+# don't edit").  Everything below arms the v6 allocator core on this fork.  There is exactly
+# ONE armed/disarmed switch — `MARGINAL_QUEUE_ARMED` — and with it False this build is v5,
+# byte-identical in behaviour, which is what makes the fallback real rather than aspirational.
+# =============================================================================================
+MARGINAL_QUEUE_ARMED = True                  # note 55 item 1: v6's allocator core replaces
+                                             # the flat seat with a queue over dollars.
+
+# --- THE RUIN FORMULA'S TWO POLICY NUMBERS (note 55, "THE CLUSTER CAP, DERIVED") ---
+# d = the day-stop fraction: the most of the stack one day may lose.  SETTLED = 0.20 (Ryan,
+# final), and the derivation trail is kept so the number is not re-guessed:
+#   (1) pure compounding barely binds at this machine's earning rates (recovery cost of a
+#       drawdown x is x/(e(1-x)) days at e ~ 5-10%/day — tolerates d > 40%);
+#   (2) the BINDING constraint is MODEL ERROR: p rests on thin tape plus the calibration
+#       table, so allow it to be 2x wrong;
+#   (3) fatal recovery line (recovery eats the program) ~ 45-50%, divided by that 2x ⇒ ~22%;
+#   (4) RYAN'S CORRECTION: earnings do NOT scale linearly with capital (sqrt-saturation per
+#       rung, knees, finite fast markets ⇒ concave in C), so (1)'s linear-recovery arithmetic
+#       OVERSTATES recovery cost and the whole derivation is conservative;
+#   (5) rounded to 0.20 — "not restricting us all that much."
+# Revisit only when p's error bars shrink with tape (loosen) or the funded mix cheapens
+# (tighten, through the floor-cap coupling in dials.py).
+# NOTE it is NOT `DAY_STOP_FRAC` (0.35).  That constant scales the intraday LOSS CIRCUIT off
+# projected reward; this one is the RUIN POLICY the cluster rail is derived from.  They answer
+# different questions and merging them would silently re-derive the rail.
+RUIN_D = 0.20
+RUIN_Z = 2.0                                 # "z = confidence (2)" — note 54 step 1.  Two
+                                             # sigma on the binomial of same-day cluster wipes.
+# READING B of note 55 §4 (see dials.py's header): force P(allocation converts in a day) = 1.
+# False by default because it is unimplementable as policy — at the funded mix's own prices it
+# returns p >> d, i.e. "fund nothing".  Flip it to ask the machine what the strict always-
+# filled worst case says today; it is an instrument, not a mode.
+RUIN_ALWAYS_FILLED = False
+
+# --- THE PRICE FLOOR DIAL (note 54 step 3; note 55 §1 dial 3) ---
+# The 6c ENTRY BAND was a guard on a RANKING THAT HAD NO BLEED TERM — remove the term and the
+# queue walks to the cheapest, most toxic end of the axis, which is the 2026-07-30 8.2c-book
+# incident.  The term now exists (`bleed.G_TABLE`, n = 8,240) and the marginal queue refuses
+# any entry whose NET is not positive at any rank, so the price floor stops being a number to
+# set and becomes a number to READ (`dials.emergent_floor_c`, logged every pass).
+# The hard band therefore drops to the exchange's own minimum tick under v6 — which the
+# CENTREPIECE also requires: treasury qualification walls live at 1-2c and a 6c band refuses
+# them outright (note 55 final amendment 2).
+# MIRROR (floor too LOW ↔ too high): too low re-opens the incident IF the bleed term is ever
+# lost — which is why `test_marginal.test_a_negative_entry_is_refused_with_its_numbers` and
+# `test_bleed` are the guards, not this constant.  Too high is what note 54 step 3 says to
+# stop doing: "at higher capital, lower the floor as good rungs exhaust."
+V6_PRICE_FLOOR_C = MIN_LEGAL_PRICE_C
+
+# --- THE 120/480 DEPLOY SPLIT (note 55, "THE DEPLOY PLAN — RYAN'S 120/480") ---
+# Ryan: stake $120 in treasury + gas (the measured top earners), "not worry about risk", test
+# earnings; the rest stabilises.  The probe's cap is NOT a constant: its worst case
+# (everything fills, everything settles wrong) is exactly d x C — 20% of $600 = $120 — so the
+# concentrated probe is precisely as safe as the diversified book BY THE DAY STOP'S OWN
+# ARITHMETIC, and no new risk machinery is needed.  `probe.probe_cap_usd` derives it; a test
+# asserts the identity at C = 600 so it can never drift into a literal 120.
+PROBE_ARMED = True
+# WINGS AND WALLS ONLY.  "NEVER mid-priced fat legs — that's what killed v4, not
+# concentration" (note 55).  A leg is a WING when its own collateral price is at or below the
+# band where the calibration table still separates prices at 1c resolution — 1c..4c each clear
+# N_MIN = 300 observations alone, and 5c is the first cent that has to be POOLED to be
+# measurable (`bleed.G_TABLE`).  So the wing edge is not chosen, it is where the measurement's
+# own resolution ends: the last band that is a single cent.
+PROBE_WING_MAX_C = 4
+# The probe's families, by cluster prefix — the two MEASURED top earners (note 55: "treasury +
+# gas (the measured top earners)", "both families run daily windows" ⇒ verdict within one
+# settle cycle).  Matched against `clusters.cluster_of`, so a family rename shows up as an
+# empty probe in the log rather than as a silent mis-fund.
+PROBE_FAMILIES = ("KXTREASURY", "KXUST", "KX10Y", "KX30Y", "KX2Y", "KX5Y", "KXNATGAS",
+                  "KXGAS", "KXNGAS")
+
+# --- THE RUIN FORMULA'S p, ANCHORED (dials.py header carries the full argument) ---
+# p = P(a cluster is wiped in a day) is a PRODUCT of two factors and only the product is
+# measurable from our own tape ("loss >= 80% of cluster allocation / cluster-days", note 54).
+# note 55's always-filled shortcut sets the first factor to 1, which at our own funded prices
+# returns p >> d and therefore "fund nothing" — unimplementable as policy.  So the product is
+# ANCHORED at the note's measured prior and MOVED by the factor the board can price:
+#     p = RUIN_P_BASE x p_against(mix) / p_against(RUIN_P_REF_PRICE)
+# RUIN_P_BASE: note 54, "With p ~ 8-10%".  0.09 is the midpoint and it reproduces the note's
+# own N ("run 30") and rail ("~$20 seats at $600") at the reference mix — 28 and $21.43,
+# computed rather than rounded.
+RUIN_P_BASE = 0.09
+# RUIN_P_REF_PRICE: the price mix that prior was measured on — bleed.py's own headline off the
+# live funded book, "funded-book natural average ~19.7c".  It is a MEASUREMENT, and moving the
+# funded mix away from it is exactly the floor-cap coupling Ryan decided (floor down => p up
+# => N up => rail down).
+RUIN_P_REF_PRICE = 0.197
+# RUIN_P_PRIOR_DAYS: the strength of that prior in cluster-days, DERIVED from the precision it
+# was stated to.  "8-10%" is +-1pp around 0.09; a binomial proportion has se = sqrt(p(1-p)/n),
+# so n = p(1-p)/se^2 = 0.09 x 0.91 / 0.0001 ~ 819 cluster-days is the tape that prior is worth.
+# Our own tape must beat that before it moves the rail.
+RUIN_P_PRIOR_DAYS = 819.0

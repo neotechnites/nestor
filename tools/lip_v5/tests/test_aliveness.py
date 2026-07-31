@@ -292,8 +292,13 @@ class TestLandGrabAppears(EngineCase):
         # this fixture the healthy NO side takes the cluster's ONE seat first, so the thin
         # side's logged skip is cluster_taken (or unaffordable when no sibling funds).
         # Either way the skip is instrumented, never a silent gate.
-        reasons = self.logs_of("law_reasons")
+        # V6 (2026-07-31): the queue's own reason names replace the law's, and the thin
+        # side's ~$59 walk is refused as `cant_afford_entry` against the derived cluster rail
+        # instead of `unaffordable` against a $10 seat.  The property under test is unchanged
+        # and is the only thing asserted: the refusal is INSTRUMENTED, never silent.
+        reasons = self.logs_of("mq_reasons") or self.logs_of("law_reasons")
         self.assertTrue(any(rec.get("unaffordable") or rec.get("cluster_taken")
+                            or rec.get("cant_afford_entry") or rec.get("cluster_rail_full")
                             for rec in reasons),
                         "the refusal must be INSTRUMENTED, not silent: %s" % reasons)
 
