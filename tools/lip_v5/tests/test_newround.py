@@ -344,9 +344,11 @@ class TestFillsPollWhileHalted(NewRoundCase):
         # The cancel-all the halt performs cannot remove it: the wire 503s (B10 UNKNOWN —
         # the order may still be live, and here it is).
         ex.cancel_status = 503
-        r.m.position_cost[TK] = 1000.0                        # crush the mark: day stop trips
+        # V6: the loss stopper is gone; the BUG ALARM is the door into a halted book.
+        r.m.position_cost[TK] = 1000.0                        # (v5: crushes the mark)
+        self.force_bug_alarm(r.m)
         out = r.iteration(NOW + 2)
-        self.assertTrue(out.get("day_stop"))
+        self.assertTrue(out.get("day_stop") or out.get("bug_alarm"))
         self.assertTrue(r.m.halt.halted)
         t = NOW + 3
         for _ in range(4):

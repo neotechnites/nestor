@@ -1543,6 +1543,9 @@ ALERTS = (
     "adopt_basis_rejected", "rate_starved", "cancel_share_exceeded", "idle_capital",
     "rstar_no_converge", "coverage_low", "credits_ritual_due", "venue_out_of_reach",
     "probe_oversized", "unit_mismatch", "ws_degraded",
+    # V6: the money-lost stopper is replaced by the BUG ALARM (note 55's risk frame).  A
+    # variance loss no longer pages; a loss the model calls impossible does.
+    "bug_alarm", "dials_dont_play", "probe_verdict",
 )
 
 
@@ -1641,3 +1644,20 @@ RUIN_P_REF_PRICE = 0.197
 # so n = p(1-p)/se^2 = 0.09 x 0.91 / 0.0001 ~ 819 cluster-days is the tape that prior is worth.
 # Our own tape must beat that before it moves the rail.
 RUIN_P_PRIOR_DAYS = 819.0
+
+# --- THE BUG ALARM (note 55, THE RISK FRAME: "NO MONEY-LOST STOPPER") ---
+# v6 deletes the loss stopper.  Variance losses never halt the earner — the sizing priced them
+# (that is what A = C/N and d = 0.20 ARE) and halting adds a $0 day on top of the loss.  What
+# halts is a loss the model says is IMPOSSIBLE.  See alarm.py for both tests.
+# ALARM_FAMILY_ALPHA: the probability that the alarm is wrong about the WHOLE PROGRAM.  The
+# consequence of a false alarm is a stopped earner and a woken human, so the budget is set per
+# program rather than per test, and Bonferroni over the program's own check count turns it into
+# the per-test alpha (alarm.derive_z).  5% is the same one-in-twenty this codebase uses for
+# every other bound it states at 95% (RULE_OF_THREE, phi's Rule-of-Three ceiling, the g-table's
+# standard errors) — one confidence level for the whole build, not a new number.
+ALARM_FAMILY_ALPHA = 0.05
+# LIP_PROGRAM_DAYS_REMAINING: the program ends 2026-09-01 (note 55 §0, "LIP ends Sept 1"); v6
+# deploys 2026-07-31.  32 days is the alarm's own lifetime and therefore the number of checks
+# the family-wise budget must cover.  It is a FACT about the program, not a tuning knob; when
+# the program is extended this is the one number that moves.
+LIP_PROGRAM_DAYS_REMAINING = 32.0

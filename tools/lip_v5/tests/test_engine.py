@@ -38,6 +38,18 @@ class EngineCase(LipTestCase):
         self._saved = {n: getattr(C, n) for n in CONFIG_PATHS}
         self.addCleanup(lambda: [setattr(C, n, v) for n, v in self._saved.items()])
 
+    # ── V6 FIXTURE HELPER ────────────────────────────────────────────────────────────────
+    # Several tests need a HALTED-AND-FLATTENED book as a starting state and used to reach it
+    # by crushing the mark until the day stop tripped.  v6 deletes the loss stopper (note 55's
+    # risk frame), so the only thing that halts is the BUG ALARM, and these fixtures arm it
+    # directly: a realised settlement loss that the calibration table says is impossible.  The
+    # property each of those tests asserts (scoped flatten, halted fills poll, cheap cadence)
+    # is unchanged; only the door into the halted state moved.
+    def force_bug_alarm(self, m):
+        m.alarm.observe_fill(10.0, 0.50)          # a fill the table expects to lose ~$0
+        m.alarm.observe_settlement(1_000.0)       # ...that lost a thousand dollars
+        return m
+
     def maker(self, **kw):
         C.DATA_DIR = self.tmp
         for name in CONFIG_PATHS[1:]:
@@ -336,15 +348,30 @@ class TestCycle(EngineCase):
         self.assertFalse(out["halted"])
 
     def test_B2_the_day_stop_HALTS_and_FLATTENS(self):
+        """V5 behaviour, kept and asserted while the v6 core is disarmed.
+
+        V6 (note 55, THE RISK FRAME): "Variance losses never halt the earner — the sizing
+        priced them, and halting adds a $0 day on top of the loss."  So under the armed core
+        this same book does NOT halt; the loss is OBSERVED with the numbers that make it
+        model-consistent, and only `alarm.BugAlarm` can stop the book.  Both behaviours are
+        asserted here so the switch is a switch and not a silent drift."""
         m = self.maker()
         m.place("KXAAAGASD-1", "bid", 0.50, 10, NOW + 3600, NOW, available_cash_usd=1000.0)
         m.positions["L"] = {"yes": 100.0, "no": 0.0}
         m.position_cost["L"] = 90.0
         out = m.cycle(NOW + 1, yes_mids={"L": 0.01})
-        self.assertTrue(out.get("day_stop"))
-        self.assertTrue(m.halt.halted)
-        self.assertEqual(m.orders, {})                   # flattened
-        self.assertTrue(any(a[0] == "halt" for a in self.alerts))
+        if not C.MARGINAL_QUEUE_ARMED:
+            self.assertTrue(out.get("day_stop"))
+            self.assertTrue(m.halt.halted)
+            self.assertEqual(m.orders, {})               # flattened
+            self.assertTrue(any(a[0] == "halt" for a in self.alerts))
+            return
+        self.assertFalse(out.get("day_stop"))
+        self.assertFalse(m.halt.halted, "a priced variance loss must not halt the earner")
+        obs = self.logs_of("loss_within_model")
+        self.assertTrue(obs, "a model-consistent loss must still be LOUD on the tape")
+        self.assertLessEqual(obs[-1]["book_loss_usd"], obs[-1]["worst_case_bound_usd"],
+                             "that is exactly what makes it model-consistent")
 
     def test_B2_unpriced_inventory_does_NOT_trip_the_stop(self):
         """The correction that keeps the stop off the gas books it exists to protect."""
@@ -361,8 +388,27 @@ class TestCycle(EngineCase):
         m = self.maker()
         m.peak.peak = 10_000.0
         out = m.cycle(NOW + 1, yes_mids={})
+        if not C.MARGINAL_QUEUE_ARMED:
+            self.assertTrue(m.halt.halted)
+            self.assertEqual(m.halt.reason, "max_drawdown")
+            return
+        # V6: a drawdown is a priced loss magnitude — observed, never halting.
+        self.assertFalse(m.halt.halted)
+        self.assertTrue(self.logs_of("drawdown_within_model"))
+
+    def test_the_BUG_ALARM_is_what_halts_now(self):
+        """note 55: "Model-impossible losses: the machine is broken."  A settlement loss the
+        calibration table says cannot happen halts, flattens and pages."""
+        m = self.maker()
+        m.place("KXAAAGASD-1", "bid", 0.50, 10, NOW + 3600, NOW, available_cash_usd=1000.0)
+        self.force_bug_alarm(m)
+        out = m.cycle(NOW + 1, yes_mids={})
+        if not C.MARGINAL_QUEUE_ARMED:
+            return
+        self.assertEqual(out.get("bug_alarm"), "loss_per_fill_outside_calibration")
         self.assertTrue(m.halt.halted)
-        self.assertEqual(m.halt.reason, "max_drawdown")
+        self.assertEqual(m.orders, {}, "the alarm flattens like the stopper did")
+        self.assertTrue(any(a[0] == "bug_alarm" for a in self.alerts))
 
     def test_B12_clock_skew_is_measured_and_alarms(self):
         m = self.maker()
@@ -436,12 +482,18 @@ class TestDrawdownEquity(EngineCase):
         self.assertFalse(m.halt.halted)
 
     def test_a_real_loss_still_breaches(self):
+        """V6: a drawdown is a LOSS MAGNITUDE and the sizing priced it, so it is observed and
+        not halted — same ruling as the day stop (note 55's risk frame)."""
         m = self.maker()
         m.cycle(NOW, yes_mids={})
         m.cash.realized_pnl = -0.36 * m.ceiling_usd      # > MAX_DRAWDOWN_FRAC of peak
         m.cycle(NOW + 1, yes_mids={})
-        self.assertTrue(m.halt.halted)
-        self.assertEqual(m.halt.reason, "max_drawdown")
+        if not C.MARGINAL_QUEUE_ARMED:
+            self.assertTrue(m.halt.halted)
+            self.assertEqual(m.halt.reason, "max_drawdown")
+            return
+        self.assertFalse(m.halt.halted)
+        self.assertTrue(self.logs_of("drawdown_within_model"))
 
 
 class TestFeesWired(EngineCase):

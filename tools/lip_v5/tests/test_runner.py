@@ -745,9 +745,10 @@ class TestCancelAllIsScopedToOurOwnOrders(RunnerCase):
         while the loop is otherwise healthy, so it gets its own statement rather than
         inheriting the halt's."""
         r, ours = self._armed_with_one_of_ours_and_two_foreign()
-        r.m.position_cost["T"] = 1000.0                       # crush the mark: day stop trips
+        r.m.position_cost["T"] = 1000.0                       # (v5: crushes the mark)
+        self.force_bug_alarm(r.m)                             # v6: the alarm is the door
         out = r.iteration(NOW + 2)
-        self.assertTrue(out.get("day_stop"))
+        self.assertTrue(out.get("day_stop") or out.get("bug_alarm"))
         self.assertIn(ours, r.m.ex.cancelled)
         self._assert_foreign_untouched(r)
 
@@ -966,8 +967,15 @@ class TestPlumbingWakes(RunnerCase):
                                                           # ($60 at $300), which the breach
                                                           # check now honors
         out = r.iteration(NOW + 1)
-        self.assertTrue(out.get("day_stop"))
-        self.assertTrue(r.m.halt.halted)
+        if not C.MARGINAL_QUEUE_ARMED:
+            self.assertTrue(out.get("day_stop"))
+            self.assertTrue(r.m.halt.halted)
+            return
+        # V6: the mark reaches the stop and the stop no longer halts — but it must still SEE
+        # the mark, which is what this test is really about, and the observation proves it.
+        obs = self.logs_of("loss_within_model")
+        self.assertTrue(obs, "the day stop must still be fed classified mids")
+        self.assertGreater(obs[-1]["book_loss_usd"], 0.0)
 
     def test_the_slot_carries_the_MARKET_close_not_the_program_end(self):
         ex = ScanExchange(balance_cents=1_000_000)

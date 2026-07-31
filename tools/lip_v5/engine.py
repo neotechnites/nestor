@@ -24,7 +24,7 @@ import os
 import signal
 
 from . import alloc, cashfeed, clusters as CL, config as C, cutover
-from . import dials as DI, marginal as MQ, quiet as QT, smooth as SM
+from . import alarm as AL, dials as DI, marginal as MQ, quiet as QT, smooth as SM
 from . import guards as G, ledger as LG, presence as P
 from . import quote as Q
 from . import ratchet as RT, ratelimit as RL, runtime as R, wsgate
@@ -56,6 +56,10 @@ class Maker(object):
         self.quiet_clusters = set()
         self.quiet_phi = {}
         self.probe = None
+        # THE BUG ALARM replaces the money-lost stopper (note 55's risk frame).  It accumulates
+        # WORLD events — fills the wire reported, settlements the wire paid — never our own
+        # decisions, so it is the same class of memory the convergence doctrine licenses.
+        self.alarm = AL.BugAlarm()
 
         self.ledger = LG.Ledger()
         self.presence_log = LG.PresenceLog()
@@ -687,6 +691,10 @@ class Maker(object):
                 if pos[leg] > 0 else 0.0
             self.position_cost[ticker] = self.position_cost.get(ticker, 0.0) + count * unit
             self.cash.fill(ticker, coid or "o", count, unit)
+            # THE BUG ALARM'S PREDICTION (alarm.py): every opening fill adds its own
+            # calibration-table expectation and variance.  Charged on OPENING fills only —
+            # a closing fill converts inventory back to cash and has no g.
+            self.alarm.observe_fill(float(count) * unit, unit)
         if fee_usd:
             self.pay_fee(fee_usd)
         self.refill.note_fill(ticker, side, count, ts=now)    # SF-6: window-keyed
@@ -981,8 +989,37 @@ class Maker(object):
                                    self.cash.fees_paid)
         out["pnl"] = pnl
         out["unpriced"] = G.unpriced_positions(self.positions, yes_mids or {})
-        if G.day_stop_breached(pnl, self.projected_day_reward,
-                               ceiling_usd=self.ceiling_usd):
+        # ── V6: THE LOSS STOPPER IS GONE; THE BUG ALARM IS WHAT HALTS. ────────────────
+        # "Variance losses never halt the earner — the sizing priced them, and halting adds a
+        # $0 day on top of the loss.  Model-impossible losses: the machine is broken."
+        # (note 55).  So a breached day stop under v6 is an OBSERVATION, logged with the
+        # numbers that make it model-consistent, and the two alarms in `alarm.py` are the only
+        # things that can stop the book.
+        _breached = G.day_stop_breached(pnl, self.projected_day_reward,
+                                        ceiling_usd=self.ceiling_usd)
+        if C.MARGINAL_QUEUE_ARMED:
+            # THE BOUND'S "at risk" TERM, off the engine's own books — the same numbers the
+            # day stop and the cluster report read, so an ADOPTED position (cost, no fill of
+            # ours) is inside the bound instead of reading as impossible.
+            _committed = (self.cash.resting_collateral
+                          + max(self.cash.inventory_basis,
+                                sum(self.position_cost.values())))
+            _halt, _why, _nums = self.alarm.check(loss_usd=max(0.0, -pnl),
+                                                  committed_usd=_committed)
+            if _breached:
+                R.log("loss_within_model", pnl=round(pnl, 4),
+                      day_stop_usd=round(G.day_stop_usd(self.projected_day_reward,
+                                                        ceiling_usd=self.ceiling_usd), 4),
+                      halting=_halt, **_nums)
+            if _halt:
+                self.day_stopped = True
+                self.halt.halt("bug_alarm", now, _nums)
+                self.flatten(now)
+                self.halt_flatten_done = True
+                R.ntfy("bug_alarm", "lip_v6 BUG ALARM %s: %s" % (_why, _nums))
+                out["bug_alarm"] = _why
+                return out
+        elif _breached:
             self.day_stopped = True
             self.halt.halt("day_stop", now, {"pnl": pnl})
             self.flatten(now)
@@ -999,6 +1036,12 @@ class Maker(object):
         equity = self.ceiling_usd + self.cash.realized_pnl + pnl
         dd, breached = self.peak.observe(equity, now)
         out["drawdown"] = dd
+        if breached and C.MARGINAL_QUEUE_ARMED:
+            # Same ruling as the day stop: a drawdown is a LOSS MAGNITUDE, and the sizing
+            # priced it.  Observed loudly, never halting; the bug alarm above is the halt.
+            R.log("drawdown_within_model", drawdown=round(dd, 4),
+                  peak=round(self.peak.peak, 4), **self.alarm.numbers())
+            breached = False
         if breached:
             self.halt.halt("max_drawdown", now, {"drawdown": dd, "peak": self.peak.peak})
             self.flatten(now)
@@ -1495,6 +1538,9 @@ class Maker(object):
                 else self.cash.settlement_zero(ticker)
             if released:
                 realized = paid - basis_p
+                # ALARM 2's OBSERVATION: realised loss on this settled position, positive for
+                # a loss.  It is the only place the table's prediction is ever scored.
+                self.alarm.observe_settlement(-realized)
                 self.ledger.write("settlement", ticker=ticker, paid_usd=round(paid, 6),
                                   realized_usd=round(realized, 6), released=True, src=src)
                 R.log("settlement_released", ticker=ticker, paid_usd=round(paid, 6),
