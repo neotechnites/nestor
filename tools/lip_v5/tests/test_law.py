@@ -346,13 +346,17 @@ class TestOneOrderPerCluster(LipTestCase):
         self.assertEqual(a[r2.key], 0)
         self.assertEqual(rep["reasons"].get("cluster_taken"), 1)
 
-    def test_both_sides_of_one_market_are_one_cluster(self):
-        """Law §2: "both sides of one market" resolve the same — only one side funds."""
+    def test_both_sides_of_one_market_SHARE_the_seat(self):
+        """REWRITTEN under the TWO-SIDED AMENDMENT (Ryan, 2026-07-31 — supersedes the
+        one-side reading of law §2): each side is scored against its OWN half-pool, the
+        legs cannot both settle against us, so both sides fund from ONE shared envelope.
+        The old assertion ("only one side funds") encoded the law this amendment replaced."""
         bid = slot(side="bid", p=0.10)
         ask = slot(side="ask", p=0.12)
         a, _s, _rep = alloc.allocate_law([bid, ask], budget_usd=300.0)
-        self.assertEqual(sum(1 for q in a.values() if q > 0), 1)
-        self.assertGreater(a[bid.key], 0, "the cheaper side takes the seat")
+        self.assertEqual(sum(1 for q in a.values() if q > 0), 2)
+        self.assertGreater(a[bid.key], 0)
+        self.assertGreater(a[ask.key], 0)
 
     def test_treasury_tenors_are_one_cluster(self):
         """Law §2: all treasury tenors are one settle source (clusters.CLUSTER_MAP)."""
@@ -779,3 +783,36 @@ class TestThereIsGenuinelyOneFormula(LipTestCase):
                     self.assertNotIn("score", line, "%s scores on total_usd" % label)
                     self.assertNotIn("append", line,
                                      "%s builds its sort key from total_usd" % label)
+
+
+class TestTwoSidedSeats(LipTestCase):
+    """TWO-SIDED AMENDMENT (Ryan, 2026-07-31): one MARKET per cluster; the seat may hold
+    BOTH sides.  Each side is scored against its own half-pool ("what says it earns more:
+    the per-side scoring rule"), the legs cannot both settle against us, and both draw from
+    ONE shared envelope.  v4's death was fat mid-priced legs unpriced — not symmetry."""
+
+    def _sides(self, p_yes=0.10, p_no=0.12):
+        a = slot("KXTWO-26AUG01-T1", side="bid", p=p_yes)
+        b = slot("KXTWO-26AUG01-T1", side="ask", p=p_no)
+        return a, b
+
+    def test_both_sides_of_ONE_market_fund_from_one_seat(self):
+        a, b = self._sides()
+        al, spent, rep = alloc.allocate_law([a, b], 300.0)
+        self.assertGreater(al[a.key], 0, "bid side must fund")
+        self.assertGreater(al[b.key], 0, "ask side must fund: its half-pool is a fresh prize")
+        self.assertEqual(rep["reasons"].get("cluster_taken"), None)
+
+    def test_the_two_sides_SHARE_the_ten_dollar_envelope(self):
+        a, b = self._sides()
+        al, spent, rep = alloc.allocate_law([a, b], 300.0)
+        total = al[a.key] * a.p + al[b.key] * b.p
+        self.assertLessEqual(total, C.ALLOC_PER_MARKET_USD + max(a.p, b.p) + 1e-9,
+                             "both sides may not exceed one market allocation")
+
+    def test_a_DIFFERENT_market_in_the_cluster_is_still_refused(self):
+        a, b = self._sides()
+        c = slot("KXTWO-26AUG01-T2", side="bid", p=0.10)
+        al, spent, rep = alloc.allocate_law([a, b, c], 300.0)
+        self.assertEqual(al[c.key], 0, "a second MARKET in the cluster is still one-per")
+        self.assertEqual(rep["reasons"].get("cluster_taken"), 1)

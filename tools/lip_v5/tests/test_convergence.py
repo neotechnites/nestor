@@ -210,8 +210,15 @@ class TestPlanGrowthReachesTheWire(ConvergenceCase):
         # reward tuned so W = ~$5.40 at 6c: the seed tranche posts $5.00 = 83 contracts,
         # and the oversize posts the $10 envelope = 166 — the rival branch's exact measured
         # pair, reproduced from the world instead of asserted.
+        # ONE-SIDED book (no NO-side depth): under the TWO-SIDED AMENDMENT (2026-07-31)
+        # a market whose both sides are viable SPLITS the seat, so the full-envelope 166
+        # would halve.  This spine tests plan-GROWTH reaching the wire, not seat-splitting;
+        # an empty NO side self-qual-refuses ($60 walk > $10 seat) and keeps the fixture's
+        # original one-sided geometry honest.
+        one_sided = {"orderbook": {"orderbook_fp": {
+            "yes_dollars": [["0.06", "1200"]], "no_dollars": []}}}
         ex = ConvergenceExchange(program_body(tickers=(TK_A,), reward=287_000),
-                                 {TK_A: cheap_book()})
+                                 {TK_A: one_sided})
         ex.market_closes[TK_A] = NOW + 16 * 3600
         m = self.maker(ex=ex)
         r = RUN.Runner(m, sleep=lambda _s: None)

@@ -788,17 +788,46 @@ def allocate_law(slots, budget_usd, market_spent=None, alloc_cap_usd=None,
 
     spent = 0.0
     funded_clusters = {}
+    pass_by_market = {}                           # in-pass charges, so side B's envelope
+    pass_by_cluster = {}                          # sees side A's spend THIS pass
+    # TWO-SIDED SEATS: tickers with BOTH sides viable this pass.  The oversize rule may not
+    # let the ranked-first side eat the whole seat when its counterpart is waiting — side
+    # B's FIRST dollar beats side A's tenth (share is concave per side; at S~0 the second
+    # half-pool is a whole fresh prize).  The first side sizes against half the envelope;
+    # the second gets what remains.
+    _sides_seen = {}
+    for _n in needs:
+        # Only sides that could actually fund count as a waiting counterpart: a side whose
+        # own need exceeds the whole seat (an empty side's $60 qualifying walk) is in the
+        # list only to be refused, and reserving half a seat for it starves the real side.
+        if _n.total_usd <= alloc_cap + 1e-9:
+            _sides_seen.setdefault(_n.slot.ticker, set()).add(_n.slot.side)
+    two_sided = {tk for tk, sd in _sides_seen.items() if len(sd) > 1}
     for n in law_rank(needs):
         s = n.slot
         if n.cluster in funded_clusters:
-            skip(n, CLUSTER_TAKEN)                # law §2: one order per cluster
-            continue
-        env = min(alloc_cap - float(market_spent.get(s.ticker, 0.0)), budget - spent)
+            _f_tk, _f_side = funded_clusters[n.cluster]
+            # ── TWO-SIDED AMENDMENT (Ryan, 2026-07-31): one MARKET per cluster, and the
+            # seat may hold BOTH of that market's sides.  Kalshi scores each side against
+            # its OWN half-pool with its own competition, so the second side is a fresh
+            # prize from the same seat — and the two legs cannot both settle against us
+            # (YES and NO can't both lose), so max directional loss HALVES while the
+            # collectable surface doubles.  v4's two-sided death was fat MID-PRICED legs
+            # with no bleed pricing, not symmetry: here both legs are wing-priced,
+            # bleed-charged, and share ONE $10 envelope (pass_by_market below).
+            if not (_f_tk == s.ticker and _f_side != s.side):
+                skip(n, CLUSTER_TAKEN)            # law §2: one MARKET per cluster
+                continue
+        env = min(alloc_cap - float(market_spent.get(s.ticker, 0.0))
+                  - pass_by_market.get(s.ticker, 0.0),
+                  budget - spent)
         if cluster_cap_usd is not None:
             # The cluster rail's room, measured over the same positions the rail reads: an
-            # envelope past it would fund an order `place()` refuses, forever.
+            # envelope past it would fund an order `place()` refuses, forever.  In-pass
+            # charges included: with two-sided seats a cluster can fund twice per pass.
             env = min(env, float(cluster_cap_usd)
-                      - float(cluster_spent.get(n.cluster, 0.0)))
+                      - float(cluster_spent.get(n.cluster, 0.0))
+                      - pass_by_cluster.get(n.cluster, 0.0))
         if env < n.unit_usd:
             # This market's $10 is spent (fills consumed it) or the $300 is gone.  The
             # distinction matters in the log: one is the market's requote budget exhausted
@@ -813,7 +842,15 @@ def allocate_law(slots, budget_usd, market_spent=None, alloc_cap_usd=None,
             # dollars makes us too concentrated."
             skip(n, UNAFFORDABLE)
             continue
-        q = law_order_q(n, env)
+        env_for_order = env
+        if s.ticker in two_sided and alloc.get((s.ticker,
+                "ask" if s.side == "bid" else "bid"), 0) == 0:
+            # The split constrains the OVERSIZE only, never the need: a rung whose W or
+            # qualifying walk requires more than half the seat still gets its need (plus
+            # the rounding contract) — otherwise the split would refuse minimums the
+            # affordability screen already admitted.
+            env_for_order = min(env, max(env / 2.0, n.total_usd + n.unit_usd))
+        q = law_order_q(n, env_for_order)
         if q < 1:
             skip(n, UNAFFORDABLE)
             continue
@@ -850,6 +887,8 @@ def allocate_law(slots, budget_usd, market_spent=None, alloc_cap_usd=None,
         alloc[s.key] = q
         charge = min(q * n.unit_usd * max(1.0, n.turnovers), env)
         spent += charge
+        pass_by_market[s.ticker] = pass_by_market.get(s.ticker, 0.0) + charge
+        pass_by_cluster[n.cluster] = pass_by_cluster.get(n.cluster, 0.0) + charge
         funded_clusters[n.cluster] = s.key
         R.log("law_funded", q=q, order_usd=round(order_usd, 4),
               order_bleed_usd=round(order_bleed, 4),
