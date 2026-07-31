@@ -128,13 +128,22 @@ class TestFreeRideDiedIntoTheFormula(LipTestCase):
 
     def test_the_one_cent_land_grab_price_is_gone(self):
         """LAND_GRAB_PRICE_C = 1 was the geometry of the -100% cohort.  The self-qualifying
-        price is the ENTRY BAND floor now, on the side's own axis, everywhere."""
+        price is a DIAL now, on the side's own axis, everywhere — the entry band floor under
+        v5, the price-floor dial under v6.
+
+        V6 (2026-07-31): the walk is priced at `V6_PRICE_FLOOR_C` (the exchange tick) because
+        that is what makes a treasury qualification wall affordable at all (1,000 x 1c = $10).
+        The -100% cohort is NOT re-admitted by that: what refuses 1c paper is now the fill-
+        bleed screen — g(1c) = 0.9484 — which refuses it wherever fills actually happen, and
+        admits it only in the quiet class where they do not.  The constant is gone either way,
+        which is what this test is really about, and the dial is asserted as a dial."""
         self.assertFalse(hasattr(C, "LAND_GRAB_PRICE_C"))
         import inspect
         from .. import scan
         src = inspect.getsource(scan.build_slots)
-        self.assertIn("ENTRY_BAND_LO_C if side ==", src.replace("C.ENTRY_BAND_LO_C",
-                                                                "ENTRY_BAND_LO_C"))
+        self.assertIn("_wall_c if side ==", src)
+        self.assertIn("V6_PRICE_FLOOR_C if C.MARGINAL_QUEUE_ARMED else C.ENTRY_BAND_LO_C",
+                      src)
 
 
 if __name__ == "__main__":

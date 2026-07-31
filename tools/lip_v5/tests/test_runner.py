@@ -308,10 +308,23 @@ class TestSlotTable(LipTestCase):
         self.assertTrue(bids, "the law prices the thin side; it does not delete it")
         self.assertEqual(bids[0].land_grab_size, 990)     # the walk gap, carried
         own_axis = bids[0].land_grab_price_c
-        self.assertEqual(own_axis, C.ENTRY_BAND_LO_C, "never 1c again")
+        # V6: the walk is priced at the FLOOR DIAL (the tick) so a wall is affordable; what
+        # keeps the -100% cohort out is the bleed screen, not this price.
+        self.assertEqual(own_axis, C.V6_PRICE_FLOOR_C if C.MARGINAL_QUEUE_ARMED
+                         else C.ENTRY_BAND_LO_C)
+        # V5: 990 x 6c = $59.40 against a $10 seat ⇒ unaffordable, logged.
+        # V6: 990 x 1c = $9.90 — THE WALL IS AFFORDABLE, and that is the centrepiece, not a
+        # regression: a self-qualified side at the tick is note 55's "treasury qualification
+        # walls across tenors at 1-2c sides ~$10-20 each".  What keeps it honest is the bleed
+        # screen (g(1c) = 0.9484 ⇒ funded only where the fills do not happen), which this
+        # fixture's zero-phi slot passes.  Either way the outcome is PRICED, never a gate.
         a2, spent, rep = alloc.allocate_law(bids, 300.0)
-        self.assertEqual(spent, 0.0)
-        self.assertEqual(rep["reasons"].get("unaffordable"), 1)
+        if C.MARGINAL_QUEUE_ARMED:
+            self.assertGreater(spent, 0.0)
+            self.assertAlmostEqual(spent, 990 * C.V6_PRICE_FLOOR_C / 100.0, delta=0.02)
+        else:
+            self.assertEqual(spent, 0.0)
+            self.assertEqual(rep["reasons"].get("unaffordable"), 1)
         # and the ask side, which DOES clear target on rival size alone, rides free
         asks = [s for s in slots if s.side == "ask"]
         self.assertTrue(asks)

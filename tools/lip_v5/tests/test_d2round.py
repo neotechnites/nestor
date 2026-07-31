@@ -118,8 +118,12 @@ class TestD4SelfQualificationIsPricedAtTheBandFloor(LipTestCase):
             self.assertEqual(s.land_grab_size, 600)
             own_axis_c = s.land_grab_price_c if s.side == "bid" \
                 else 100 - s.land_grab_price_c
-            self.assertEqual(own_axis_c, C.ENTRY_BAND_LO_C,
-                             "the 1c funding path is the -100% cohort's own geometry")
+            # V6: the walk's price is the FLOOR DIAL, not the band constant — the tick, so a
+            # 1,000-contract wall costs $10 and fits a $21 rail (note 55 final amendment 2).
+            # What refuses toxic paper is the bleed screen, not this price.
+            self.assertEqual(own_axis_c,
+                             C.V6_PRICE_FLOOR_C if C.MARGINAL_QUEUE_ARMED
+                             else C.ENTRY_BAND_LO_C)
 
     def test_the_allocator_not_a_gate_refuses_the_unaffordable_walk(self):
         own = {(TK, "bid"): [(12, 300.0)]}
@@ -186,9 +190,29 @@ class TestTheEntryBandIsABiasFloor(LipTestCase):
 
     def test_a_sub_floor_price_is_refused_and_only_that_side(self):
         """A binary's two sides sum to ~$1, so the floor bites ONE side: the 2c bid goes, the
-        95c ask stays.  With no upper bound that is the whole effect of the floor."""
+        95c ask stays.  With no upper bound that is the whole effect of the floor.
+
+        V6 (2026-07-31): the band's low edge is the DIAL, so a 2c bid is no longer deleted
+        before anyone prices it — it reaches the queue and the FILL-BLEED SCREEN decides, with
+        numbers.  The property this class is really about (measured bias must not be bought)
+        is unchanged and is asserted where it now lives: `test_the_bleed_screen_is_what_
+        refuses_2c_now`."""
+        expect = ["ask"] if not C.MARGINAL_QUEUE_ARMED else ["ask", "bid"]
         self.assertEqual(sides(scan.build_slots([prog()], Table(bid_p=0.02, ask_p=0.95), NOW)),
-                         ["ask"])
+                         expect)
+
+    def test_the_bleed_screen_is_what_refuses_2c_now(self):
+        """THE GUARD THAT REPLACED THE BAND.  g(2c) = 1.0000 (n = 1,368 side-observations,
+        realised 0.00%), so a 2c rung with ANY fill hazard has a net-negative entry and the
+        marginal queue refuses it at any rank — and, unlike the band, it says so with the
+        arithmetic.  A 2c rung with NO fill hazard (the quiet class) is admitted, which is the
+        centrepiece and is exactly the distinction the band could not make."""
+        from .. import marginal as MQ, alloc as AL
+        hot = AL.Slot("KXB-26JUL31-T1", "bid", rho=0.4, S=50.0, p=0.02, phi=1.0,
+                      hours_left=24.0, target_size=1000, cum_size=2000.0)
+        a, spent, rep = MQ.allocate_marginal([hot], budget_usd=600.0)
+        self.assertEqual(spent, 0.0)
+        self.assertEqual(rep["reasons"].get(MQ.NEGATIVE_ENTRY), 1)
 
     def test_an_expensive_side_is_NOT_refused(self):
         """The old 20c ceiling deleted these, and it is what emptied the book."""
@@ -585,8 +609,11 @@ class TestTheFloorLiftsOnEvidence(LipTestCase):
                  "fill_notional": 0.0}]
 
     def test_an_UNMEASURED_cheap_side_is_refused(self):
+        # V6: refused by the BLEED SCREEN rather than deleted by the band — see
+        # TestTheEntryBandIsABiasFloor.test_the_bleed_screen_is_what_refuses_2c_now.
+        expect = ["ask"] if not C.MARGINAL_QUEUE_ARMED else ["ask", "bid"]
         self.assertEqual(
-            sides(scan.build_slots([prog()], Table(bid_p=0.02, ask_p=0.95), NOW)), ["ask"])
+            sides(scan.build_slots([prog()], Table(bid_p=0.02, ask_p=0.95), NOW)), expect)
 
     def test_a_MEASURED_cheap_side_is_admitted_and_judged_by_star_instead(self):
         rows = self.rows(1, 500.0 * 3600.0)

@@ -778,9 +778,10 @@ class TestTheEmptyBookIsEnterable(FixRoundCase if 'FixRoundCase' in dir() else _
         slots = scan.build_slots([prog], cls, now, p6=lambda t: True,
                                  held={"KXEMPTY-26JUL29-T1"})
         self.assertEqual(len(slots), 2)
+        _floor = C.V6_PRICE_FLOOR_C if C.MARGINAL_QUEUE_ARMED else C.ENTRY_BAND_LO_C
         for s in slots:
-            self.assertAlmostEqual(s.p, C.ENTRY_BAND_LO_C / 100.0, places=9)
-            self.assertLessEqual(C.ENTRY_BAND_LO_C, int(round(s.p * 100)))
+            self.assertAlmostEqual(s.p, _floor / 100.0, places=9)
+            self.assertLessEqual(_floor, int(round(s.p * 100)))
             self.assertLessEqual(int(round(s.p * 100)), C.ENTRY_BAND_HI_C)
 
     def test_the_band_no_longer_refuses_an_empty_book_on_ENTRY_either(self):
@@ -800,12 +801,13 @@ class TestTheEmptyBookIsEnterable(FixRoundCase if 'FixRoundCase' in dir() else _
         self.assertEqual(len(slots), 2)
         # both sides cheap IN THEIR OWN CURRENCY: the bid is 6c of YES, the ask is 6c of NO
         # (= a YES ask at 94c).  Nothing to cross in an empty book, so both stand.
-        self.assertEqual(sorted(int(round(s.p * 100)) for s in slots),
-                         [C.ENTRY_BAND_LO_C, C.ENTRY_BAND_LO_C])
+        # V6: both prices are the FLOOR DIAL, on each side's own axis.
+        _floor = C.V6_PRICE_FLOOR_C if C.MARGINAL_QUEUE_ARMED else C.ENTRY_BAND_LO_C
+        self.assertEqual(sorted(int(round(s.p * 100)) for s in slots), [_floor, _floor])
         # RESOLVED by the owner's law §7a (2026-07-30): the self-qualifying price IS the
-        # band floor on each side's own axis — the 1c/99c inconsistency died with the flag.
+        # floor on each side's own axis — the 1c/99c inconsistency died with the flag.
         self.assertEqual(sorted(s.land_grab_price_c for s in slots),
-                         [C.ENTRY_BAND_LO_C, 100 - C.ENTRY_BAND_LO_C])
+                         [_floor, 100 - _floor])
 
     def test_a_pinned_empty_book_is_still_refused(self):
         import time
@@ -942,11 +944,18 @@ class TestTheEmptySideIsLegalAndRefusedInTheNeed(__import__('unittest').TestCase
 
     def test_a_small_walk_funds_through_the_law(self):
         from lip_v5 import alloc
-        slots = self._empty(100)                  # 101 x 6c = $6.06 <= $10
+        slots = self._empty(100)                  # 101 contracts at the floor dial
         a, spent, rep = alloc.allocate_law(slots, 300.0)
         funded = [(k, q) for k, q in a.items() if q > 0]
-        self.assertEqual(len(funded), 1, "one order per cluster, and it must exist")
-        self.assertGreaterEqual(funded[0][1], 101, "the walk plus the earning contract")
+        # ONE MARKET per cluster — and under the TWO-SIDED AMENDMENT (2026-07-31) that one
+        # market's BOTH sides may share the seat.  At the v6 floor dial a 101-contract walk
+        # costs ~$1 a side, so both sides now fit where at 6c only one did; the cluster
+        # invariant is asserted directly rather than through a side count.
+        self.assertTrue(funded, "the walk must fund")
+        self.assertEqual(len({k[0] for k, _q in funded}), 1,
+                         "one MARKET per cluster: %s" % funded)
+        self.assertTrue(all(q >= 101 for _k, q in funded),
+                        "the walk plus the earning contract: %s" % funded)
         self.assertGreater(spent, 0.0)
 
 

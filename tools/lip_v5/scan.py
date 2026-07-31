@@ -1040,7 +1040,11 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                 # way.  6c is the fiction we are willing to trade at.
                 if rec["pinned"]:
                     continue
-                p = C.ENTRY_BAND_LO_C / 100.0
+                # V6: the fiction is the FLOOR DIAL, not the band constant — same reasoning
+                # as the wall's price below, and it must be the SAME number, because on an
+                # empty side the quoted price and the qualifying walk's price are one order.
+                p = (C.V6_PRICE_FLOOR_C if C.MARGINAL_QUEUE_ARMED
+                     else C.ENTRY_BAND_LO_C) / 100.0
                 # AND THE SIDE IS LEGAL — grafted 2026-07-30 from the allocator-law branch
                 # after adjudication.  The comment above has always asserted it ("a legal
                 # price always exists on an empty side; pinned markets are excluded above")
@@ -1101,8 +1105,18 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
                                   P.rest_contract_hours(rows, key) if rows else 0.0))
             p_c = int(round(float(p) * 100))
             unmeasured = fills <= 0 and rest_ch <= 0.0
+            # ── V6: THE BAND'S LOW EDGE IS A DIAL, NOT A CONSTANT (note 54 step 3). ──────
+            # The 6c edge was a guard on a RANKING WITH NO BLEED TERM; the term exists now
+            # (`bleed.G_TABLE`, n = 8,240) and the marginal queue refuses a net-negative entry
+            # at any rank, so the edge drops to the exchange's own minimum tick.  The
+            # CENTREPIECE requires exactly that: treasury qualification walls live at 1-2c and
+            # a 6c edge refuses them outright (note 55 final amendment 2).  The realised floor
+            # is then READ off the queue every pass (`dials.emergent_floor_c`), which is what
+            # note 54 step 3 asks for — "lower the floor until the marginal admitted rung's
+            # (credit - bleed) equals the deepening margin."
+            _band_lo = (C.V6_PRICE_FLOOR_C if C.MARGINAL_QUEUE_ARMED else C.ENTRY_BAND_LO_C)
             if C.ENTRY_BAND_ARMED and not is_held and unmeasured and \
-                    not (C.ENTRY_BAND_LO_C <= p_c <= C.ENTRY_BAND_HI_C):
+                    not (_band_lo <= p_c <= C.ENTRY_BAND_HI_C):
                 R.log_once("entry_band_refused", ticker=ticker, side=side)
                 continue
             # SF-5: S is the RIVAL score — the classified book contains our own orders.
@@ -1173,8 +1187,17 @@ def build_slots(programs, classifier, now, presence_rows=None, tape=None, frozen
             # is the price the preserved entry band exists to refuse (n = 8,240: 2c realised
             # 0.00% on 765 markets; the 999-contract 1c gas rung was this exact geometry),
             # and a module cannot both price a thing and refuse its own price.
-            lg_px_c = C.ENTRY_BAND_LO_C if side == "bid" \
-                else (100 - C.ENTRY_BAND_LO_C)
+            # THE WALL'S PRICE.  v5 priced the self-qualifying walk at the 6c band floor
+            # because 1c was the price the band existed to refuse.  Under v6 the walk is
+            # priced at the floor DIAL — the tick — because that is what makes a wall
+            # affordable at all: 1,000 contracts x 1c = $10, x 2c = $20, which is note 55's
+            # "treasury qualification walls across tenors at 1-2c sides ~$10-20 each" and fits
+            # a $21 rail.  It is not a licence to buy 1c paper: g(1c) = 0.9484, so the bleed
+            # term makes the wall viable ONLY where the fills do not happen (T ~ 0), i.e. only
+            # in the quiet class the centrepiece is about.  The screen, not the price, is the
+            # guard.
+            _wall_c = (C.V6_PRICE_FLOOR_C if C.MARGINAL_QUEUE_ARMED else C.ENTRY_BAND_LO_C)
+            lg_px_c = _wall_c if side == "bid" else (100 - _wall_c)
             if not sd["qualifies"] and not rec["pinned"]:
                 land_grab = alloc.t0_qualification_size(sd["cum_size"], rec["target_size"])
                 # Never cross the OTHER side (v4, kept): a bid grab must sit below the yes

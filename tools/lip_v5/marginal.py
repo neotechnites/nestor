@@ -133,9 +133,10 @@ class Curve(object):
     """
 
     __slots__ = ("slot", "cluster", "S", "rho", "h", "h_eff", "cliff", "accrued", "p", "T",
-                 "g", "present", "q_entry", "qualify_q", "reason", "half_pool")
+                 "g", "present", "q_entry", "qualify_q", "reason", "half_pool", "phi")
 
-    def __init__(self, slot, cliff=None, horizon_h=None, transit=None, s_override=None):
+    def __init__(self, slot, cliff=None, horizon_h=None, transit=None, s_override=None,
+                 phi_override=None):
         cliff = C.CREDIT_TARGET_USD if cliff is None else float(cliff)
         horizon = A.LAW_HORIZON_H if horizon_h is None else float(horizon_h)
         tr = transit_h() if transit is None else float(transit)
@@ -150,7 +151,13 @@ class Curve(object):
         # number, which survives a cancel-all and therefore keeps the spine intact.
         self.present = self.accrued > 0.0
         self.h_eff = self.h if self.present else max(0.0, self.h - tr)
-        self.T = max(0.0, float(slot.phi)) * self.h
+        # PHI, with the QUIET FAMILY's pooled bound allowed to LOWER it and never to raise it
+        # (quiet.family_phi_bound): family evidence may license presence, never manufacture it.
+        _phi = max(0.0, float(slot.phi))
+        if phi_override is not None:
+            _phi = min(_phi, max(0.0, float(phi_override)))
+        self.T = _phi * self.h
+        self.phi = _phi
         self.half_pool = (self.rho / C.SCORE_SIDES) * self.h_eff
         self.reason = ""
         # THE SELF-QUALIFYING WALK (law §7a, unchanged from v5's `law_need`): a side whose
@@ -260,7 +267,8 @@ class Curve(object):
                 "present": self.present, "accrued": round(self.accrued, 4),
                 "cliff_usd": round(self.cliff, 4),
                 "T": round(self.T, 4), "g": round(self.g, 4),
-                "phi": round(float(self.slot.phi), 6)}
+                "phi": round(self.phi, 6),
+                "phi_slot": round(float(self.slot.phi), 6)}
 
 
 class Plan(object):
@@ -314,7 +322,7 @@ def _block_to_rate(curve, q0, q_hi, floor_rate):
 def allocate_marginal(slots, budget_usd, market_spent=None, cluster_spent=None,
                       cluster_cap_usd=None, per_market_cap_usd=None, cliff=None,
                       s_smoothed=None, multi_market_clusters=None, horizon_h=None,
-                      probe=None):
+                      probe=None, phi_by_cluster=None):
     """THE MARGINAL QUEUE.  Returns `(alloc {(ticker, side): q}, spent_usd, report)` — the
     same shape `alloc.allocate_law` returns, so it is a drop-in for the engine's plan step.
 
@@ -328,6 +336,8 @@ def allocate_marginal(slots, budget_usd, market_spent=None, cluster_spent=None,
                            that binds only for freak markets), passed explicitly by the caller.
     `s_smoothed`         — {(ticker, side): S̄} from `smooth.SmoothedS`.  Ranking on the
                            SNAPSHOT is what churns (note 55 item 4b).
+    `phi_by_cluster`     — the quiet class's family-pooled phi bound, applied where it LOWERS
+                           a strike's own posterior (quiet.family_phi_bound).
     `multi_market_clusters` — clusters exempt from one-market-per-cluster (the quiet
                            ladder-wide class, note 55 final amendment 2).  The DOLLAR rail is
                            the correlation bound either way.
@@ -361,7 +371,8 @@ def allocate_marginal(slots, budget_usd, market_spent=None, cluster_spent=None,
             why[WINDOW] = why.get(WINDOW, 0) + 1
             continue
         cv = Curve(s, cliff=cliff, horizon_h=horizon_h,
-                   s_override=(s_smoothed or {}).get(s.key))
+                   s_override=(s_smoothed or {}).get(s.key),
+                   phi_override=(phi_by_cluster or {}).get(CL.cluster_of(s.ticker)))
         if cv.reason:
             skip(cv, cv.reason)
             continue

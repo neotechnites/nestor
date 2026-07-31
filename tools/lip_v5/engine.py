@@ -24,7 +24,7 @@ import os
 import signal
 
 from . import alloc, cashfeed, clusters as CL, config as C, cutover
-from . import dials as DI, marginal as MQ, smooth as SM
+from . import dials as DI, marginal as MQ, quiet as QT, smooth as SM
 from . import guards as G, ledger as LG, presence as P
 from . import quote as Q
 from . import ratchet as RT, ratelimit as RL, runtime as R, wsgate
@@ -54,6 +54,7 @@ class Maker(object):
         # Filled by the quiet-family classifier (stage 3) and the 120/480 probe (stage 5);
         # both are properties of the BOARD and of config, never of our own past decisions.
         self.quiet_clusters = set()
+        self.quiet_phi = {}
         self.probe = None
 
         self.ledger = LG.Ledger()
@@ -291,12 +292,21 @@ class Maker(object):
         s_smoothed = {}
         for s in slots:
             s_smoothed[s.key] = self.smoothed.observe(s.key, s.S, now)
+        # THE CENTREPIECE'S GATE (note 55 final amendment 2).  Which clusters may hold MORE
+        # THAN ONE market — nothing else.  The dollar rail, the per-strike cliff and the
+        # bleed screen are untouched, which is the whole safety argument for relaxing it.
+        # The probe's families are multi-market BY CONSTRUCTION (it is the experiment that
+        # creates the evidence `quiet` needs); see probe.py.
+        self.quiet_clusters, self.quiet_phi = QT.classify(slots, MQ.A.LAW_HORIZON_H)
+        if self.probe is not None:
+            self.quiet_clusters = self.quiet_clusters | self.probe.clusters(slots)
 
         def _alloc(sl, budget, rail, **kw):
             return MQ.allocate_marginal(sl, min(budget_usd, budget), market_spent=market_spent,
                                         cluster_spent=cluster_spent, cluster_cap_usd=rail,
                                         per_market_cap_usd=rail, s_smoothed=s_smoothed,
                                         multi_market_clusters=self.quiet_clusters,
+                                        phi_by_cluster=self.quiet_phi,
                                         probe=self.probe, **kw)
 
         self.dials = DI.derive_from_slots(self.ceiling_usd, slots, _alloc)
