@@ -1089,3 +1089,50 @@ class TestClassifyDiscoversBreadth(LipTestCase):
             progs2, now, accrued={"pc": 0.63})][0]
         self.assertEqual(lead, "KXTRUEV-26JUL30-T1",
                          "the cheapest-need cluster leads the read rounds")
+
+
+class TestPartialScanRetiresNothing(LipTestCase):
+    """ABSENCE IS EVIDENCE ONLY WHEN THE MAP FINISHED ARRIVING (red team, 2026-07-31).
+    Measured live the same night: 36 rate-starved partial scans and healthy top-earning
+    rungs recalled `retired_venue_recalled` because the retirement diff ran against a
+    partial program table. `last_scan_complete` existed for exactly this and had no
+    production consumer."""
+
+    def test_a_partial_map_does_not_retire_held_orders(self):
+        from .. import runner as RUN, scan
+        m = object.__new__(type("M", (), {}))
+        class FakeMaker:
+            orders = {"o1": {"ticker": "KXHELD-26AUG01-T1", "side": "bid", "remaining": 5}}
+            retired_tickers = {"KXPREV-RETIRED"}
+        r = RUN.Runner.__new__(RUN.Runner)
+        r.scanner = scan.Scanner()
+        r.m = FakeMaker()
+        # partial map missing the held ticker
+        r.scanner.last_scan_complete = False
+        live = [{"tickers": ["KXOTHER-1"]}]
+        live_tk = set()
+        for prog in live:
+            live_tk.update(prog.get("tickers") or [])
+        if r.scanner.last_scan_complete:
+            r.m.retired_tickers = {t for t in {o["ticker"] for o in r.m.orders.values()}
+                                   if t not in live_tk}
+        self.assertEqual(r.m.retired_tickers, {"KXPREV-RETIRED"},
+                         "a partial map may not mint retirements")
+        # complete map: retirement fires normally
+        r.scanner.last_scan_complete = True
+        if r.scanner.last_scan_complete:
+            r.m.retired_tickers = {t for t in {o["ticker"] for o in r.m.orders.values()}
+                                   if t not in live_tk}
+        self.assertEqual(r.m.retired_tickers, {"KXHELD-26AUG01-T1"})
+
+    def test_the_production_path_carries_the_gate(self):
+        """Structural: the gate must guard the REAL retirement diff in runner.iteration,
+        not just this test's replica — a mutation there must be caught here."""
+        import inspect
+        from .. import runner as RUN
+        body = inspect.getsource(RUN.Runner.iteration)
+        i_gate = body.find("if self.scanner.last_scan_complete:")
+        i_diff = body.find("self.m.retired_tickers = ")
+        self.assertGreater(i_gate, -1, "the completeness gate is gone from iteration()")
+        self.assertGreater(i_diff, i_gate,
+                           "the retirement diff must sit INSIDE the completeness gate")

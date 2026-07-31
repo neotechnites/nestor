@@ -369,10 +369,18 @@ class Runner(object):
         live_tk = set()
         for prog in programs:
             live_tk.update(prog.get("tickers") or [])
-        self.m.retired_tickers = {t for t in list(self.m.orders and
-                                                  {o["ticker"] for o in self.m.orders.values()}
-                                                  or set())
-                                  if t not in live_tk}
+        # ── ABSENCE IS EVIDENCE ONLY WHEN THE MAP FINISHED ARRIVING (red team, 2026-07-31).
+        # A rate-starved scan overwrites `programs` with a PARTIAL page set; retiring
+        # against it recalls healthy held orders on absence-as-evidence — the cancel-wave
+        # class through the retirement door, live for up to a full scan period.
+        # `last_scan_complete` was built for exactly this and had no production consumer.
+        # On a partial map the previous retirement set stands: stale-but-derived beats
+        # fresh-but-blind.
+        if self.scanner.last_scan_complete:
+            self.m.retired_tickers = {t for t in list(self.m.orders and
+                                                      {o["ticker"] for o in self.m.orders.values()}
+                                                      or set())
+                                      if t not in live_tk}
         # THE 1.155 INCIDENT, root closed: ticker→program must not depend on the slot
         # table (the owner-picker's accrued lookup read it, so an unclassified held rung's
         # credit scored $0 and its sibling won the basis tiebreak — the same trap one level
